@@ -1782,9 +1782,11 @@ async fn admin_created_user_key_inherits_target_user_policy_not_admin_policy() {
         .expect("created key snapshot should exist");
     assert_eq!(resolved.user_id, "target-user");
     assert_eq!(
-        resolved.effective_allowed_providers(),
-        Some(&["anthropic".to_string()][..])
+        resolved.provider_allowlist_layers(),
+        [None, Some(&["anthropic".to_string()][..])]
     );
+    assert!(resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+    assert!(!resolved.allows_provider("provider-google", "Google", "google"));
     assert_eq!(
         resolved.effective_allowed_api_formats(),
         Some(&["claude:messages".to_string()][..])
@@ -1825,9 +1827,11 @@ async fn admin_created_user_key_inherits_target_user_policy_not_admin_policy() {
         .expect("created key snapshot should still exist");
     assert_eq!(updated.user_id, "target-user");
     assert_eq!(
-        updated.effective_allowed_providers(),
-        Some(&["google".to_string()][..])
+        updated.provider_allowlist_layers(),
+        [None, Some(&["google".to_string()][..])]
     );
+    assert!(updated.allows_provider("provider-google", "Google", "google"));
+    assert!(!updated.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
     assert_eq!(
         updated.effective_allowed_api_formats(),
         Some(&["gemini:generate-content".to_string()][..])
