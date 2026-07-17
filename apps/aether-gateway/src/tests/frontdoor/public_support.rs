@@ -8268,8 +8268,8 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
     );
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![
-            sample_provider("provider-openai", "openai", 10),
-            sample_provider("provider-claude", "claude", 20),
+            sample_provider("provider-openai", "OpenAI", 10),
+            sample_provider("provider-claude", "Claude", 20),
         ],
         vec![
             sample_endpoint(
