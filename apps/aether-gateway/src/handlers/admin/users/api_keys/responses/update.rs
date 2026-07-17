@@ -116,6 +116,9 @@ pub(crate) async fn build_admin_update_user_api_key_response(
             rate_limit: payload.rate_limit,
             concurrent_limit,
             ip_rules,
+            allowed_providers: None,
+            // Same atomic write as basic fields (None = leave unchanged).
+            feature_settings,
         })
         .await?
     else {
@@ -124,14 +127,6 @@ pub(crate) async fn build_admin_update_user_api_key_response(
             Json(json!({ "detail": "API Key不存在或不属于该用户" })),
         )
             .into_response());
-    };
-    let updated = if let Some(feature_settings) = feature_settings {
-        state
-            .set_user_api_key_feature_settings(&user_id, &api_key_id, feature_settings)
-            .await?
-            .unwrap_or(updated)
-    } else {
-        updated
     };
 
     let is_locked = state

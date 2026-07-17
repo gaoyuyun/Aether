@@ -1,6 +1,10 @@
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchedulerAuthConstraints {
+    /// Primary provider allowlist layer (OR within the list; id/name/type tokens).
     pub allowed_providers: Option<Vec<String>>,
+    /// Optional second layer that must **also** match (AND). Used when both user
+    /// policy and non-standalone key policy are present with different identifier systems.
+    pub allowed_providers_and: Option<Vec<String>>,
     pub allowed_api_formats: Option<Vec<String>>,
     pub allowed_models: Option<Vec<String>>,
 }
@@ -18,21 +22,41 @@ pub fn provider_matches_allowed_value(
             || allowed_value.eq_ignore_ascii_case(provider_type.trim()))
 }
 
+fn provider_allowlist_layer_allows(
+    allowed: Option<&[String]>,
+    provider_id: &str,
+    provider_name: &str,
+    provider_type: &str,
+) -> bool {
+    let Some(allowed) = allowed else {
+        return true;
+    };
+    // Empty list is explicit deny-all for the layer.
+    allowed.iter().any(|value| {
+        provider_matches_allowed_value(value, provider_id, provider_name, provider_type)
+    })
+}
+
 pub fn auth_constraints_allow_provider(
     constraints: Option<&SchedulerAuthConstraints>,
     provider_id: &str,
     provider_name: &str,
     provider_type: &str,
 ) -> bool {
-    let Some(allowed) =
-        constraints.and_then(|constraints| constraints.allowed_providers.as_deref())
-    else {
+    let Some(constraints) = constraints else {
         return true;
     };
-
-    allowed.iter().any(|value| {
-        provider_matches_allowed_value(value, provider_id, provider_name, provider_type)
-    })
+    provider_allowlist_layer_allows(
+        constraints.allowed_providers.as_deref(),
+        provider_id,
+        provider_name,
+        provider_type,
+    ) && provider_allowlist_layer_allows(
+        constraints.allowed_providers_and.as_deref(),
+        provider_id,
+        provider_name,
+        provider_type,
+    )
 }
 
 pub fn auth_constraints_allow_api_format(
@@ -106,9 +130,38 @@ mod tests {
     fn sample_constraints() -> SchedulerAuthConstraints {
         SchedulerAuthConstraints {
             allowed_providers: Some(vec!["provider-1".to_string(), "OpenAI".to_string()]),
+            allowed_providers_and: None,
             allowed_api_formats: Some(vec!["OPENAI:CHAT".to_string()]),
             allowed_models: Some(vec!["gpt-5".to_string()]),
         }
+    }
+
+    #[test]
+    fn constraints_and_second_provider_layer() {
+        let constraints = SchedulerAuthConstraints {
+            allowed_providers: Some(vec!["provider-openai-1".to_string()]),
+            allowed_providers_and: Some(vec!["openai".to_string()]),
+            allowed_api_formats: None,
+            allowed_models: None,
+        };
+        assert!(auth_constraints_allow_provider(
+            Some(&constraints),
+            "provider-openai-1",
+            "OpenAI",
+            "openai",
+        ));
+        assert!(!auth_constraints_allow_provider(
+            Some(&constraints),
+            "provider-openai-2",
+            "OpenAI 2",
+            "openai",
+        ));
+        assert!(!auth_constraints_allow_provider(
+            Some(&constraints),
+            "provider-claude-1",
+            "Claude",
+            "anthropic",
+        ));
     }
 
     #[test]

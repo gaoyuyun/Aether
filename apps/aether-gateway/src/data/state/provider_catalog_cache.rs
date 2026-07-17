@@ -8,8 +8,10 @@ use aether_cache::ExpiringMap;
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
-    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
-    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
+    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogProviderIdentity,
 };
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -151,6 +153,27 @@ impl ProviderCatalogReadRepository for CachedProviderCatalogReadRepository {
         }
     }
 
+    async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        match self
+            .get_or_load(
+                ProviderCatalogCacheKey::ProviderIdentities { active_only },
+                || async move {
+                    self.inner
+                        .list_provider_identities(active_only)
+                        .await
+                        .map(ProviderCatalogCacheValue::ProviderIdentities)
+                },
+            )
+            .await?
+        {
+            ProviderCatalogCacheValue::ProviderIdentities(items) => Ok(items),
+            _ => Ok(Vec::new()),
+        }
+    }
+
     async fn list_providers_by_ids(
         &self,
         provider_ids: &[String],
@@ -204,6 +227,26 @@ impl ProviderCatalogReadRepository for CachedProviderCatalogReadRepository {
             .await?
         {
             ProviderCatalogCacheValue::Endpoints(items) => Ok(items),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        let key =
+            ProviderCatalogCacheKey::EndpointIdentitiesByProviderIds(normalize_ids(provider_ids));
+        match self
+            .get_or_load(key, || async move {
+                self.inner
+                    .list_endpoint_identities_by_provider_ids(provider_ids)
+                    .await
+                    .map(ProviderCatalogCacheValue::EndpointIdentities)
+            })
+            .await?
+        {
+            ProviderCatalogCacheValue::EndpointIdentities(items) => Ok(items),
             _ => Ok(Vec::new()),
         }
     }
@@ -316,9 +359,11 @@ impl ProviderCatalogReadRepository for CachedProviderCatalogReadRepository {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ProviderCatalogCacheKey {
     Providers { active_only: bool },
+    ProviderIdentities { active_only: bool },
     ProvidersByIds(Vec<String>),
     EndpointsByIds(Vec<String>),
     EndpointsByProviderIds(Vec<String>),
+    EndpointIdentitiesByProviderIds(Vec<String>),
     KeysByIds(Vec<String>),
     KeysByProviderIds(Vec<String>),
     KeySummariesByProviderIds(Vec<String>),
@@ -329,7 +374,9 @@ enum ProviderCatalogCacheKey {
 #[derive(Clone)]
 enum ProviderCatalogCacheValue {
     Providers(Vec<StoredProviderCatalogProvider>),
+    ProviderIdentities(Vec<StoredProviderCatalogProviderIdentity>),
     Endpoints(Vec<StoredProviderCatalogEndpoint>),
+    EndpointIdentities(Vec<StoredProviderCatalogEndpointIdentity>),
     Keys(Vec<StoredProviderCatalogKey>),
     KeyMaintenanceSummaries(Vec<StoredProviderCatalogKeyMaintenanceSummary>),
     KeyStats(Vec<StoredProviderCatalogKeyStats>),

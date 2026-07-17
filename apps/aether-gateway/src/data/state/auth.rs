@@ -1782,7 +1782,7 @@ impl GatewayDataState {
             return Ok(None);
         };
         if snapshot.user_role.eq_ignore_ascii_case("admin") && !snapshot.api_key_is_standalone {
-            apply_admin_unrestricted_auth_snapshot(&mut snapshot);
+            apply_admin_account_policy_bypass(&mut snapshot);
             return Ok(Some(GatewayAuthApiKeySnapshot::from_stored(
                 snapshot,
                 now_unix_secs,
@@ -1808,7 +1808,7 @@ impl GatewayDataState {
         };
         if user.role.eq_ignore_ascii_case("admin") && !snapshot.api_key_is_standalone {
             snapshot.user_role = user.role;
-            apply_admin_unrestricted_auth_snapshot(&mut snapshot);
+            apply_admin_account_policy_bypass(&mut snapshot);
             return Ok(Some(GatewayAuthApiKeySnapshot::from_stored(
                 snapshot,
                 now_unix_secs,
@@ -1925,12 +1925,13 @@ impl GatewayDataState {
     }
 }
 
-fn apply_admin_unrestricted_auth_snapshot(snapshot: &mut StoredAuthApiKeySnapshot) {
+fn apply_admin_account_policy_bypass(snapshot: &mut StoredAuthApiKeySnapshot) {
     snapshot.user_allowed_providers = None;
     snapshot.user_allowed_api_formats = None;
     snapshot.user_allowed_models = None;
     snapshot.user_rate_limit = None;
-    snapshot.api_key_allowed_providers = None;
+    // Admins bypass account/group policy, but an ordinary user API key may still
+    // intentionally narrow its own provider access. Preserve that key-level layer.
     snapshot.api_key_allowed_api_formats = None;
     snapshot.api_key_allowed_models = None;
     snapshot.api_key_rate_limit = None;
@@ -2482,7 +2483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_non_standalone_snapshot_bypasses_group_and_key_policies() {
+    async fn admin_non_standalone_snapshot_keeps_key_provider_policy_only() {
         let mut snapshot = sample_snapshot_with_role("key-admin", "admin-1", "admin")
             .with_user_rate_limit(Some(120));
         snapshot.api_key_allowed_providers = Some(vec!["anthropic".to_string()]);
@@ -2528,7 +2529,12 @@ mod tests {
             .expect("snapshot should resolve")
             .expect("snapshot should exist");
 
-        assert_eq!(resolved.effective_allowed_providers(), None);
+        assert_eq!(
+            resolved.preferred_allowed_providers(),
+            Some(&["anthropic".to_string()][..])
+        );
+        assert!(resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+        assert!(!resolved.allows_provider("provider-openai", "OpenAI", "openai"));
         assert_eq!(resolved.effective_allowed_api_formats(), None);
         assert_eq!(resolved.effective_allowed_models(), None);
         assert_eq!(resolved.user_rate_limit, None);
@@ -2537,7 +2543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_admin_role_bypasses_stored_user_and_key_policies() {
+    async fn current_admin_role_bypasses_account_policy_but_keeps_key_provider_policy() {
         let mut snapshot = sample_snapshot("key-admin", "admin-1");
         snapshot.api_key_allowed_providers = Some(vec!["anthropic".to_string()]);
         snapshot.api_key_allowed_api_formats = Some(vec!["anthropic:messages".to_string()]);
@@ -2560,7 +2566,12 @@ mod tests {
             .expect("snapshot should exist");
 
         assert_eq!(resolved.user_role, "admin");
-        assert_eq!(resolved.effective_allowed_providers(), None);
+        assert_eq!(
+            resolved.preferred_allowed_providers(),
+            Some(&["anthropic".to_string()][..])
+        );
+        assert!(resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+        assert!(!resolved.allows_provider("provider-openai", "OpenAI", "openai"));
         assert_eq!(resolved.effective_allowed_api_formats(), None);
         assert_eq!(resolved.effective_allowed_models(), None);
         assert_eq!(resolved.user_rate_limit, None);
@@ -2614,7 +2625,7 @@ mod tests {
             .expect("snapshot should exist");
 
         assert_eq!(
-            resolved.effective_allowed_providers(),
+            resolved.preferred_allowed_providers(),
             Some(&["anthropic".to_string()][..])
         );
         assert_eq!(
@@ -2633,7 +2644,7 @@ mod tests {
             .expect("catalog policies should resolve");
         assert_eq!(
             catalog_policies.allowed_providers.as_deref(),
-            resolved.effective_allowed_providers()
+            resolved.preferred_allowed_providers()
         );
         assert_eq!(
             catalog_policies.allowed_api_formats.as_deref(),
