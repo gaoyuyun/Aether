@@ -41,12 +41,22 @@ export interface UserPreferences {
   }
 }
 
-// 提供商配置接口
+// 提供商配置接口（历史绑定结构；密钥 allowed_providers 现为 string[] ID 列表）
 export interface ProviderConfig {
   provider_id: string
   priority: number  // 优先级（越高越优先）
   weight: number    // 负载均衡权重
   enabled: boolean  // 是否启用
+}
+
+/** 用户可见的可用提供商（已按账户策略过滤） */
+export interface AvailableProvider {
+  id: string
+  name?: string | null
+  provider_priority?: number
+  endpoints?: Array<Record<string, unknown>>
+  models?: Array<Record<string, unknown>>
+  description?: string | null
 }
 
 // 使用记录接口
@@ -182,7 +192,8 @@ export interface ApiKey {
   rate_limit?: number | null
   concurrent_limit?: number | null
   ip_rules?: string[] | null
-  allowed_providers?: ProviderConfig[]
+  /** null/undefined = 跟随账户可用提供商；列表 = 密钥级白名单 */
+  allowed_providers?: string[] | null
   force_capabilities?: Record<string, boolean> | null  // 强制能力配置
   feature_settings?: FeatureSettingsMap | null
 }
@@ -266,7 +277,14 @@ export const meApi = {
     return response.data
   },
 
-  async createApiKey(data: { name: string; rate_limit?: number | null; concurrent_limit?: number | null; ip_rules?: string[] | null; feature_settings?: FeatureSettingsMap | null }): Promise<ApiKey> {
+  async createApiKey(data: {
+    name: string
+    rate_limit?: number | null
+    concurrent_limit?: number | null
+    ip_rules?: string[] | null
+    feature_settings?: FeatureSettingsMap | null
+    allowed_providers?: string[] | null
+  }): Promise<ApiKey> {
     const response = await apiClient.post<ApiKey>('/api/users/me/api-keys', data)
     return response.data
   },
@@ -304,7 +322,15 @@ export const meApi = {
 
   async updateApiKey(
     keyId: string,
-    data: { name?: string; rate_limit?: number | null; concurrent_limit?: number | null; ip_rules?: string[] | null; feature_settings?: FeatureSettingsMap | null | undefined }
+    data: {
+      name?: string
+      rate_limit?: number | null
+      concurrent_limit?: number | null
+      ip_rules?: string[] | null
+      feature_settings?: FeatureSettingsMap | null | undefined
+      /** null = inherit account allowance; list = key-level subset */
+      allowed_providers?: string[] | null
+    }
   ): Promise<ApiKey & { message: string }> {
     const response = await apiClient.put<ApiKey & { message: string }>(
       `/api/users/me/api-keys/${keyId}`,
@@ -380,9 +406,14 @@ export const meApi = {
     return response.data
   },
 
-  // 获取可用的提供商
-  async getAvailableProviders(): Promise<Array<Record<string, unknown>>> {
-    const response = await apiClient.get('/api/users/me/providers')
+  // 获取可用的提供商（已按账户策略过滤）
+  // view=options：仅 id/name，供密钥白名单选择器使用，避免加载 endpoints/models
+  async getAvailableProviders(options?: {
+    view?: 'full' | 'options'
+  }): Promise<AvailableProvider[]> {
+    const response = await apiClient.get<AvailableProvider[]>('/api/users/me/providers', {
+      params: options?.view && options.view !== 'full' ? { view: options.view } : undefined,
+    })
     return response.data
   },
 
@@ -429,10 +460,11 @@ export const meApi = {
 
   // 提供商绑定管理相关方法已移除，改为直接从可用提供商中选择
 
-  // API密钥提供商关联
+  // API密钥提供商关联（null = 跟随账户；列表 = 密钥级子集）
   async updateApiKeyProviders(keyId: string, data: {
-    allowed_providers?: ProviderConfig[]
-  }): Promise<{ message: string }> {
+    allowed_providers?: string[] | null
+    providers?: string[]
+  }): Promise<{ message: string; allowed_providers?: string[] | null }> {
     const response = await apiClient.put(`/api/users/me/api-keys/${keyId}/providers`, data)
     return response.data
   },

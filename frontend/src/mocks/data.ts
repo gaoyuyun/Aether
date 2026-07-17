@@ -368,6 +368,7 @@ export const MOCK_USER_API_KEYS = [
     is_standalone: false,
     total_requests: 1234,
     total_cost_usd: 45.67,
+    allowed_providers: null,
     force_capabilities: null
   },
   {
@@ -380,6 +381,7 @@ export const MOCK_USER_API_KEYS = [
     is_standalone: false,
     total_requests: 5678,
     total_cost_usd: 123.45,
+    allowed_providers: ['provider-002'],
     force_capabilities: { cache_1h: true }
   },
   {
@@ -391,6 +393,7 @@ export const MOCK_USER_API_KEYS = [
     is_standalone: false,
     total_requests: 100,
     total_cost_usd: 2.34,
+    allowed_providers: [],
     force_capabilities: null
   }
 ]

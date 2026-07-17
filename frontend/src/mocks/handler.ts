@@ -1440,8 +1440,12 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
       is_active: true,
       is_standalone: false,
       total_requests: 0,
-      total_cost_usd: 0
+      total_cost_usd: 0,
+      allowed_providers: body.allowed_providers ?? null,
+      ip_rules: body.ip_rules ?? null,
+      feature_settings: body.feature_settings ?? null,
     }
+    MOCK_USER_API_KEYS.unshift(newKey as typeof MOCK_USER_API_KEYS[number])
     return createMockResponse(newKey)
   },
 
@@ -3885,6 +3889,64 @@ registerDynamicRoute('DELETE', '/api/users/me/api-keys/:keyId', async (_config, 
     throw { response: createMockResponse({ detail: 'API Key 不存在' }, 404) }
   }
   return createMockResponse({ message: '删除成功（演示模式）' })
+})
+
+// 用户 API Key 主更新（名称/限速/IP/提供商等同请求，避免部分写入）
+registerDynamicRoute('PUT', '/api/users/me/api-keys/:keyId', async (config, params) => {
+  await delay()
+  const key = MOCK_USER_API_KEYS.find(k => k.id === params.keyId)
+  if (!key) {
+    throw { response: createMockResponse({ detail: 'API Key 不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}') as Record<string, unknown>
+  if (typeof body.name === 'string') {
+    ;(key as { name: string }).name = body.name
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'rate_limit')) {
+    ;(key as { rate_limit?: number | null }).rate_limit = body.rate_limit as number | null
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'concurrent_limit')) {
+    ;(key as { concurrent_limit?: number | null }).concurrent_limit =
+      body.concurrent_limit as number | null
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'ip_rules')) {
+    ;(key as { ip_rules?: string[] | null }).ip_rules = body.ip_rules as string[] | null
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'feature_settings')) {
+    ;(key as { feature_settings?: unknown }).feature_settings = body.feature_settings
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(body, 'allowed_providers')
+    || Object.prototype.hasOwnProperty.call(body, 'providers')
+  ) {
+    const allowedProviders = Object.prototype.hasOwnProperty.call(body, 'allowed_providers')
+      ? body.allowed_providers
+      : body.providers
+    ;(key as { allowed_providers?: string[] | null }).allowed_providers =
+      allowedProviders as string[] | null
+  }
+  return createMockResponse({
+    ...key,
+    message: 'API密钥已更新',
+  })
+})
+
+// 用户 API Key 可用提供商（兼容独立接口；前端已优先走主更新）
+registerDynamicRoute('PUT', '/api/users/me/api-keys/:keyId/providers', async (config, params) => {
+  await delay()
+  const key = MOCK_USER_API_KEYS.find(k => k.id === params.keyId)
+  if (!key) {
+    throw { response: createMockResponse({ detail: 'API Key 不存在' }, 404) }
+  }
+  const body = JSON.parse(config.data || '{}')
+  const allowedProviders = Object.prototype.hasOwnProperty.call(body, 'allowed_providers')
+    ? body.allowed_providers
+    : (body.providers ?? null)
+  ;(key as { allowed_providers?: string[] | null }).allowed_providers = allowedProviders
+  return createMockResponse({
+    message: 'API密钥可用提供商已更新',
+    allowed_providers: allowedProviders,
+  })
 })
 
 // 使用记录详情 - /api/admin/usage/:requestId

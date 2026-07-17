@@ -64,6 +64,10 @@ describe('main layout navigation builder', () => {
 
     const managementItems = navigation.find(group => group.title === 'tx:nav.group.management')?.items ?? []
     expect(managementItems.map(item => item.name)).toEqual(expect.arrayContaining(['Second module', 'First module']))
+    expect(managementItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'tx:nav.apiKeys', href: '/admin/my-api-keys' }),
+      expect.objectContaining({ name: 'tx:nav.standaloneKeys', href: '/admin/keys' }),
+    ]))
     expect(managementItems.findIndex(item => item.name === 'Second module')).toBeLessThan(
       managementItems.findIndex(item => item.name === 'First module')
     )

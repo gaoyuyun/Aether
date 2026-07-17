@@ -130,6 +130,7 @@ export function buildNavigation(options: {
         { name: t('nav.modelManagement'), href: '/admin/models', icon: Layers },
         { name: t('nav.routing'), href: '/admin/routing', icon: SlidersHorizontal },
         { name: t('nav.pool'), href: '/admin/pool', icon: Database },
+        { name: t('nav.apiKeys'), href: '/admin/my-api-keys', icon: KeyRound },
         { name: t('nav.standaloneKeys'), href: '/admin/keys', icon: Key },
         { name: t('nav.walletManagement'), href: '/admin/wallets', icon: Wallet },
         { name: t('nav.billingManagement'), href: '/admin/billing-plans', icon: Package },

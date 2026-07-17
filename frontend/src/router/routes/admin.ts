@@ -28,6 +28,11 @@ export const adminRoutes: RouteRecordRaw[] = [
         component: view(() => import('@/views/admin/ApiKeys.vue'))
       },
       {
+        path: 'my-api-keys',
+        name: 'AdminMyApiKeys',
+        component: view(() => import('@/views/user/MyApiKeys.vue'))
+      },
+      {
         path: 'wallets',
         name: 'WalletsManagement',
         component: view(() => import('@/views/admin/WalletsManagement.vue'))
