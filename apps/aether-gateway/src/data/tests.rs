@@ -892,10 +892,10 @@ async fn data_state_reads_minimal_candidate_selection_with_auth_filters() {
         .list_minimal_candidate_selection_rows("openai:chat", "gpt-4.1")
         .await
         .expect("minimal candidate selection rows should read");
+    let layers = auth_snapshot.provider_allowlist_layers();
     let auth_constraints = SchedulerAuthConstraints {
-        allowed_providers: auth_snapshot
-            .effective_allowed_providers()
-            .map(|items| items.to_vec()),
+        allowed_providers: layers[0].map(|items| items.to_vec()),
+        allowed_providers_and: layers[1].map(|items| items.to_vec()),
         allowed_api_formats: auth_snapshot
             .effective_allowed_api_formats()
             .map(|items| items.to_vec()),

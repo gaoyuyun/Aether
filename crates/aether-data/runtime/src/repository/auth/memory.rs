@@ -637,6 +637,7 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                 .as_ref()
                 .map(|value| serde_json::json!(value)),
         )?
+        .with_feature_settings(record.feature_settings)
         .with_activity_timestamps(None, Some(now_unix_secs), Some(now_unix_secs))?;
 
         index
@@ -831,6 +832,22 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
             }
             if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
                 export.ip_rules = ip_rules;
+            }
+        }
+        if let Some(allowed_providers) = record.allowed_providers {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_allowed_providers = allowed_providers.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.allowed_providers = allowed_providers;
+            }
+        }
+        if let Some(feature_settings) = record.feature_settings {
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.feature_settings = match feature_settings {
+                    Some(serde_json::Value::Null) | None => None,
+                    Some(value) => Some(value),
+                };
             }
         }
         Ok(index.export_by_api_key_id.get(&record.api_key_id).cloned())
@@ -1158,8 +1175,8 @@ mod tests {
     use super::InMemoryAuthApiKeySnapshotRepository;
     use crate::repository::auth::{
         AuthApiKeyLookupKey, AuthApiKeyReadRepository, AuthApiKeyWriteRepository,
-        StandaloneApiKeyExportListQuery, StoredAuthApiKeyExportRecord, StoredAuthApiKeySnapshot,
-        UpdateStandaloneApiKeyBasicRecord, UpdateUserApiKeyBasicRecord,
+        CreateUserApiKeyRecord, StandaloneApiKeyExportListQuery, StoredAuthApiKeyExportRecord,
+        StoredAuthApiKeySnapshot, UpdateStandaloneApiKeyBasicRecord, UpdateUserApiKeyBasicRecord,
     };
 
     fn sample_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
@@ -1360,6 +1377,8 @@ mod tests {
                 rate_limit: None,
                 concurrent_limit: Some(11),
                 ip_rules: None,
+                allowed_providers: None,
+                feature_settings: None,
             })
             .await
             .expect("update should succeed")
@@ -1372,6 +1391,90 @@ mod tests {
             .expect("find should succeed")
             .expect("snapshot should exist");
         assert_eq!(snapshot.api_key_concurrent_limit, Some(11));
+    }
+
+    #[tokio::test]
+    async fn create_and_update_user_key_preserve_provider_and_feature_tri_state() {
+        let repository = InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some("hash-template".to_string()),
+            sample_snapshot("key-template", "user-1"),
+        )]);
+        let created = repository
+            .create_user_api_key(CreateUserApiKeyRecord {
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created".to_string(),
+                key_hash: "hash-created".to_string(),
+                key_encrypted: Some("enc-created".to_string()),
+                name: Some("created".to_string()),
+                allowed_providers: Some(vec!["provider-a".to_string()]),
+                allowed_api_formats: None,
+                allowed_models: None,
+                ip_rules: None,
+                rate_limit: 0,
+                concurrent_limit: None,
+                force_capabilities: None,
+                feature_settings: Some(serde_json::json!({"redaction": {"enabled": true}})),
+                is_active: true,
+                expires_at_unix_secs: None,
+                auto_delete_on_expiry: false,
+                total_requests: 0,
+                total_tokens: 0,
+                total_cost_usd: 0.0,
+            })
+            .await
+            .expect("create should succeed")
+            .expect("created key should exist");
+        assert_eq!(
+            created.allowed_providers,
+            Some(vec!["provider-a".to_string()])
+        );
+        assert_eq!(
+            created.feature_settings,
+            Some(serde_json::json!({"redaction": {"enabled": true}}))
+        );
+
+        let denied = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created".to_string(),
+                name: None,
+                rate_limit: None,
+                concurrent_limit: None,
+                ip_rules: None,
+                allowed_providers: Some(Some(Vec::new())),
+                feature_settings: None,
+            })
+            .await
+            .expect("deny-all update should succeed")
+            .expect("updated key should exist");
+        assert_eq!(denied.allowed_providers, Some(Vec::new()));
+        assert_eq!(
+            denied.feature_settings,
+            Some(serde_json::json!({"redaction": {"enabled": true}}))
+        );
+
+        let cleared = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created".to_string(),
+                name: None,
+                rate_limit: None,
+                concurrent_limit: None,
+                ip_rules: None,
+                allowed_providers: Some(None),
+                feature_settings: Some(None),
+            })
+            .await
+            .expect("clear update should succeed")
+            .expect("cleared key should exist");
+        assert_eq!(cleared.allowed_providers, None);
+        assert_eq!(cleared.feature_settings, None);
+        let snapshot = repository
+            .find_api_key_snapshot(AuthApiKeyLookupKey::ApiKeyId("key-created"))
+            .await
+            .expect("snapshot lookup should succeed")
+            .expect("created snapshot should exist");
+        assert_eq!(snapshot.api_key_allowed_providers, None);
     }
 
     #[tokio::test]
