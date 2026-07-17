@@ -522,7 +522,7 @@ mod tests {
             "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request\",\"message\":\"This content was flagged for possible cybersecurity risk.\",\"code\":\"cyber_policy_violation\",\"param\":\"input\",\"details\":{\"policy_category\":\"cybersecurity\",\"appeal_allowed\":true}}}}\n\n",
         )
         .as_bytes();
-        let terminal_error = aether_ai_formats::api::extract_provider_private_stream_error_body(
+        let terminal_error = crate::ai_serving::api::extract_provider_private_stream_error_body(
             None,
             provider_buffered_body,
         )

@@ -695,14 +695,15 @@ fn extract_stream_error_event_body(body: &[u8]) -> Option<Value> {
             current_event_type = Some(event_name.trim().to_string());
             continue;
         }
-        let data_line = if let Some(rest) = line.strip_prefix("data:") {
-            rest.trim()
+        let (data_line, is_sse_data_line) = if let Some(rest) = line.strip_prefix("data:") {
+            (rest.trim(), true)
         } else {
-            line
+            (line, false)
         };
         if data_line.is_empty() || data_line == "[DONE]" {
             continue;
         }
+        let has_sse_event_name = current_event_type.is_some();
         let Ok(mut event) = serde_json::from_str::<Value>(data_line) else {
             continue;
         };
@@ -720,7 +721,18 @@ fn extract_stream_error_event_body(body: &[u8]) -> Option<Value> {
         {
             return Some(normalize_provider_private_error_body(event));
         }
-        if let Some(mut error_body) = openai_stream_terminal_error_body(&event) {
+        let is_explicit_stream_terminal_event = event
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|event_type| {
+                matches!(event_type, "response.failed" | "response.incomplete")
+            });
+        let is_stream_event =
+            is_sse_data_line || has_sse_event_name || is_explicit_stream_terminal_event;
+        if let Some(mut error_body) = is_stream_event
+            .then(|| openai_stream_terminal_error_body(&event))
+            .flatten()
+        {
             let response_failed_without_provider_type = event
                 .get("type")
                 .and_then(Value::as_str)
@@ -1199,6 +1211,21 @@ data: {"message":"bad"}
 
 "#;
         assert!(stream_body_contains_error_event(body));
+    }
+
+    #[test]
+    fn plain_json_error_responses_are_not_treated_as_stream_events() {
+        for body in [
+            br#"{"error":{"message":"slow down"}}"#.as_slice(),
+            br#"{"error":"authorization_pending","error_description":"waiting for user confirmation"}"#
+                .as_slice(),
+        ] {
+            assert_eq!(
+                extract_provider_private_stream_error_body(None, body),
+                None,
+                "plain JSON error responses must remain unchanged"
+            );
+        }
     }
 
     #[test]
