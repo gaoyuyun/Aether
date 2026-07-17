@@ -1233,18 +1233,12 @@ pub(crate) fn auth_snapshot_allows_cross_format_candidate(
     requested_base_model: Option<&str>,
     candidate: &SchedulerMinimalCandidateSelectionCandidate,
 ) -> bool {
-    if let Some(allowed_providers) = auth_snapshot.effective_allowed_providers() {
-        let provider_allowed = allowed_providers.iter().any(|value| {
-            aether_scheduler_core::provider_matches_allowed_value(
-                value,
-                &candidate.provider_id,
-                &candidate.provider_name,
-                &candidate.provider_type,
-            )
-        });
-        if !provider_allowed {
-            return false;
-        }
+    if !auth_snapshot.allows_provider(
+        &candidate.provider_id,
+        &candidate.provider_name,
+        &candidate.provider_type,
+    ) {
+        return false;
     }
 
     if let Some(allowed_models) = auth_snapshot.effective_allowed_models() {
