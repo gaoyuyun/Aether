@@ -1,5 +1,8 @@
 use async_trait::async_trait;
 
+pub const WALLET_BILLING_ENABLED_METADATA_KEY: &str = "wallet_billing_enabled";
+pub const BILLING_PLANS_ENABLED_METADATA_KEY: &str = "billing_plans_enabled";
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSettlementInput {
     pub request_id: String,
@@ -7,6 +10,10 @@ pub struct UsageSettlementInput {
     pub api_key_id: Option<String>,
     #[serde(default)]
     pub api_key_is_standalone: bool,
+    #[serde(default)]
+    pub skip_user_billing: Option<bool>,
+    #[serde(default)]
+    pub skip_plan_billing: Option<bool>,
     pub provider_id: Option<String>,
     pub status: String,
     pub billing_status: String,
@@ -124,6 +131,8 @@ mod tests {
             user_id: None,
             api_key_id: None,
             api_key_is_standalone: false,
+            skip_user_billing: Some(false),
+            skip_plan_billing: Some(false),
             provider_id: None,
             status: "completed".to_string(),
             billing_status: "pending".to_string(),

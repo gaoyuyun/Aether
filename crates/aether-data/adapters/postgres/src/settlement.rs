@@ -485,11 +485,13 @@ impl SettlementWriteRepository for SqlxSettlementRepository {
                         provider_monthly_used_usd: None,
                         finalized_at_unix_secs: Some(finalized_at as u64),
                     };
+                    let skip_user_billing = input.skip_user_billing.unwrap_or(false);
+                    let skip_plan_billing = input.skip_plan_billing.unwrap_or(false);
 
                     if final_billing_status == "settled" {
-                        let api_key_id = input
-                            .api_key_id
-                            .as_deref()
+                        let api_key_id = (!skip_user_billing)
+                            .then_some(input.api_key_id.as_deref())
+                            .flatten()
                             .filter(|value| !value.is_empty());
                         let api_key_is_standalone = if input.api_key_is_standalone {
                             true
@@ -535,7 +537,7 @@ LIMIT 1
 
                         let wallet_row = if wallet_row.is_some() {
                             wallet_row
-                        } else if !api_key_is_standalone {
+                        } else if !skip_user_billing && !api_key_is_standalone {
                             if let Some(user_id) =
                                 input.user_id.as_deref().filter(|value| !value.is_empty())
                             {
@@ -595,7 +597,9 @@ LIMIT 1
                         }
 
                         let billable_cost_usd = settlement_billable_cost_usd(&input);
-                        let wallet_debit_cost_usd = if !api_key_is_standalone {
+                        let wallet_debit_cost_usd = if skip_user_billing {
+                            0.0
+                        } else if !api_key_is_standalone && !skip_plan_billing {
                             if let Some(user_id) =
                                 input.user_id.as_deref().filter(|value| !value.is_empty())
                             {
@@ -734,6 +738,11 @@ WHERE id = $1
 
 #[cfg(test)]
 mod tests {
+    use super::SqlxSettlementRepository;
+    use aether_data_contracts::repository::settlement::{
+        SettlementWriteRepository, UsageSettlementInput,
+    };
+
     #[test]
     fn finalize_usage_billing_sql_does_not_require_usage_updated_at_column() {
         assert!(!super::FINALIZE_USAGE_BILLING_SQL.contains("updated_at"));
@@ -776,7 +785,211 @@ mod tests {
     #[test]
     fn settlement_sql_blocks_standalone_key_owner_wallet_fallback() {
         let source = include_str!("settlement.rs");
-        assert!(source.contains("SELECT is_standalone"));
-        assert!(source.contains("} else if !api_key_is_standalone {"));
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("settlement implementation should precede tests");
+        assert!(implementation.contains("SELECT is_standalone"));
+        // Build the needle outside a source literal so this assertion cannot
+        // match its own test text after the guard is removed.
+        let standalone_fallback_guard = [
+            "} else if !",
+            "skip_user_billing && !",
+            "api_key_is_standalone {",
+        ]
+        .concat();
+        assert!(implementation.contains(&standalone_fallback_guard));
+    }
+
+    #[tokio::test]
+    async fn postgres_settlement_respects_commerce_billing_flags_when_database_url_is_set() {
+        let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!(
+                "skipping postgres settlement commerce test because AETHER_TEST_POSTGRES_URL is unset"
+            );
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("postgres test pool should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("postgres migrations should run");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("commerce-user-{}", &suffix[..8]);
+        let user_key_id = format!("commerce-key-{}", &suffix[..8]);
+        let standalone_key_id = format!("commerce-standalone-{}", &suffix[..8]);
+        let provider_id = format!("commerce-provider-{}", &suffix[..8]);
+        let wallet_id = format!("commerce-wallet-{}", &suffix[..8]);
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO public.users (id, username, role, auth_source, email_verified) VALUES ($1, $2, 'user', 'local', true)",
+        )
+        .bind(&user_id)
+        .bind(format!("commerce-{}", &suffix[..8]))
+        .execute(&pool)
+        .await
+        .expect("postgres commerce user should insert");
+        for (key_id, standalone) in [(&user_key_id, false), (&standalone_key_id, true)] {
+            sqlx::query(
+                "INSERT INTO public.api_keys (id, user_id, key_hash, is_standalone) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(key_id)
+            .bind(&user_id)
+            .bind(format!("hash-{key_id}"))
+            .bind(standalone)
+            .execute(&pool)
+            .await
+            .expect("postgres commerce api key should insert");
+        }
+        sqlx::query(
+            "INSERT INTO public.providers (id, name, provider_type, created_at, updated_at) VALUES ($1, $2, 'custom', $3, $3)",
+        )
+        .bind(&provider_id)
+        .bind(format!("Commerce Provider {}", &suffix[..8]))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("postgres commerce provider should insert");
+        sqlx::query(
+            "INSERT INTO public.wallets (id, user_id, balance, gift_balance, created_at, updated_at) VALUES ($1, $2, 10, 0, $3, $3)",
+        )
+        .bind(&wallet_id)
+        .bind(&user_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("postgres commerce wallet should insert");
+
+        let skip_user_request = format!("commerce-skip-user-{}", &suffix[..8]);
+        let skip_plan_request = format!("commerce-skip-plan-{}", &suffix[..8]);
+        let standalone_request = format!("commerce-standalone-{}", &suffix[..8]);
+        sqlx::query(
+            r#"
+INSERT INTO public.usage (
+  id, request_id, user_id, api_key_id, provider_name, model, provider_id,
+  status, billing_status, total_cost_usd, actual_total_cost_usd
+)
+VALUES
+  ($1, $2, $3, $4, 'Commerce', 'model', $5, 'completed', 'pending', 3, 6),
+  ($6, $7, $3, $4, 'Commerce', 'model', $5, 'completed', 'pending', 3, 6),
+  ($8, $9, $3, $10, 'Commerce', 'model', $5, 'completed', 'pending', 3, 6)
+"#,
+        )
+        .bind(format!("usage-{skip_user_request}"))
+        .bind(&skip_user_request)
+        .bind(&user_id)
+        .bind(&user_key_id)
+        .bind(&provider_id)
+        .bind(format!("usage-{skip_plan_request}"))
+        .bind(&skip_plan_request)
+        .bind(format!("usage-{standalone_request}"))
+        .bind(&standalone_request)
+        .bind(&standalone_key_id)
+        .execute(&pool)
+        .await
+        .expect("postgres commerce usage should insert");
+
+        let repository = SqlxSettlementRepository::new(pool.clone());
+        let settled = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: skip_user_request,
+                user_id: Some(user_id.clone()),
+                api_key_id: Some(user_key_id.clone()),
+                api_key_is_standalone: false,
+                skip_user_billing: Some(true),
+                skip_plan_billing: Some(true),
+                provider_id: Some(provider_id.clone()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(2_000),
+            })
+            .await
+            .expect("skip-user settlement should run")
+            .expect("skip-user usage should exist");
+        assert_eq!(settled.wallet_id, None);
+
+        let plan_settled = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: skip_plan_request.clone(),
+                user_id: Some(user_id.clone()),
+                api_key_id: Some(user_key_id.clone()),
+                api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(true),
+                provider_id: Some(provider_id.clone()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(2_001),
+            })
+            .await
+            .expect("skip-plan settlement should run")
+            .expect("skip-plan usage should exist");
+        assert_eq!(plan_settled.wallet_balance_after, Some(4.0));
+        let replay = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: skip_plan_request,
+                user_id: Some(user_id.clone()),
+                api_key_id: Some(user_key_id),
+                api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(true),
+                provider_id: Some(provider_id.clone()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(9_999),
+            })
+            .await
+            .expect("replayed settlement should run")
+            .expect("replayed usage should exist");
+        assert_eq!(replay.finalized_at_unix_secs, Some(2_001));
+
+        let standalone = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: standalone_request,
+                user_id: Some(user_id.clone()),
+                api_key_id: Some(standalone_key_id),
+                api_key_is_standalone: true,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
+                provider_id: Some(provider_id.clone()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(2_002),
+            })
+            .await
+            .expect("standalone settlement should run")
+            .expect("standalone usage should exist");
+        assert_eq!(standalone.wallet_id, None);
+        assert_eq!(standalone.billing_status, "insufficient_quota");
+
+        let wallet_balance: f64 = sqlx::query_scalar(
+            "SELECT CAST(balance AS DOUBLE PRECISION) FROM public.wallets WHERE id = $1",
+        )
+        .bind(&wallet_id)
+        .fetch_one(&pool)
+        .await
+        .expect("postgres commerce wallet should load");
+        assert_eq!(wallet_balance, 4.0);
+        let provider_cost: f64 = sqlx::query_scalar(
+            "SELECT CAST(monthly_used_usd AS DOUBLE PRECISION) FROM public.providers WHERE id = $1",
+        )
+        .bind(&provider_id)
+        .fetch_one(&pool)
+        .await
+        .expect("postgres commerce provider should load");
+        assert_eq!(provider_cost, 12.0);
     }
 }
