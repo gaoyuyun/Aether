@@ -603,6 +603,10 @@ pub struct UpdateUserApiKeyBasicRecord {
     pub ip_rules: Option<Option<Vec<String>>>,
     /// `None` = leave unchanged; `Some(None)` = clear to inherit; `Some(Some(list))` = set.
     pub allowed_providers: Option<Option<Vec<String>>>,
+    /// `None` = leave unchanged; `Some(None)` = clear to inherit; `Some(Some(list))` = set.
+    pub allowed_api_formats: Option<Option<Vec<String>>>,
+    /// `None` = leave unchanged; `Some(None)` = clear to inherit; `Some(Some(list))` = set.
+    pub allowed_models: Option<Option<Vec<String>>>,
     /// `None` = leave unchanged; `Some(None)` = clear; `Some(Some(value))` = set.
     pub feature_settings: Option<Option<serde_json::Value>>,
 }

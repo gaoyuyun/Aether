@@ -542,6 +542,8 @@ SET name = COALESCE(?, name),
     concurrent_limit = COALESCE(?, concurrent_limit),
     ip_rules = CASE WHEN ? THEN ? ELSE ip_rules END,
     allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
+    allowed_api_formats = CASE WHEN ? THEN ? ELSE allowed_api_formats END,
+    allowed_models = CASE WHEN ? THEN ? ELSE allowed_models END,
     feature_settings = CASE WHEN ? THEN ? ELSE feature_settings END,
     updated_at = ?
 WHERE id = ?
@@ -561,6 +563,16 @@ WHERE id = ?
         .bind(json_string_from_nested_string_list(
             &record.allowed_providers,
             "api_keys.allowed_providers",
+        )?)
+        .bind(record.allowed_api_formats.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_api_formats,
+            "api_keys.allowed_api_formats",
+        )?)
+        .bind(record.allowed_models.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_models,
+            "api_keys.allowed_models",
         )?)
         .bind(record.feature_settings.is_some())
         .bind(optional_json_to_string(
@@ -1276,6 +1288,8 @@ mod tests {
                 concurrent_limit: None,
                 ip_rules: None,
                 allowed_providers: Some(Some(vec!["must-not-apply".to_string()])),
+                allowed_api_formats: None,
+                allowed_models: None,
                 feature_settings: None,
             })
             .await
@@ -1322,6 +1336,8 @@ mod tests {
                 concurrent_limit: Some(6),
                 ip_rules: Some(Some(vec!["10.0.0.0/24".to_string()])),
                 allowed_providers: None,
+                allowed_api_formats: None,
+                allowed_models: None,
                 feature_settings: None,
             })
             .await
@@ -1347,6 +1363,8 @@ mod tests {
                 concurrent_limit: None,
                 ip_rules: None,
                 allowed_providers: Some(None),
+                allowed_api_formats: Some(None),
+                allowed_models: Some(None),
                 feature_settings: Some(None),
             })
             .await
@@ -1364,12 +1382,16 @@ mod tests {
                 concurrent_limit: None,
                 ip_rules: None,
                 allowed_providers: Some(Some(Vec::new())),
+                allowed_api_formats: Some(Some(Vec::new())),
+                allowed_models: Some(Some(Vec::new())),
                 feature_settings: Some(Some(json!({"chat_pii_redaction": {"enabled": false}}))),
             })
             .await
             .expect("user key deny-all should update")
             .expect("user key should reload after deny-all");
         assert_eq!(denied_user_key.allowed_providers, Some(Vec::new()));
+        assert_eq!(denied_user_key.allowed_api_formats, Some(Vec::new()));
+        assert_eq!(denied_user_key.allowed_models, Some(Vec::new()));
         assert_eq!(
             denied_user_key.feature_settings,
             Some(json!({"chat_pii_redaction": {"enabled": false}}))
@@ -1384,6 +1406,8 @@ mod tests {
                 concurrent_limit: None,
                 ip_rules: None,
                 allowed_providers: Some(Some(vec!["anthropic".to_string()])),
+                allowed_api_formats: Some(Some(vec!["claude:messages".to_string()])),
+                allowed_models: Some(Some(vec!["claude-sonnet-4".to_string()])),
                 feature_settings: None,
             })
             .await
@@ -1392,6 +1416,14 @@ mod tests {
         assert_eq!(
             restricted_user_key.allowed_providers,
             Some(vec!["anthropic".to_string()])
+        );
+        assert_eq!(
+            restricted_user_key.allowed_api_formats,
+            Some(vec!["claude:messages".to_string()])
+        );
+        assert_eq!(
+            restricted_user_key.allowed_models,
+            Some(vec!["claude-sonnet-4".to_string()])
         );
         assert_eq!(
             restricted_user_key.feature_settings,
