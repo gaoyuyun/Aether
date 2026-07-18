@@ -43,6 +43,10 @@ struct UsersMeCreateApiKeyRequest {
     allowed_providers: Option<Option<Vec<UsersMeApiKeyProviderValue>>>,
     #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
     providers: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    allowed_api_formats: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    allowed_models: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +71,10 @@ struct UsersMeUpdateApiKeyRequest {
     allowed_providers: Option<Option<Vec<UsersMeApiKeyProviderValue>>>,
     #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
     providers: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    allowed_api_formats: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    allowed_models: Option<Option<Vec<String>>>,
 }
 
 fn deserialize_optional_provider_list_patch<'de, D>(
@@ -191,6 +199,8 @@ fn build_users_me_api_key_list_payload(
         "rate_limit": record.rate_limit,
         "concurrent_limit": record.concurrent_limit,
         "allowed_providers": record.allowed_providers,
+        "allowed_api_formats": record.allowed_api_formats,
+        "allowed_models": record.allowed_models,
         "ip_rules": record.ip_rules,
         "force_capabilities": record.force_capabilities,
         "feature_settings": record.feature_settings,
@@ -209,6 +219,8 @@ fn build_users_me_api_key_detail_payload(
         "is_active": record.is_active,
         "is_locked": is_locked,
         "allowed_providers": record.allowed_providers,
+        "allowed_api_formats": record.allowed_api_formats,
+        "allowed_models": record.allowed_models,
         "ip_rules": record.ip_rules,
         "force_capabilities": record.force_capabilities,
         "feature_settings": record.feature_settings,
@@ -430,6 +442,121 @@ async fn resolve_users_me_api_key_allowed_providers(
             false,
         )),
     }
+}
+
+fn normalize_users_me_api_key_string_list(
+    values: Option<Vec<String>>,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!("{field_name} 不能为空"));
+        }
+        if seen.insert(value.to_string()) {
+            normalized.push(value.to_string());
+        }
+    }
+    Ok(Some(normalized))
+}
+
+fn normalize_users_me_api_key_api_formats(
+    values: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        let Some(value) = crate::api::ai::normalize_admin_endpoint_signature(value) else {
+            return Err(format!("allowed_api_formats 格式无效: {value}"));
+        };
+        if seen.insert(value.to_string()) {
+            normalized.push(value.to_string());
+        }
+    }
+    Ok(Some(normalized))
+}
+
+async fn resolve_users_me_api_key_allowed_formats_and_models(
+    state: &AppState,
+    user: &aether_data::repository::users::StoredUserAuthRecord,
+    requested_api_formats: Option<Vec<String>>,
+    requested_models: Option<Vec<String>>,
+) -> Result<(Option<Vec<String>>, Option<Vec<String>>), Response<Body>> {
+    let needs_policy_lookup = requested_api_formats
+        .as_ref()
+        .is_some_and(|values| !values.is_empty())
+        || requested_models
+            .as_ref()
+            .is_some_and(|values| !values.is_empty());
+    if !needs_policy_lookup {
+        return Ok((requested_api_formats, requested_models));
+    }
+
+    let effective_policies = match state.data.resolve_user_effective_list_policies(user).await {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("user policy lookup failed: {err:?}"),
+                false,
+            ))
+        }
+    };
+
+    if let (Some(requested), Some(user_allowed)) = (
+        requested_api_formats.as_ref(),
+        effective_policies.allowed_api_formats.as_ref(),
+    ) {
+        let denied = requested
+            .iter()
+            .filter(|requested_format| {
+                !user_allowed.iter().any(|allowed_format| {
+                    aether_ai_formats::api_format_permission_covers(
+                        allowed_format,
+                        requested_format,
+                    )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !denied.is_empty() {
+            return Err(build_auth_error_response(
+                http::StatusCode::BAD_REQUEST,
+                format!("以下端点不在您的可用范围内: {}", denied.join(", ")),
+                false,
+            ));
+        }
+    }
+
+    if let (Some(requested), Some(user_allowed)) = (
+        requested_models.as_ref(),
+        effective_policies.allowed_models.as_ref(),
+    ) {
+        let allowed = user_allowed.iter().collect::<BTreeSet<_>>();
+        let denied = requested
+            .iter()
+            .filter(|model| !allowed.contains(model))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !denied.is_empty() {
+            return Err(build_auth_error_response(
+                http::StatusCode::BAD_REQUEST,
+                format!("以下模型不在您的可用范围内: {}", denied.join(", ")),
+                false,
+            ));
+        }
+    }
+
+    Ok((requested_api_formats, requested_models))
 }
 
 fn normalize_users_me_api_key_force_capabilities(
@@ -758,6 +885,34 @@ pub(super) async fn handle_users_me_api_key_create(
             Ok(value) => value,
             Err(response) => return response,
         };
+    let requested_api_formats =
+        match normalize_users_me_api_key_api_formats(payload.allowed_api_formats.flatten()) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+            }
+        };
+    let requested_models = match normalize_users_me_api_key_string_list(
+        payload.allowed_models.flatten(),
+        "allowed_models",
+    ) {
+        Ok(value) => value,
+        Err(detail) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+        }
+    };
+    let (allowed_api_formats, allowed_models) =
+        match resolve_users_me_api_key_allowed_formats_and_models(
+            state,
+            &auth.user,
+            requested_api_formats,
+            requested_models,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
 
     let plaintext_key = generate_users_me_api_key_plaintext();
     let Some(key_encrypted) = encrypt_catalog_secret_with_fallbacks(state, &plaintext_key) else {
@@ -774,8 +929,8 @@ pub(super) async fn handle_users_me_api_key_create(
         key_encrypted: Some(key_encrypted),
         name: Some(name.clone()),
         allowed_providers,
-        allowed_api_formats: None,
-        allowed_models: None,
+        allowed_api_formats,
+        allowed_models,
         ip_rules,
         rate_limit,
         concurrent_limit,
@@ -811,6 +966,8 @@ pub(super) async fn handle_users_me_api_key_create(
         "concurrent_limit": created.concurrent_limit,
         "ip_rules": created.ip_rules,
         "allowed_providers": created.allowed_providers,
+        "allowed_api_formats": created.allowed_api_formats,
+        "allowed_models": created.allowed_models,
         "feature_settings": created.feature_settings,
         "last_used_at": format_users_me_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
         "created_at": format_users_me_optional_unix_secs_iso8601(created.created_at_unix_secs),
@@ -923,6 +1080,38 @@ pub(super) async fn handle_users_me_api_key_update(
             }
         }
     };
+    let api_formats_patch_present = payload.allowed_api_formats.is_some();
+    let models_patch_present = payload.allowed_models.is_some();
+    let requested_api_formats =
+        match normalize_users_me_api_key_api_formats(payload.allowed_api_formats.flatten()) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+            }
+        };
+    let requested_models = match normalize_users_me_api_key_string_list(
+        payload.allowed_models.flatten(),
+        "allowed_models",
+    ) {
+        Ok(value) => value,
+        Err(detail) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+        }
+    };
+    let (resolved_api_formats, resolved_models) =
+        match resolve_users_me_api_key_allowed_formats_and_models(
+            state,
+            &auth.user,
+            requested_api_formats,
+            requested_models,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    let allowed_api_formats = api_formats_patch_present.then_some(resolved_api_formats);
+    let allowed_models = models_patch_present.then_some(resolved_models);
 
     let Some(updated) = (match state
         .update_user_api_key_basic(aether_data::repository::auth::UpdateUserApiKeyBasicRecord {
@@ -933,6 +1122,8 @@ pub(super) async fn handle_users_me_api_key_update(
             concurrent_limit,
             ip_rules,
             allowed_providers,
+            allowed_api_formats,
+            allowed_models,
             // Same write as basic fields so partial "success then 500" cannot occur.
             feature_settings,
         })
@@ -1214,10 +1405,10 @@ pub(super) async fn handle_users_me_api_key_capabilities_put(
 mod tests {
     use super::{
         catalog_provider_allowed_by_user_policy, filter_catalog_providers_to_user_allowed,
-        normalize_users_me_api_key_provider_patch_values,
-        normalize_users_me_api_key_provider_values, normalize_users_me_ip_rules,
-        resolve_users_me_api_key_allowed_providers, UsersMeCreateApiKeyRequest,
-        UsersMeUpdateApiKeyRequest,
+        normalize_users_me_api_key_api_formats, normalize_users_me_api_key_provider_patch_values,
+        normalize_users_me_api_key_provider_values, normalize_users_me_api_key_string_list,
+        normalize_users_me_ip_rules, resolve_users_me_api_key_allowed_providers,
+        UsersMeCreateApiKeyRequest, UsersMeUpdateApiKeyRequest,
     };
     use axum::http;
     use serde_json::json;
@@ -1340,6 +1531,43 @@ mod tests {
         assert_eq!(
             normalized,
             Some(vec!["provider-a".to_string(), "provider-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn update_payload_distinguishes_endpoint_and_model_patch_states() {
+        let missing = serde_json::from_value::<UsersMeUpdateApiKeyRequest>(json!({
+            "name": "unchanged-access",
+        }))
+        .expect("missing access restrictions should deserialize");
+        assert!(missing.allowed_api_formats.is_none());
+        assert!(missing.allowed_models.is_none());
+
+        let cleared = serde_json::from_value::<UsersMeUpdateApiKeyRequest>(json!({
+            "allowed_api_formats": null,
+            "allowed_models": null,
+        }))
+        .expect("null access restrictions should deserialize");
+        assert!(matches!(cleared.allowed_api_formats, Some(None)));
+        assert!(matches!(cleared.allowed_models, Some(None)));
+
+        let restricted = serde_json::from_value::<UsersMeUpdateApiKeyRequest>(json!({
+            "allowed_api_formats": [" /v1/responses ", "openai:responses"],
+            "allowed_models": [" gpt-5 ", "gpt-5"],
+        }))
+        .expect("specific access restrictions should deserialize");
+        assert_eq!(
+            normalize_users_me_api_key_api_formats(restricted.allowed_api_formats.flatten())
+                .expect("formats should normalize"),
+            Some(vec!["openai:responses".to_string()]),
+        );
+        assert_eq!(
+            normalize_users_me_api_key_string_list(
+                restricted.allowed_models.flatten(),
+                "allowed_models",
+            )
+            .expect("models should normalize"),
+            Some(vec!["gpt-5".to_string()]),
         );
     }
 

@@ -288,10 +288,24 @@ pub(super) async fn handle_users_me_available_models(
     .into_response()
 }
 
-fn users_me_providers_view_is_options(query: Option<&str>) -> bool {
-    query_param_value(query, "view")
-        .map(|value| value.eq_ignore_ascii_case("options"))
-        .unwrap_or(false)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsersMeProvidersView {
+    Full,
+    Options,
+    AccessOptions,
+}
+
+fn users_me_providers_view(query: Option<&str>) -> UsersMeProvidersView {
+    match query_param_value(query, "view")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "options" => UsersMeProvidersView::Options,
+        "access-options" => UsersMeProvidersView::AccessOptions,
+        _ => UsersMeProvidersView::Full,
+    }
 }
 
 pub(super) async fn handle_users_me_providers_get(
@@ -311,18 +325,18 @@ pub(super) async fn handle_users_me_providers_get(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let options_only =
-        users_me_providers_view_is_options(request_context.request_query_string.as_deref());
-    let expose_provider_details = !options_only && auth.user.role.eq_ignore_ascii_case("admin");
-    let allowed_provider_names = if auth.user.role.eq_ignore_ascii_case("admin") {
+    let view = users_me_providers_view(request_context.request_query_string.as_deref());
+    let expose_provider_details =
+        view == UsersMeProvidersView::Full && auth.user.role.eq_ignore_ascii_case("admin");
+    let effective_policies = if auth.user.role.eq_ignore_ascii_case("admin") {
         None
     } else {
-        let effective_policies = match state
+        match state
             .data
             .resolve_user_effective_list_policies(&auth.user)
             .await
         {
-            Ok(value) => value,
+            Ok(value) => Some(value),
             Err(err) => {
                 return build_auth_error_response(
                     http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -330,11 +344,22 @@ pub(super) async fn handle_users_me_providers_get(
                     false,
                 )
             }
-        };
-        users_me_allowed_provider_names(effective_policies.allowed_providers.as_deref())
+        }
     };
+    let allowed_provider_names = effective_policies.as_ref().and_then(|policies| {
+        users_me_allowed_provider_names(policies.allowed_providers.as_deref())
+    });
+    let allowed_api_formats = effective_policies
+        .as_ref()
+        .and_then(|policies| policies.allowed_api_formats.as_deref());
+    let allowed_models = effective_policies
+        .as_ref()
+        .and_then(|policies| policies.allowed_models.as_deref());
 
-    if options_only {
+    if matches!(
+        view,
+        UsersMeProvidersView::Options | UsersMeProvidersView::AccessOptions
+    ) {
         let mut providers = match state.list_provider_catalog_provider_identities(true).await {
             Ok(value) => value,
             Err(err) => {
@@ -357,6 +382,65 @@ pub(super) async fn handle_users_me_providers_get(
                 .cmp(&right.provider_priority)
                 .then_with(|| left.name.cmp(&right.name))
         });
+        if view == UsersMeProvidersView::AccessOptions {
+            let provider_ids = providers
+                .iter()
+                .map(|provider| provider.id.clone())
+                .collect::<Vec<_>>();
+            let endpoints = match state
+                .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return build_auth_error_response(
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("user provider endpoint option lookup failed: {err:?}"),
+                        false,
+                    )
+                }
+            };
+            let mut formats_by_provider = BTreeMap::<String, BTreeSet<String>>::new();
+            for endpoint in endpoints {
+                if !endpoint.is_active {
+                    continue;
+                }
+                if let Some(allowed_api_formats) = allowed_api_formats {
+                    if !allowed_api_formats.iter().any(|allowed| {
+                        aether_ai_formats::api_format_permission_covers(
+                            allowed,
+                            &endpoint.api_format,
+                        )
+                    }) {
+                        continue;
+                    }
+                }
+                formats_by_provider
+                    .entry(endpoint.provider_id)
+                    .or_default()
+                    .insert(endpoint.api_format);
+            }
+            return Json(
+                providers
+                    .into_iter()
+                    .map(|provider| {
+                        let provider_id = provider.id.clone();
+                        json!({
+                            "id": provider_id.clone(),
+                            "name": provider.name,
+                            "provider_priority": provider.provider_priority,
+                            "endpoints": formats_by_provider
+                                .remove(&provider_id)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|api_format| json!({ "api_format": api_format }))
+                                .collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_response();
+        }
         return Json(
             providers
                 .into_iter()
@@ -414,6 +498,16 @@ pub(super) async fn handle_users_me_providers_get(
     };
     let mut endpoints_by_provider = BTreeMap::<String, Vec<serde_json::Value>>::new();
     for endpoint in endpoints {
+        if !endpoint.is_active {
+            continue;
+        }
+        if let Some(allowed_api_formats) = allowed_api_formats {
+            if !allowed_api_formats.iter().any(|allowed| {
+                aether_ai_formats::api_format_permission_covers(allowed, &endpoint.api_format)
+            }) {
+                continue;
+            }
+        }
         let mut endpoint_payload = json!({
             "id": endpoint.id,
             "api_format": endpoint.api_format,
@@ -452,6 +546,10 @@ pub(super) async fn handle_users_me_providers_get(
                 provider_id.clone(),
                 models
                     .into_iter()
+                    .filter(|model| {
+                        allowed_models
+                            .is_none_or(|allowed| allowed.iter().any(|name| name == &model.name))
+                    })
                     .map(|model| {
                         json!({
                             "id": model.id,

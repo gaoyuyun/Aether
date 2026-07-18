@@ -542,6 +542,8 @@ SET name = COALESCE(?, name),
     concurrent_limit = COALESCE(?, concurrent_limit),
     ip_rules = CASE WHEN ? THEN ? ELSE ip_rules END,
     allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
+    allowed_api_formats = CASE WHEN ? THEN ? ELSE allowed_api_formats END,
+    allowed_models = CASE WHEN ? THEN ? ELSE allowed_models END,
     feature_settings = CASE WHEN ? THEN ? ELSE feature_settings END,
     updated_at = ?
 WHERE id = ?
@@ -561,6 +563,16 @@ WHERE id = ?
         .bind(json_string_from_nested_string_list(
             &record.allowed_providers,
             "api_keys.allowed_providers",
+        )?)
+        .bind(record.allowed_api_formats.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_api_formats,
+            "api_keys.allowed_api_formats",
+        )?)
+        .bind(record.allowed_models.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_models,
+            "api_keys.allowed_models",
         )?)
         .bind(record.feature_settings.is_some())
         .bind(optional_json_to_string(
