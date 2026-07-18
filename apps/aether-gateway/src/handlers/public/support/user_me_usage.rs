@@ -22,6 +22,7 @@ use axum::{
 use chrono::Utc;
 use serde_json::{json, Value};
 
+use crate::handlers::shared::system_config_bool;
 use crate::GatewayError;
 
 use super::{
@@ -31,6 +32,7 @@ use super::{
 };
 
 const USERS_ME_USAGE_DATA_UNAVAILABLE_DETAIL: &str = "用户用量数据暂不可用";
+const SHOW_PROVIDER_IN_USER_USAGE_CONFIG_KEY: &str = "show_provider_in_user_usage";
 
 fn build_users_me_usage_reader_unavailable_response() -> Response<Body> {
     build_auth_error_response(
@@ -38,6 +40,19 @@ fn build_users_me_usage_reader_unavailable_response() -> Response<Body> {
         USERS_ME_USAGE_DATA_UNAVAILABLE_DETAIL,
         false,
     )
+}
+
+async fn users_me_usage_provider_visibility_enabled(
+    state: &AppState,
+    user_role: &str,
+) -> Result<bool, GatewayError> {
+    if user_role.eq_ignore_ascii_case("admin") {
+        return Ok(true);
+    }
+    let configured = state
+        .read_system_config_json_value(SHOW_PROVIDER_IN_USER_USAGE_CONFIG_KEY)
+        .await?;
+    Ok(system_config_bool(configured.as_ref(), true))
 }
 
 fn parse_users_me_usage_limit(query: Option<&str>) -> Result<usize, String> {
@@ -444,6 +459,7 @@ fn users_me_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> 
 
 fn build_users_me_usage_record_payload(
     item: &StoredRequestUsageAudit,
+    include_provider: bool,
     include_actual_cost: bool,
     api_key_names: &BTreeMap<String, String>,
     auth_api_key_reader_available: bool,
@@ -500,6 +516,9 @@ fn build_users_me_usage_record_payload(
         ),
     });
 
+    if include_provider {
+        payload["provider"] = json!(item.provider_name);
+    }
     if item.target_model.is_some() {
         payload["target_model"] = json!(item.target_model.clone());
     }
@@ -522,7 +541,10 @@ fn build_users_me_usage_record_payload(
     payload
 }
 
-fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_json::Value {
+fn build_users_me_usage_active_payload(
+    item: &StoredRequestUsageAudit,
+    include_provider: bool,
+) -> serde_json::Value {
     let cache_creation_input_tokens = users_me_usage_cache_creation_tokens(item);
     let client_is_stream = users_me_usage_client_is_stream(item);
     let upstream_is_stream = users_me_usage_upstream_is_stream(item);
@@ -559,6 +581,9 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
         "target_model": item.target_model,
         "has_fallback": item.has_fallback(),
     });
+    if include_provider {
+        payload["provider"] = json!(item.provider_name);
+    }
     if item.api_format.is_none() {
         payload
             .as_object_mut()
@@ -913,6 +938,17 @@ pub(super) async fn handle_users_me_usage_get(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let include_provider =
+        match users_me_usage_provider_visibility_enabled(state, &auth.user.role).await {
+            Ok(value) => value,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user usage provider visibility lookup failed: {err:?}"),
+                    false,
+                );
+            }
+        };
     let query = request_context.request_query_string.as_deref();
     let time_range = match AdminStatsTimeRange::resolve_optional(query) {
         Ok(value) => value,
@@ -1206,6 +1242,7 @@ pub(super) async fn handle_users_me_usage_get(
         .map(|item| {
             build_users_me_usage_record_payload(
                 &item,
+                include_provider,
                 include_actual_cost,
                 &api_key_names,
                 auth_api_key_reader_available,
@@ -1226,6 +1263,7 @@ pub(super) async fn handle_users_me_usage_get(
         "total_tokens": total_tokens,
         "total_cost": total_cost,
         "avg_response_time": avg_response_time,
+        "provider_visibility_enabled": include_provider,
         "billing": build_auth_wallet_summary_payload(wallet.as_ref()),
         "summary_by_model": build_users_me_usage_summary_by_model(&summary_by_model, include_actual_cost),
         "summary_by_api_format": build_users_me_usage_summary_by_api_format(&summary_by_api_format),
@@ -1259,6 +1297,17 @@ pub(super) async fn handle_users_me_usage_active_get(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let include_provider =
+        match users_me_usage_provider_visibility_enabled(state, &auth.user.role).await {
+            Ok(value) => value,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user active usage provider visibility lookup failed: {err:?}"),
+                    false,
+                );
+            }
+        };
     let ids = parse_users_me_usage_ids(request_context.request_query_string.as_deref());
     // When polling for active (pending/streaming) requests without specific ids,
     // limit to the last 1 hour to avoid scanning all historical records.
@@ -1333,10 +1382,11 @@ pub(super) async fn handle_users_me_usage_active_get(
         };
 
     Json(json!({
+        "provider_visibility_enabled": include_provider,
         "requests": items
             .iter()
             .map(|item| {
-                let mut payload = build_users_me_usage_active_payload(item);
+                let mut payload = build_users_me_usage_active_payload(item, include_provider);
                 if let (Some(payload), Some(overrides)) = (
                     payload.as_object_mut(),
                     active_state_overrides
@@ -1549,6 +1599,7 @@ mod tests {
     use super::{
         build_users_me_usage_active_payload, build_users_me_usage_record_payload,
         users_me_usage_client_is_stream, users_me_usage_is_failed,
+        users_me_usage_provider_visibility_enabled,
         users_me_usage_terminal_candidate_state_override, users_me_usage_upstream_is_stream,
     };
 
@@ -1638,7 +1689,8 @@ mod tests {
             ..sample_usage("completed")
         };
 
-        let payload = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let payload =
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
 
         assert_eq!(payload["cache_creation_input_tokens"], 20);
         assert_eq!(payload["cache_creation_ephemeral_5m_input_tokens"], 9);
@@ -1654,11 +1706,59 @@ mod tests {
             ..sample_usage("streaming")
         };
 
-        let payload = build_users_me_usage_active_payload(&item);
+        let payload = build_users_me_usage_active_payload(&item, false);
 
         assert_eq!(payload["cache_creation_input_tokens"], 10);
         assert_eq!(payload["cache_creation_ephemeral_5m_input_tokens"], 4);
         assert_eq!(payload["cache_creation_ephemeral_1h_input_tokens"], 6);
+    }
+
+    #[test]
+    fn user_usage_payloads_only_expose_provider_when_enabled() {
+        let item = sample_usage("completed");
+
+        let hidden_record =
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
+        let visible_record =
+            build_users_me_usage_record_payload(&item, true, false, &BTreeMap::new(), false);
+        let hidden_active = build_users_me_usage_active_payload(&item, false);
+        let visible_active = build_users_me_usage_active_payload(&item, true);
+
+        assert!(hidden_record.get("provider").is_none());
+        assert!(hidden_active.get("provider").is_none());
+        assert_eq!(visible_record["provider"], "OpenAI");
+        assert_eq!(visible_active["provider"], "OpenAI");
+    }
+
+    #[tokio::test]
+    async fn user_usage_provider_visibility_defaults_on_and_honors_the_system_config() {
+        let default_state = crate::AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(crate::data::GatewayDataState::disabled());
+        assert!(
+            users_me_usage_provider_visibility_enabled(&default_state, "user")
+                .await
+                .expect("default visibility should resolve")
+        );
+
+        let disabled_state = crate::AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::disabled().with_system_config_values_for_tests([(
+                    "show_provider_in_user_usage".to_string(),
+                    json!(false),
+                )]),
+            );
+        assert!(
+            !users_me_usage_provider_visibility_enabled(&disabled_state, "user")
+                .await
+                .expect("configured visibility should resolve")
+        );
+        assert!(
+            users_me_usage_provider_visibility_enabled(&disabled_state, "admin")
+                .await
+                .expect("admin visibility should resolve")
+        );
     }
 
     #[test]
@@ -1673,8 +1773,9 @@ mod tests {
             ..sample_usage("completed")
         };
 
-        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
-        let active = build_users_me_usage_active_payload(&item);
+        let record =
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item, false);
 
         assert_eq!(record["requested_reasoning_effort"], "xhigh");
         assert_eq!(active["requested_reasoning_effort"], "xhigh");
@@ -1738,7 +1839,8 @@ mod tests {
             ..sample_usage("completed")
         };
 
-        let payload = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let payload =
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
 
         assert_eq!(payload["input_tokens"], 4941);
         assert_eq!(payload["effective_input_tokens"], 4941);
@@ -1770,13 +1872,13 @@ mod tests {
         assert!(!users_me_usage_client_is_stream(&item));
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
         assert_eq!(record_payload["is_stream"], true);
         assert_eq!(record_payload["upstream_is_stream"], true);
         assert_eq!(record_payload["client_requested_stream"], false);
         assert_eq!(record_payload["client_is_stream"], false);
 
-        let active_payload = build_users_me_usage_active_payload(&item);
+        let active_payload = build_users_me_usage_active_payload(&item, false);
         assert_eq!(active_payload["is_stream"], true);
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
@@ -1794,8 +1896,8 @@ mod tests {
         };
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
-        let active_payload = build_users_me_usage_active_payload(&item);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
+        let active_payload = build_users_me_usage_active_payload(&item, false);
 
         assert_eq!(record_payload["client_family"], "codex_vscode");
         assert_eq!(record_payload["client_ip"], "192.168.0.28");
@@ -1813,7 +1915,7 @@ mod tests {
         };
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
 
         assert_eq!(record_payload["client_family"], "openai_js_sdk");
     }
@@ -1832,7 +1934,7 @@ mod tests {
         assert!(!users_me_usage_client_is_stream(&item));
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
         assert_eq!(record_payload["is_stream"], true);
         assert_eq!(record_payload["upstream_is_stream"], true);
         assert_eq!(record_payload["client_requested_stream"], false);
@@ -1855,13 +1957,13 @@ mod tests {
         assert!(!users_me_usage_client_is_stream(&item));
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
         assert_eq!(record_payload["is_stream"], true);
         assert_eq!(record_payload["upstream_is_stream"], true);
         assert_eq!(record_payload["client_requested_stream"], false);
         assert_eq!(record_payload["client_is_stream"], false);
 
-        let active_payload = build_users_me_usage_active_payload(&item);
+        let active_payload = build_users_me_usage_active_payload(&item, false);
         assert_eq!(active_payload["is_stream"], true);
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
@@ -1884,7 +1986,7 @@ mod tests {
         assert!(!users_me_usage_client_is_stream(&item));
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
         assert_eq!(record_payload["client_requested_stream"], false);
         assert_eq!(record_payload["client_is_stream"], false);
     }
@@ -1901,13 +2003,13 @@ mod tests {
         };
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
         assert_eq!(record_payload["is_stream"], false);
         assert_eq!(record_payload["upstream_is_stream"], true);
         assert_eq!(record_payload["client_requested_stream"], false);
         assert_eq!(record_payload["client_is_stream"], false);
 
-        let active_payload = build_users_me_usage_active_payload(&item);
+        let active_payload = build_users_me_usage_active_payload(&item, false);
         assert_eq!(active_payload["is_stream"], false);
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
@@ -1943,13 +2045,13 @@ mod tests {
         assert!(users_me_usage_upstream_is_stream(&item));
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
         assert_eq!(record_payload["is_stream"], true);
         assert_eq!(record_payload["upstream_is_stream"], true);
         assert_eq!(record_payload["client_requested_stream"], false);
         assert_eq!(record_payload["client_is_stream"], false);
 
-        let active_payload = build_users_me_usage_active_payload(&item);
+        let active_payload = build_users_me_usage_active_payload(&item, false);
         assert_eq!(active_payload["is_stream"], true);
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
@@ -1977,13 +2079,13 @@ mod tests {
         assert!(users_me_usage_upstream_is_stream(&item));
 
         let record_payload =
-            build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
         assert_eq!(record_payload["is_stream"], true);
         assert_eq!(record_payload["upstream_is_stream"], true);
         assert_eq!(record_payload["client_requested_stream"], false);
         assert_eq!(record_payload["client_is_stream"], false);
 
-        let active_payload = build_users_me_usage_active_payload(&item);
+        let active_payload = build_users_me_usage_active_payload(&item, false);
         assert_eq!(active_payload["is_stream"], true);
         assert_eq!(active_payload["upstream_is_stream"], true);
         assert_eq!(active_payload["client_requested_stream"], false);
