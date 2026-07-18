@@ -206,6 +206,9 @@ pub(in super::super) async fn build_admin_create_user_response(
         ));
     };
 
+    // Disabling the wallet module pauses billing and hides wallet controls, but
+    // keeps wallet initialization intact so re-enabling it does not require a
+    // repair pass for users created during the pause.
     if state
         .initialize_auth_user_wallet(&user.id, initial_gift_usd, payload.unlimited)
         .await?

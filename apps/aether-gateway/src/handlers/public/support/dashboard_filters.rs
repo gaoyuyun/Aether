@@ -1155,56 +1155,83 @@ pub(super) async fn handle_dashboard_stats_get(
         return dashboard_cached_json_response(state, cache_key, cache_ttl, &payload);
     }
 
-    let wallet = if state.has_wallet_data_reader() {
-        match state
-            .find_wallet(aether_data::repository::wallet::WalletLookupKey::UserId(
-                auth.user.id.as_str(),
-            ))
-            .await
+    let wallet_enabled = match crate::commerce_modules::wallet_module_enabled(state).await {
+        Ok(enabled) => enabled,
+        Err(err) => {
+            return build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dashboard wallet module status lookup failed: {err:?}"),
+                false,
+            );
+        }
+    };
+    let mut stats = vec![
+        json!({
+            "name": "API 密钥",
+            "value": dashboard_format_integer(api_key_counts.0),
+            "subValue": format!("活跃 {}", dashboard_format_integer(api_key_counts.1)),
+            "icon": "Activity",
+        }),
+        json!({
+            "name": "本月请求",
+            "value": dashboard_format_integer(period_totals.requests),
+            "subValue": format!("今日 {}", dashboard_format_integer(today_totals.requests)),
+            "icon": "Users",
+        }),
+    ];
+    if wallet_enabled {
+        let wallet = if state.has_wallet_data_reader() {
+            match state
+                .find_wallet(aether_data::repository::wallet::WalletLookupKey::UserId(
+                    auth.user.id.as_str(),
+                ))
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return build_auth_error_response(
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("dashboard wallet lookup failed: {err:?}"),
+                        false,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let wallet_payload = match build_wallet_balance_payload_for_user(
+            state,
+            &auth.user.id,
+            wallet.as_ref(),
+        )
+        .await
         {
-            Ok(value) => value,
+            Ok(payload) => payload,
             Err(err) => {
                 return build_auth_error_response(
                     http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("dashboard wallet lookup failed: {err:?}"),
+                    format!("dashboard billing status lookup failed: {err:?}"),
                     false,
                 );
             }
-        }
-    } else {
-        None
-    };
-    let wallet_payload =
-        build_wallet_balance_payload_for_user(state, &auth.user.id, wallet.as_ref()).await;
-    let (wallet_value, wallet_sub_value) =
-        dashboard_wallet_card_value_and_subvalue(&wallet_payload);
+        };
+        let (wallet_value, wallet_sub_value) =
+            dashboard_wallet_card_value_and_subvalue(&wallet_payload);
+        stats.push(json!({
+            "name": "钱包余额",
+            "value": wallet_value,
+            "subValue": wallet_sub_value,
+            "icon": "DollarSign",
+        }));
+    }
+    stats.push(json!({
+        "name": "本月 Token",
+        "value": dashboard_format_integer(period_totals.total_tokens),
+        "subValue": dashboard_format_token_subvalue(&period_totals),
+        "icon": "Zap",
+    }));
     let payload = json!({
-        "stats": [
-            {
-                "name": "API 密钥",
-                "value": dashboard_format_integer(api_key_counts.0),
-                "subValue": format!("活跃 {}", dashboard_format_integer(api_key_counts.1)),
-                "icon": "Activity",
-            },
-            {
-                "name": "本月请求",
-                "value": dashboard_format_integer(period_totals.requests),
-                "subValue": format!("今日 {}", dashboard_format_integer(today_totals.requests)),
-                "icon": "Users",
-            },
-            {
-                "name": "钱包余额",
-                "value": wallet_value,
-                "subValue": wallet_sub_value,
-                "icon": "DollarSign",
-            },
-            {
-                "name": "本月 Token",
-                "value": dashboard_format_integer(period_totals.total_tokens),
-                "subValue": dashboard_format_token_subvalue(&period_totals),
-                "icon": "Zap",
-            }
-        ],
+        "stats": stats,
         "today": today_payload,
         "api_keys": {
             "total": api_key_counts.0,

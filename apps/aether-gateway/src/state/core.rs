@@ -84,6 +84,8 @@ const SCHEDULER_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &[
 const AUTH_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &[
     crate::constants::DEFAULT_USER_GROUP_CONFIG_KEY,
     crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
+    crate::commerce_modules::WALLET_MODULE_CONFIG_KEY,
+    crate::commerce_modules::BILLING_PLANS_MODULE_CONFIG_KEY,
 ];
 const FRONTDOOR_RPM_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &["rate_limit_per_minute"];
 const CHAT_PII_REDACTION_SYSTEM_CONFIG_PREFIX: &str = "module.chat_pii_redaction.";
@@ -801,6 +803,15 @@ impl AppState {
         if deleted && system_config_key_affects_auth(key) {
             self.invalidate_auth_context_cache();
         }
+        if deleted
+            && matches!(
+                key.trim(),
+                crate::commerce_modules::WALLET_MODULE_CONFIG_KEY
+                    | crate::commerce_modules::BILLING_PLANS_MODULE_CONFIG_KEY
+            )
+        {
+            self.dashboard_response_cache.clear();
+        }
         if deleted && system_config_key_affects_frontdoor_rpm(key) {
             self.frontdoor_user_rpm.clear_system_default_cache();
         }
@@ -861,6 +872,17 @@ impl AppState {
         self.candidate_resolved_page_cache.clear();
     }
 
+    fn invalidate_all_system_config_caches(&self) {
+        self.system_config_cache.clear();
+        self.invalidate_provider_routing_caches();
+        self.invalidate_auth_context_cache();
+        self.dashboard_response_cache.clear();
+        self.frontdoor_user_rpm.clear_system_default_cache();
+        crate::privacy::clear_chat_pii_redaction_runtime_config_cache(
+            &self.chat_pii_redaction_runtime_config_cache,
+        );
+    }
+
     fn remember_system_config_write(&self, key: &str, value: Option<serde_json::Value>) {
         self.system_config_cache
             .insert(key.to_string(), value, SYSTEM_CONFIG_CACHE_TTL);
@@ -869,6 +891,13 @@ impl AppState {
         }
         if system_config_key_affects_auth(key) {
             self.invalidate_auth_context_cache();
+        }
+        if matches!(
+            key.trim(),
+            crate::commerce_modules::WALLET_MODULE_CONFIG_KEY
+                | crate::commerce_modules::BILLING_PLANS_MODULE_CONFIG_KEY
+        ) {
+            self.dashboard_response_cache.clear();
         }
         if system_config_key_affects_frontdoor_rpm(key) {
             self.frontdoor_user_rpm.clear_system_default_cache();
@@ -904,7 +933,13 @@ impl AppState {
         if matches!(
             target,
             aether_data::repository::system::AdminSystemPurgeTarget::Config
-                | aether_data::repository::system::AdminSystemPurgeTarget::Users
+        ) {
+            self.invalidate_all_system_config_caches();
+            return Ok(summary);
+        }
+        if matches!(
+            target,
+            aether_data::repository::system::AdminSystemPurgeTarget::Users
                 | aether_data::repository::system::AdminSystemPurgeTarget::Usage
                 | aether_data::repository::system::AdminSystemPurgeTarget::Stats
         ) {
@@ -3348,6 +3383,7 @@ mod tests {
         METRIC_SNAPSHOT_TTL,
     };
     use crate::cache::SchedulerAffinityTarget;
+    use crate::control::GatewayControlAuthContext;
     use crate::data::{GatewayDataConfig, GatewayDataState};
 
     #[test]
@@ -3428,6 +3464,83 @@ mod tests {
                 .expect("refreshed system config read should succeed"),
             Some(json!("fresh"))
         );
+    }
+
+    #[tokio::test]
+    async fn config_purge_immediately_invalidates_commerce_auth_and_dashboard_caches() {
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([
+                    ("module.wallet.enabled".to_string(), json!(true)),
+                    ("module.billing_plans.enabled".to_string(), json!(true)),
+                ]),
+            );
+        let ttl = Duration::from_secs(60);
+        let auth_cache_key = "config-purge-auth";
+        let dashboard_cache_key = "config-purge-dashboard";
+
+        assert_eq!(
+            crate::commerce_modules::commerce_billing_policy(&state)
+                .await
+                .expect("commerce policy should load"),
+            crate::commerce_modules::CommerceBillingPolicy {
+                wallet_enabled: true,
+                billing_plans_enabled: true,
+            }
+        );
+        state.auth_context_cache.insert(
+            auth_cache_key.to_string(),
+            GatewayControlAuthContext {
+                user_id: "user-1".to_string(),
+                api_key_id: "key-1".to_string(),
+                username: None,
+                api_key_name: None,
+                balance_remaining: Some(1.0),
+                access_allowed: true,
+                user_rate_limit: None,
+                api_key_rate_limit: None,
+                api_key_is_standalone: false,
+                wallet_billing_enabled: true,
+                billing_plans_enabled: true,
+                admin_bypass_limits: false,
+                local_rejection: None,
+                allowed_models: None,
+                ip_rules: None,
+            },
+            ttl,
+            1,
+        );
+        state.dashboard_response_cache.insert(
+            dashboard_cache_key.to_string(),
+            b"cached".to_vec(),
+            ttl,
+        );
+
+        state
+            .purge_admin_system_data(
+                aether_data::repository::system::AdminSystemPurgeTarget::Config,
+            )
+            .await
+            .expect("config purge should succeed");
+
+        assert_eq!(
+            crate::commerce_modules::commerce_billing_policy(&state)
+                .await
+                .expect("commerce policy should reload"),
+            crate::commerce_modules::CommerceBillingPolicy {
+                wallet_enabled: false,
+                billing_plans_enabled: false,
+            }
+        );
+        assert!(state
+            .auth_context_cache
+            .get_fresh(auth_cache_key, ttl)
+            .is_none());
+        assert!(state
+            .dashboard_response_cache
+            .get(dashboard_cache_key, ttl)
+            .is_none());
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@
       <span v-if="mobile">{{ legacyT('编辑') }}</span>
     </Button>
     <Button
-      v-if="canOperateAdmin"
+      v-if="canOperateAdmin && walletEnabled"
       :variant="mobile ? 'outline' : 'ghost'"
       :size="mobile ? 'sm' : 'icon'"
       :class="mobile ? 'h-8 text-xs' : 'h-8 w-8'"
@@ -23,7 +23,7 @@
       <span v-if="mobile">{{ legacyT('资金') }}</span>
     </Button>
     <Button
-      v-if="canOperateAdmin"
+      v-if="canOperateAdmin && billingPlansEnabled"
       :variant="mobile ? 'outline' : 'ghost'"
       :size="mobile ? 'sm' : 'icon'"
       :class="mobile ? 'h-8 text-xs' : 'h-8 w-8'"
@@ -102,6 +102,8 @@ import { useI18n } from '@/i18n'
 const props = withDefaults(defineProps<{
   canOperateAdmin: boolean
   isActive: boolean
+  walletEnabled: boolean
+  billingPlansEnabled: boolean
   mobile?: boolean
 }>(), {
   mobile: false,

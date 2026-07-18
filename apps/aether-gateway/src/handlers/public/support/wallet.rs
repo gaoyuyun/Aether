@@ -127,6 +127,23 @@ pub(super) async fn maybe_build_local_wallet_response(
     if decision.route_family.as_deref() != Some("wallet") {
         return None;
     }
+    match crate::commerce_modules::wallet_module_enabled(state).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Some(build_auth_error_response(
+                http::StatusCode::NOT_FOUND,
+                "钱包模块未启用",
+                false,
+            ));
+        }
+        Err(err) => {
+            return Some(build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("wallet module status lookup failed: {err:?}"),
+                false,
+            ));
+        }
+    }
 
     if decision.route_kind.as_deref() == Some("balance")
         && request_context.request_path == "/api/wallet/balance"

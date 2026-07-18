@@ -3,6 +3,7 @@ use aether_wallet::{
     WalletAccessDecision, WalletAccessFailure, WalletLimitMode, WalletSnapshot, WalletStatus,
 };
 
+use crate::commerce_modules::CommerceBillingPolicy;
 use crate::control::GatewayLocalAuthRejection;
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::{AppState, GatewayError};
@@ -13,21 +14,44 @@ pub(crate) async fn resolve_wallet_auth_gate(
     state: &AppState,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
 ) -> Result<Option<WalletAccessDecision>, GatewayError> {
-    resolve_wallet_auth_gate_with_cache(state, auth_snapshot, true).await
+    let commerce_policy = crate::commerce_modules::commerce_billing_policy(state).await?;
+    resolve_wallet_auth_gate_with_commerce_policy(state, auth_snapshot, commerce_policy).await
 }
 
 pub(crate) async fn resolve_wallet_auth_gate_uncached(
     state: &AppState,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
 ) -> Result<Option<WalletAccessDecision>, GatewayError> {
-    resolve_wallet_auth_gate_with_cache(state, auth_snapshot, false).await
+    let commerce_policy = crate::commerce_modules::commerce_billing_policy(state).await?;
+    resolve_wallet_auth_gate_uncached_with_commerce_policy(state, auth_snapshot, commerce_policy)
+        .await
+}
+
+pub(crate) async fn resolve_wallet_auth_gate_with_commerce_policy(
+    state: &AppState,
+    auth_snapshot: &GatewayAuthApiKeySnapshot,
+    commerce_policy: CommerceBillingPolicy,
+) -> Result<Option<WalletAccessDecision>, GatewayError> {
+    resolve_wallet_auth_gate_with_cache(state, auth_snapshot, true, commerce_policy).await
+}
+
+pub(crate) async fn resolve_wallet_auth_gate_uncached_with_commerce_policy(
+    state: &AppState,
+    auth_snapshot: &GatewayAuthApiKeySnapshot,
+    commerce_policy: CommerceBillingPolicy,
+) -> Result<Option<WalletAccessDecision>, GatewayError> {
+    resolve_wallet_auth_gate_with_cache(state, auth_snapshot, false, commerce_policy).await
 }
 
 async fn resolve_wallet_auth_gate_with_cache(
     state: &AppState,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
     use_cache: bool,
+    commerce_policy: CommerceBillingPolicy,
 ) -> Result<Option<WalletAccessDecision>, GatewayError> {
+    if !commerce_policy.wallet_enabled {
+        return Ok(None);
+    }
     if !state.has_wallet_data_reader() {
         return Ok(None);
     }
@@ -54,7 +78,7 @@ async fn resolve_wallet_auth_gate_with_cache(
         Some(wallet) => map_wallet_snapshot(wallet).access_decision(false),
         None => WalletAccessDecision::wallet_unavailable(None),
     };
-    if !auth_snapshot.api_key_is_standalone {
+    if !auth_snapshot.api_key_is_standalone && commerce_policy.billing_plans_enabled {
         let quota = if use_cache {
             state
                 .find_user_daily_quota_availability_for_auth(&auth_snapshot.user_id)
@@ -122,9 +146,11 @@ mod tests {
     use aether_runtime::ConcurrencyGate;
     use aether_wallet::{WalletAccessFailure, WalletLimitMode, WalletSnapshot, WalletStatus};
     use async_trait::async_trait;
+    use serde_json::json;
 
     use super::{
         local_rejection_from_wallet_access, map_wallet_snapshot, resolve_wallet_auth_gate,
+        resolve_wallet_auth_gate_with_commerce_policy,
     };
     use crate::control::GatewayLocalAuthRejection;
     use crate::data::auth::GatewayAuthApiKeySnapshot;
@@ -247,6 +273,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_wallet_module_skips_wallet_access_gate() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let billing_repository: Arc<dyn BillingReadRepository> =
+            Arc::new(FixedQuotaBillingReadRepository { quota: None });
+        let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![empty_user_wallet()]));
+        let data = GatewayDataState::with_usage_billing_and_wallet_for_tests(
+            usage_repository,
+            billing_repository,
+            wallet_repository,
+        );
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+
+        let decision = resolve_wallet_auth_gate(&state, &ordinary_user_api_key_snapshot())
+            .await
+            .expect("wallet gate should resolve");
+
+        assert_eq!(decision, None);
+    }
+
+    #[tokio::test]
+    async fn disabled_billing_plans_module_ignores_stored_daily_quota() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let billing_repository: Arc<dyn BillingReadRepository> =
+            Arc::new(FixedQuotaBillingReadRepository {
+                quota: Some(quota_availability(10.0, 4.0, false)),
+            });
+        let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![empty_user_wallet()]));
+        let data = GatewayDataState::with_usage_billing_and_wallet_for_tests(
+            usage_repository,
+            billing_repository,
+            wallet_repository,
+        )
+        .with_system_config_values_for_tests([("module.wallet.enabled".to_string(), json!(true))]);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+
+        let decision = resolve_wallet_auth_gate(&state, &ordinary_user_api_key_snapshot())
+            .await
+            .expect("wallet gate should resolve")
+            .expect("wallet gate should return a decision");
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.failure, Some(WalletAccessFailure::BalanceDenied));
+    }
+
+    #[tokio::test]
     async fn ordinary_user_key_with_remaining_quota_allows_empty_wallet() {
         let state = state_with_wallet_and_quota(
             empty_user_wallet(),
@@ -262,6 +337,40 @@ mod tests {
         assert!(decision.allowed);
         assert_eq!(decision.failure, None);
         assert_eq!(decision.remaining, Some(4.0));
+    }
+
+    #[tokio::test]
+    async fn in_flight_wallet_gate_keeps_its_commerce_policy_snapshot() {
+        let state = state_with_wallet_and_quota(
+            empty_user_wallet(),
+            Some(quota_availability(10.0, 4.0, false)),
+        );
+        let auth_snapshot = ordinary_user_api_key_snapshot();
+        let request_policy = crate::commerce_modules::commerce_billing_policy(&state)
+            .await
+            .expect("request policy should resolve");
+
+        state
+            .upsert_system_config_json_value(
+                crate::commerce_modules::WALLET_MODULE_CONFIG_KEY,
+                &json!(false),
+                None,
+            )
+            .await
+            .expect("wallet module should disable");
+
+        let in_flight =
+            resolve_wallet_auth_gate_with_commerce_policy(&state, &auth_snapshot, request_policy)
+                .await
+                .expect("in-flight wallet gate should resolve")
+                .expect("original request should retain its wallet gate");
+        assert!(in_flight.allowed);
+        assert_eq!(in_flight.remaining, Some(4.0));
+
+        let next_request = resolve_wallet_auth_gate(&state, &auth_snapshot)
+            .await
+            .expect("next wallet gate should resolve");
+        assert_eq!(next_request, None);
     }
 
     #[tokio::test]
@@ -349,7 +458,11 @@ mod tests {
             usage_repository,
             billing_repository,
             wallet_repository,
-        );
+        )
+        .with_system_config_values_for_tests([
+            ("module.wallet.enabled".to_string(), json!(true)),
+            ("module.billing_plans.enabled".to_string(), json!(true)),
+        ]);
         AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data)

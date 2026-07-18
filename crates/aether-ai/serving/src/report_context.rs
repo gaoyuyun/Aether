@@ -64,6 +64,14 @@ pub fn build_ai_execution_report_context(parts: AiExecutionReportContextParts<'_
         Value::Bool(parts.auth_context.api_key_is_standalone),
     );
     object.insert(
+        "wallet_billing_enabled".to_string(),
+        Value::Bool(parts.auth_context.wallet_billing_enabled),
+    );
+    object.insert(
+        "billing_plans_enabled".to_string(),
+        Value::Bool(parts.auth_context.billing_plans_enabled),
+    );
+    object.insert(
         "username".to_string(),
         parts
             .auth_context
@@ -269,6 +277,8 @@ mod tests {
             balance_remaining: Some(42.0),
             access_allowed: true,
             api_key_is_standalone: false,
+            wallet_billing_enabled: true,
+            billing_plans_enabled: false,
         }
     }
 
@@ -330,6 +340,8 @@ mod tests {
         });
 
         assert_eq!(report["user_id"], "user-1");
+        assert_eq!(report["wallet_billing_enabled"], true);
+        assert_eq!(report["billing_plans_enabled"], false);
         assert_eq!(report["candidate_index"], 3);
         assert_eq!(report["retry_index"], 1);
         assert_eq!(report["pool_key_index"], 0);

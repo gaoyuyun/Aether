@@ -19,8 +19,7 @@ use crate::constants::{
 };
 
 #[tokio::test]
-async fn gateway_locally_denies_explicit_trusted_balance_failure_without_hitting_control_or_upstream(
-) {
+async fn gateway_locally_denies_explicit_trusted_balance_failure_when_billing_is_enabled() {
     let auth_context_hits = Arc::new(Mutex::new(0usize));
     let auth_context_hits_clone = Arc::clone(&auth_context_hits);
     let public_hits = Arc::new(Mutex::new(0usize));
@@ -60,10 +59,15 @@ async fn gateway_locally_denies_explicit_trusted_balance_failure_without_hitting
         sample_currently_usable_auth_snapshot("key-123", "user-123"),
     )]));
     let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let data_state = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
+        .with_system_config_values_for_tests([
+            ("module.wallet.enabled".to_string(), json!(true)),
+            ("module.billing_plans.enabled".to_string(), json!(true)),
+        ]);
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway state should build")
-            .with_auth_api_key_data_reader_for_tests(repository),
+            .with_data_state_for_tests(data_state),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -223,7 +227,11 @@ async fn gateway_locally_denies_missing_wallet_without_hitting_control_or_upstre
     let wallet_repository = Arc::new(InMemoryWalletRepository::default());
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let data_state =
-        GatewayDataState::with_auth_and_wallet_for_tests(auth_repository, wallet_repository);
+        GatewayDataState::with_auth_and_wallet_for_tests(auth_repository, wallet_repository)
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ]);
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway state should build")

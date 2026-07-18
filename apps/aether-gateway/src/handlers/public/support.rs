@@ -2,10 +2,10 @@ use super::{
     build_api_format_health_monitor_payload, build_model_health_monitor_payload,
     build_public_auth_modules_status_payload, build_public_catalog_models_payload,
     build_public_catalog_search_models_payload, build_public_providers_payload,
-    build_related_health_monitor_payload, capability_detail_by_name, ldap_module_config_is_valid,
-    sanitize_public_model_config_for_user, serialize_public_capability, supported_capability_names,
-    ApiFormatHealthMonitorOptions, HealthMonitorRelationDimension, ModelHealthMonitorOptions,
-    PUBLIC_CAPABILITY_DEFINITIONS,
+    build_public_runtime_modules_status_payload, build_related_health_monitor_payload,
+    capability_detail_by_name, ldap_module_config_is_valid, sanitize_public_model_config_for_user,
+    serialize_public_capability, supported_capability_names, ApiFormatHealthMonitorOptions,
+    HealthMonitorRelationDimension, ModelHealthMonitorOptions, PUBLIC_CAPABILITY_DEFINITIONS,
 };
 use crate::control::GatewayPublicRequestContext;
 use crate::handlers::shared::{
@@ -112,6 +112,23 @@ pub(crate) fn build_unhandled_public_support_response(
         })),
     )
         .into_response()
+}
+
+fn build_public_modules_status_response(
+    result: Result<serde_json::Value, GatewayError>,
+    unavailable_detail: &'static str,
+) -> Response<Body> {
+    match result {
+        Ok(payload) => Json(payload).into_response(),
+        Err(err) => {
+            tracing::warn!(error = ?err, detail = unavailable_detail, "public module status lookup failed");
+            build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                unavailable_detail,
+                false,
+            )
+        }
+    }
 }
 
 pub(crate) async fn maybe_build_local_public_support_response(
@@ -637,11 +654,21 @@ pub(crate) async fn maybe_build_local_public_support_response(
     }
 
     if decision.route_family.as_deref() == Some("modules") {
+        if decision.route_kind.as_deref() == Some("runtime_status")
+            && request_context.request_path == "/api/modules/status"
+        {
+            return Some(build_public_modules_status_response(
+                build_public_runtime_modules_status_payload(state).await,
+                "模块运行状态暂不可用",
+            ));
+        }
         if decision.route_kind.as_deref() == Some("auth_status")
             && request_context.request_path == "/api/modules/auth-status"
         {
-            let payload = build_public_auth_modules_status_payload(state).await.ok()?;
-            return Some(Json(payload).into_response());
+            return Some(build_public_modules_status_response(
+                build_public_auth_modules_status_payload(state).await,
+                "认证模块状态暂不可用",
+            ));
         }
     }
 
@@ -894,4 +921,28 @@ pub(crate) async fn maybe_build_local_public_support_response(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::{build_public_modules_status_response, GatewayError};
+
+    #[tokio::test]
+    async fn public_module_status_errors_return_explicit_internal_server_error() {
+        let response = build_public_modules_status_response(
+            Err(GatewayError::Internal("database unavailable".to_string())),
+            "模块运行状态暂不可用",
+        );
+
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body should be json");
+        assert_eq!(payload["detail"], "模块运行状态暂不可用");
+        assert!(!String::from_utf8_lossy(&body).contains("route not implemented"));
+    }
 }

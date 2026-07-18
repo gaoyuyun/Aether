@@ -154,23 +154,39 @@ pub(crate) struct AuthSnapshotCache {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum AuthSnapshotCacheKey {
-    KeyHash(String),
-    UserApiKeyIds(AuthApiKeyIdentityCacheKey),
+    KeyHash {
+        key_hash: String,
+        billing_plans_enabled: bool,
+    },
+    UserApiKeyIds {
+        identity: AuthApiKeyIdentityCacheKey,
+        billing_plans_enabled: bool,
+    },
 }
 
 impl AuthSnapshotCacheKey {
-    pub(crate) fn key_hash(key_hash: &str) -> Self {
-        Self::KeyHash(key_hash.trim().to_string())
+    pub(crate) fn key_hash(key_hash: &str, billing_plans_enabled: bool) -> Self {
+        Self::KeyHash {
+            key_hash: key_hash.trim().to_string(),
+            billing_plans_enabled,
+        }
     }
 
-    pub(crate) fn user_api_key_ids(user_id: &str, api_key_id: &str) -> Self {
-        Self::UserApiKeyIds(AuthApiKeyIdentityCacheKey::new(user_id, api_key_id))
+    pub(crate) fn user_api_key_ids(
+        user_id: &str,
+        api_key_id: &str,
+        billing_plans_enabled: bool,
+    ) -> Self {
+        Self::UserApiKeyIds {
+            identity: AuthApiKeyIdentityCacheKey::new(user_id, api_key_id),
+            billing_plans_enabled,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         match self {
-            Self::KeyHash(key_hash) => key_hash.is_empty(),
-            Self::UserApiKeyIds(key) => key.is_empty(),
+            Self::KeyHash { key_hash, .. } => key_hash.is_empty(),
+            Self::UserApiKeyIds { identity, .. } => identity.is_empty(),
         }
     }
 }

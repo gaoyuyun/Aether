@@ -225,8 +225,17 @@ impl UsageSettlementWriter for GatewayDataState {
 
     async fn settle_usage(
         &self,
-        input: UsageSettlementInput,
+        mut input: UsageSettlementInput,
     ) -> Result<Option<StoredUsageSettlement>, DataLayerError> {
+        if input.skip_user_billing.is_none() || input.skip_plan_billing.is_none() {
+            let policy = crate::commerce_modules::commerce_billing_policy_for_data(self).await?;
+            input
+                .skip_user_billing
+                .get_or_insert(!policy.wallet_enabled);
+            input
+                .skip_plan_billing
+                .get_or_insert(!policy.billing_plans_enabled);
+        }
         GatewayDataState::settle_usage(self, input).await
     }
 }

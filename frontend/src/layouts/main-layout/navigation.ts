@@ -52,6 +52,8 @@ const moduleIconMap: Record<string, LucideIcon> = {
   SlidersHorizontal,
   CreditCard,
   Gift,
+  Wallet,
+  Package,
 }
 
 function activeModuleItems(modules: ModuleRecord, group: string): NavItem[] {
@@ -93,8 +95,8 @@ export function buildNavigation(options: {
       {
         title: t('nav.group.account'),
         items: [
-          { name: t('nav.walletCenter'), href: '/dashboard/wallet', icon: Wallet },
-          { name: t('nav.billingCenter'), href: '/dashboard/billing', icon: Package },
+          ...(isModuleActive('wallet') ? [{ name: t('nav.walletCenter'), href: '/dashboard/wallet', icon: Wallet }] : []),
+          ...(isModuleActive('billing_plans') ? [{ name: t('nav.billingCenter'), href: '/dashboard/billing', icon: Package }] : []),
           ...(isModuleActive('referral') ? [{ name: t('nav.myReferral'), href: '/dashboard/referral', icon: Gift }] : []),
           { name: t('nav.usageStats'), href: '/dashboard/usage', icon: BarChart3 },
         ]
@@ -131,8 +133,6 @@ export function buildNavigation(options: {
         { name: t('nav.routing'), href: '/admin/routing', icon: SlidersHorizontal },
         { name: t('nav.pool'), href: '/admin/pool', icon: Database },
         { name: t('nav.standaloneKeys'), href: '/admin/keys', icon: Key },
-        { name: t('nav.walletManagement'), href: '/admin/wallets', icon: Wallet },
-        { name: t('nav.billingManagement'), href: '/admin/billing-plans', icon: Package },
         ...activeModuleItems(modules, 'management'),
         { name: t('nav.asyncTasks'), href: '/admin/async-tasks', icon: Zap },
         { name: t('nav.usageRecords'), href: '/admin/usage', icon: BarChart3 },
@@ -166,6 +166,12 @@ export function buildBreadcrumbs(options: {
     const moduleName = route.meta.module as string
     const moduleStatus = modules[moduleName]
     const displayName = moduleStatus?.display_name || moduleName
+    if (route.path.startsWith('/dashboard/')) {
+      return [
+        { label: t('nav.group.account') },
+        { label: displayName }
+      ]
+    }
     return [
       { label: t('nav.group.system') },
       { label: t('nav.moduleManagement'), href: '/admin/modules' },
