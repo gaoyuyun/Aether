@@ -58,6 +58,12 @@ pub(super) struct AdminUpdateUserApiKeyRequest {
         deserialize_with = "deserialize_optional_string_list_patch"
     )]
     pub(super) ip_rules: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    pub(super) allowed_providers: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    pub(super) allowed_api_formats: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    pub(super) allowed_models: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, serde::Deserialize)]

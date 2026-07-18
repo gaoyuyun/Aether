@@ -2680,7 +2680,15 @@ impl<'a> AdminAppState<'a> {
                                         },
                                         ip_rules: imported_ip_rules_present(key)
                                             .then(|| ip_rules.clone()),
-                                        allowed_providers: None,
+                                        allowed_providers: key
+                                            .contains_key("allowed_providers")
+                                            .then(|| allowed_providers.clone()),
+                                        allowed_api_formats: key
+                                            .contains_key("allowed_api_formats")
+                                            .then(|| allowed_api_formats.clone()),
+                                        allowed_models: key
+                                            .contains_key("allowed_models")
+                                            .then(|| allowed_models.clone()),
                                         feature_settings: None,
                                     },
                                 )
@@ -2691,13 +2699,6 @@ impl<'a> AdminAppState<'a> {
                                     json!({ "detail": "Admin system data unavailable" }),
                                 )));
                             }
-                            let _ = self
-                                .set_user_api_key_allowed_providers(
-                                    &user_id,
-                                    &existing_key.api_key_id,
-                                    allowed_providers.clone(),
-                                )
-                                .await?;
                             let _ = self
                                 .set_user_api_key_force_capabilities(
                                     &user_id,
@@ -2742,13 +2743,11 @@ impl<'a> AdminAppState<'a> {
                                     )));
                                 }
                             }
-                            if key.contains_key("allowed_api_formats")
-                                || key.contains_key("allowed_models")
-                                || key.contains_key("expires_at")
+                            if key.contains_key("expires_at")
                                 || key.contains_key("auto_delete_on_expiry")
                             {
                                 stats.errors.push(format!(
-                                    "用户 '{}' 的现有 API Key 仅覆盖基础字段；高级导入字段保持原值",
+                                    "用户 '{}' 的现有 API Key 不支持覆盖有效期字段；expires_at/auto_delete_on_expiry 保持原值",
                                     email.clone().unwrap_or(username.clone())
                                 ));
                             }
