@@ -1535,6 +1535,11 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     })
   },
 
+  'GET /api/users/me/usage/heatmap': async () => {
+    await delay()
+    return createMockResponse(getActivityHeatmap())
+  },
+
   'GET /api/users/me/providers': async (config) => {
     await delay()
     const view = String(config.params?.view || 'full')
@@ -1950,6 +1955,12 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
       },
       activity_heatmap: heatmap
     })
+  },
+
+  'GET /api/admin/usage/heatmap': async () => {
+    await delay()
+    requireAdmin()
+    return createMockResponse(getActivityHeatmap())
   },
 
   'GET /api/admin/usage/records': async (config) => {
