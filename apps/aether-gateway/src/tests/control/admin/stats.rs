@@ -1649,8 +1649,7 @@ async fn gateway_handles_admin_stats_leaderboard_api_keys_locally_without_auth_s
 }
 
 #[tokio::test]
-async fn gateway_handles_admin_stats_leaderboard_api_keys_with_auth_snapshot_single_lookup_fallback(
-) {
+async fn gateway_handles_admin_stats_leaderboard_api_keys_without_snapshot_n_plus_one_fallback() {
     let (_upstream_url, upstream_hits, upstream_handle) =
         start_stats_upstream("/api/admin/stats/leaderboard/api-keys").await;
 
@@ -1695,10 +1694,8 @@ async fn gateway_handles_admin_stats_leaderboard_api_keys_with_auth_snapshot_sin
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["total"], 1);
-    assert_eq!(payload["items"][0]["id"], "key-1");
-    assert_eq!(payload["items"][0]["name"], "fresh-key");
-    assert_eq!(payload["items"][0]["value"], 0.3);
+    assert_eq!(payload["total"], 0);
+    assert_eq!(payload["items"], json!([]));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
