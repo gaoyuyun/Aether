@@ -449,7 +449,7 @@ pub(super) async fn handle_users_me_providers_get(
                 }
                 if let Some(allowed_api_formats) = allowed_api_formats {
                     if !allowed_api_formats.iter().any(|allowed| {
-                        aether_ai_formats::api_format_permission_covers(
+                        crate::ai_serving::api::api_format_permission_covers(
                             allowed,
                             &endpoint.api_format,
                         )
@@ -545,7 +545,7 @@ pub(super) async fn handle_users_me_providers_get(
         }
         if let Some(allowed_api_formats) = allowed_api_formats {
             if !allowed_api_formats.iter().any(|allowed| {
-                aether_ai_formats::api_format_permission_covers(allowed, &endpoint.api_format)
+                crate::ai_serving::api::api_format_permission_covers(allowed, &endpoint.api_format)
             }) {
                 continue;
             }

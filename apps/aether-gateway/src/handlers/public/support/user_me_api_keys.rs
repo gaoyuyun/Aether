@@ -520,7 +520,7 @@ async fn resolve_users_me_api_key_allowed_formats_and_models(
             .iter()
             .filter(|requested_format| {
                 !user_allowed.iter().any(|allowed_format| {
-                    aether_ai_formats::api_format_permission_covers(
+                    crate::ai_serving::api::api_format_permission_covers(
                         allowed_format,
                         requested_format,
                     )
