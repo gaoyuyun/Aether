@@ -1440,7 +1440,9 @@ pub fn build_admin_module_validation_result(
                 )
             }
         }
-        "management_tokens" | "model_directives" | "proxy_nodes" => (true, None),
+        "management_tokens" | "model_directives" | "proxy_nodes" | "wallet" | "billing_plans" => {
+            (true, None)
+        }
         _ => (true, None),
     }
 }
@@ -1456,7 +1458,9 @@ pub fn build_admin_module_health(
         | "important_notification"
         | "bark_push"
         | "server_chan_push"
-        | "s3_backup" => "healthy",
+        | "s3_backup"
+        | "wallet"
+        | "billing_plans" => "healthy",
         "gemini_files" => {
             if gemini_files_has_capable_key {
                 "healthy"

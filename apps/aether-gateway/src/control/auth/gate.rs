@@ -154,10 +154,17 @@ async fn available_balance_capacity_usd(
     state: &AppState,
     auth_context: &GatewayControlAuthContext,
 ) -> Result<Option<f64>, GatewayError> {
-    let quota = state
-        .find_user_daily_quota_availability_for_auth(&auth_context.user_id)
-        .await?
-        .filter(|quota| quota.has_active_daily_quota);
+    if !auth_context.wallet_billing_enabled {
+        return Ok(None);
+    }
+    let quota = if auth_context.billing_plans_enabled {
+        state
+            .find_user_daily_quota_availability_for_auth(&auth_context.user_id)
+            .await?
+            .filter(|quota| quota.has_active_daily_quota)
+    } else {
+        None
+    };
     let wallet = state
         .read_wallet_snapshot_for_auth(
             &auth_context.user_id,
@@ -763,6 +770,8 @@ mod tests {
             user_rate_limit: None,
             api_key_rate_limit: None,
             api_key_is_standalone: false,
+            wallet_billing_enabled: true,
+            billing_plans_enabled: true,
             admin_bypass_limits: false,
             local_rejection: None,
             allowed_models: Some(allowed_models),
@@ -791,7 +800,11 @@ mod tests {
         let data = GatewayDataState::with_minimal_candidate_selection_and_billing_for_tests(
             candidate_repository,
             billing_repository,
-        );
+        )
+        .with_system_config_values_for_tests([
+            ("module.wallet.enabled".to_string(), json!(true)),
+            ("module.billing_plans.enabled".to_string(), json!(true)),
+        ]);
         AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data)
@@ -1426,7 +1439,11 @@ mod tests {
         let data = GatewayDataState::with_minimal_candidate_selection_and_billing_for_tests(
             candidate_repository,
             billing_repository,
-        );
+        )
+        .with_system_config_values_for_tests([
+            ("module.wallet.enabled".to_string(), json!(true)),
+            ("module.billing_plans.enabled".to_string(), json!(true)),
+        ]);
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data)

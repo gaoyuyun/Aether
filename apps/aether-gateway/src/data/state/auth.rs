@@ -14,7 +14,7 @@ use super::{
 use crate::LocalMutationOutcome;
 use aether_data::repository::auth::ResolvedAuthApiKeySnapshotReader;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GatewayUserEffectiveListPolicies {
     pub(crate) allowed_providers: Option<Vec<String>>,
     pub(crate) allowed_api_formats: Option<Vec<String>>,
@@ -1745,6 +1745,24 @@ impl GatewayDataState {
         api_key_id: &str,
         now_unix_secs: u64,
     ) -> Result<Option<GatewayAuthApiKeySnapshot>, DataLayerError> {
+        let commerce_policy =
+            crate::commerce_modules::commerce_billing_policy_for_data(self).await?;
+        self.read_auth_api_key_snapshot_with_commerce_policy(
+            user_id,
+            api_key_id,
+            now_unix_secs,
+            commerce_policy,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_auth_api_key_snapshot_with_commerce_policy(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        now_unix_secs: u64,
+        commerce_policy: crate::commerce_modules::CommerceBillingPolicy,
+    ) -> Result<Option<GatewayAuthApiKeySnapshot>, DataLayerError> {
         let snapshot = crate::request_diagnostics::observe_db_operation(
             "auth_api_key_snapshot",
             self.database_pool_summary(),
@@ -1754,7 +1772,7 @@ impl GatewayDataState {
             }),
         )
         .await?;
-        self.apply_user_group_effective_policies(snapshot, now_unix_secs)
+        self.apply_user_group_effective_policies(snapshot, now_unix_secs, commerce_policy)
             .await
     }
 
@@ -1763,13 +1781,29 @@ impl GatewayDataState {
         key_hash: &str,
         now_unix_secs: u64,
     ) -> Result<Option<GatewayAuthApiKeySnapshot>, DataLayerError> {
+        let commerce_policy =
+            crate::commerce_modules::commerce_billing_policy_for_data(self).await?;
+        self.read_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+            key_hash,
+            now_unix_secs,
+            commerce_policy,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+        &self,
+        key_hash: &str,
+        now_unix_secs: u64,
+        commerce_policy: crate::commerce_modules::CommerceBillingPolicy,
+    ) -> Result<Option<GatewayAuthApiKeySnapshot>, DataLayerError> {
         let snapshot = crate::request_diagnostics::observe_db_operation(
             "auth_api_key_snapshot_by_hash",
             self.database_pool_summary(),
             self.find_stored_auth_api_key_snapshot(AuthApiKeyLookupKey::KeyHash(key_hash)),
         )
         .await?;
-        self.apply_user_group_effective_policies(snapshot, now_unix_secs)
+        self.apply_user_group_effective_policies(snapshot, now_unix_secs, commerce_policy)
             .await
     }
 
@@ -1777,6 +1811,7 @@ impl GatewayDataState {
         &self,
         snapshot: Option<StoredAuthApiKeySnapshot>,
         now_unix_secs: u64,
+        commerce_policy: crate::commerce_modules::CommerceBillingPolicy,
     ) -> Result<Option<GatewayAuthApiKeySnapshot>, DataLayerError> {
         let Some(mut snapshot) = snapshot else {
             return Ok(None);
@@ -1815,7 +1850,10 @@ impl GatewayDataState {
             )));
         }
         let groups = self
-            .effective_user_groups_for_user(&snapshot.user_id)
+            .effective_user_groups_for_user(
+                &snapshot.user_id,
+                commerce_policy.billing_plans_enabled,
+            )
             .await?;
 
         let GatewayUserEffectiveListPolicies {
@@ -1842,8 +1880,11 @@ impl GatewayDataState {
             return Ok(GatewayUserEffectiveListPolicies::default());
         }
 
+        let commerce_policy =
+            crate::commerce_modules::commerce_billing_policy_for_data(self).await?;
         let groups = if self.user_reader.is_some() {
-            self.effective_user_groups_for_user(&user.id).await?
+            self.effective_user_groups_for_user(&user.id, commerce_policy.billing_plans_enabled)
+                .await?
         } else {
             Vec::new()
         };
@@ -1853,12 +1894,17 @@ impl GatewayDataState {
     async fn effective_user_groups_for_user(
         &self,
         user_id: &str,
+        billing_plans_enabled: bool,
     ) -> Result<Vec<aether_data::repository::users::StoredUserGroup>, DataLayerError> {
         let Some(repository) = self.user_reader.as_ref() else {
             return Ok(Vec::new());
         };
         let mut groups = repository.list_user_groups_for_user(user_id).await?;
-        let dynamic_group_ids = self.active_membership_group_ids_for_user(user_id).await?;
+        let dynamic_group_ids = if billing_plans_enabled {
+            self.active_membership_group_ids_for_user(user_id).await?
+        } else {
+            Vec::new()
+        };
         if !dynamic_group_ids.is_empty() {
             groups.extend(
                 repository
@@ -2157,8 +2203,40 @@ mod tests {
         InMemoryUserReadRepository, StoredUserAuthRecord, StoredUserGroup, UpsertUserGroupRecord,
         UserReadRepository,
     };
+    use aether_data_contracts::repository::billing::{
+        BillingReadRepository, StoredBillingModelContext, UserPlanEntitlementRecord,
+    };
+    use async_trait::async_trait;
 
     use crate::data::GatewayDataState;
+
+    #[derive(Debug)]
+    struct FixedEntitlementBillingRepository {
+        entitlement: UserPlanEntitlementRecord,
+    }
+
+    #[async_trait]
+    impl BillingReadRepository for FixedEntitlementBillingRepository {
+        async fn find_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _global_model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            Ok(None)
+        }
+
+        async fn list_user_plan_entitlements(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, DataLayerError> {
+            Ok(Some(
+                (self.entitlement.user_id == user_id)
+                    .then(|| vec![self.entitlement.clone()])
+                    .unwrap_or_default(),
+            ))
+        }
+    }
 
     fn sample_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
         sample_snapshot_with_role(api_key_id, user_id, "user")
@@ -2245,6 +2323,120 @@ mod tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn billing_plan_module_controls_only_membership_derived_groups() {
+        let user = sample_auth_user("user-membership", "user");
+        let user_repository = Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![
+            user.clone()
+        ]));
+        let static_group = user_repository
+            .create_user_group(UpsertUserGroupRecord {
+                name: "Static Group".to_string(),
+                description: None,
+                priority: 10,
+                allowed_providers: None,
+                allowed_providers_mode: "unrestricted".to_string(),
+                allowed_api_formats: None,
+                allowed_api_formats_mode: "unrestricted".to_string(),
+                allowed_models: Some(vec!["static-model".to_string()]),
+                allowed_models_mode: "specific".to_string(),
+                rate_limit: None,
+                rate_limit_mode: "system".to_string(),
+            })
+            .await
+            .expect("static group should create")
+            .expect("static group should exist");
+        user_repository
+            .add_user_to_group(&static_group.id, &user.id)
+            .await
+            .expect("static membership should create");
+        let plan_group = user_repository
+            .create_user_group(UpsertUserGroupRecord {
+                name: "Plan Group".to_string(),
+                description: None,
+                priority: 20,
+                allowed_providers: None,
+                allowed_providers_mode: "unrestricted".to_string(),
+                allowed_api_formats: None,
+                allowed_api_formats_mode: "unrestricted".to_string(),
+                allowed_models: Some(vec!["plan-model".to_string()]),
+                allowed_models_mode: "specific".to_string(),
+                rate_limit: Some(120),
+                rate_limit_mode: "custom".to_string(),
+            })
+            .await
+            .expect("plan group should create")
+            .expect("plan group should exist");
+        let now = chrono::Utc::now().timestamp().max(1) as u64;
+        let billing_repository: Arc<dyn BillingReadRepository> =
+            Arc::new(FixedEntitlementBillingRepository {
+                entitlement: UserPlanEntitlementRecord {
+                    id: "entitlement-membership".to_string(),
+                    user_id: user.id.clone(),
+                    plan_id: "plan-membership".to_string(),
+                    payment_order_id: "order-membership".to_string(),
+                    status: "active".to_string(),
+                    starts_at_unix_secs: now.saturating_sub(1),
+                    expires_at_unix_secs: now + 3_600,
+                    entitlements_snapshot: serde_json::json!([{
+                        "type": "membership_group",
+                        "grant_user_groups": [plan_group.id]
+                    }]),
+                    created_at_unix_secs: now,
+                    updated_at_unix_secs: now,
+                },
+            });
+        let state = GatewayDataState::with_billing_reader_for_tests(billing_repository)
+            .with_user_reader(user_repository)
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), serde_json::json!(true)),
+                (
+                    "module.billing_plans.enabled".to_string(),
+                    serde_json::json!(true),
+                ),
+            ]);
+
+        let enabled = state
+            .resolve_user_effective_list_policies(&user)
+            .await
+            .expect("enabled plan policies should resolve");
+        assert_eq!(
+            enabled.allowed_models,
+            Some(vec!["plan-model".to_string(), "static-model".to_string()])
+        );
+
+        state
+            .upsert_system_config_value(
+                "module.billing_plans.enabled",
+                &serde_json::json!(false),
+                None,
+            )
+            .await
+            .expect("billing plans should disable");
+        let disabled = state
+            .resolve_user_effective_list_policies(&user)
+            .await
+            .expect("disabled plan policies should resolve");
+        assert_eq!(
+            disabled.allowed_models,
+            Some(vec!["static-model".to_string()])
+        );
+
+        state
+            .upsert_system_config_value(
+                "module.billing_plans.enabled",
+                &serde_json::json!(true),
+                None,
+            )
+            .await
+            .expect("billing plans should re-enable");
+        let reenabled = state
+            .resolve_user_effective_list_policies(&user)
+            .await
+            .expect("re-enabled plan policies should resolve");
+        assert_eq!(reenabled, enabled);
     }
 
     #[test]

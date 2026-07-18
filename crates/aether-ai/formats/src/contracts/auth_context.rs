@@ -16,4 +16,8 @@ pub struct ExecutionRuntimeAuthContext {
     pub access_allowed: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub api_key_is_standalone: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wallet_billing_enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub billing_plans_enabled: bool,
 }

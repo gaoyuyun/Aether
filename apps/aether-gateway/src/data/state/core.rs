@@ -674,6 +674,13 @@ impl GatewayDataState {
             .remove(key);
     }
 
+    pub(crate) fn clear_system_config_value_cache(&self) {
+        self.system_config_value_cache
+            .write()
+            .expect("system config value cache lock")
+            .clear();
+    }
+
     pub(crate) async fn read_admin_system_stats(
         &self,
     ) -> Result<super::AdminSystemStats, DataLayerError> {
@@ -687,10 +694,11 @@ impl GatewayDataState {
         &self,
         target: aether_data::repository::system::AdminSystemPurgeTarget,
     ) -> Result<aether_data::repository::system::AdminSystemPurgeSummary, DataLayerError> {
-        if matches!(
+        let purges_config = matches!(
             target,
             aether_data::repository::system::AdminSystemPurgeTarget::Config
-        ) {
+        );
+        let summary = if purges_config {
             if let Some(values) = &self.system_config_values {
                 let mut values = values.write().expect("system config values lock");
                 let deleted = values.len() as u64;
@@ -698,13 +706,23 @@ impl GatewayDataState {
                 let mut summary =
                     aether_data::repository::system::AdminSystemPurgeSummary::default();
                 summary.add("system_configs", deleted);
-                return Ok(summary);
+                summary
+            } else {
+                match self.backends.as_ref() {
+                    Some(backends) => backends.purge_admin_system_data(target).await?,
+                    None => aether_data::repository::system::AdminSystemPurgeSummary::default(),
+                }
             }
+        } else {
+            match self.backends.as_ref() {
+                Some(backends) => backends.purge_admin_system_data(target).await,
+                None => Ok(aether_data::repository::system::AdminSystemPurgeSummary::default()),
+            }?
+        };
+        if purges_config {
+            self.clear_system_config_value_cache();
         }
-        match self.backends.as_ref() {
-            Some(backends) => backends.purge_admin_system_data(target).await,
-            None => Ok(aether_data::repository::system::AdminSystemPurgeSummary::default()),
-        }
+        Ok(summary)
     }
 
     pub(crate) async fn export_admin_system_usage_aggregates(
@@ -754,5 +772,50 @@ impl GatewayDataState {
             Some(backends) => backends.purge_admin_request_bodies_batch(batch_size).await,
             None => Ok(aether_data::repository::system::AdminSystemPurgeSummary::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use serde_json::json;
+
+    use super::GatewayDataState;
+
+    #[tokio::test]
+    async fn config_purge_clears_the_data_layer_system_config_value_cache() {
+        let state = GatewayDataState::disabled().with_system_config_values_for_tests([(
+            "module.wallet.enabled".to_string(),
+            json!(true),
+        )]);
+        state
+            .system_config_value_cache
+            .write()
+            .expect("system config value cache lock")
+            .insert(
+                "module.wallet.enabled".to_string(),
+                (Instant::now(), Some(json!(true))),
+            );
+
+        state
+            .purge_admin_system_data(
+                aether_data::repository::system::AdminSystemPurgeTarget::Config,
+            )
+            .await
+            .expect("config purge should succeed");
+
+        assert!(state
+            .system_config_value_cache
+            .read()
+            .expect("system config value cache lock")
+            .is_empty());
+        assert_eq!(
+            state
+                .find_system_config_value("module.wallet.enabled")
+                .await
+                .expect("system config lookup should succeed"),
+            None
+        );
     }
 }

@@ -271,6 +271,8 @@ mod tests {
             balance_remaining: None,
             access_allowed: true,
             api_key_is_standalone: false,
+            wallet_billing_enabled: false,
+            billing_plans_enabled: false,
         };
         let original_headers = http::HeaderMap::new();
         let provider_request_headers = BTreeMap::new();
@@ -356,6 +358,8 @@ mod tests {
             balance_remaining: None,
             access_allowed: true,
             api_key_is_standalone: false,
+            wallet_billing_enabled: false,
+            billing_plans_enabled: false,
         };
         let original_headers = http::HeaderMap::new();
         let provider_request_headers = BTreeMap::new();
@@ -423,6 +427,8 @@ mod tests {
             balance_remaining: None,
             access_allowed: true,
             api_key_is_standalone: false,
+            wallet_billing_enabled: false,
+            billing_plans_enabled: false,
         };
         let mut original_headers = http::HeaderMap::new();
         original_headers.insert("x-aether-tls-ja3", "ja3-value".parse().unwrap());

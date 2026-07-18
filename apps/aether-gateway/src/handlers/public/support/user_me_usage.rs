@@ -1255,6 +1255,20 @@ pub(super) async fn handle_users_me_usage_get(
         .await
         .ok()
         .flatten();
+    let mut billing_payload = build_auth_wallet_summary_payload(wallet.as_ref());
+    match crate::commerce_modules::wallet_module_enabled(state).await {
+        Ok(false) => {
+            crate::commerce_modules::mark_wallet_summary_unlimited(&mut billing_payload);
+        }
+        Ok(true) => {}
+        Err(err) => {
+            return build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("wallet module status lookup failed: {err:?}"),
+                false,
+            );
+        }
+    }
 
     let mut payload = json!({
         "total_requests": total_requests,
@@ -1264,7 +1278,7 @@ pub(super) async fn handle_users_me_usage_get(
         "total_cost": total_cost,
         "avg_response_time": avg_response_time,
         "provider_visibility_enabled": include_provider,
-        "billing": build_auth_wallet_summary_payload(wallet.as_ref()),
+        "billing": billing_payload,
         "summary_by_model": build_users_me_usage_summary_by_model(&summary_by_model, include_actual_cost),
         "summary_by_api_format": build_users_me_usage_summary_by_api_format(&summary_by_api_format),
         "pagination": {

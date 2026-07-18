@@ -34,7 +34,23 @@ describe('main layout navigation builder', () => {
       'tx:nav.group.resources',
       'tx:nav.group.account',
     ])
-    expect(navigation.flatMap(group => group.items.map(item => item.name))).toContain('tx:nav.myReferral')
+    const itemNames = navigation.flatMap(group => group.items.map(item => item.name))
+    expect(itemNames).toContain('tx:nav.myReferral')
+    expect(itemNames).not.toContain('tx:nav.walletCenter')
+    expect(itemNames).not.toContain('tx:nav.billingCenter')
+  })
+
+  it('shows user wallet and billing entries only while their modules are active', () => {
+    const navigation = buildNavigation({
+      canAccessAdmin: false,
+      modules: {},
+      isModuleActive: name => name === 'wallet' || name === 'billing_plans',
+      t: translate,
+    })
+
+    const itemNames = navigation.flatMap(group => group.items.map(item => item.name))
+    expect(itemNames).toContain('tx:nav.walletCenter')
+    expect(itemNames).toContain('tx:nav.billingCenter')
   })
 
   it('builds admin navigation with dynamic module menu items sorted by menu order', () => {
@@ -86,6 +102,19 @@ describe('main layout navigation builder', () => {
     })).toEqual([
       { label: 'tx:nav.group.account' },
       { label: 'tx:breadcrumb.personalSettings' },
+    ])
+
+    expect(buildBreadcrumbs({
+      route: route('/dashboard/wallet', 'WalletCenter', { module: 'wallet' }),
+      navigation,
+      modules: {
+        wallet: { display_name: '钱包管理' },
+      },
+      isNavActive: () => false,
+      t: translate,
+    })).toEqual([
+      { label: 'tx:nav.group.account' },
+      { label: '钱包管理' },
     ])
 
     expect(buildBreadcrumbs({

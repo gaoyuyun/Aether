@@ -186,7 +186,10 @@
           />
         </div>
 
-        <div class="space-y-2">
+        <div
+          v-if="walletEnabled"
+          class="space-y-2"
+        >
           <Label class="text-sm font-medium">{{ legacyT('额度') }}</Label>
           <div class="flex items-center gap-3">
             <div class="flex-1 min-w-0">
@@ -313,6 +316,7 @@ const props = defineProps<{
   open: boolean
   user: UserFormData | null
   groups?: UserGroup[]
+  walletEnabled: boolean
 }>()
 
 const emit = defineEmits<{

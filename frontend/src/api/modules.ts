@@ -27,6 +27,12 @@ export interface AuthModuleInfo {
   active: boolean
 }
 
+export interface RuntimeModuleInfo {
+  name: string
+  display_name: string
+  active: boolean
+}
+
 export type ChatPiiRedactionTtlSeconds = 300 | 3600
 
 export interface ChatPiiRedactionRuleFeatures {
@@ -187,6 +193,11 @@ async function getAllSystemConfigValues(): Promise<Map<string, unknown>> {
 }
 
 export const modulesApi = {
+  async getRuntimeStatus(): Promise<RuntimeModuleInfo[]> {
+    const response = await apiClient.get<RuntimeModuleInfo[]>('/api/modules/status')
+    return response.data
+  },
+
   /**
    * 获取所有模块状态（管理员）
    */
