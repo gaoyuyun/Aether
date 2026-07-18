@@ -1573,6 +1573,9 @@ async fn gateway_handles_admin_user_api_key_routes_locally_with_trusted_admin_pr
         .json(&json!({
             "name": "new-key",
             "rate_limit": 90,
+            "allowed_providers": ["provider-openai"],
+            "allowed_api_formats": ["openai:responses"],
+            "allowed_models": ["gpt-5.4"]
         }))
         .send()
         .await
@@ -1585,6 +1588,15 @@ async fn gateway_handles_admin_user_api_key_routes_locally_with_trusted_admin_pr
     assert_eq!(create_payload["name"], "new-key");
     assert_eq!(create_payload["rate_limit"], 90);
     assert_eq!(create_payload["concurrent_limit"], serde_json::Value::Null);
+    assert_eq!(
+        create_payload["allowed_providers"],
+        json!(["provider-openai"])
+    );
+    assert_eq!(
+        create_payload["allowed_api_formats"],
+        json!(["openai:responses"])
+    );
+    assert_eq!(create_payload["allowed_models"], json!(["gpt-5.4"]));
     assert_eq!(
         create_payload["message"],
         "API Key创建成功，请妥善保存完整密钥"
@@ -1613,6 +1625,9 @@ async fn gateway_handles_admin_user_api_key_routes_locally_with_trusted_admin_pr
             "name": "renamed",
             "rate_limit": 120,
             "concurrent_limit": 9,
+            "allowed_providers": [],
+            "allowed_api_formats": null,
+            "allowed_models": ["gpt-4.1"]
         }))
         .send()
         .await
@@ -1627,6 +1642,12 @@ async fn gateway_handles_admin_user_api_key_routes_locally_with_trusted_admin_pr
     assert_eq!(update_payload["is_locked"], false);
     assert_eq!(update_payload["rate_limit"], 120);
     assert_eq!(update_payload["concurrent_limit"], 9);
+    assert_eq!(update_payload["allowed_providers"], json!([]));
+    assert_eq!(
+        update_payload["allowed_api_formats"],
+        serde_json::Value::Null
+    );
+    assert_eq!(update_payload["allowed_models"], json!(["gpt-4.1"]));
     assert_eq!(update_payload["created_at"], "2024-03-21T05:48:20+00:00");
     assert_eq!(update_payload["message"], "API Key更新成功");
 
@@ -1782,9 +1803,11 @@ async fn admin_created_user_keys_inherit_owner_group_policy() {
         .expect("created key snapshot should exist");
     assert_eq!(resolved.user_id, "target-user");
     assert_eq!(
-        resolved.effective_allowed_providers(),
-        Some(&["anthropic".to_string()][..])
+        resolved.provider_allowlist_layers(),
+        [None, Some(&["anthropic".to_string()][..])]
     );
+    assert!(resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+    assert!(!resolved.allows_provider("provider-google", "Google", "google"));
     assert_eq!(
         resolved.effective_allowed_api_formats(),
         Some(&["claude:messages".to_string()][..])
@@ -1825,9 +1848,11 @@ async fn admin_created_user_keys_inherit_owner_group_policy() {
         .expect("created key snapshot should still exist");
     assert_eq!(updated.user_id, "target-user");
     assert_eq!(
-        updated.effective_allowed_providers(),
-        Some(&["google".to_string()][..])
+        updated.provider_allowlist_layers(),
+        [None, Some(&["google".to_string()][..])]
     );
+    assert!(updated.allows_provider("provider-google", "Google", "google"));
+    assert!(!updated.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
     assert_eq!(
         updated.effective_allowed_api_formats(),
         Some(&["gemini:generate-content".to_string()][..])
@@ -2465,6 +2490,16 @@ async fn gateway_lists_admin_user_api_keys_locally_with_trusted_admin_principal(
     assert_eq!(payload["api_keys"][0]["total_requests"], 9);
     assert_eq!(payload["api_keys"][0]["total_cost_usd"], 1.5);
     assert_eq!(payload["api_keys"][0]["rate_limit"], 60);
+    assert_eq!(
+        payload["api_keys"][0]["allowed_providers"],
+        json!(["openai"])
+    );
+    assert_eq!(
+        payload["api_keys"][0]["allowed_api_formats"],
+        json!(["openai:chat"])
+    );
+    assert_eq!(payload["api_keys"][0]["allowed_models"], json!(["gpt-4.1"]));
+    assert_eq!(payload["api_keys"][0]["ip_rules"], serde_json::Value::Null);
     assert_eq!(
         payload["api_keys"][0]["created_at"],
         "2024-03-21T05:48:20+00:00"

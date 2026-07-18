@@ -224,6 +224,9 @@ export interface ApiKey {
   rate_limit?: number | null  // 普通Key: 0 = 不限制，历史 null 视为跟随系统默认
   concurrent_limit?: number | null  // 普通Key: 0 = 不限制并发，历史 null 兼容
   ip_rules?: string[] | null
+  allowed_providers?: string[] | null
+  allowed_api_formats?: string[] | null
+  allowed_models?: string[] | null
   total_requests?: number  // 总请求数
   total_cost_usd?: number  // 总费用
 }
@@ -233,6 +236,9 @@ export interface UpsertUserApiKeyRequest {
   rate_limit?: number | null
   concurrent_limit?: number | null
   ip_rules?: string[] | null
+  allowed_providers?: string[] | null
+  allowed_api_formats?: string[] | null
+  allowed_models?: string[] | null
   feature_settings?: FeatureSettings | null
 }
 

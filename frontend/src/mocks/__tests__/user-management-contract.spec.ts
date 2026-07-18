@@ -59,4 +59,51 @@ describe('user management demo contracts', () => {
     expect(aliceKeys?.data?.api_keys[0]).not.toHaveProperty('fullKey')
     expect(bobKeys?.data).toEqual({ api_keys: [], total: 0 })
   })
+
+  it('persists all user API key access restrictions across create and update', async () => {
+    setMockUserToken('demo-access-token-user')
+    const created = await handleMockRequest({
+      method: 'POST',
+      url: '/api/users/me/api-keys',
+      data: JSON.stringify({
+        name: 'Restricted demo key',
+        allowed_providers: ['provider-001'],
+        allowed_api_formats: ['openai:chat'],
+        allowed_models: ['gpt-5.1'],
+      }),
+    })
+    const createdKey = created?.data as {
+      id: string
+      allowed_providers: string[] | null
+      allowed_api_formats: string[] | null
+      allowed_models: string[] | null
+    }
+
+    expect(createdKey).toMatchObject({
+      allowed_providers: ['provider-001'],
+      allowed_api_formats: ['openai:chat'],
+      allowed_models: ['gpt-5.1'],
+    })
+
+    await handleMockRequest({
+      method: 'PUT',
+      url: `/api/users/me/api-keys/${createdKey.id}`,
+      data: JSON.stringify({
+        allowed_providers: [],
+        allowed_api_formats: ['openai:responses'],
+        allowed_models: ['gpt-5.1-codex'],
+      }),
+    })
+    const listed = await handleMockRequest({
+      method: 'GET',
+      url: '/api/users/me/api-keys',
+    })
+    const persisted = (listed?.data as Array<{ id: string }>).find(key => key.id === createdKey.id)
+
+    expect(persisted).toMatchObject({
+      allowed_providers: [],
+      allowed_api_formats: ['openai:responses'],
+      allowed_models: ['gpt-5.1-codex'],
+    })
+  })
 })

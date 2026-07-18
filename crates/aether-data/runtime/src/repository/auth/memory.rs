@@ -842,6 +842,22 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                 export.allowed_providers = allowed_providers;
             }
         }
+        if let Some(allowed_api_formats) = record.allowed_api_formats {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_allowed_api_formats = allowed_api_formats.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.allowed_api_formats = allowed_api_formats;
+            }
+        }
+        if let Some(allowed_models) = record.allowed_models {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_allowed_models = allowed_models.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.allowed_models = allowed_models;
+            }
+        }
         if let Some(feature_settings) = record.feature_settings {
             if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
                 export.feature_settings = match feature_settings {
@@ -1378,6 +1394,8 @@ mod tests {
                 concurrent_limit: Some(11),
                 ip_rules: None,
                 allowed_providers: None,
+                allowed_api_formats: None,
+                allowed_models: None,
                 feature_settings: None,
             })
             .await
@@ -1442,6 +1460,8 @@ mod tests {
                 concurrent_limit: None,
                 ip_rules: None,
                 allowed_providers: Some(Some(Vec::new())),
+                allowed_api_formats: None,
+                allowed_models: None,
                 feature_settings: None,
             })
             .await
@@ -1462,6 +1482,8 @@ mod tests {
                 concurrent_limit: None,
                 ip_rules: None,
                 allowed_providers: Some(None),
+                allowed_api_formats: None,
+                allowed_models: None,
                 feature_settings: Some(None),
             })
             .await

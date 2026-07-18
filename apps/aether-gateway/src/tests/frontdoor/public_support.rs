@@ -7078,6 +7078,27 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
         .expect("export record should build")]),
     );
     let user_repository = Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![user]));
+    let access_group = user_repository
+        .create_user_group(UpsertUserGroupRecord {
+            name: "API key access scope".to_string(),
+            description: None,
+            priority: 0,
+            allowed_providers: Some(vec!["openai".to_string()]),
+            allowed_providers_mode: "specific".to_string(),
+            allowed_api_formats: Some(vec!["openai:chat".to_string()]),
+            allowed_api_formats_mode: "specific".to_string(),
+            allowed_models: Some(vec!["gpt-5".to_string()]),
+            allowed_models_mode: "specific".to_string(),
+            rate_limit: None,
+            rate_limit_mode: "system".to_string(),
+        })
+        .await
+        .expect("access group should create")
+        .expect("access group should exist");
+    user_repository
+        .add_user_to_group(&access_group.id, "user-auth-1")
+        .await
+        .expect("access group membership should create");
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider("provider-openai", "openai", 10)],
         vec![sample_endpoint(
@@ -7119,7 +7140,9 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
         .json(&json!({
             "name": "writer-key",
             "rate_limit": 120,
-            "allowed_providers": ["provider-openai"]
+            "allowed_providers": ["provider-openai"],
+            "allowed_api_formats": ["openai:chat"],
+            "allowed_models": ["gpt-5"]
         }))
         .send()
         .await
@@ -7141,6 +7164,11 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
         create_payload["allowed_providers"],
         json!(["provider-openai"])
     );
+    assert_eq!(
+        create_payload["allowed_api_formats"],
+        json!(["openai:chat"])
+    );
+    assert_eq!(create_payload["allowed_models"], json!(["gpt-5"]));
     assert_eq!(create_payload["feature_settings"], serde_json::Value::Null);
     assert_eq!(create_payload["message"], "API密钥创建成功");
     let created_at = create_payload["created_at"]
@@ -7167,7 +7195,9 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
                     "enabled": true
                 }
             },
-            "allowed_providers": []
+            "allowed_providers": [],
+            "allowed_api_formats": [],
+            "allowed_models": []
         }))
         .send()
         .await
@@ -7181,11 +7211,35 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
     assert_eq!(update_payload["rate_limit"], 30);
     assert_eq!(update_payload["concurrent_limit"], 4);
     assert_eq!(update_payload["allowed_providers"], json!([]));
+    assert_eq!(update_payload["allowed_api_formats"], json!([]));
+    assert_eq!(update_payload["allowed_models"], json!([]));
     assert_eq!(
         update_payload["feature_settings"]["chat_pii_redaction"]["enabled"],
         true
     );
     assert_eq!(update_payload["message"], "API密钥已更新");
+
+    let rejected_format_response = client
+        .put(format!("{gateway_url}/api/users/me/api-keys/{created_id}"))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-api-key-writes")
+        .header("user-agent", "AetherTest/1.0")
+        .json(&json!({ "allowed_api_formats": ["openai:responses"] }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(rejected_format_response.status(), StatusCode::BAD_REQUEST);
+
+    let rejected_model_response = client
+        .put(format!("{gateway_url}/api/users/me/api-keys/{created_id}"))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-api-key-writes")
+        .header("user-agent", "AetherTest/1.0")
+        .json(&json!({ "allowed_models": ["gpt-4.1"] }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(rejected_model_response.status(), StatusCode::BAD_REQUEST);
 
     let toggle_response = client
         .patch(format!("{gateway_url}/api/users/me/api-keys/{created_id}"))
@@ -7262,6 +7316,8 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
         detail_payload["allowed_providers"],
         json!(["provider-openai"])
     );
+    assert_eq!(detail_payload["allowed_api_formats"], json!([]));
+    assert_eq!(detail_payload["allowed_models"], json!([]));
     assert_eq!(detail_payload["concurrent_limit"], 4);
     assert_eq!(detail_payload["force_capabilities"], json!({}));
     assert_eq!(detail_payload["created_at"], created_at);
@@ -8268,14 +8324,20 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
     );
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![
-            sample_provider("provider-openai", "openai", 10),
-            sample_provider("provider-claude", "claude", 20),
+            sample_provider("provider-openai", "OpenAI", 10),
+            sample_provider("provider-claude", "Claude", 20),
         ],
         vec![
             sample_endpoint(
                 "endpoint-openai-1",
                 "provider-openai",
                 "openai:chat",
+                "https://api.openai.example",
+            ),
+            sample_endpoint(
+                "endpoint-openai-responses",
+                "provider-openai",
+                "openai:responses",
                 "https://api.openai.example",
             ),
             sample_endpoint(
@@ -8299,6 +8361,14 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
                     "GPT 5",
                 ),
                 sample_public_catalog_model(
+                    "model-openai-gpt4",
+                    "provider-openai",
+                    "openai",
+                    "gpt-4.1-preview",
+                    "gpt-4.1",
+                    "GPT 4.1",
+                ),
+                sample_public_catalog_model(
                     "model-claude-sonnet",
                     "provider-claude",
                     "claude",
@@ -8316,10 +8386,10 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
             priority: 0,
             allowed_providers: Some(vec!["openai".to_string()]),
             allowed_providers_mode: "specific".to_string(),
-            allowed_api_formats: None,
-            allowed_api_formats_mode: "unrestricted".to_string(),
-            allowed_models: None,
-            allowed_models_mode: "unrestricted".to_string(),
+            allowed_api_formats: Some(vec!["openai:chat".to_string()]),
+            allowed_api_formats_mode: "specific".to_string(),
+            allowed_models: Some(vec!["gpt-5".to_string()]),
+            allowed_models_mode: "specific".to_string(),
             rate_limit: None,
             rate_limit_mode: "system".to_string(),
         })
@@ -8368,8 +8438,10 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
     assert!(providers[0].get("name").is_none());
     assert!(providers[0].get("description").is_none());
     assert_eq!(providers[0]["endpoints"][0]["id"], "endpoint-openai-1");
+    assert_eq!(providers[0]["endpoints"].as_array().map(Vec::len), Some(1));
     assert!(providers[0]["endpoints"][0].get("base_url").is_none());
     assert_eq!(providers[0]["models"][0]["name"], "gpt-5");
+    assert_eq!(providers[0]["models"].as_array().map(Vec::len), Some(1));
 
     let options_response = reqwest::Client::new()
         .get(format!("{gateway_url}/api/users/me/providers?view=options"))
@@ -8392,6 +8464,32 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
     assert_eq!(options[0]["name"], "OpenAI");
     assert!(options[0].get("endpoints").is_none());
     assert!(options[0].get("models").is_none());
+
+    let access_options_response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/users/me/providers?view=access-options"
+        ))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-providers")
+        .header("user-agent", "AetherTest/1.0")
+        .send()
+        .await
+        .expect("provider access options request should succeed");
+    assert_eq!(access_options_response.status(), StatusCode::OK);
+    let access_options_payload: serde_json::Value = access_options_response
+        .json()
+        .await
+        .expect("provider access options body should parse");
+    let access_options = access_options_payload
+        .as_array()
+        .expect("provider access options should be array");
+    assert_eq!(access_options.len(), 1);
+    assert_eq!(access_options[0]["id"], "provider-openai");
+    assert_eq!(
+        access_options[0]["endpoints"],
+        json!([{ "api_format": "openai:chat" }])
+    );
+    assert!(access_options[0].get("models").is_none());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

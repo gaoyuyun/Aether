@@ -1,6 +1,7 @@
 use super::super::super::{
     build_admin_users_bad_request_response, build_admin_users_read_only_response,
-    normalize_admin_feature_settings, normalize_admin_user_ip_rules, AdminUpdateUserApiKeyRequest,
+    normalize_admin_feature_settings, normalize_admin_user_api_formats,
+    normalize_admin_user_ip_rules, normalize_admin_user_string_list, AdminUpdateUserApiKeyRequest,
 };
 use super::super::helpers::{
     attach_audit_response, build_admin_user_api_key_detail_payload,
@@ -107,6 +108,45 @@ pub(crate) async fn build_admin_update_user_api_key_response(
         },
         None => None,
     };
+    let allowed_providers = match payload.allowed_providers {
+        Some(value) => match normalize_admin_user_string_list(value, "allowed_providers") {
+            Ok(value) => Some(value),
+            Err(detail) => {
+                return Ok((
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({ "detail": detail })),
+                )
+                    .into_response());
+            }
+        },
+        None => None,
+    };
+    let allowed_api_formats = match payload.allowed_api_formats {
+        Some(value) => match normalize_admin_user_api_formats(value) {
+            Ok(value) => Some(value),
+            Err(detail) => {
+                return Ok((
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({ "detail": detail })),
+                )
+                    .into_response());
+            }
+        },
+        None => None,
+    };
+    let allowed_models = match payload.allowed_models {
+        Some(value) => match normalize_admin_user_string_list(value, "allowed_models") {
+            Ok(value) => Some(value),
+            Err(detail) => {
+                return Ok((
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({ "detail": detail })),
+                )
+                    .into_response());
+            }
+        },
+        None => None,
+    };
 
     let Some(updated) = state
         .update_user_api_key_basic(aether_data::repository::auth::UpdateUserApiKeyBasicRecord {
@@ -116,7 +156,9 @@ pub(crate) async fn build_admin_update_user_api_key_response(
             rate_limit: payload.rate_limit,
             concurrent_limit,
             ip_rules,
-            allowed_providers: None,
+            allowed_providers,
+            allowed_api_formats,
+            allowed_models,
             // Same atomic write as basic fields (None = leave unchanged).
             feature_settings,
         })

@@ -1,12 +1,13 @@
 use super::super::super::{
     build_admin_users_bad_request_response, build_admin_users_data_unavailable_response,
     build_admin_users_read_only_response, normalize_admin_feature_settings,
-    normalize_admin_user_ip_rules, AdminCreateUserApiKeyRequest,
+    normalize_admin_user_api_formats, normalize_admin_user_ip_rules,
+    normalize_admin_user_string_list, AdminCreateUserApiKeyRequest,
 };
 use super::super::helpers::{
     attach_audit_response, default_admin_user_api_key_name, format_optional_unix_secs_iso8601,
     generate_admin_user_api_key_plaintext, hash_admin_user_api_key, masked_user_api_key_display,
-    normalize_admin_api_key_providers, normalize_admin_optional_api_key_name,
+    normalize_admin_optional_api_key_name,
 };
 use super::super::paths::admin_user_id_from_api_keys_path;
 
@@ -63,9 +64,7 @@ pub(crate) async fn build_admin_create_user_api_key_response(
                 .into_response());
         }
     };
-    if payload.allowed_api_formats.is_some()
-        || payload.allowed_models.is_some()
-        || payload.expire_days.is_some()
+    if payload.expire_days.is_some()
         || payload.expires_at.is_some()
         || payload.initial_balance_usd.is_some()
         || payload.unlimited_balance.unwrap_or(false)
@@ -74,7 +73,7 @@ pub(crate) async fn build_admin_create_user_api_key_response(
     {
         return Ok((
             http::StatusCode::BAD_REQUEST,
-            Json(json!({ "detail": "当前仅支持 name、rate_limit、concurrent_limit、allowed_providers、ip_rules、feature_settings 字段" })),
+            Json(json!({ "detail": "当前仅支持 name、rate_limit、concurrent_limit、allowed_providers、allowed_api_formats、allowed_models、ip_rules、feature_settings 字段" })),
         )
             .into_response());
     }
@@ -100,7 +99,18 @@ pub(crate) async fn build_admin_create_user_api_key_response(
                 .into_response());
         }
     };
-    let allowed_providers = match normalize_admin_api_key_providers(payload.allowed_providers) {
+    let allowed_providers =
+        match normalize_admin_user_string_list(payload.allowed_providers, "allowed_providers") {
+            Ok(value) => value,
+            Err(detail) => {
+                return Ok((
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({ "detail": detail })),
+                )
+                    .into_response());
+            }
+        };
+    let allowed_api_formats = match normalize_admin_user_api_formats(payload.allowed_api_formats) {
         Ok(value) => value,
         Err(detail) => {
             return Ok((
@@ -110,6 +120,17 @@ pub(crate) async fn build_admin_create_user_api_key_response(
                 .into_response());
         }
     };
+    let allowed_models =
+        match normalize_admin_user_string_list(payload.allowed_models, "allowed_models") {
+            Ok(value) => value,
+            Err(detail) => {
+                return Ok((
+                    http::StatusCode::BAD_REQUEST,
+                    Json(json!({ "detail": detail })),
+                )
+                    .into_response());
+            }
+        };
     let ip_rules = match normalize_admin_user_ip_rules(payload.ip_rules) {
         Ok(value) => value,
         Err(detail) => {
@@ -157,8 +178,8 @@ pub(crate) async fn build_admin_create_user_api_key_response(
             key_encrypted: Some(key_encrypted),
             name: Some(name.clone()),
             allowed_providers,
-            allowed_api_formats: None,
-            allowed_models: None,
+            allowed_api_formats,
+            allowed_models,
             ip_rules,
             rate_limit,
             concurrent_limit,
@@ -186,6 +207,8 @@ pub(crate) async fn build_admin_create_user_api_key_response(
             "concurrent_limit": created.concurrent_limit,
             "ip_rules": created.ip_rules,
             "allowed_providers": created.allowed_providers,
+            "allowed_api_formats": created.allowed_api_formats,
+            "allowed_models": created.allowed_models,
             "expires_at": format_optional_unix_secs_iso8601(created.expires_at_unix_secs),
             "last_used_at": format_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
             "created_at": format_optional_unix_secs_iso8601(created.created_at_unix_secs),

@@ -530,7 +530,9 @@ SET
   concurrent_limit = COALESCE($5, concurrent_limit),
   ip_rules = CASE WHEN $6 THEN $7::jsonb ELSE ip_rules END,
   allowed_providers = CASE WHEN $8 THEN $9::json ELSE allowed_providers END,
-  feature_settings = CASE WHEN $10 THEN $11::jsonb ELSE feature_settings END,
+  allowed_api_formats = CASE WHEN $10 THEN $11::json ELSE allowed_api_formats END,
+  allowed_models = CASE WHEN $12 THEN $13::json ELSE allowed_models END,
+  feature_settings = CASE WHEN $14 THEN $15::jsonb ELSE feature_settings END,
   updated_at = NOW()
 WHERE user_id = $1
   AND id = $2
@@ -1282,6 +1284,20 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+        let allowed_api_formats = record
+            .allowed_api_formats
+            .clone()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+        let allowed_models = record
+            .allowed_models
+            .clone()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
         // Some(None) clears to NULL; Some(Some(v)) sets; None leaves unchanged via CASE.
         let feature_settings = record.feature_settings.clone().flatten();
         let row = sqlx::query(UPDATE_USER_API_KEY_BASIC_SQL)
@@ -1294,6 +1310,10 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             .bind(ip_rules)
             .bind(record.allowed_providers.is_some())
             .bind(allowed_providers)
+            .bind(record.allowed_api_formats.is_some())
+            .bind(allowed_api_formats)
+            .bind(record.allowed_models.is_some())
+            .bind(allowed_models)
             .bind(record.feature_settings.is_some())
             .bind(feature_settings)
             .fetch_optional(&self.pool)
@@ -1674,7 +1694,12 @@ mod tests {
         assert!(UPDATE_USER_API_KEY_BASIC_SQL
             .contains("allowed_providers = CASE WHEN $8 THEN $9::json ELSE allowed_providers END"));
         assert!(UPDATE_USER_API_KEY_BASIC_SQL.contains(
-            "feature_settings = CASE WHEN $10 THEN $11::jsonb ELSE feature_settings END"
+            "allowed_api_formats = CASE WHEN $10 THEN $11::json ELSE allowed_api_formats END"
+        ));
+        assert!(UPDATE_USER_API_KEY_BASIC_SQL
+            .contains("allowed_models = CASE WHEN $12 THEN $13::json ELSE allowed_models END"));
+        assert!(UPDATE_USER_API_KEY_BASIC_SQL.contains(
+            "feature_settings = CASE WHEN $14 THEN $15::jsonb ELSE feature_settings END"
         ));
     }
 
