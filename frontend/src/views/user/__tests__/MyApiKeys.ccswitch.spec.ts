@@ -14,8 +14,10 @@ const meApiMock = vi.hoisted(() => ({
   getFullApiKey: vi.fn(),
   getClientConfig: vi.fn(),
   getAvailableModels: vi.fn(),
+  getAvailableProviders: vi.fn(),
   createApiKeyInstallSession: vi.fn(),
   updateApiKey: vi.fn(),
+  updateApiKeyProviders: vi.fn(),
   deleteApiKey: vi.fn(),
   toggleApiKey: vi.fn(),
 }))
@@ -47,6 +49,26 @@ vi.mock('@/components/common', async () => {
     AlertDialog: defineComponent({
       emits: ['confirm', 'cancel'],
       setup: () => () => null,
+    }),
+    MultiSelect: defineComponent({
+      props: {
+        modelValue: { type: Array, default: () => [] },
+        options: { type: Array, default: () => [] },
+        disabled: Boolean,
+        placeholder: String,
+      },
+      emits: ['update:modelValue'],
+      setup: (props, { attrs, emit }) => () => h('button', {
+        'data-testid': attrs['data-testid'] || 'multi-select',
+        'data-disabled': props.disabled ? 'true' : 'false',
+        disabled: props.disabled,
+        onClick: () => {
+          const firstOption = props.options[0] as { value?: unknown } | undefined
+          if (typeof firstOption?.value === 'string') {
+            emit('update:modelValue', [firstOption.value])
+          }
+        },
+      }, props.placeholder || 'multi-select'),
     }),
   }
 })
@@ -100,6 +122,25 @@ beforeEach(() => {
     base_url: 'https://aether.example.com',
     site_name: 'Aether Local',
   })
+  meApiMock.getAvailableProviders.mockImplementation(
+    (options?: { view?: string }) => Promise.resolve(options?.view === 'access-options'
+      ? [
+          {
+            id: 'provider-openai',
+            name: 'OpenAI',
+            endpoints: [{ api_format: 'openai:chat' }],
+          },
+          {
+            id: 'provider-claude',
+            name: 'Claude',
+            endpoints: [{ api_format: 'claude:messages' }],
+          },
+        ]
+      : [
+          { id: 'provider-openai', name: 'OpenAI' },
+          { id: 'provider-claude', name: 'Claude' },
+        ]),
+  )
   meApiMock.getAvailableModels.mockResolvedValue({
     models: [
       { id: 'gm-1', name: 'claude-haiku-4', display_name: 'Claude Haiku 4', is_active: true },
@@ -238,5 +279,105 @@ describe('MyApiKeys CC Switch import', () => {
 
     expect(meApiMock.toggleApiKey).toHaveBeenCalledWith('user-key-1', false)
     expect(toastMock.success).toHaveBeenCalledWith('密钥已禁用')
+  })
+
+  it('omits unchanged provider restrictions from a name-only edit', async () => {
+    meApiMock.getApiKeys.mockResolvedValue([
+      apiKey({ allowed_providers: ['provider-openai'] }),
+    ])
+    meApiMock.updateApiKey.mockResolvedValue({ message: 'updated' })
+
+    await mountMyApiKeys()
+    document.querySelector<HTMLButtonElement>('[title="编辑"]')?.click()
+    await flushPromises()
+
+    const nameInput = document.querySelector<HTMLInputElement>('#key-name')
+    nameInput!.value = 'renamed'
+    nameInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    await flushPromises()
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '保存')
+      ?.click()
+    await flushPromises()
+
+    expect(meApiMock.updateApiKey).toHaveBeenCalledTimes(1)
+    const [, payload] = meApiMock.updateApiKey.mock.calls[0]
+    expect(payload).not.toHaveProperty('allowed_providers')
+    expect(payload).not.toHaveProperty('allowed_api_formats')
+    expect(payload).not.toHaveProperty('allowed_models')
+    expect(payload).toMatchObject({ name: 'renamed' })
+  })
+
+  it('submits provider, endpoint, and model restrictions when creating a key', async () => {
+    const createdKey = apiKey({
+      id: 'restricted-key-1',
+      key: 'sk-created-live',
+      allowed_providers: ['provider-openai'],
+      allowed_api_formats: ['openai:chat'],
+      allowed_models: ['gpt-5'],
+    })
+    meApiMock.getApiKeys.mockResolvedValue([])
+    meApiMock.getAvailableModels.mockResolvedValue({
+      models: [
+        { id: 'gm-4', name: 'gpt-5', display_name: 'GPT 5', is_active: true },
+      ],
+      total: 1,
+    })
+    meApiMock.getAvailableProviders.mockImplementation(
+      (options?: { view?: string }) => Promise.resolve(options?.view === 'access-options'
+        ? [{
+            id: 'provider-openai',
+            name: 'OpenAI',
+            endpoints: [{ api_format: 'openai:chat' }],
+          }]
+        : [{ id: 'provider-openai', name: 'OpenAI' }]),
+    )
+    meApiMock.createApiKey.mockResolvedValue(createdKey)
+
+    await mountMyApiKeys()
+    document.querySelector<HTMLButtonElement>('[title="创建新 API Key"]')?.click()
+    await flushPromises()
+
+    document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-providers-unrestricted"]')?.click()
+    document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-api-formats-unrestricted"]')?.click()
+    document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-models-unrestricted"]')?.click()
+    await flushPromises()
+
+    document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-providers"]')?.click()
+    document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-api-formats"]')?.click()
+    document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-models"]')?.click()
+    const nameInput = document.querySelector<HTMLInputElement>('#key-name')
+    nameInput!.value = 'restricted key'
+    nameInput!.dispatchEvent(new Event('input', { bubbles: true }))
+    await flushPromises()
+
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === '创建')
+      ?.click()
+    await flushPromises()
+
+    expect(meApiMock.createApiKey).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'restricted key',
+      allowed_providers: ['provider-openai'],
+      allowed_api_formats: ['openai:chat'],
+      allowed_models: ['gpt-5'],
+    }))
+  })
+
+  it('caches empty access-control option responses when dialogs are reopened', async () => {
+    meApiMock.getApiKeys.mockResolvedValue([apiKey()])
+    meApiMock.getAvailableProviders.mockResolvedValue([])
+
+    await mountMyApiKeys()
+    expect(meApiMock.getAvailableProviders).toHaveBeenCalledTimes(1)
+
+    document.querySelector<HTMLButtonElement>('[title="编辑"]')?.click()
+    await flushPromises()
+    expect(meApiMock.getAvailableProviders).toHaveBeenCalledTimes(2)
+
+    document.querySelector<HTMLButtonElement>('[title="编辑"]')?.click()
+    await flushPromises()
+
+    expect(meApiMock.getAvailableProviders).toHaveBeenCalledTimes(2)
   })
 })

@@ -84,6 +84,26 @@
                     <Copy class="h-3 w-3 text-muted-foreground" />
                   </button>
                 </div>
+                <div class="mt-1 grid gap-0.5 text-xs text-muted-foreground sm:grid-cols-3">
+                  <span
+                    class="truncate"
+                    :title="formatRestriction(apiKey.allowed_providers, '跟随用户')"
+                  >
+                    {{ legacyT('提供商：') }}{{ formatRestriction(apiKey.allowed_providers, '跟随用户') }}
+                  </span>
+                  <span
+                    class="truncate"
+                    :title="formatRestriction(apiKey.allowed_api_formats, '跟随用户')"
+                  >
+                    {{ legacyT('端点：') }}{{ formatRestriction(apiKey.allowed_api_formats, '跟随用户') }}
+                  </span>
+                  <span
+                    class="truncate"
+                    :title="formatRestriction(apiKey.allowed_models, '跟随用户')"
+                  >
+                    {{ legacyT('模型：') }}{{ formatRestriction(apiKey.allowed_models, '跟随用户') }}
+                  </span>
+                </div>
               </div>
             </div>
             <div class="flex flex-shrink-0 items-center gap-4">
@@ -197,4 +217,11 @@ defineEmits<{
 }>()
 
 const { legacyT } = useI18n()
+
+function formatRestriction(values: string[] | null | undefined, unrestrictedLabel: string): string {
+  if (values == null) return legacyT(unrestrictedLabel)
+  if (values.length === 0) return legacyT('全部禁用')
+  if (values.length <= 2) return values.join('、')
+  return legacyT(`${values.length} 项`)
+}
 </script>

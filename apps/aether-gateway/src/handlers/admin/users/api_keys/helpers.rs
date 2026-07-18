@@ -7,7 +7,6 @@ use crate::handlers::shared::{
 };
 use axum::{body::Body, response::Response};
 use serde_json::json;
-use std::collections::BTreeSet;
 
 pub(crate) fn format_optional_unix_secs_iso8601(value: Option<u64>) -> Option<String> {
     let secs = value?;
@@ -44,6 +43,9 @@ pub(super) fn build_admin_user_api_key_detail_payload(
         "total_cost_usd": record.total_cost_usd,
         "rate_limit": record.rate_limit,
         "concurrent_limit": record.concurrent_limit,
+        "allowed_providers": record.allowed_providers,
+        "allowed_api_formats": record.allowed_api_formats,
+        "allowed_models": record.allowed_models,
         "ip_rules": record.ip_rules,
         "feature_settings": record.feature_settings,
         "expires_at": format_optional_unix_secs_iso8601(record.expires_at_unix_secs),
@@ -65,26 +67,6 @@ pub(crate) fn normalize_admin_optional_api_key_name(
             Ok(Some(trimmed.chars().take(100).collect()))
         }
     }
-}
-
-pub(super) fn normalize_admin_api_key_providers(
-    value: Option<Vec<String>>,
-) -> Result<Option<Vec<String>>, String> {
-    let Some(values) = value else {
-        return Ok(None);
-    };
-    let mut normalized = Vec::new();
-    let mut seen = BTreeSet::new();
-    for provider_id in values {
-        let provider_id = provider_id.trim();
-        if provider_id.is_empty() {
-            return Err("提供商ID不能为空".to_string());
-        }
-        if seen.insert(provider_id.to_string()) {
-            normalized.push(provider_id.to_string());
-        }
-    }
-    Ok(Some(normalized))
 }
 
 pub(crate) fn generate_admin_user_api_key_plaintext() -> String {
