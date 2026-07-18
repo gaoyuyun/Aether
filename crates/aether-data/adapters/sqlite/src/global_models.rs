@@ -6,9 +6,9 @@ use aether_data_contracts::repository::global_models::{
     CreateAdminGlobalModelRecord, GlobalModelReadRepository, GlobalModelWriteRepository,
     PublicCatalogModelListQuery, PublicCatalogModelSearchQuery, PublicGlobalModelQuery,
     StoredAdminGlobalModel, StoredAdminGlobalModelPage, StoredAdminProviderModel,
-    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
-    StoredPublicGlobalModel, StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
-    UpsertAdminProviderModelRecord,
+    StoredGlobalModelIdentity, StoredProviderActiveGlobalModel, StoredProviderModelStats,
+    StoredPublicCatalogModel, StoredPublicGlobalModel, StoredPublicGlobalModelPage,
+    UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -489,6 +489,23 @@ impl GlobalModelReadRepository for SqliteGlobalModelReadRepository {
             .collect::<Result<_, _>>()?;
 
         Ok(StoredPublicGlobalModelPage { items, total })
+    }
+
+    async fn list_active_global_model_identities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredGlobalModelIdentity>, DataLayerError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, name FROM global_models WHERE is_active = TRUE ORDER BY name ASC LIMIT ?",
+        )
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name)| StoredGlobalModelIdentity { id, name })
+            .collect())
     }
 
     async fn get_public_model_by_name(
@@ -1180,6 +1197,14 @@ mod tests {
             .expect("public models should load");
         assert_eq!(public.total, 1);
         assert_eq!(public.items[0].name, "gpt-4.1");
+
+        let identities = repository
+            .list_active_global_model_identities(10)
+            .await
+            .expect("global model identities should load");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].id, "global-1");
+        assert_eq!(identities[0].name, "gpt-4.1");
 
         let catalog = repository
             .search_public_catalog_models(&PublicCatalogModelSearchQuery {

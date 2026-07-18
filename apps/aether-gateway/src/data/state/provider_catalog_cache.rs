@@ -7,7 +7,8 @@ use std::time::Duration;
 use aether_cache::ExpiringMap;
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
+    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
+    StoredProviderCatalogAuthorizationSnapshot, StoredProviderCatalogEndpoint,
     StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
@@ -18,6 +19,7 @@ use tokio::sync::Notify;
 
 const PROVIDER_CATALOG_CACHE_TTL: Duration = Duration::from_secs(5);
 const PROVIDER_CATALOG_CACHE_MAX_ENTRIES: usize = 1024;
+const PROVIDER_AUTHORIZATION_SNAPSHOT_CACHE_TTL: Duration = Duration::MAX;
 
 pub(super) struct CachedProviderCatalogReadRepository {
     inner: Arc<dyn ProviderCatalogReadRepository>,
@@ -49,7 +51,21 @@ impl CachedProviderCatalogReadRepository {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<ProviderCatalogCacheValue, DataLayerError>>,
     {
-        if let Some(value) = self.entries.get_fresh(&key, PROVIDER_CATALOG_CACHE_TTL) {
+        self.get_or_load_with_ttl(key, PROVIDER_CATALOG_CACHE_TTL, load)
+            .await
+    }
+
+    async fn get_or_load_with_ttl<F, Fut>(
+        &self,
+        key: ProviderCatalogCacheKey,
+        ttl: Duration,
+        load: F,
+    ) -> Result<ProviderCatalogCacheValue, DataLayerError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<ProviderCatalogCacheValue, DataLayerError>>,
+    {
+        if let Some(value) = self.entries.get_fresh(&key, ttl) {
             return Ok(value);
         }
 
@@ -59,7 +75,7 @@ impl CachedProviderCatalogReadRepository {
                 InflightRegistration::Bypass => return load().await,
                 InflightRegistration::Follower => {
                     notified.await;
-                    if let Some(value) = self.entries.get_fresh(&key, PROVIDER_CATALOG_CACHE_TTL) {
+                    if let Some(value) = self.entries.get_fresh(&key, ttl) {
                         return Ok(value);
                     }
                 }
@@ -72,7 +88,7 @@ impl CachedProviderCatalogReadRepository {
                             self.entries.insert(
                                 key.clone(),
                                 value.clone(),
-                                PROVIDER_CATALOG_CACHE_TTL,
+                                ttl,
                                 PROVIDER_CATALOG_CACHE_MAX_ENTRIES,
                             );
                         }
@@ -251,6 +267,41 @@ impl ProviderCatalogReadRepository for CachedProviderCatalogReadRepository {
         }
     }
 
+    async fn read_authorization_snapshot(
+        &self,
+    ) -> Result<StoredProviderCatalogAuthorizationSnapshot, DataLayerError> {
+        match self
+            .get_or_load_with_ttl(
+                ProviderCatalogCacheKey::AuthorizationSnapshot,
+                PROVIDER_AUTHORIZATION_SNAPSHOT_CACHE_TTL,
+                || async move {
+                    let providers = self.inner.list_provider_identities(true).await?;
+                    let provider_ids = providers
+                        .iter()
+                        .map(|provider| provider.id.clone())
+                        .collect::<Vec<_>>();
+                    let endpoints = self
+                        .inner
+                        .list_endpoint_identities_by_provider_ids(&provider_ids)
+                        .await?;
+                    Ok(ProviderCatalogCacheValue::AuthorizationSnapshot(
+                        StoredProviderCatalogAuthorizationSnapshot {
+                            providers,
+                            endpoints,
+                        },
+                    ))
+                },
+            )
+            .await?
+        {
+            ProviderCatalogCacheValue::AuthorizationSnapshot(snapshot) => Ok(snapshot),
+            _ => Ok(StoredProviderCatalogAuthorizationSnapshot {
+                providers: Vec::new(),
+                endpoints: Vec::new(),
+            }),
+        }
+    }
+
     async fn list_keys_by_ids(
         &self,
         key_ids: &[String],
@@ -364,6 +415,7 @@ enum ProviderCatalogCacheKey {
     EndpointsByIds(Vec<String>),
     EndpointsByProviderIds(Vec<String>),
     EndpointIdentitiesByProviderIds(Vec<String>),
+    AuthorizationSnapshot,
     KeysByIds(Vec<String>),
     KeysByProviderIds(Vec<String>),
     KeySummariesByProviderIds(Vec<String>),
@@ -377,6 +429,7 @@ enum ProviderCatalogCacheValue {
     ProviderIdentities(Vec<StoredProviderCatalogProviderIdentity>),
     Endpoints(Vec<StoredProviderCatalogEndpoint>),
     EndpointIdentities(Vec<StoredProviderCatalogEndpointIdentity>),
+    AuthorizationSnapshot(StoredProviderCatalogAuthorizationSnapshot),
     Keys(Vec<StoredProviderCatalogKey>),
     KeyMaintenanceSummaries(Vec<StoredProviderCatalogKeyMaintenanceSummary>),
     KeyStats(Vec<StoredProviderCatalogKeyStats>),

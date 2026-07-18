@@ -1,5 +1,6 @@
 import client from '../client'
 import { buildCacheKey, cachedRequest, dedupedRequest } from '@/utils/cache'
+import { markAccessControlCatalogChanged } from '@/utils/accessControlCatalog'
 import type {
   GlobalModelCreate,
   GlobalModelUpdate,
@@ -59,6 +60,7 @@ export async function getGlobalModel(id: string): Promise<GlobalModelWithStats> 
  */
 export async function createGlobalModel(data: GlobalModelCreate): Promise<GlobalModelResponse> {
   const response = await client.post('/api/admin/models/global', data)
+  markAccessControlCatalogChanged()
   return response.data
 }
 
@@ -70,6 +72,7 @@ export async function updateGlobalModel(
   data: GlobalModelUpdate
 ): Promise<GlobalModelResponse> {
   const response = await client.patch(`/api/admin/models/global/${id}`, data)
+  markAccessControlCatalogChanged()
   return response.data
 }
 
@@ -81,6 +84,7 @@ export async function deleteGlobalModel(
   force: boolean = false
 ): Promise<void> {
   await client.delete(`/api/admin/models/global/${id}`, { params: { force } })
+  markAccessControlCatalogChanged()
 }
 
 /**
@@ -90,6 +94,7 @@ export async function batchDeleteGlobalModels(
   ids: string[]
 ): Promise<{ success_count: number; failed: Array<{ id: string; error: string }> }> {
   const response = await client.post('/api/admin/models/global/batch-delete', { ids })
+  markAccessControlCatalogChanged()
   return response.data
 }
 

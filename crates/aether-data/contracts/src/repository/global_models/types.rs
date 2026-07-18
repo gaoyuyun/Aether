@@ -559,6 +559,21 @@ pub struct StoredPublicGlobalModel {
     pub usage_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredGlobalModelIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<StoredPublicGlobalModel> for StoredGlobalModelIdentity {
+    fn from(model: StoredPublicGlobalModel) -> Self {
+        Self {
+            id: model.id,
+            name: model.name,
+        }
+    }
+}
+
 impl StoredPublicGlobalModel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1194,6 +1209,24 @@ pub trait GlobalModelReadRepository: Send + Sync {
         &self,
         query: &PublicGlobalModelQuery,
     ) -> Result<StoredPublicGlobalModelPage, crate::DataLayerError>;
+
+    async fn list_active_global_model_identities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredGlobalModelIdentity>, crate::DataLayerError> {
+        Ok(self
+            .list_public_models(&PublicGlobalModelQuery {
+                offset: 0,
+                limit,
+                is_active: Some(true),
+                search: None,
+            })
+            .await?
+            .items
+            .into_iter()
+            .map(StoredGlobalModelIdentity::from)
+            .collect())
+    }
 
     async fn get_public_model_by_name(
         &self,

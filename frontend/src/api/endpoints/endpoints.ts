@@ -1,5 +1,6 @@
 import client from '../client'
 import type { ProviderEndpoint, ProxyConfig, HeaderRule, BodyRule, FormatAcceptanceConfig } from './types'
+import { markAccessControlCatalogChanged } from '@/utils/accessControlCatalog'
 
 /**
  * 获取指定 Provider 的所有 Endpoints
@@ -37,6 +38,7 @@ export async function createEndpoint(
   }
 ): Promise<ProviderEndpoint> {
   const response = await client.post(`/api/admin/endpoints/providers/${providerId}/endpoints`, data)
+  markAccessControlCatalogChanged()
   return response.data
 }
 
@@ -58,6 +60,7 @@ export async function updateEndpoint(
   }>
 ): Promise<ProviderEndpoint> {
   const response = await client.put(`/api/admin/endpoints/${endpointId}`, data)
+  markAccessControlCatalogChanged()
   return response.data
 }
 
@@ -66,6 +69,7 @@ export async function updateEndpoint(
  */
 export async function deleteEndpoint(endpointId: string): Promise<{ message: string; affected_keys_count: number }> {
   const response = await client.delete(`/api/admin/endpoints/${endpointId}`)
+  markAccessControlCatalogChanged()
   return response.data
 }
 
