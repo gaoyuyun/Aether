@@ -1,6 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
-use aether_data_contracts::repository::settlement::{StoredUsageSettlement, UsageSettlementInput};
+use aether_data_contracts::repository::settlement::{
+    StoredUsageSettlement, UsageSettlementInput, BILLING_PLANS_ENABLED_METADATA_KEY,
+    WALLET_BILLING_ENABLED_METADATA_KEY,
+};
 use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
 use aether_data_contracts::{DataLayerError, DataLayerError::InvalidInput};
 use async_trait::async_trait;
@@ -36,6 +39,13 @@ pub async fn settle_usage_if_needed(
         user_id: usage.user_id.clone(),
         api_key_id: usage.api_key_id.clone(),
         api_key_is_standalone: usage_api_key_is_standalone(usage),
+        skip_user_billing: usage_commerce_policy_enabled(
+            usage,
+            WALLET_BILLING_ENABLED_METADATA_KEY,
+        )
+        .map(|enabled| !enabled),
+        skip_plan_billing: usage_commerce_policy_enabled(usage, BILLING_PLANS_ENABLED_METADATA_KEY)
+            .map(|enabled| !enabled),
         provider_id: usage.provider_id.clone(),
         status: usage.status.clone(),
         billing_status: usage.billing_status.clone(),
@@ -82,6 +92,14 @@ fn usage_api_key_is_standalone(usage: &StoredRequestUsageAudit) -> bool {
         .and_then(|metadata| metadata.get("api_key_is_standalone"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+fn usage_commerce_policy_enabled(usage: &StoredRequestUsageAudit, key: &str) -> Option<bool> {
+    usage
+        .request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(key))
+        .and_then(serde_json::Value::as_bool)
 }
 
 fn finite_cost(value: f64) -> Result<f64, DataLayerError> {
@@ -228,6 +246,8 @@ mod tests {
         assert_eq!(inputs[0].total_cost_usd, 1.25);
         assert_eq!(inputs[0].actual_total_cost_usd, 0.75);
         assert!(!inputs[0].api_key_is_standalone);
+        assert_eq!(inputs[0].skip_user_billing, None);
+        assert_eq!(inputs[0].skip_plan_billing, None);
     }
 
     #[tokio::test]
@@ -264,6 +284,28 @@ mod tests {
         let inputs = writer.inputs.lock().expect("settlement inputs lock");
         assert_eq!(inputs.len(), 1);
         assert!(inputs[0].api_key_is_standalone);
+    }
+
+    #[tokio::test]
+    async fn propagates_commerce_policy_snapshot_from_usage_metadata() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.request_metadata = Some(json!({
+            "wallet_billing_enabled": true,
+            "billing_plans_enabled": false,
+        }));
+
+        settle_usage_if_needed(&writer, &usage)
+            .await
+            .expect("settlement should succeed");
+
+        let inputs = writer.inputs.lock().expect("settlement inputs lock");
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].skip_user_billing, Some(false));
+        assert_eq!(inputs[0].skip_plan_billing, Some(true));
     }
 
     #[tokio::test]

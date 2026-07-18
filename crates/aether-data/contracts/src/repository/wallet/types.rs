@@ -1108,6 +1108,8 @@ mod tests {
             user_id: None,
             api_key_id: None,
             api_key_is_standalone: false,
+            skip_user_billing: Some(false),
+            skip_plan_billing: Some(false),
             provider_id: None,
             status: "completed".to_string(),
             billing_status: "pending".to_string(),
