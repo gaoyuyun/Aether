@@ -59,6 +59,7 @@ export function useUsageData(options: UseUsageDataOptions) {
   const modelStats = ref<ModelStatsItem[]>([])
   const providerStats = ref<ProviderStatsItem[]>([])
   const apiFormatStats = ref<ApiFormatStatsItem[]>([])
+  const providerVisibilityEnabled = ref(isAdminPage.value)
 
   // 记录数据 - 只存储当前页
   const currentRecords = ref<UsageRecord[]>([])
@@ -134,6 +135,7 @@ export function useUsageData(options: UseUsageDataOptions) {
 
     try {
       if (isAdminPage.value) {
+        providerVisibilityEnabled.value = true
         // 管理员页面顺序加载统计数据，避免刷新使用记录时瞬时打满后端 worker。
         if (!options.preserveOnFailure) {
           stats.value = createDefaultStats()
@@ -273,6 +275,7 @@ export function useUsageData(options: UseUsageDataOptions) {
         period_start: '',
         period_end: '',
       }
+      providerVisibilityEnabled.value = userData.provider_visibility_enabled === true
 
       modelStats.value = (userData.summary_by_model || []).map((item) => ({
         model: item.model,
@@ -351,6 +354,7 @@ export function useUsageData(options: UseUsageDataOptions) {
       if (!isAdminPage.value) {
         stats.value = createDefaultStats()
         modelStats.value = []
+        providerVisibilityEnabled.value = false
         // 用户页的 records 依赖 stats 一起加载；管理员页的 records 是独立分页，不应被统计失败清空。
         currentRecords.value = []
         totalRecords.value = 0
@@ -436,6 +440,7 @@ export function useUsageData(options: UseUsageDataOptions) {
           return
         }
         const nextRecords = (userData.records || []) as UsageRecord[]
+        providerVisibilityEnabled.value = userData.provider_visibility_enabled === true
         currentRecords.value = mergeRecordStatus(currentRecords.value, nextRecords)
         totalRecords.value = userData.pagination?.total || currentRecords.value.length
       }
@@ -444,6 +449,9 @@ export function useUsageData(options: UseUsageDataOptions) {
         return
       }
       log.error('加载记录失败:', error)
+      if (!isAdminPage.value) {
+        providerVisibilityEnabled.value = false
+      }
       currentRecords.value = []
       totalRecords.value = 0
     } finally {
@@ -712,6 +720,7 @@ export function useUsageData(options: UseUsageDataOptions) {
     modelStats,
     providerStats,
     apiFormatStats,
+    providerVisibilityEnabled,
     currentRecords,
     totalRecords,
 

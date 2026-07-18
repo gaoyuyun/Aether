@@ -1716,6 +1716,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "provider_priority_mode" => Some(json!("provider")),
         "scheduling_mode" => Some(json!("cache_affinity")),
         "auto_delete_expired_keys" => Some(json!(false)),
+        "show_provider_in_user_usage" => Some(json!(true)),
         "turnstile_enabled" => Some(json!(false)),
         "turnstile_site_key" => Some(serde_json::Value::Null),
         "turnstile_secret_key" => Some(serde_json::Value::Null),
@@ -2153,7 +2154,8 @@ pub fn parse_admin_system_config_update(
     }
 
     match normalized_key.as_str() {
-        "module.important_notification.enabled"
+        "show_provider_in_user_usage"
+        | "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
         | "module.server_chan_push.enabled"
         | "module.bark_push.enabled" => match value.as_bool() {
@@ -3383,6 +3385,28 @@ mod tests {
             admin_system_config_default_value("backup_s3_user_agent"),
             Some(json!("rclone/v1.68.0"))
         );
+    }
+
+    #[test]
+    fn user_usage_provider_visibility_defaults_on_and_accepts_boolean_updates() {
+        assert_eq!(
+            admin_system_config_default_value("show_provider_in_user_usage"),
+            Some(json!(true))
+        );
+
+        let update = parse_admin_system_config_update(
+            "show_provider_in_user_usage",
+            br#"{ "value": false }"#,
+        )
+        .expect("provider visibility update should parse");
+        assert_eq!(update.value, json!(false));
+
+        let err = parse_admin_system_config_update(
+            "show_provider_in_user_usage",
+            br#"{ "value": "false" }"#,
+        )
+        .expect_err("provider visibility should require a boolean");
+        assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
     }
 
     #[test]

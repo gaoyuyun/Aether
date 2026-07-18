@@ -81,6 +81,7 @@
     <UsageRecordsTable
       :records="displayRecords"
       :is-admin="isAdminPage"
+      :show-provider="isAdminPage || providerVisibilityEnabled"
       :show-actual-cost="authStore.canAccessAdmin"
       :loading="isLoadingRecords"
       :time-range="timeRange"
@@ -251,6 +252,7 @@ const {
   isLoadingRecords,
   providerStats,
   apiFormatStats,
+  providerVisibilityEnabled,
   currentRecords,
   totalRecords,
   enhancedModelStats,
@@ -259,6 +261,12 @@ const {
   loadStats,
   loadRecords
 } = useUsageData({ isAdminPage })
+
+watch(providerVisibilityEnabled, (enabled) => {
+  if (!enabled) {
+    filterProvider.value = '__all__'
+  }
+})
 
 // 热力图状态
 const activityHeatmapData = ref<ActivityHeatmap | null>(null)
@@ -483,7 +491,11 @@ async function pollActiveRequests() {
   pollInFlight = true
 
   try {
-    const { requests } = await loadActiveRequestUpdates(activeRequestIds.value)
+    const activeResponse = await loadActiveRequestUpdates(activeRequestIds.value)
+    if (!isAdminPage.value && typeof activeResponse.provider_visibility_enabled === 'boolean') {
+      providerVisibilityEnabled.value = activeResponse.provider_visibility_enabled
+    }
+    const { requests } = activeResponse
 
     const recordMap = new Map(currentRecords.value.map(record => [record.id, record]))
 

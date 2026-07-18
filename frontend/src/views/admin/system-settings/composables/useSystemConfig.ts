@@ -14,6 +14,7 @@ export interface SystemConfig {
   default_user_initial_gift_usd: number
   rate_limit_per_minute: number
   enable_registration: boolean
+  show_provider_in_user_usage: boolean
   password_policy_level: string
   turnstile_enabled: boolean
   turnstile_site_key: string | null
@@ -71,6 +72,7 @@ const CONFIG_KEYS = [
   'default_user_initial_gift_usd',
   'rate_limit_per_minute',
   'enable_registration',
+  'show_provider_in_user_usage',
   'password_policy_level',
   'turnstile_enabled',
   'turnstile_site_key',
@@ -128,6 +130,7 @@ function createDefaultConfig(): SystemConfig {
     default_user_initial_gift_usd: 10.0,
     rate_limit_per_minute: 0,
     enable_registration: false,
+    show_provider_in_user_usage: true,
     password_policy_level: 'weak',
     turnstile_enabled: false,
     turnstile_site_key: null,
@@ -215,6 +218,8 @@ export function useSystemConfig() {
       systemConfig.value.default_user_initial_gift_usd !== originalConfig.value.default_user_initial_gift_usd ||
       systemConfig.value.rate_limit_per_minute !== originalConfig.value.rate_limit_per_minute ||
       systemConfig.value.enable_registration !== originalConfig.value.enable_registration ||
+      systemConfig.value.show_provider_in_user_usage !==
+      originalConfig.value.show_provider_in_user_usage ||
       systemConfig.value.password_policy_level !== originalConfig.value.password_policy_level ||
       systemConfig.value.turnstile_enabled !== originalConfig.value.turnstile_enabled ||
       systemConfig.value.turnstile_site_key !== originalConfig.value.turnstile_site_key ||
@@ -431,6 +436,11 @@ export function useSystemConfig() {
           description: '是否开放用户注册',
         },
         {
+          key: 'show_provider_in_user_usage',
+          value: systemConfig.value.show_provider_in_user_usage,
+          description: '是否允许普通用户在自己的使用记录中查看 Provider',
+        },
+        {
           key: 'password_policy_level',
           value: systemConfig.value.password_policy_level,
           description: '密码策略等级',
@@ -534,6 +544,8 @@ export function useSystemConfig() {
         originalConfig.value.default_user_initial_gift_usd = systemConfig.value.default_user_initial_gift_usd
         originalConfig.value.rate_limit_per_minute = systemConfig.value.rate_limit_per_minute
         originalConfig.value.enable_registration = systemConfig.value.enable_registration
+        originalConfig.value.show_provider_in_user_usage =
+          systemConfig.value.show_provider_in_user_usage
         originalConfig.value.password_policy_level = systemConfig.value.password_policy_level
         originalConfig.value.turnstile_enabled = systemConfig.value.turnstile_enabled
         originalConfig.value.turnstile_site_key = systemConfig.value.turnstile_site_key?.trim() || null
