@@ -475,6 +475,8 @@ fn settlement_input(index: usize) -> UsageSettlementInput {
         user_id: None,
         api_key_id: None,
         api_key_is_standalone: false,
+        skip_user_billing: Some(false),
+        skip_plan_billing: Some(false),
         provider_id: Some(PROVIDER_ID.to_string()),
         status: "completed".to_string(),
         billing_status: "pending".to_string(),

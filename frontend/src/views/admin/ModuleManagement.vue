@@ -181,7 +181,7 @@
             <div class="flex items-center gap-3">
               <Switch
                 :model-value="module.enabled"
-                :disabled="!module.available || !module.config_validated || toggling[module.name]"
+                :disabled="!module.available || (!module.config_validated && !module.enabled) || toggling[module.name]"
                 @update:model-value="(val: boolean) => toggleModule(module.name, val)"
               />
               <div class="flex flex-col">

@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info};
 
+use crate::commerce_modules::CommerceBillingPolicy;
 use crate::wallet_runtime::{
-    local_rejection_from_wallet_access, resolve_wallet_auth_gate_uncached,
+    local_rejection_from_wallet_access, resolve_wallet_auth_gate_uncached_with_commerce_policy,
 };
 use crate::{AppState, GatewayError};
 
@@ -85,6 +86,10 @@ pub(crate) struct GatewayControlAuthContext {
     pub(crate) api_key_rate_limit: Option<i32>,
     #[serde(skip)]
     pub(crate) api_key_is_standalone: bool,
+    #[serde(skip)]
+    pub(crate) wallet_billing_enabled: bool,
+    #[serde(skip)]
+    pub(crate) billing_plans_enabled: bool,
     #[serde(skip)]
     pub(crate) admin_bypass_limits: bool,
     #[serde(skip)]
@@ -740,15 +745,17 @@ pub(crate) async fn refresh_execution_runtime_auth_context(
     {
         return Ok(auth_context);
     }
+    let commerce_policy = crate::commerce_modules::commerce_billing_policy(state).await?;
 
     let snapshot = {
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
         state
             .data
-            .read_auth_api_key_snapshot_strong(
+            .read_auth_api_key_snapshot_with_commerce_policy(
                 &auth_context.user_id,
                 &auth_context.api_key_id,
                 current_unix_secs(),
+                commerce_policy,
             )
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
@@ -761,16 +768,19 @@ pub(crate) async fn refresh_execution_runtime_auth_context(
         return Ok(denied);
     };
 
-    let wallet_access = resolve_wallet_auth_gate_uncached(state, &snapshot).await?;
-    Ok(build_data_backed_auth_context(
+    let wallet_access =
+        resolve_wallet_auth_gate_uncached_with_commerce_policy(state, &snapshot, commerce_policy)
+            .await?;
+    build_data_backed_auth_context(
         state,
         snapshot,
         auth_endpoint_signature,
         Some(true),
         auth_context.balance_remaining,
         wallet_access,
+        commerce_policy,
     )
-    .await)
+    .await
 }
 
 fn put_cached_auth_context(
@@ -895,20 +905,32 @@ pub(super) async fn resolve_data_backed_auth_context(
     if !state.has_auth_api_key_reader() {
         return Ok(None);
     }
+    let commerce_policy = crate::commerce_modules::commerce_billing_policy(state).await?;
     let extracted = extract_request_credentials(headers, uri, signature);
     let principal = derive_principal_candidate(&extracted);
     let now_unix_secs = current_unix_secs();
 
     match principal {
         Some(GatewayPrincipalCandidate::TrustedHeaders(trusted_headers)) => {
-            resolve_trusted_auth_context(state, signature, trusted_headers, now_unix_secs).await
+            resolve_trusted_auth_context(
+                state,
+                signature,
+                trusted_headers,
+                now_unix_secs,
+                commerce_policy,
+            )
+            .await
         }
         Some(GatewayPrincipalCandidate::ApiKeyHash { key_hash, .. }) => {
             let snapshot = {
                 let _permit = state.acquire_auth_snapshot_load_gate().await?;
                 state
                     .data
-                    .read_auth_api_key_snapshot_by_key_hash_strong(&key_hash, now_unix_secs)
+                    .read_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+                        &key_hash,
+                        now_unix_secs,
+                        commerce_policy,
+                    )
                     .await
                     .map_err(|err| GatewayError::Internal(err.to_string()))?
             };
@@ -923,6 +945,8 @@ pub(super) async fn resolve_data_backed_auth_context(
                     user_rate_limit: None,
                     api_key_rate_limit: None,
                     api_key_is_standalone: false,
+                    wallet_billing_enabled: false,
+                    billing_plans_enabled: false,
                     admin_bypass_limits: false,
                     local_rejection: Some(GatewayLocalAuthRejection::InvalidApiKey),
                     allowed_models: None,
@@ -934,7 +958,12 @@ pub(super) async fn resolve_data_backed_auth_context(
                 .touch_auth_api_key_last_used_best_effort(&snapshot.api_key_id)
                 .await;
 
-            let wallet_access = resolve_wallet_auth_gate_uncached(state, &snapshot).await?;
+            let wallet_access = resolve_wallet_auth_gate_uncached_with_commerce_policy(
+                state,
+                &snapshot,
+                commerce_policy,
+            )
+            .await?;
             Ok(Some(
                 build_data_backed_auth_context(
                     state,
@@ -943,8 +972,9 @@ pub(super) async fn resolve_data_backed_auth_context(
                     None,
                     None,
                     wallet_access,
+                    commerce_policy,
                 )
-                .await,
+                .await?,
             ))
         }
         Some(GatewayPrincipalCandidate::DeferredBearerToken { raw, carrier }) => {
@@ -954,6 +984,7 @@ pub(super) async fn resolve_data_backed_auth_context(
                 raw.as_str(),
                 carrier,
                 now_unix_secs,
+                commerce_policy,
             )
             .await?
             {
@@ -972,6 +1003,7 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
     raw_bearer: &str,
     carrier: GatewayCredentialCarrier,
     now_unix_secs: u64,
+    commerce_policy: CommerceBillingPolicy,
 ) -> Result<Option<GatewayControlAuthContext>, GatewayError> {
     if carrier != GatewayCredentialCarrier::AuthorizationBearer
         || !auth_endpoint_signature
@@ -1021,7 +1053,12 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
         state
             .data
-            .read_auth_api_key_snapshot_strong(user_id, api_key_id, now_unix_secs)
+            .read_auth_api_key_snapshot_with_commerce_policy(
+                user_id,
+                api_key_id,
+                now_unix_secs,
+                commerce_policy,
+            )
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
     };
@@ -1036,6 +1073,8 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
             user_rate_limit: None,
             api_key_rate_limit: None,
             api_key_is_standalone: false,
+            wallet_billing_enabled: false,
+            billing_plans_enabled: false,
             admin_bypass_limits: false,
             local_rejection: Some(GatewayLocalAuthRejection::InvalidApiKey),
             allowed_models: None,
@@ -1043,7 +1082,9 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
         }));
     };
 
-    let wallet_access = resolve_wallet_auth_gate_uncached(state, &snapshot).await?;
+    let wallet_access =
+        resolve_wallet_auth_gate_uncached_with_commerce_policy(state, &snapshot, commerce_policy)
+            .await?;
     let auth_context = build_data_backed_auth_context(
         state,
         snapshot,
@@ -1051,8 +1092,9 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
         None,
         None,
         wallet_access,
+        commerce_policy,
     )
-    .await;
+    .await?;
     info!(
         event_name = "antigravity_bearer_bridge_auth_context_resolved",
         log_type = "event",
@@ -1071,15 +1113,27 @@ async fn resolve_trusted_auth_context(
     auth_endpoint_signature: &str,
     trusted_headers: GatewayTrustedAuthHeaders,
     now_unix_secs: u64,
+    commerce_policy: CommerceBillingPolicy,
 ) -> Result<Option<GatewayControlAuthContext>, GatewayError> {
+    // Trusted billing headers aggregate wallet and plan checks. If either module is disabled,
+    // only the local snapshot and enabled local billing gates are authoritative.
+    let trusted_billing_headers_compatible =
+        commerce_policy.wallet_enabled && commerce_policy.billing_plans_enabled;
+    let trusted_billing_access_allowed = trusted_billing_headers_compatible
+        .then_some(trusted_headers.access_allowed)
+        .flatten();
+    let trusted_balance_remaining = trusted_billing_headers_compatible
+        .then_some(trusted_headers.balance_remaining)
+        .flatten();
     let snapshot = {
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
         state
             .data
-            .read_auth_api_key_snapshot_strong(
+            .read_auth_api_key_snapshot_with_commerce_policy(
                 &trusted_headers.user_id,
                 &trusted_headers.api_key_id,
                 now_unix_secs,
+                commerce_policy,
             )
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?
@@ -1090,11 +1144,13 @@ async fn resolve_trusted_auth_context(
             api_key_id: trusted_headers.api_key_id,
             username: None,
             api_key_name: None,
-            balance_remaining: trusted_headers.balance_remaining,
+            balance_remaining: trusted_balance_remaining,
             access_allowed: false,
             user_rate_limit: None,
             api_key_rate_limit: None,
             api_key_is_standalone: false,
+            wallet_billing_enabled: false,
+            billing_plans_enabled: false,
             admin_bypass_limits: false,
             local_rejection: Some(GatewayLocalAuthRejection::InvalidApiKey),
             allowed_models: None,
@@ -1102,17 +1158,20 @@ async fn resolve_trusted_auth_context(
         }));
     };
 
-    let wallet_access = resolve_wallet_auth_gate_uncached(state, &snapshot).await?;
+    let wallet_access =
+        resolve_wallet_auth_gate_uncached_with_commerce_policy(state, &snapshot, commerce_policy)
+            .await?;
     Ok(Some(
         build_data_backed_auth_context(
             state,
             snapshot,
             auth_endpoint_signature,
-            trusted_headers.access_allowed,
-            trusted_headers.balance_remaining,
+            trusted_billing_access_allowed,
+            trusted_balance_remaining,
             wallet_access,
+            commerce_policy,
         )
-        .await,
+        .await?,
     ))
 }
 
@@ -1123,7 +1182,8 @@ async fn build_data_backed_auth_context(
     header_access_allowed: Option<bool>,
     balance_remaining: Option<f64>,
     wallet_access: Option<aether_wallet::WalletAccessDecision>,
-) -> GatewayControlAuthContext {
+    commerce_policy: CommerceBillingPolicy,
+) -> Result<GatewayControlAuthContext, GatewayError> {
     let allowed_models = snapshot
         .effective_allowed_models()
         .map(|items| items.to_vec());
@@ -1182,7 +1242,7 @@ async fn build_data_backed_auth_context(
         None
     };
 
-    GatewayControlAuthContext {
+    Ok(GatewayControlAuthContext {
         username: Some(snapshot.username.clone()),
         api_key_name: snapshot.api_key_name.clone(),
         user_id: snapshot.user_id,
@@ -1192,12 +1252,14 @@ async fn build_data_backed_auth_context(
         user_rate_limit: snapshot.user_rate_limit,
         api_key_rate_limit: snapshot.api_key_rate_limit,
         api_key_is_standalone: snapshot.api_key_is_standalone,
+        wallet_billing_enabled: commerce_policy.wallet_enabled,
+        billing_plans_enabled: commerce_policy.billing_plans_enabled,
         admin_bypass_limits: snapshot.user_role.eq_ignore_ascii_case("admin")
             && !snapshot.api_key_is_standalone,
         local_rejection,
         allowed_models,
         ip_rules: snapshot.api_key_ip_rules,
-    }
+    })
 }
 
 fn contains_api_format_or_alias(items: &[String], target: &str) -> bool {
@@ -1408,6 +1470,7 @@ mod tests {
     use aether_runtime::ConcurrencyGate;
     use axum::http::{HeaderMap, Uri};
     use futures_util::future::join_all;
+    use serde_json::json;
 
     use super::{
         get_cached_auth_context, resolve_control_decision_auth, resolve_data_backed_auth_context,
@@ -1738,6 +1801,80 @@ mod tests {
         assert_eq!(repository.touch_count("key-1"), 1);
     }
 
+    async fn resolve_trusted_billing_denial_with_config(
+        config: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) -> super::GatewayControlAuthContext {
+        let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some("unused-key-hash".to_string()),
+            sample_snapshot("key-trusted", "user-trusted"),
+        )]));
+        let data = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
+            .with_system_config_values_for_tests(config);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
+            "user-trusted".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
+            "key-trusted".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_AUTH_BALANCE_HEADER,
+            "0".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
+            "false".parse().unwrap(),
+        );
+
+        resolve_data_backed_auth_context(
+            &state,
+            &headers,
+            &uri("/v1/chat/completions"),
+            Some("openai:chat"),
+        )
+        .await
+        .expect("resolution should succeed")
+        .expect("auth context should exist")
+    }
+
+    #[tokio::test]
+    async fn trusted_billing_denial_is_ignored_when_wallet_is_disabled() {
+        let auth_context = resolve_trusted_billing_denial_with_config([
+            ("module.wallet.enabled".to_string(), json!(false)),
+            ("module.billing_plans.enabled".to_string(), json!(false)),
+        ])
+        .await;
+
+        assert!(auth_context.access_allowed);
+        assert_eq!(auth_context.local_rejection, None);
+        assert_eq!(auth_context.balance_remaining, None);
+        assert!(!auth_context.wallet_billing_enabled);
+    }
+
+    #[tokio::test]
+    async fn trusted_plan_denial_is_ignored_when_billing_plans_are_disabled() {
+        let auth_context = resolve_trusted_billing_denial_with_config([
+            ("module.wallet.enabled".to_string(), json!(true)),
+            ("module.billing_plans.enabled".to_string(), json!(false)),
+        ])
+        .await;
+
+        assert!(auth_context.access_allowed);
+        assert_eq!(auth_context.local_rejection, None);
+        assert_eq!(auth_context.balance_remaining, None);
+        assert!(auth_context.wallet_billing_enabled);
+        assert!(!auth_context.billing_plans_enabled);
+    }
+
     #[tokio::test]
     async fn control_auth_context_singleflights_concurrent_cache_misses() {
         let api_key = "sk-test-concurrent-auth-miss";
@@ -1819,7 +1956,11 @@ mod tests {
             .expect("wallet should build"),
         ]));
         let data =
-            GatewayDataState::with_auth_and_wallet_for_tests(auth_repository, wallet_repository);
+            GatewayDataState::with_auth_and_wallet_for_tests(auth_repository, wallet_repository)
+                .with_system_config_values_for_tests([
+                    ("module.wallet.enabled".to_string(), json!(true)),
+                    ("module.billing_plans.enabled".to_string(), json!(true)),
+                ]);
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data);
@@ -1877,7 +2018,11 @@ mod tests {
         let data = GatewayDataState::with_auth_and_wallet_for_tests(
             auth_repository.clone(),
             Arc::clone(&wallet_repository),
-        );
+        )
+        .with_system_config_values_for_tests([
+            ("module.wallet.enabled".to_string(), json!(true)),
+            ("module.billing_plans.enabled".to_string(), json!(true)),
+        ]);
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data);

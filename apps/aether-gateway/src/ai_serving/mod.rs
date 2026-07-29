@@ -185,6 +185,8 @@ pub(crate) fn build_execution_runtime_auth_context(
         balance_remaining: auth_context.balance_remaining,
         access_allowed: auth_context.access_allowed,
         api_key_is_standalone: auth_context.api_key_is_standalone,
+        wallet_billing_enabled: auth_context.wallet_billing_enabled,
+        billing_plans_enabled: auth_context.billing_plans_enabled,
     }
 }
 

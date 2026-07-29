@@ -2187,6 +2187,8 @@ mod tests {
                 balance_remaining: Some(10.0),
                 access_allowed: true,
                 api_key_is_standalone: false,
+                wallet_billing_enabled: false,
+                billing_plans_enabled: false,
             },
             requested_model: "gemini-2.5-pro".to_string(),
             auth_snapshot: sample_auth_snapshot(),

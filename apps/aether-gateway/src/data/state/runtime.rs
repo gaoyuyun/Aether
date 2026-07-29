@@ -47,6 +47,49 @@ use aether_video_tasks_core::read_data_backed_video_task_response;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
+fn commerce_policy_from_usage_metadata(
+    metadata: Option<&serde_json::Value>,
+) -> Option<crate::commerce_modules::CommerceBillingPolicy> {
+    use aether_data_contracts::repository::settlement::{
+        BILLING_PLANS_ENABLED_METADATA_KEY, WALLET_BILLING_ENABLED_METADATA_KEY,
+    };
+
+    let metadata = metadata?.as_object()?;
+    Some(crate::commerce_modules::CommerceBillingPolicy {
+        wallet_enabled: metadata
+            .get(WALLET_BILLING_ENABLED_METADATA_KEY)?
+            .as_bool()?,
+        billing_plans_enabled: metadata
+            .get(BILLING_PLANS_ENABLED_METADATA_KEY)?
+            .as_bool()?,
+    })
+}
+
+fn attach_commerce_policy_to_usage_metadata(
+    metadata: &mut Option<serde_json::Value>,
+    policy: crate::commerce_modules::CommerceBillingPolicy,
+) {
+    use aether_data_contracts::repository::settlement::{
+        BILLING_PLANS_ENABLED_METADATA_KEY, WALLET_BILLING_ENABLED_METADATA_KEY,
+    };
+
+    let value = metadata.get_or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !value.is_object() {
+        *value = serde_json::Value::Object(Default::default());
+    }
+    let object = value
+        .as_object_mut()
+        .expect("commerce policy metadata should be an object");
+    object.insert(
+        WALLET_BILLING_ENABLED_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(policy.wallet_enabled),
+    );
+    object.insert(
+        BILLING_PLANS_ENABLED_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(policy.billing_plans_enabled),
+    );
+}
+
 fn normalize_billing_context_cache_part(value: &str) -> String {
     value.trim().to_string()
 }
@@ -1185,8 +1228,17 @@ impl GatewayDataState {
 
     pub(crate) async fn upsert_usage(
         &self,
-        usage: UpsertUsageRecord,
+        mut usage: UpsertUsageRecord,
     ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
+        // Compatibility records without a request snapshot use the cached current policy. Module
+        // switches happen during maintenance, so preserving old metadata does not justify a read
+        // before every usage write.
+        let policy = match commerce_policy_from_usage_metadata(usage.request_metadata.as_ref()) {
+            Some(policy) => policy,
+            None => crate::commerce_modules::commerce_billing_policy_for_data(self).await?,
+        };
+        attach_commerce_policy_to_usage_metadata(&mut usage.request_metadata, policy);
+
         crate::request_diagnostics::observe_db_operation(
             "usage_upsert",
             self.database_pool_summary(),
@@ -2736,6 +2788,7 @@ mod tests {
     use std::time::Duration;
 
     use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data::repository::users::{InMemoryUserReadRepository, StoredUserExportRow};
     use aether_data_contracts::repository::billing::{
         BillingReadRepository, StoredBillingModelContext,
@@ -2743,14 +2796,163 @@ mod tests {
     use aether_data_contracts::repository::global_models::{
         StoredAdminGlobalModel, StoredPublicGlobalModel, UpdateAdminGlobalModelRecord,
     };
+    use aether_data_contracts::repository::usage::UpsertUsageRecord;
     use aether_data_contracts::DataLayerError;
     use async_trait::async_trait;
     use serde_json::json;
     use tokio::sync::Barrier;
 
     use super::{
+        attach_commerce_policy_to_usage_metadata, commerce_policy_from_usage_metadata,
         BillingModelContextCacheKey, BillingModelContextInflightRegistration, GatewayDataState,
     };
+
+    #[test]
+    fn commerce_policy_usage_metadata_round_trips() {
+        let policy = crate::commerce_modules::CommerceBillingPolicy {
+            wallet_enabled: true,
+            billing_plans_enabled: false,
+        };
+        let mut metadata = Some(json!({ "trace_id": "trace-1" }));
+
+        attach_commerce_policy_to_usage_metadata(&mut metadata, policy);
+
+        assert_eq!(
+            commerce_policy_from_usage_metadata(metadata.as_ref()),
+            Some(policy)
+        );
+        assert_eq!(
+            metadata
+                .as_ref()
+                .and_then(|value| value["trace_id"].as_str()),
+            Some("trace-1")
+        );
+    }
+
+    fn sample_upsert_usage(request_id: &str) -> UpsertUsageRecord {
+        UpsertUsageRecord {
+            request_id: request_id.to_string(),
+            user_id: None,
+            api_key_id: None,
+            username: None,
+            api_key_name: None,
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5".to_string(),
+            target_model: None,
+            provider_id: Some("provider-1".to_string()),
+            provider_endpoint_id: None,
+            provider_api_key_id: None,
+            request_type: None,
+            api_format: None,
+            api_family: None,
+            endpoint_kind: None,
+            endpoint_api_format: None,
+            provider_api_family: None,
+            provider_endpoint_kind: None,
+            has_format_conversion: Some(false),
+            is_stream: Some(false),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_creation_ephemeral_5m_input_tokens: None,
+            cache_creation_ephemeral_1h_input_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_cost_usd: None,
+            cache_read_cost_usd: None,
+            output_price_per_1m: None,
+            total_cost_usd: None,
+            actual_total_cost_usd: None,
+            status_code: None,
+            error_message: None,
+            error_category: None,
+            response_time_ms: None,
+            first_byte_time_ms: None,
+            status: "pending".to_string(),
+            billing_status: "pending".to_string(),
+            request_headers: None,
+            request_body: None,
+            request_body_ref: None,
+            request_body_state: None,
+            provider_request_headers: None,
+            provider_request_body: None,
+            provider_request_body_ref: None,
+            provider_request_body_state: None,
+            response_headers: None,
+            response_body: None,
+            response_body_ref: None,
+            response_body_state: None,
+            client_response_headers: None,
+            client_response_body: None,
+            client_response_body_ref: None,
+            client_response_body_state: None,
+            candidate_id: None,
+            candidate_index: None,
+            key_name: None,
+            planner_kind: None,
+            route_family: None,
+            route_kind: None,
+            execution_path: None,
+            local_execution_runtime_miss_reason: None,
+            request_metadata: None,
+            finalized_at_unix_secs: None,
+            created_at_unix_ms: Some(1_700_000_000),
+            updated_at_unix_secs: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_upsert_preserves_incoming_commerce_policy_snapshot() {
+        let repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = GatewayDataState::with_usage_repository_for_tests(repository)
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(false)),
+                ("module.billing_plans.enabled".to_string(), json!(false)),
+            ]);
+        let mut usage = sample_upsert_usage("request-policy-snapshot");
+        usage.request_metadata = Some(json!({
+            "wallet_billing_enabled": true,
+            "billing_plans_enabled": false,
+        }));
+
+        let stored = state
+            .upsert_usage(usage)
+            .await
+            .expect("usage upsert should succeed")
+            .expect("usage repository should be available");
+
+        assert_eq!(
+            commerce_policy_from_usage_metadata(stored.request_metadata.as_ref()),
+            Some(crate::commerce_modules::CommerceBillingPolicy {
+                wallet_enabled: true,
+                billing_plans_enabled: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_upsert_falls_back_to_current_commerce_policy_without_metadata() {
+        let repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = GatewayDataState::with_usage_repository_for_tests(repository)
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ]);
+
+        let stored = state
+            .upsert_usage(sample_upsert_usage("request-policy-fallback"))
+            .await
+            .expect("usage upsert should succeed")
+            .expect("usage repository should be available");
+
+        assert_eq!(
+            commerce_policy_from_usage_metadata(stored.request_metadata.as_ref()),
+            Some(crate::commerce_modules::CommerceBillingPolicy {
+                wallet_enabled: true,
+                billing_plans_enabled: true,
+            })
+        );
+    }
 
     struct SlowBillingContextRepository {
         calls: AtomicUsize,

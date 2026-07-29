@@ -42,16 +42,28 @@ describe('Users request loading', () => {
     expect(source).toContain('@refresh="handleManualRefresh"')
   })
 
-  it('refreshes wallet state after user access-control mutations', () => {
+  it('refreshes wallet state after mutations only while the wallet module is active', () => {
     const batchCompleted = source
       .split('async function handleUserBatchCompleted')[1]
       ?.split('function invalidateUserOptions')[0]
-    expect(batchCompleted).toContain('Promise.all([refreshUsers(), loadUserWallets()])')
+    expect(batchCompleted).toContain('if (walletModuleActive.value) tasks.push(loadUserWallets())')
+    expect(batchCompleted).toContain('await Promise.all(tasks)')
 
     const formSubmit = source
       .split('async function handleUserFormSubmit')[1]
       ?.split('async function manageApiKeys')[0]
-    expect(formSubmit).toContain('Promise.all([refreshUsers(), loadUserWallets()])')
+    expect(formSubmit).toContain('if (walletModuleActive.value) tasks.push(loadUserWallets())')
+    expect(formSubmit).toContain('await Promise.all(tasks)')
+  })
+
+  it('loads wallet data when module status becomes active after mount', () => {
+    const moduleWatcher = source
+      .split('watch(walletModuleActive')[1]
+      ?.split('onMounted(() =>')[0]
+
+    expect(moduleWatcher).toContain('if (enabled && !wasEnabled)')
+    expect(moduleWatcher).toContain('loadUserWallets({ cacheTtlMs: USER_WALLETS_CACHE_TTL_MS })')
+    expect(moduleWatcher).toContain('userWalletMap.value = {}')
   })
 
   it('seeds a new managed key from the selected target user feature settings', () => {

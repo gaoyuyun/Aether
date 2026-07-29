@@ -46,12 +46,14 @@ export const dashboardRoutes: RouteRecordRaw[] = [
       {
         path: 'wallet',
         name: 'WalletCenter',
-        component: view(() => import('@/views/user/WalletCenter.vue'))
+        component: view(() => import('@/views/user/WalletCenter.vue')),
+        meta: { module: 'wallet' }
       },
       {
         path: 'billing',
         name: 'BillingPlans',
-        component: view(() => import('@/views/user/BillingPlans.vue'))
+        component: view(() => import('@/views/user/BillingPlans.vue')),
+        meta: { module: 'billing_plans' }
       },
       {
         path: 'referral',

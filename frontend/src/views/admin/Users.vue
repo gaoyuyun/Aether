@@ -55,6 +55,8 @@
         :selection-disabled="selectAllFiltered || usersStore.loading"
         :loading="usersStore.loading"
         :can-operate-admin="authStore.canOperateAdmin"
+        :wallet-enabled="walletModuleActive"
+        :billing-plans-enabled="billingPlansModuleActive"
         :has-filters="hasUserFilters"
         :sort-by="sortBy"
         :sort-order="sortOrder"
@@ -87,6 +89,7 @@
       :open="showUserFormDialog"
       :user="editingUser"
       :groups="userGroups"
+      :wallet-enabled="walletModuleActive"
       @close="closeUserFormDialog"
       @submit="handleUserFormSubmit"
     />
@@ -98,6 +101,7 @@
       :selected-count="selectedCount"
       :filters="batchSelectionFilters"
       :groups="userGroups"
+      :wallet-enabled="walletModuleActive"
       @close="showUserBatchDialog = false"
       @completed="handleUserBatchCompleted"
     />
@@ -110,6 +114,7 @@
     />
 
     <UserPlanDialog
+      v-if="billingPlansModuleActive"
       :open="showUserPlansDialog"
       :user-id="selectedUser?.id || null"
       :user-name="selectedUser?.username || ''"
@@ -169,6 +174,7 @@
     />
 
     <WalletOpsDrawer
+      v-if="walletModuleActive"
       :open="showWalletActionDialogState"
       :wallet="walletActionTarget?.wallet || null"
       :owner-name="walletActionTarget?.user.username || ''"
@@ -192,6 +198,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useUsersStore } from '@/stores/users'
 import { useAuthStore } from '@/stores/auth'
+import { useModuleStore } from '@/stores/modules'
 import {
   usersApi,
   type User,
@@ -260,6 +267,9 @@ const { copyToClipboard } = useClipboard()
 const { legacyT, locale } = useI18n()
 const usersStore = useUsersStore()
 const authStore = useAuthStore()
+const moduleStore = useModuleStore()
+const walletModuleActive = computed(() => moduleStore.isActive('wallet'))
+const billingPlansModuleActive = computed(() => moduleStore.isActive('billing_plans'))
 
 function localizedApiError(err: unknown, fallback: string): string {
   return legacyT(parseApiError(err, fallback))
@@ -447,11 +457,20 @@ watch([filterRole, filterStatus, filterGroup, sortOption], () => {
 })
 
 watch(paginatedUsers, (users) => rememberBatchPageUsers(users), { immediate: true })
+watch(walletModuleActive, (enabled, wasEnabled) => {
+  if (enabled && !wasEnabled) {
+    void loadUserWallets({ cacheTtlMs: USER_WALLETS_CACHE_TTL_MS })
+  } else if (!enabled) {
+    userWalletMap.value = {}
+  }
+})
 
 onMounted(() => {
-  void refreshUsers({ preferCache: true }).then(() =>
-    loadUserWallets({ cacheTtlMs: USER_WALLETS_CACHE_TTL_MS })
-  )
+  void refreshUsers({ preferCache: true }).then(() => {
+    if (walletModuleActive.value) {
+      return loadUserWallets({ cacheTtlMs: USER_WALLETS_CACHE_TTL_MS })
+    }
+  })
   void loadUserGroups()
 })
 
@@ -480,11 +499,9 @@ async function refreshUsers(options: { preferCache?: boolean } = {}) {
 
 async function handleManualRefresh() {
   clearUsersSearchDebounce()
-  await Promise.all([
-    refreshUsers(),
-    loadUserGroups(),
-    loadUserWallets(),
-  ])
+  const tasks: Promise<unknown>[] = [refreshUsers(), loadUserGroups()]
+  if (walletModuleActive.value) tasks.push(loadUserWallets())
+  await Promise.all(tasks)
 }
 
 function handleTableSort(payload: { key: string, direction: AdminUserSortOrder }): void {
@@ -526,7 +543,9 @@ function openUserBatchDialog(): void {
 }
 
 async function handleUserBatchCompleted(_result: UserBatchActionResponse): Promise<void> {
-  await Promise.all([refreshUsers(), loadUserWallets()])
+  const tasks: Promise<unknown>[] = [refreshUsers()]
+  if (walletModuleActive.value) tasks.push(loadUserWallets())
+  await Promise.all(tasks)
   resetBatchSelection(true)
 }
 
@@ -584,6 +603,10 @@ function hasPackageEntitlement(items: BillingEntitlement[] | undefined): boolean
 }
 
 async function loadUserWallets(options: { cacheTtlMs?: number } = {}) {
+  if (!walletModuleActive.value) {
+    userWalletMap.value = {}
+    return
+  }
   const requestId = ++userWalletsRequestId
   try {
     const wallets = await adminWalletApi.listAllWallets(
@@ -757,11 +780,11 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string; un
       const updateData: Record<string, unknown> = {
         username: data.username,
         email: data.email || undefined,
-        unlimited: data.unlimited,
         role: data.role,
         group_ids: data.group_ids ?? [],
         feature_settings: data.feature_settings ?? null,
       }
+      if (walletModuleActive.value) updateData.unlimited = data.unlimited
       if (data.password) {
         updateData.password = data.password
       }
@@ -788,7 +811,9 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string; un
       success(legacyT('用户创建成功'))
     }
     closeUserFormDialog()
-    await Promise.all([refreshUsers(), loadUserWallets()])
+    const tasks: Promise<unknown>[] = [refreshUsers()]
+    if (walletModuleActive.value) tasks.push(loadUserWallets())
+    await Promise.all(tasks)
   } catch (err: unknown) {
     const title = data.id ? '更新用户失败' : '创建用户失败'
     error(localizedApiError(err, '未知错误'), legacyT(title))
@@ -828,6 +853,7 @@ async function manageUserSessions(user: User) {
 }
 
 async function manageUserPlans(user: User) {
+  if (!billingPlansModuleActive.value) return
   selectedUser.value = user
   showUserPlansDialog.value = true
   selectedGrantPlanId.value = ''
@@ -1155,6 +1181,7 @@ async function copyFullKey(apiKey: ApiKey) {
 }
 
 function openWalletActionDialog(user: User) {
+  if (!walletModuleActive.value) return
   const wallet = getUserWallet(user.id)
   if (!wallet) {
     error(legacyT('该用户的钱包尚未初始化，暂时无法进行资金操作'))
@@ -1173,6 +1200,7 @@ function closeWalletActionDrawer() {
 }
 
 async function handleWalletDrawerChanged() {
+  if (!walletModuleActive.value) return
   await loadUserWallets()
   if (!walletActionTarget.value) return
   const latestWallet = getUserWallet(walletActionTarget.value.user.id)

@@ -4,12 +4,73 @@ import { modulesApi, type ModuleStatus } from '@/api/modules'
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
 
+const RUNTIME_MODULE_STATUS_TTL_MS = 30_000
+
 export const useModuleStore = defineStore('modules', () => {
   const modules = ref<Record<string, ModuleStatus>>({})
   const loaded = ref(false)
+  const runtimeLoaded = ref(false)
   const loading = ref(false)
   const error = ref<string | null>(null)
   let fetchModulesPromise: Promise<Record<string, ModuleStatus>> | null = null
+  let fetchRuntimeModulesPromise: Promise<Record<string, ModuleStatus>> | null = null
+  let runtimeLoadedAt = 0
+  let storeGeneration = 0
+
+  function runtimeStatusIsFresh() {
+    return runtimeLoaded.value && Date.now() - runtimeLoadedAt < RUNTIME_MODULE_STATUS_TTL_MS
+  }
+
+  async function fetchRuntimeModules(options: { force?: boolean } = {}) {
+    if (!options.force && runtimeStatusIsFresh()) {
+      return modules.value
+    }
+    if (fetchRuntimeModulesPromise) return fetchRuntimeModulesPromise
+
+    loading.value = true
+    error.value = null
+    const requestGeneration = storeGeneration
+    const request = (async () => {
+      try {
+        const statuses = await modulesApi.getRuntimeStatus()
+        if (requestGeneration !== storeGeneration) return modules.value
+        const nextModules = { ...modules.value }
+        for (const status of statuses) {
+          nextModules[status.name] = {
+            name: status.name,
+            display_name: status.display_name,
+            description: '',
+            category: 'integration',
+            available: true,
+            enabled: status.active,
+            active: status.active,
+            config_validated: true,
+            config_error: null,
+            admin_route: null,
+            admin_menu_icon: null,
+            admin_menu_group: null,
+            admin_menu_order: 0,
+            health: status.active ? 'healthy' : 'unknown',
+          }
+        }
+        modules.value = nextModules
+        runtimeLoaded.value = true
+        runtimeLoadedAt = Date.now()
+        return nextModules
+      } catch (err: unknown) {
+        if (requestGeneration !== storeGeneration) return modules.value
+        log.error('Failed to fetch runtime modules status', err)
+        error.value = parseApiError(err, '获取模块状态失败')
+        throw err
+      } finally {
+        if (requestGeneration === storeGeneration) loading.value = false
+        if (fetchRuntimeModulesPromise === request) fetchRuntimeModulesPromise = null
+      }
+    })()
+    fetchRuntimeModulesPromise = request
+
+    return fetchRuntimeModulesPromise
+  }
 
   /**
    * 获取所有模块状态
@@ -20,23 +81,41 @@ export const useModuleStore = defineStore('modules', () => {
     loading.value = true
     error.value = null
 
-    fetchModulesPromise = (async () => {
+    const requestGeneration = storeGeneration
+    const request = (async () => {
       try {
         const nextModules = await modulesApi.getAllStatus()
+        if (requestGeneration !== storeGeneration) return modules.value
         modules.value = nextModules
         loaded.value = true
+        runtimeLoaded.value = true
+        runtimeLoadedAt = Date.now()
         return nextModules
       } catch (err: unknown) {
+        if (requestGeneration !== storeGeneration) return modules.value
         log.error('Failed to fetch modules status', err)
         error.value = parseApiError(err, '获取模块状态失败')
         throw err
       } finally {
-        loading.value = false
-        fetchModulesPromise = null
+        if (requestGeneration === storeGeneration) loading.value = false
+        if (fetchModulesPromise === request) fetchModulesPromise = null
       }
     })()
+    fetchModulesPromise = request
 
     return fetchModulesPromise
+  }
+
+  function reset() {
+    storeGeneration += 1
+    modules.value = {}
+    loaded.value = false
+    runtimeLoaded.value = false
+    loading.value = false
+    error.value = null
+    runtimeLoadedAt = 0
+    fetchModulesPromise = null
+    fetchRuntimeModulesPromise = null
   }
 
   /**
@@ -108,9 +187,12 @@ export const useModuleStore = defineStore('modules', () => {
   return {
     modules,
     loaded,
+    runtimeLoaded,
     loading,
     error,
     fetchModules,
+    fetchRuntimeModules,
+    reset,
     isAvailable,
     isEnabled,
     isActive,

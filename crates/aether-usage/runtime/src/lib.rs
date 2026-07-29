@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod body_capture;
 pub mod config;
 pub mod event;

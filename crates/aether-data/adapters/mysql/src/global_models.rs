@@ -6,9 +6,9 @@ use aether_data_contracts::repository::global_models::{
     CreateAdminGlobalModelRecord, GlobalModelReadRepository, GlobalModelWriteRepository,
     PublicCatalogModelListQuery, PublicCatalogModelSearchQuery, PublicGlobalModelQuery,
     StoredAdminGlobalModel, StoredAdminGlobalModelPage, StoredAdminProviderModel,
-    StoredGlobalModelIdentity, StoredProviderActiveGlobalModel,
-    StoredProviderModelStats, StoredPublicCatalogModel, StoredPublicGlobalModel,
-    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    StoredGlobalModelIdentity, StoredProviderActiveGlobalModel, StoredProviderModelStats,
+    StoredPublicCatalogModel, StoredPublicGlobalModel, StoredPublicGlobalModelPage,
+    UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::DataLayerError;
 

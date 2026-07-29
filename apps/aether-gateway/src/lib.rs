@@ -37,6 +37,7 @@ mod bark_push;
 mod cache;
 mod client_session_affinity;
 mod clock;
+mod commerce_modules;
 mod constants;
 mod control;
 mod data;

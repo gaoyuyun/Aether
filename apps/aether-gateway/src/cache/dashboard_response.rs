@@ -25,4 +25,8 @@ impl DashboardResponseCache {
     pub(crate) fn insert(&self, key: String, value: Vec<u8>, ttl: Duration) {
         self.entries.insert(key, value, ttl, MAX_ENTRIES);
     }
+
+    pub(crate) fn clear(&self) {
+        self.entries.clear();
+    }
 }

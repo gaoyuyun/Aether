@@ -171,6 +171,10 @@ async fn gateway_handles_dashboard_stats_locally_without_proxying_upstream() {
                 wallet_repository,
                 usage_repository,
             )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ])
             .with_auth_api_key_reader(auth_repository);
             AppState::new()
                 .expect("gateway should build")
@@ -262,6 +266,10 @@ async fn gateway_dashboard_stats_user_wallet_card_uses_wallet_center_balance_bre
                 Arc::clone(&billing_repository),
                 wallet_repository,
             )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ])
             .with_user_reader(user_repository)
             .with_auth_api_key_reader(auth_repository);
             AppState::new()

@@ -30,7 +30,8 @@ export const adminRoutes: RouteRecordRaw[] = [
       {
         path: 'wallets',
         name: 'WalletsManagement',
-        component: view(() => import('@/views/admin/WalletsManagement.vue'))
+        component: view(() => import('@/views/admin/WalletsManagement.vue')),
+        meta: { module: 'wallet' }
       },
       {
         path: 'payment-gateways',
@@ -40,7 +41,8 @@ export const adminRoutes: RouteRecordRaw[] = [
       {
         path: 'billing-plans',
         name: 'BillingPlansManagement',
-        component: view(() => import('@/views/admin/BillingPlansManagement.vue'))
+        component: view(() => import('@/views/admin/BillingPlansManagement.vue')),
+        meta: { module: 'billing_plans' }
       },
       {
         path: 'referrals',

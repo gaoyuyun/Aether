@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
+use aether_data_contracts::repository::settlement::{
+    BILLING_PLANS_ENABLED_METADATA_KEY, WALLET_BILLING_ENABLED_METADATA_KEY,
+};
 use aether_data_contracts::repository::usage::{UpsertUsageRecord, UsageBodyCaptureState};
 use aether_data_contracts::DataLayerError;
 use base64::Engine as _;
@@ -2114,6 +2117,14 @@ fn build_runtime_request_metadata_seed_from_parts(
             Value::Bool(api_key_is_standalone),
         );
     }
+    for key in [
+        WALLET_BILLING_ENABLED_METADATA_KEY,
+        BILLING_PLANS_ENABLED_METADATA_KEY,
+    ] {
+        if let Some(enabled) = context_bool(context, key) {
+            metadata.insert(key.to_string(), Value::Bool(enabled));
+        }
+    }
     let provider_source_bytes = provider_request_body_base64.and_then(decoded_base64_len_hint);
     append_runtime_body_capture_metadata(
         &mut metadata,
@@ -3871,6 +3882,8 @@ mod tests {
             &plan,
             Some(&json!({
                 "api_key_is_standalone": true,
+                "wallet_billing_enabled": true,
+                "billing_plans_enabled": false,
                 "client_ip": "203.0.113.8",
                 "user_agent": "Claude-Code/1.0"
             })),
@@ -3884,6 +3897,8 @@ mod tests {
             .and_then(Value::as_object)
             .expect("pending usage should keep request metadata");
         assert_eq!(metadata.get("api_key_is_standalone"), Some(&json!(true)));
+        assert_eq!(metadata.get("wallet_billing_enabled"), Some(&json!(true)));
+        assert_eq!(metadata.get("billing_plans_enabled"), Some(&json!(false)));
         assert_eq!(metadata.get("client_ip"), Some(&json!("203.0.113.8")));
         assert_eq!(metadata.get("user_agent"), Some(&json!("Claude-Code/1.0")));
         let body_size = metadata
