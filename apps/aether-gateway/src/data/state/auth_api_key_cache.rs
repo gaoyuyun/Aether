@@ -152,6 +152,26 @@ impl super::GatewayDataState {
             .await
     }
 
+    pub(crate) async fn read_auth_api_key_snapshot_strong_with_commerce_policy(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        now_unix_secs: u64,
+        commerce_policy: crate::commerce_modules::CommerceBillingPolicy,
+    ) -> Result<Option<crate::data::auth::GatewayAuthApiKeySnapshot>, DataLayerError> {
+        AUTH_API_KEY_READ_CACHE_BYPASS
+            .scope(
+                (),
+                self.read_auth_api_key_snapshot_with_commerce_policy(
+                    user_id,
+                    api_key_id,
+                    now_unix_secs,
+                    commerce_policy,
+                ),
+            )
+            .await
+    }
+
     pub(crate) async fn read_auth_api_key_snapshot_by_key_hash_strong(
         &self,
         key_hash: &str,
@@ -161,6 +181,24 @@ impl super::GatewayDataState {
             .scope(
                 (),
                 self.read_auth_api_key_snapshot_by_key_hash(key_hash, now_unix_secs),
+            )
+            .await
+    }
+
+    pub(crate) async fn read_auth_api_key_snapshot_by_key_hash_strong_with_commerce_policy(
+        &self,
+        key_hash: &str,
+        now_unix_secs: u64,
+        commerce_policy: crate::commerce_modules::CommerceBillingPolicy,
+    ) -> Result<Option<crate::data::auth::GatewayAuthApiKeySnapshot>, DataLayerError> {
+        AUTH_API_KEY_READ_CACHE_BYPASS
+            .scope(
+                (),
+                self.read_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+                    key_hash,
+                    now_unix_secs,
+                    commerce_policy,
+                ),
             )
             .await
     }

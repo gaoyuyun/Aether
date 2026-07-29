@@ -1905,7 +1905,7 @@ async fn admin_created_user_keys_inherit_owner_group_policy() {
     assert_eq!(resolved.user_id, "admin-user");
     assert!(!resolved.api_key_is_standalone);
     assert_eq!(
-        resolved.effective_allowed_providers(),
+        resolved.preferred_allowed_providers(),
         Some(&["openai".to_string()][..])
     );
     assert_eq!(
