@@ -2320,6 +2320,123 @@ async fn gateway_fetches_allowed_models_immediately_when_enabling_auto_fetch_fro
 }
 
 #[test]
+fn gateway_preserves_model_fetch_configuration_when_immediate_fetch_fails() {
+    run_provider_keys_test(
+        "gateway_preserves_model_fetch_configuration_when_immediate_fetch_fails",
+        gateway_preserves_model_fetch_configuration_when_immediate_fetch_fails_impl,
+    );
+}
+
+async fn gateway_preserves_model_fetch_configuration_when_immediate_fetch_fails_impl() {
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                assert_eq!(plan.url, "https://api.openai.example/v1/models");
+                Json(json!({
+                    "request_id": "req-update-key-auto-fetch-failed",
+                    "status_code": 401,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": {
+                            "error": {
+                                "message": "invalid upstream credential"
+                            }
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+
+    let mut key = sample_key(
+        "key-openai-a",
+        "provider-openai",
+        "openai:chat",
+        "sk-test-a",
+    );
+    key.auto_fetch_models = false;
+    key.allowed_models = Some(json!(["manual-model"]));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        vec![sample_endpoint(
+            "endpoint-openai-chat",
+            "provider-openai",
+            "openai:chat",
+            "https://api.openai.example/v1",
+        )],
+        vec![key],
+    ));
+
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{gateway_url}/api/admin/endpoints/keys/key-openai-a"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "auto_fetch_models": true,
+            "model_include_patterns": ["gpt-*"],
+            "model_exclude_patterns": ["*-preview"]
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["auto_fetch_models"], true);
+    assert_eq!(payload["model_include_patterns"], json!(["gpt-*"]));
+    assert_eq!(payload["model_exclude_patterns"], json!(["*-preview"]));
+    assert!(payload["last_models_fetch_error"]
+        .as_str()
+        .is_some_and(|error| !error.is_empty()));
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        1
+    );
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-openai-a".to_string()])
+        .await
+        .expect("keys should read");
+    assert_eq!(reloaded.len(), 1);
+    assert!(reloaded[0].auto_fetch_models);
+    assert_eq!(reloaded[0].model_include_patterns, Some(json!(["gpt-*"])));
+    assert_eq!(
+        reloaded[0].model_exclude_patterns,
+        Some(json!(["*-preview"]))
+    );
+    assert!(reloaded[0].last_models_fetch_error.is_some());
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
 fn gateway_refreshes_allowed_models_when_updating_include_patterns_with_auto_fetch_enabled() {
     run_provider_keys_test(
         "gateway_refreshes_allowed_models_when_updating_include_patterns_with_auto_fetch_enabled",

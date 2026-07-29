@@ -397,8 +397,8 @@ mod tests {
 
     use super::{
         expand_previous_response_for_chat, hydrate_response_history,
-        record_converted_response_history, response_history_storage_key, response_history_store,
-        ResponseHistoryStore,
+        record_converted_response_history, response_history_key, response_history_storage_key,
+        response_history_store,
     };
 
     fn conversion_report_context(original_request_body: serde_json::Value) -> serde_json::Value {
@@ -496,9 +496,13 @@ mod tests {
         assert!(!record.storage_key.contains("distributed-history-key-a"));
         assert!(!record.storage_key.contains("resp_distributed_history_1"));
 
-        *response_history_store()
+        response_history_store()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ResponseHistoryStore::default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&response_history_key(
+                "resp_distributed_history_1",
+                Some("distributed-history-key-a"),
+            ));
         let continuation = json!({
             "model": "deepseek-v4-flash",
             "previous_response_id": "resp_distributed_history_1",

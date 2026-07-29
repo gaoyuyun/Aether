@@ -1054,6 +1054,19 @@ VALUES
                 .fetch_one(&pool)
                 .await
                 .expect("mysql commerce provider should load");
-        assert_eq!(provider_cost, 12.0);
+        assert_eq!(provider_cost, 0.0);
+        let provider_delta: (i64, f64) = sqlx::query_as(
+            r#"
+SELECT CAST(COUNT(*) AS SIGNED), COALESCE(SUM(total_cost_usd_delta), 0)
+FROM usage_counter_deltas
+WHERE kind = 'provider_monthly'
+  AND target_id = ?
+"#,
+        )
+        .bind(&provider_id)
+        .fetch_one(&pool)
+        .await
+        .expect("mysql commerce provider delta should load");
+        assert_eq!(provider_delta, (2, 12.0));
     }
 }

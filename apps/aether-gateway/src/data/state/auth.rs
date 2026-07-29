@@ -2695,7 +2695,9 @@ mod tests {
             .expect("snapshot should exist");
 
         assert_eq!(resolved.user_role, "admin");
-        assert_eq!(resolved.effective_allowed_providers(), Some(&[][..]));
+        let provider_layers = resolved.provider_allowlist_layers();
+        assert_eq!(provider_layers[0], Some(&["anthropic".to_string()][..]));
+        assert_eq!(provider_layers[1], Some(&["openai".to_string()][..]));
         assert_eq!(
             resolved.preferred_allowed_providers(),
             Some(&["anthropic".to_string()][..])
@@ -2734,7 +2736,7 @@ mod tests {
 
         assert_eq!(resolved.user_role, "admin");
         assert_eq!(
-            resolved.effective_allowed_providers(),
+            resolved.preferred_allowed_providers(),
             Some(&["anthropic".to_string()][..])
         );
         assert_eq!(

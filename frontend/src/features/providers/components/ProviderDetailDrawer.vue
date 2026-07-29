@@ -2828,8 +2828,17 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
   }
 }
 
-async function handleKeyChanged() {
-  await Promise.all([loadProvider(), loadEndpoints(), loadMappingPreview()])
+async function handleKeyChanged(updatedKey?: EndpointAPIKey) {
+  if (updatedKey) {
+    const keyIndex = providerKeys.value.findIndex(key => key.id === updatedKey.id)
+    if (keyIndex >= 0) {
+      providerKeys.value[keyIndex] = updatedKey
+    }
+    if (editingKey.value?.id === updatedKey.id) {
+      editingKey.value = updatedKey
+    }
+  }
+  await Promise.all([loadEndpoints(), loadMappingPreview()])
   emit('refresh')
   // 添加/修改 key 后自动获取已支持 provider 的配额（新 key 的 upstream_metadata 为空）
   void autoRefreshQuotaInBackground().then((changed) => {

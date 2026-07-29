@@ -990,6 +990,19 @@ VALUES
         .fetch_one(&pool)
         .await
         .expect("postgres commerce provider should load");
-        assert_eq!(provider_cost, 12.0);
+        assert_eq!(provider_cost, 0.0);
+        let provider_delta: (i64, f64) = sqlx::query_as(
+            r#"
+SELECT COUNT(*), CAST(COALESCE(SUM(total_cost_usd_delta), 0) AS DOUBLE PRECISION)
+FROM public.usage_counter_deltas
+WHERE kind = 'provider_monthly'
+  AND target_id = $1
+"#,
+        )
+        .bind(&provider_id)
+        .fetch_one(&pool)
+        .await
+        .expect("postgres commerce provider delta should load");
+        assert_eq!(provider_delta, (2, 12.0));
     }
 }
