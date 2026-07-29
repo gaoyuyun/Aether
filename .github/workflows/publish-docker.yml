@@ -1,0 +1,187 @@
+name: Publish Docker Image
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify_ci:
+    name: Verify CI passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require successful CI for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          successful_runs="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+              -f head_sha="${GITHUB_SHA}" \
+              -f status=success \
+              -f per_page=1 \
+              --jq '.total_count'
+          )"
+
+          if [[ "${successful_runs}" -lt 1 ]]; then
+            echo "::error::Commit ${GITHUB_SHA} has no successful CI run. Wait for CI to pass before creating the tag."
+            exit 1
+          fi
+
+  build_frontend:
+    name: Build frontend
+    needs: verify_ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies and build
+        working-directory: frontend
+        env:
+          AETHER_BUILD_VERSION: ${{ github.ref_name }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  build_gateway:
+    name: Build gateway (${{ matrix.arch }})
+    needs: verify_ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          workspaces: . -> target
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build gateway
+        env:
+          AETHER_BUILD_VERSION: ${{ github.ref_name }}
+          AETHER_BUILD_TYPE: release
+          CARGO_TERM_COLOR: always
+        run: cross build --release --locked -p aether-gateway --target ${{ matrix.target }}
+
+      - name: Upload gateway artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: aether-gateway-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/aether-gateway
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Build and publish Docker image
+    needs:
+      - build_frontend
+      - build_gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Docker build context
+        run: |
+          mkdir -p dist/frontend
+          install -m 0755 artifacts/aether-gateway-amd64/aether-gateway dist/aether-gateway-amd64
+          install -m 0755 artifacts/aether-gateway-arm64/aether-gateway dist/aether-gateway-arm64
+          cp -R artifacts/frontend-dist/. dist/frontend/
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=raw,value=beta,enable=${{ contains(github.ref_name, '-beta') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.app
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
