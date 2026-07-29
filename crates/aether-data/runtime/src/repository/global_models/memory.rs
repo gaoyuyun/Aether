@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -7,9 +8,9 @@ use super::{
     GlobalModelReadRepository, GlobalModelSnapshot, GlobalModelWriteRepository,
     PublicCatalogModelListQuery, PublicCatalogModelSearchQuery, PublicGlobalModelQuery,
     StoredAdminGlobalModel, StoredAdminGlobalModelPage, StoredAdminProviderModel,
-    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
-    StoredPublicGlobalModel, StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
-    UpsertAdminProviderModelRecord,
+    StoredGlobalModelIdentity, StoredProviderActiveGlobalModel, StoredProviderModelStats,
+    StoredPublicCatalogModel, StoredPublicGlobalModel, StoredPublicGlobalModelPage,
+    UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
 };
 use crate::DataLayerError;
 
@@ -21,6 +22,8 @@ pub struct InMemoryGlobalModelReadRepository {
     admin_provider_model_items: RwLock<Vec<StoredAdminProviderModel>>,
     provider_model_stats: RwLock<Vec<StoredProviderModelStats>>,
     active_global_model_refs: RwLock<Vec<StoredProviderActiveGlobalModel>>,
+    public_model_read_count: AtomicUsize,
+    identity_read_count: AtomicUsize,
 }
 
 impl InMemoryGlobalModelReadRepository {
@@ -35,7 +38,17 @@ impl InMemoryGlobalModelReadRepository {
             admin_provider_model_items: RwLock::new(Vec::new()),
             provider_model_stats: RwLock::new(Vec::new()),
             active_global_model_refs: RwLock::new(Vec::new()),
+            public_model_read_count: AtomicUsize::new(0),
+            identity_read_count: AtomicUsize::new(0),
         }
+    }
+
+    pub fn public_model_read_count(&self) -> usize {
+        self.public_model_read_count.load(Ordering::Acquire)
+    }
+
+    pub fn identity_read_count(&self) -> usize {
+        self.identity_read_count.load(Ordering::Acquire)
     }
 
     pub fn with_public_catalog_models<I>(self, items: I) -> Self
@@ -139,7 +152,29 @@ impl GlobalModelReadRepository for InMemoryGlobalModelReadRepository {
         &self,
         query: &PublicGlobalModelQuery,
     ) -> Result<StoredPublicGlobalModelPage, DataLayerError> {
+        self.public_model_read_count.fetch_add(1, Ordering::AcqRel);
         Ok(self.snapshot().list_public_models(query))
+    }
+
+    async fn list_active_global_model_identities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredGlobalModelIdentity>, DataLayerError> {
+        self.identity_read_count.fetch_add(1, Ordering::AcqRel);
+        let mut items = self
+            .items
+            .read()
+            .expect("global model repository lock")
+            .iter()
+            .filter(|model| model.is_active)
+            .map(|model| StoredGlobalModelIdentity {
+                id: model.id.clone(),
+                name: model.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.name.cmp(&right.name));
+        items.truncate(limit);
+        Ok(items)
     }
 
     async fn get_public_model_by_name(

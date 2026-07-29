@@ -7,7 +7,8 @@ pub use types::{
     AdminProviderModelListQuery, CreateAdminGlobalModelRecord, ExplicitPricingCatalogState,
     GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
     PublicCatalogModelSearchQuery, PublicGlobalModelQuery, StoredAdminGlobalModel,
-    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredProviderActiveGlobalModel,
-    StoredProviderModelStats, StoredPublicCatalogModel, StoredPublicGlobalModel,
-    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredGlobalModelIdentity,
+    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
+    StoredPublicGlobalModel, StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
+    UpsertAdminProviderModelRecord,
 };

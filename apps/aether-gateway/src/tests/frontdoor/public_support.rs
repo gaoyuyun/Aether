@@ -8353,6 +8353,7 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
         ],
         vec![],
     ));
+    let provider_catalog_probe = provider_catalog_repository.clone();
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::<StoredPublicGlobalModel>::new())
             .with_public_catalog_models(vec![
@@ -8468,6 +8469,8 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
     assert_eq!(options[0]["name"], "OpenAI");
     assert!(options[0].get("endpoints").is_none());
     assert!(options[0].get("models").is_none());
+    let full_endpoint_reads_before_access_options =
+        provider_catalog_probe.endpoint_by_provider_ids_read_count();
 
     let access_options_response = reqwest::Client::new()
         .get(format!(
@@ -8494,6 +8497,12 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
         json!([{ "api_format": "openai:chat" }])
     );
     assert!(access_options[0].get("models").is_none());
+    assert_eq!(
+        provider_catalog_probe.endpoint_by_provider_ids_read_count(),
+        full_endpoint_reads_before_access_options,
+        "access-options must not read or deserialize full endpoint rows"
+    );
+    assert_eq!(provider_catalog_probe.endpoint_identity_read_count(), 1);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -9764,7 +9773,8 @@ async fn gateway_handles_auth_me_locally_without_proxying_upstream() {
 #[tokio::test]
 async fn gateway_handles_users_me_available_models_locally_without_proxying_upstream() {
     let now = Utc::now();
-    let user = sample_auth_user(now);
+    let mut user = sample_auth_user(now);
+    user.role = "admin".to_string();
     let access_token = build_test_auth_token(
         "access",
         serde_json::Map::from_iter([
@@ -9794,6 +9804,7 @@ async fn gateway_handles_users_me_available_models_locally_without_proxying_upst
                 .expect("active global model ref should build"),
         ]),
     );
+    let global_model_probe = global_model_repository.clone();
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![
             sample_provider("provider-openai", "openai", 10),
@@ -9844,6 +9855,37 @@ async fn gateway_handles_users_me_available_models_locally_without_proxying_upst
     assert_eq!(models[0]["id"], "gm-1");
     assert_eq!(models[0]["name"], "gpt-5");
     assert_eq!(models[0]["display_name"], "GPT 5");
+    let public_model_reads_before_options = global_model_probe.public_model_read_count();
+
+    let options_response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/users/me/available-models?view=options&limit=1000"
+        ))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-available-models")
+        .header("user-agent", "AetherTest/1.0")
+        .send()
+        .await
+        .expect("model options request should succeed");
+    assert_eq!(options_response.status(), StatusCode::OK);
+    let options_payload: serde_json::Value = options_response
+        .json()
+        .await
+        .expect("model options body should parse");
+    assert_eq!(options_payload["total"], 2);
+    assert_eq!(
+        options_payload["models"],
+        json!([
+            { "id": "gm-2", "name": "claude-sonnet-4-5" },
+            { "id": "gm-1", "name": "gpt-5" },
+        ])
+    );
+    assert_eq!(
+        global_model_probe.public_model_read_count(),
+        public_model_reads_before_options,
+        "model options must not deserialize full global model rows"
+    );
+    assert_eq!(global_model_probe.identity_read_count(), 1);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

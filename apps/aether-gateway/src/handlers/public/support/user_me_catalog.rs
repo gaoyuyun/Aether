@@ -154,6 +154,48 @@ pub(super) async fn handle_users_me_available_models(
     };
     let (skip, limit, search) =
         parse_users_me_available_models_query(request_context.request_query_string.as_deref());
+    let options_view = query_param_value(request_context.request_query_string.as_deref(), "view")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("options"));
+
+    if options_view && auth.user.role.eq_ignore_ascii_case("admin") {
+        let identities = match state
+            .list_active_global_model_identities(USERS_ME_AVAILABLE_MODELS_FETCH_LIMIT)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("available model option lookup failed: {err:?}"),
+                    false,
+                )
+            }
+        };
+        let search = search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let filtered = identities
+            .into_iter()
+            .filter(|model| {
+                search
+                    .as_deref()
+                    .is_none_or(|value| model.name.to_ascii_lowercase().contains(value))
+            })
+            .collect::<Vec<_>>();
+        let total = filtered.len();
+        return Json(json!({
+            "models": filtered
+                .into_iter()
+                .skip(skip)
+                .take(limit)
+                .map(|model| json!({ "id": model.id, "name": model.name }))
+                .collect::<Vec<_>>(),
+            "total": total,
+        }))
+        .into_response();
+    }
 
     let effective_policies = if auth.user.role.eq_ignore_ascii_case("admin") {
         None
@@ -388,7 +430,7 @@ pub(super) async fn handle_users_me_providers_get(
                 .map(|provider| provider.id.clone())
                 .collect::<Vec<_>>();
             let endpoints = match state
-                .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
+                .list_provider_catalog_endpoint_identities_by_provider_ids(&provider_ids)
                 .await
             {
                 Ok(value) => value,

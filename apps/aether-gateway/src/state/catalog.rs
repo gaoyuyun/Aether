@@ -73,12 +73,31 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn read_provider_catalog_authorization_snapshot(
+        &self,
+    ) -> Result<provider_catalog::StoredProviderCatalogAuthorizationSnapshot, GatewayError> {
+        self.data
+            .read_provider_catalog_authorization_snapshot()
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn list_public_global_models(
         &self,
         query: &global_models::PublicGlobalModelQuery,
     ) -> Result<global_models::StoredPublicGlobalModelPage, GatewayError> {
         self.data
             .list_public_global_models(query)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    pub(crate) async fn list_active_global_model_identities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<global_models::StoredGlobalModelIdentity>, GatewayError> {
+        self.data
+            .list_active_global_model_identities(limit)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
