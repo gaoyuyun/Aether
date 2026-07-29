@@ -439,11 +439,13 @@ impl SettlementWriteRepository for SqliteSettlementRepository {
             provider_monthly_used_usd: None,
             finalized_at_unix_secs: Some(finalized_at as u64),
         };
+        let skip_user_billing = input.skip_user_billing.unwrap_or(false);
+        let skip_plan_billing = input.skip_plan_billing.unwrap_or(false);
 
         if final_billing_status == "settled" {
-            let api_key_id = input
-                .api_key_id
-                .as_deref()
+            let api_key_id = (!skip_user_billing)
+                .then_some(input.api_key_id.as_deref())
+                .flatten()
                 .filter(|value| !value.is_empty());
             let api_key_is_standalone = if input.api_key_is_standalone {
                 true
@@ -484,7 +486,7 @@ LIMIT 1
 
             let wallet_row = if wallet_row.is_some() {
                 wallet_row
-            } else if !api_key_is_standalone {
+            } else if !skip_user_billing && !api_key_is_standalone {
                 if let Some(user_id) = input.user_id.as_deref().filter(|value| !value.is_empty()) {
                     sqlx::query(
                         r#"
@@ -535,7 +537,9 @@ LIMIT 1
             }
 
             let billable_cost_usd = settlement_billable_cost_usd(&input);
-            let wallet_debit_cost_usd = if !api_key_is_standalone {
+            let wallet_debit_cost_usd = if skip_user_billing {
+                0.0
+            } else if !api_key_is_standalone && !skip_plan_billing {
                 if let Some(user_id) = input.user_id.as_deref().filter(|value| !value.is_empty()) {
                     let quota = consume_daily_quota_sqlite(
                         &mut tx,
@@ -747,6 +751,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: None,
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -782,6 +788,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: None,
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -836,6 +844,50 @@ WHERE request_id = 'request-1'
     }
 
     #[tokio::test]
+    async fn sqlite_repository_skips_user_billing_but_tracks_provider_cost() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_settlement_rows(&pool).await;
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        let settlement = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: "request-1".to_string(),
+                user_id: Some("user-1".to_string()),
+                api_key_id: None,
+                api_key_is_standalone: false,
+                skip_user_billing: Some(true),
+                skip_plan_billing: Some(true),
+                provider_id: Some("provider-1".to_string()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(1_234),
+            })
+            .await
+            .expect("settlement should run")
+            .expect("usage should exist");
+
+        assert_eq!(settlement.billing_status, "settled");
+        assert_eq!(settlement.wallet_id, None);
+        assert_eq!(settlement.provider_monthly_used_usd, Some(11.0));
+
+        let wallet_total: f64 =
+            sqlx::query_scalar("SELECT balance + gift_balance FROM wallets WHERE id = 'wallet-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("wallet should load");
+        assert_eq!(wallet_total, 12.0);
+    }
+
+    #[tokio::test]
     async fn sqlite_repository_voids_failed_usage_without_wallet_mutation() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -854,6 +906,8 @@ WHERE request_id = 'request-1'
                 user_id: Some("user-1".to_string()),
                 api_key_id: None,
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "failed".to_string(),
                 billing_status: "pending".to_string(),
@@ -894,6 +948,8 @@ WHERE request_id = 'request-1'
                 user_id: Some("user-1".to_string()),
                 api_key_id: None,
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -950,6 +1006,8 @@ WHERE request_id = 'request-1'
                 user_id: Some("user-quota".to_string()),
                 api_key_id: Some("key-quota".to_string()),
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: None,
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -1010,6 +1068,8 @@ WHERE request_id = 'request-1'
             user_id: Some("user-1".to_string()),
             api_key_id: None,
             api_key_is_standalone: false,
+            skip_user_billing: None,
+            skip_plan_billing: None,
             provider_id: Some("provider-1".to_string()),
             status: "completed".to_string(),
             billing_status: "pending".to_string(),
@@ -1049,6 +1109,51 @@ WHERE request_id = 'request-1'
         let _ = std::fs::remove_file(&database_path);
         let _ = std::fs::remove_file(format!("{}-wal", database_path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", database_path.display()));
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_skips_plan_quota_but_still_debits_wallet() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_quota_covered_settlement_rows(&pool).await;
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        let settlement = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: "request-plan-disabled".to_string(),
+                user_id: Some("user-quota".to_string()),
+                api_key_id: Some("key-quota".to_string()),
+                api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(true),
+                provider_id: None,
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(1_261),
+            })
+            .await
+            .expect("settlement should run")
+            .expect("usage should exist");
+
+        assert_eq!(settlement.billing_status, "settled");
+        assert_eq!(settlement.wallet_id.as_deref(), Some("wallet-quota"));
+        assert_eq!(settlement.wallet_balance_after, Some(-6.0));
+
+        let quota_used: f64 = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(SUM(amount_usd), 0) AS REAL) FROM entitlement_usage_ledgers WHERE request_id = 'request-plan-disabled'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("quota ledger should load");
+        assert_eq!(quota_used, 0.0);
     }
 
     async fn seed_settlement_rows(pool: &sqlx::SqlitePool) {
@@ -1100,6 +1205,9 @@ INSERT INTO "usage" (
   total_cost_usd, actual_total_cost_usd
 ) VALUES (
   'request-quota-covered', 'user-quota', 'key-quota', 'completed',
+  'pending', 3.0, 6.0
+), (
+  'request-plan-disabled', 'user-quota', 'key-quota', 'completed',
   'pending', 3.0, 6.0
 );
 

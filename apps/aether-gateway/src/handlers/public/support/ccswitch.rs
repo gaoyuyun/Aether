@@ -122,13 +122,23 @@ pub(super) async fn maybe_build_local_ccswitch_response(
             ))
         }
     };
-    let wallet_payload = build_wallet_balance_payload_for_auth_scope(
+    let wallet_payload = match build_wallet_balance_payload_for_auth_scope(
         state,
         &auth_context.user_id,
         auth_context.api_key_is_standalone,
         wallet.as_ref(),
     )
-    .await;
+    .await
+    {
+        Ok(payload) => payload,
+        Err(err) => {
+            return Some(build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ccswitch billing status lookup failed: {err:?}"),
+                false,
+            ))
+        }
+    };
     let today_payload = match if auth_context.api_key_is_standalone {
         build_wallet_live_today_usage_payload_for_api_key(state, &auth_context.api_key_id).await
     } else {

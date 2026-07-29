@@ -656,6 +656,23 @@ pub(super) async fn maybe_build_local_billing_response(
     if decision.route_family.as_deref() != Some("billing") {
         return None;
     }
+    match crate::commerce_modules::billing_plans_module_enabled(state).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Some(build_auth_error_response(
+                http::StatusCode::NOT_FOUND,
+                "套餐模块未启用",
+                false,
+            ));
+        }
+        Err(err) => {
+            return Some(build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("billing plans module status lookup failed: {err:?}"),
+                false,
+            ));
+        }
+    }
     match decision.route_kind.as_deref() {
         Some("plans") if request_context.request_path == "/api/billing/plans" => {
             Some(handle_billing_plans_list(state).await)

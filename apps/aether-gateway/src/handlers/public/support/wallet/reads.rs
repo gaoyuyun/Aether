@@ -1,7 +1,7 @@
 use super::{
     build_auth_error_response, build_auth_json_response, build_auth_wallet_summary_payload, http,
     query_param_value, resolve_authenticated_local_user, unix_secs_to_rfc3339, AppState, Body,
-    GatewayPublicRequestContext, Response, WALLET_LEGACY_TIMEZONE,
+    GatewayError, GatewayPublicRequestContext, Response, WALLET_LEGACY_TIMEZONE,
 };
 use crate::handlers::shared::round_to;
 use aether_data_contracts::repository::usage::UsageSettledCostSummaryQuery;
@@ -53,7 +53,7 @@ pub(in crate::handlers::public::support) async fn build_wallet_balance_payload_f
     state: &AppState,
     user_id: &str,
     wallet: Option<&aether_data::repository::wallet::StoredWalletSnapshot>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, GatewayError> {
     build_wallet_balance_payload_for_quota_user(state, Some(user_id), wallet).await
 }
 
@@ -62,7 +62,7 @@ pub(in crate::handlers::public::support) async fn build_wallet_balance_payload_f
     user_id: &str,
     api_key_is_standalone: bool,
     wallet: Option<&aether_data::repository::wallet::StoredWalletSnapshot>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, GatewayError> {
     let quota_user_id = if api_key_is_standalone {
         None
     } else {
@@ -75,17 +75,30 @@ async fn build_wallet_balance_payload_for_quota_user(
     state: &AppState,
     quota_user_id: Option<&str>,
     wallet: Option<&aether_data::repository::wallet::StoredWalletSnapshot>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, GatewayError> {
     let mut payload = build_wallet_balance_payload(wallet);
+    let commerce_policy = crate::commerce_modules::commerce_billing_policy(state).await?;
+    if !commerce_policy.wallet_enabled {
+        crate::commerce_modules::mark_wallet_summary_unlimited(&mut payload);
+        crate::commerce_modules::mark_wallet_summary_unlimited(&mut payload["wallet"]);
+        payload["daily_quota"] = json!({
+            "has_active": false,
+            "total_usd": 0.0,
+            "used_usd": 0.0,
+            "remaining_usd": 0.0,
+            "allow_wallet_overage": false,
+        });
+        payload["package_balance"] = json!(0.0);
+        payload["wallet_balance"] = json!(0.0);
+        payload["total_available_balance"] = serde_json::Value::Null;
+        payload["deduction_order"] = json!([]);
+        return Ok(payload);
+    }
     let wallet_balance = wallet
         .map(|value| value.balance + value.gift_balance)
         .unwrap_or(0.0);
-    let daily_quota = match quota_user_id {
-        Some(user_id) => state
-            .find_user_daily_quota_availability(user_id)
-            .await
-            .ok()
-            .flatten(),
+    let daily_quota = match quota_user_id.filter(|_| commerce_policy.billing_plans_enabled) {
+        Some(user_id) => state.find_user_daily_quota_availability(user_id).await?,
         None => None,
     };
     let (has_active_daily_quota, total_quota_usd, used_usd, remaining_usd, allow_wallet_overage) =
@@ -129,7 +142,7 @@ async fn build_wallet_balance_payload_for_quota_user(
         "wallet_recharge_balance",
         "wallet_gift_balance"
     ]);
-    payload
+    Ok(payload)
 }
 
 pub(super) fn parse_wallet_limit(query: Option<&str>) -> Result<usize, String> {
@@ -322,16 +335,27 @@ pub(super) async fn handle_wallet_balance(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let wallet = state
+    let wallet = match state
         .read_wallet_snapshot_for_auth(&auth.user.id, "", false)
         .await
-        .ok()
-        .flatten();
-    build_auth_json_response(
-        http::StatusCode::OK,
-        build_wallet_balance_payload_for_user(state, &auth.user.id, wallet.as_ref()).await,
-        None,
-    )
+    {
+        Ok(wallet) => wallet,
+        Err(err) => {
+            return build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("wallet balance lookup failed: {err:?}"),
+                false,
+            )
+        }
+    };
+    match build_wallet_balance_payload_for_user(state, &auth.user.id, wallet.as_ref()).await {
+        Ok(payload) => build_auth_json_response(http::StatusCode::OK, payload, None),
+        Err(err) => build_auth_error_response(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("wallet balance lookup failed: {err:?}"),
+            false,
+        ),
+    }
 }
 
 pub(super) async fn handle_wallet_today_cost(
@@ -452,4 +476,80 @@ pub(super) async fn handle_wallet_transactions(
         }
     }
     build_auth_json_response(http::StatusCode::OK, payload, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aether_data_contracts::repository::billing::{
+        BillingReadRepository, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+    };
+    use aether_data_contracts::DataLayerError;
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::build_wallet_balance_payload_for_user;
+    use crate::data::GatewayDataState;
+    use crate::{AppState, GatewayError};
+
+    #[derive(Debug)]
+    struct FailingQuotaBillingRepository;
+
+    #[async_trait]
+    impl BillingReadRepository for FailingQuotaBillingRepository {
+        async fn find_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _global_model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            Ok(None)
+        }
+
+        async fn find_user_daily_quota_availability(
+            &self,
+            _user_id: &str,
+        ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, DataLayerError> {
+            Err(DataLayerError::Sql("quota lookup failed".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_wallet_still_returns_the_unlimited_compatibility_payload() {
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([
+                    ("module.wallet.enabled".to_string(), json!(false)),
+                    ("module.billing_plans.enabled".to_string(), json!(false)),
+                ]),
+            );
+
+        let payload = build_wallet_balance_payload_for_user(&state, "user-1", None)
+            .await
+            .expect("disabled wallet payload should build");
+
+        assert_eq!(payload["limit_mode"], "unlimited");
+        assert_eq!(payload["unlimited"], true);
+        assert_eq!(payload["total_available_balance"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn daily_quota_errors_are_not_reported_as_zero_balance() {
+        let data = GatewayDataState::with_billing_reader_for_tests(Arc::new(
+            FailingQuotaBillingRepository,
+        ))
+        .with_system_config_values_for_tests([
+            ("module.wallet.enabled".to_string(), json!(true)),
+            ("module.billing_plans.enabled".to_string(), json!(true)),
+        ]);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+
+        let result = build_wallet_balance_payload_for_user(&state, "user-1", None).await;
+
+        assert!(matches!(result, Err(GatewayError::Internal(_))));
+    }
 }

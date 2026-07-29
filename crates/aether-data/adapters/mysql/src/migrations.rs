@@ -6,9 +6,63 @@ use sqlx::{
 use aether_data_contracts::PendingMigrationInfo;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+const FRESH_INSTALLATION_MARKER_TABLE: &str = "_aether_fresh_installation";
 
 pub async fn run_migrations(pool: &MySqlPool) -> Result<(), MigrateError> {
-    MIGRATOR.run(pool).await
+    let fresh_installation =
+        fresh_installation_marker_exists(pool).await? || !has_existing_aether_schema(pool).await?;
+    if fresh_installation {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS `_aether_fresh_installation` (id BIGINT PRIMARY KEY)",
+        )
+        .execute(pool)
+        .await?;
+    }
+    MIGRATOR.run(pool).await?;
+    if fresh_installation {
+        sqlx::query(
+            r#"
+UPDATE system_configs
+SET value = 'false'
+WHERE `key` IN ('module.wallet.enabled', 'module.billing_plans.enabled')
+"#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("DROP TABLE IF EXISTS `_aether_fresh_installation`")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn fresh_installation_marker_exists(pool: &MySqlPool) -> Result<bool, MigrateError> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)
+FROM information_schema.tables
+WHERE table_schema = DATABASE()
+  AND table_name = ?
+"#,
+    )
+    .bind(FRESH_INSTALLATION_MARKER_TABLE)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+async fn has_existing_aether_schema(pool: &MySqlPool) -> Result<bool, MigrateError> {
+    let count: i64 = sqlx::query_scalar(
+        r#"
+SELECT COUNT(*)
+FROM information_schema.tables
+WHERE table_schema = DATABASE()
+  AND table_name IN ('system_configs', 'users', 'usage')
+"#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
 }
 
 pub async fn pending_migrations(

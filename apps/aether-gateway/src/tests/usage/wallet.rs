@@ -140,6 +140,10 @@ async fn gateway_settles_wallet_for_completed_execution_runtime_sync_usage_impl(
         wallet_repository.clone(),
         DEVELOPMENT_ENCRYPTION_KEY,
     )
+    .with_system_config_values_for_tests([
+        ("module.wallet.enabled".to_string(), json!(true)),
+        ("module.billing_plans.enabled".to_string(), json!(true)),
+    ])
     .with_settlement_writer_for_tests(Arc::new(
         InMemorySettlementRepository::from_wallet_repository(wallet_repository.clone()),
     ));

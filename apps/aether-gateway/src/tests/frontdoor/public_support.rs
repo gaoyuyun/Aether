@@ -1385,6 +1385,51 @@ async fn gateway_handles_public_auth_modules_status_without_proxying_upstream() 
 }
 
 #[tokio::test]
+async fn gateway_handles_public_runtime_modules_status_without_admin_access() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/{*path}",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("proxied"))
+            }
+        }),
+    );
+
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
+    let data = crate::data::GatewayDataState::disabled().with_system_config_values_for_tests([
+        ("module.wallet.enabled".to_string(), json!(true)),
+        ("module.billing_plans.enabled".to_string(), json!(true)),
+    ]);
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/modules/status"))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload[0]["name"], "wallet");
+    assert_eq!(payload[0]["active"], true);
+    assert_eq!(payload[1]["name"], "billing_plans");
+    assert_eq!(payload[1]["active"], true);
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_handles_public_capabilities_without_proxying_upstream() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -2503,7 +2548,11 @@ async fn start_auth_gateway_with_state(
             crate::data::GatewayDataState::with_user_and_wallet_for_tests(
                 user_repository,
                 wallet_repository,
-            ),
+            )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ]),
         )
         .with_auth_sessions_for_tests(sessions);
     let gateway = build_router_with_state(state);
@@ -2548,7 +2597,11 @@ where
                 user_repository,
                 wallet_repository,
                 usage_repository,
-            ),
+            )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ]),
         )
         .with_auth_sessions_for_tests(sessions);
     let gateway = build_router_with_state(state);
@@ -2593,6 +2646,10 @@ where
         wallet_repository,
         usage_repository,
     )
+    .with_system_config_values_for_tests([
+        ("module.wallet.enabled".to_string(), json!(true)),
+        ("module.billing_plans.enabled".to_string(), json!(true)),
+    ])
     .with_provider_catalog_reader(provider_catalog_repository);
     let state = AppState::new()
         .expect("gateway should build")
@@ -3712,7 +3769,11 @@ async fn gateway_redeems_wallet_code_locally() {
             crate::data::GatewayDataState::with_user_and_wallet_for_tests(
                 user_repository,
                 wallet_repository,
-            ),
+            )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ]),
         )
         .with_auth_sessions_for_tests([sample_auth_session(
             "user-auth-1",
@@ -4031,11 +4092,17 @@ async fn gateway_reuses_pending_billing_plan_checkout_order_without_proxying_ups
     let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![wallet]));
     let state = AppState::new()
         .expect("gateway should build")
-        .with_data_state_for_tests(GatewayDataState::with_user_billing_and_wallet_for_tests(
-            user_repository,
-            billing_repository,
-            wallet_repository,
-        ))
+        .with_data_state_for_tests(
+            GatewayDataState::with_user_billing_and_wallet_for_tests(
+                user_repository,
+                billing_repository,
+                wallet_repository,
+            )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ]),
+        )
         .with_auth_sessions_for_tests([sample_auth_session(
             "user-billing-checkout-reuse",
             "session-billing-checkout-reuse",
@@ -4650,6 +4717,10 @@ async fn gateway_handles_ccswitch_usage_with_api_key_without_proxying_upstream()
                 )])),
                 Arc::clone(&usage_repository),
             )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ])
             .with_auth_api_key_reader(auth_repository);
             AppState::new()
                 .expect("gateway should build")
@@ -4733,6 +4804,10 @@ async fn gateway_handles_ccswitch_usage_for_standalone_key_without_owner_usage()
                 ])),
                 Arc::clone(&usage_repository),
             )
+            .with_system_config_values_for_tests([
+                ("module.wallet.enabled".to_string(), json!(true)),
+                ("module.billing_plans.enabled".to_string(), json!(true)),
+            ])
             .with_auth_api_key_reader(auth_repository);
             AppState::new()
                 .expect("gateway should build")

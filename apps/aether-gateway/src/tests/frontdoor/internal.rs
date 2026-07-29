@@ -1239,7 +1239,11 @@ async fn gateway_internal_decision_sync_revalidates_supplied_auth_context_wallet
                     billing_repository,
                     wallet_repository,
                     DEVELOPMENT_ENCRYPTION_KEY,
-                ),
+                )
+                .with_system_config_values_for_tests([
+                    ("module.wallet.enabled".to_string(), json!(true)),
+                    ("module.billing_plans.enabled".to_string(), json!(true)),
+                ]),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;

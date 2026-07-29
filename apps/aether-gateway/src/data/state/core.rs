@@ -988,6 +988,10 @@ impl GatewayDataState {
         self.system_config_value_cache.invalidate(key);
     }
 
+    pub(crate) fn clear_system_config_value_cache(&self) {
+        self.system_config_value_cache.clear();
+    }
+
     pub(crate) async fn read_admin_system_stats(
         &self,
     ) -> Result<super::AdminSystemStats, DataLayerError> {
@@ -1010,7 +1014,7 @@ impl GatewayDataState {
                 let mut values = values.write().expect("system config values lock");
                 let deleted = values.len() as u64;
                 values.clear();
-                self.system_config_value_cache.clear();
+                self.clear_system_config_value_cache();
                 let mut summary =
                     aether_data::repository::system::AdminSystemPurgeSummary::default();
                 summary.add("system_configs", deleted);
@@ -1022,7 +1026,7 @@ impl GatewayDataState {
             None => Ok(aether_data::repository::system::AdminSystemPurgeSummary::default()),
         };
         if purges_config && result.is_ok() {
-            self.system_config_value_cache.clear();
+            self.clear_system_config_value_cache();
         }
         result
     }
@@ -1101,5 +1105,46 @@ mod usage_counter_flush_backend_tests {
             DatabaseDriver::Sqlite
         )));
         assert!(!database_driver_supports_usage_counter_flush(None));
+    }
+}
+
+#[cfg(test)]
+mod config_purge_tests {
+    use serde_json::json;
+
+    use super::GatewayDataState;
+
+    #[tokio::test]
+    async fn config_purge_clears_the_data_layer_system_config_value_cache() {
+        let state = GatewayDataState::disabled().with_system_config_values_for_tests([(
+            "module.wallet.enabled".to_string(),
+            json!(true),
+        )]);
+        assert_eq!(
+            state
+                .find_system_config_value("module.wallet.enabled")
+                .await
+                .expect("system config lookup should succeed"),
+            Some(json!(true))
+        );
+
+        state
+            .purge_admin_system_data(
+                aether_data::repository::system::AdminSystemPurgeTarget::Config,
+            )
+            .await
+            .expect("config purge should succeed");
+
+        assert!(state
+            .system_config_value_cache
+            .get("module.wallet.enabled")
+            .is_none());
+        assert_eq!(
+            state
+                .find_system_config_value("module.wallet.enabled")
+                .await
+                .expect("system config lookup should succeed"),
+            None
+        );
     }
 }

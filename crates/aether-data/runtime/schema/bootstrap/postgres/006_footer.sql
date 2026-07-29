@@ -33,6 +33,22 @@ VALUES (
 )
 ON CONFLICT (key) DO NOTHING;
 
+INSERT INTO public.system_configs (id, key, value, description)
+VALUES
+    (
+        '00000000-0000-0000-0000-000000000101',
+        'module.wallet.enabled',
+        'false'::json,
+        'Wallet module enabled state for a new installation'
+    ),
+    (
+        '00000000-0000-0000-0000-000000000102',
+        'module.billing_plans.enabled',
+        'false'::json,
+        'Billing plans module enabled state for a new installation'
+    )
+ON CONFLICT (key) DO NOTHING;
+
 INSERT INTO public.user_group_members (group_id, user_id)
 SELECT '00000000-0000-0000-0000-000000000001', id
 FROM public.users

@@ -605,7 +605,10 @@
         </Card>
 
         <!-- 钱包状态 -->
-        <Card class="p-6">
+        <Card
+          v-if="walletModuleActive"
+          class="p-6"
+        >
           <h3 class="text-lg font-medium text-foreground mb-4">
             钱包状态
           </h3>
@@ -657,6 +660,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useModuleStore } from '@/stores/modules'
 import { meApi, type Profile } from '@/api/me'
 import { type UserSession, formatSessionMeta } from '@/types/session'
 import { authApi } from '@/api/auth'
@@ -695,12 +699,14 @@ import {
 } from '@/utils/featureSettings'
 
 const authStore = useAuthStore()
+const moduleStore = useModuleStore()
 const route = useRoute()
 const router = useRouter()
 const { success, error: showError } = useToast()
 const { setThemeMode } = useDarkMode()
 
 const profile = ref<Profile | null>(null)
+const walletModuleActive = computed(() => moduleStore.isActive('wallet'))
 const userSessions = ref<UserSession[]>([])
 const profileRoleLabel = computed(() => {
   if (profile.value?.role === 'admin') return '管理员'

@@ -31,7 +31,28 @@ impl AppState {
         api_key_id: &str,
         now_unix_secs: u64,
     ) -> Result<Option<GatewayAuthApiKeySnapshot>, GatewayError> {
-        let cache_key = AuthSnapshotCacheKey::user_api_key_ids(user_id, api_key_id);
+        let commerce_policy = crate::commerce_modules::commerce_billing_policy(self).await?;
+        self.read_cached_auth_api_key_snapshot_with_commerce_policy(
+            user_id,
+            api_key_id,
+            now_unix_secs,
+            commerce_policy,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_cached_auth_api_key_snapshot_with_commerce_policy(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        now_unix_secs: u64,
+        commerce_policy: crate::commerce_modules::CommerceBillingPolicy,
+    ) -> Result<Option<GatewayAuthApiKeySnapshot>, GatewayError> {
+        let cache_key = AuthSnapshotCacheKey::user_api_key_ids(
+            user_id,
+            api_key_id,
+            commerce_policy.billing_plans_enabled,
+        );
         if cache_key.is_empty() {
             return Ok(None);
         }
@@ -42,7 +63,12 @@ impl AppState {
                 || async move {
                     let _permit = self.acquire_auth_snapshot_load_gate().await?;
                     self.data
-                        .read_auth_api_key_snapshot(user_id, api_key_id, now_unix_secs)
+                        .read_auth_api_key_snapshot_with_commerce_policy(
+                            user_id,
+                            api_key_id,
+                            now_unix_secs,
+                            commerce_policy,
+                        )
                         .await
                         .map_err(|err| GatewayError::Internal(err.to_string()))
                 },
@@ -55,7 +81,23 @@ impl AppState {
         key_hash: &str,
         now_unix_secs: u64,
     ) -> Result<Option<GatewayAuthApiKeySnapshot>, GatewayError> {
-        let cache_key = AuthSnapshotCacheKey::key_hash(key_hash);
+        let commerce_policy = crate::commerce_modules::commerce_billing_policy(self).await?;
+        self.read_cached_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+            key_hash,
+            now_unix_secs,
+            commerce_policy,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_cached_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+        &self,
+        key_hash: &str,
+        now_unix_secs: u64,
+        commerce_policy: crate::commerce_modules::CommerceBillingPolicy,
+    ) -> Result<Option<GatewayAuthApiKeySnapshot>, GatewayError> {
+        let cache_key =
+            AuthSnapshotCacheKey::key_hash(key_hash, commerce_policy.billing_plans_enabled);
         if cache_key.is_empty() {
             return Ok(None);
         }
@@ -68,7 +110,11 @@ impl AppState {
                 || async move {
                     let _permit = self.acquire_auth_snapshot_load_gate().await?;
                     self.data
-                        .read_auth_api_key_snapshot_by_key_hash(key_hash, now_unix_secs)
+                        .read_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+                            key_hash,
+                            now_unix_secs,
+                            commerce_policy,
+                        )
                         .await
                         .map_err(|err| GatewayError::Internal(err.to_string()))
                 },
@@ -76,7 +122,11 @@ impl AppState {
             .await?;
         if let Some(snapshot) = snapshot.as_ref() {
             self.auth_snapshot_cache.insert_if_generation(
-                AuthSnapshotCacheKey::user_api_key_ids(&snapshot.user_id, &snapshot.api_key_id),
+                AuthSnapshotCacheKey::user_api_key_ids(
+                    &snapshot.user_id,
+                    &snapshot.api_key_id,
+                    commerce_policy.billing_plans_enabled,
+                ),
                 Some(snapshot.clone()),
                 AUTH_API_KEY_SNAPSHOT_RUNTIME_CACHE_TTL,
                 cache_generation,
