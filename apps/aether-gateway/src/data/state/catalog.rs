@@ -5,10 +5,12 @@ use super::{
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     PublicHealthStatusCount, PublicHealthTimelineBucket, StoredGeminiFileMapping,
-    StoredGeminiFileMappingListPage, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredGeminiFileMappingListPage,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider, StoredRequestCandidate,
-    UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
+    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogProviderIdentity, StoredRequestCandidate, UpsertGeminiFileMappingRecord,
+    UpsertRequestCandidateRecord,
 };
 
 impl GatewayDataState {
@@ -248,6 +250,16 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn list_provider_catalog_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        match &self.provider_catalog_reader {
+            Some(repository) => repository.list_provider_identities(active_only).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) async fn list_provider_catalog_endpoints_by_ids(
         &self,
         endpoint_ids: &[String],
@@ -266,6 +278,20 @@ impl GatewayDataState {
             Some(repository) => {
                 repository
                     .list_endpoints_by_provider_ids(provider_ids)
+                    .await
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn list_provider_catalog_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        match &self.provider_catalog_reader {
+            Some(repository) => {
+                repository
+                    .list_endpoint_identities_by_provider_ids(provider_ids)
                     .await
             }
             None => Ok(Vec::new()),

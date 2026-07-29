@@ -13,9 +13,12 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity,
+    StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogProviderIdentity,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -53,6 +56,17 @@ SELECT
   updated_at AS updated_at_unix_secs
 FROM providers
 WHERE id IN (
+"#;
+
+const LIST_PROVIDER_IDENTITIES_SQL: &str = r#"
+SELECT id, name, provider_type, provider_priority, is_active
+FROM providers
+"#;
+
+const LIST_ENDPOINT_IDENTITIES_BY_PROVIDER_IDS_PREFIX: &str = r#"
+SELECT provider_id, api_format, api_family, is_active
+FROM provider_endpoints
+WHERE provider_id IN (
 "#;
 
 const LIST_ENDPOINTS_BY_IDS_PREFIX: &str = r#"
@@ -345,6 +359,20 @@ impl SqliteProviderCatalogReadRepository {
         rows.iter().map(map_provider_row).collect()
     }
 
+    pub async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(LIST_PROVIDER_IDENTITIES_SQL);
+        let mut where_clause = WhereClause::new();
+        if active_only {
+            push_eq(&mut builder, &mut where_clause, "is_active", true);
+        }
+        builder.push(" ORDER BY provider_priority ASC, name ASC");
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
+        rows.iter().map(map_provider_identity_row).collect()
+    }
+
     pub async fn list_endpoints_by_ids(
         &self,
         endpoint_ids: &[String],
@@ -383,6 +411,25 @@ impl SqliteProviderCatalogReadRepository {
         .await
         .map_sql_err()?;
         rows.iter().map(map_endpoint_row).collect()
+    }
+
+    pub async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = build_list_query(
+            LIST_ENDPOINT_IDENTITIES_BY_PROVIDER_IDS_PREFIX,
+            provider_ids,
+            " AND api_format IS NOT NULL ORDER BY provider_id ASC, api_format ASC",
+        )
+        .build()
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+        rows.iter().map(map_endpoint_identity_row).collect()
     }
 
     pub async fn list_keys_by_ids(
@@ -1958,6 +2005,13 @@ impl ProviderCatalogReadRepository for SqliteProviderCatalogReadRepository {
         Self::list_providers(self, active_only).await
     }
 
+    async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        Self::list_provider_identities(self, active_only).await
+    }
+
     async fn list_providers_by_ids(
         &self,
         provider_ids: &[String],
@@ -1977,6 +2031,13 @@ impl ProviderCatalogReadRepository for SqliteProviderCatalogReadRepository {
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
         Self::list_endpoints_by_provider_ids(self, provider_ids).await
+    }
+
+    async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        Self::list_endpoint_identities_by_provider_ids(self, provider_ids).await
     }
 
     async fn list_keys_by_ids(
@@ -2754,6 +2815,18 @@ fn map_provider_row(row: &SqliteRow) -> Result<StoredProviderCatalogProvider, Da
     ))
 }
 
+fn map_provider_identity_row(
+    row: &SqliteRow,
+) -> Result<StoredProviderCatalogProviderIdentity, DataLayerError> {
+    StoredProviderCatalogProviderIdentity::new(
+        row.try_get("id").map_sql_err()?,
+        row.try_get("name").map_sql_err()?,
+        row.try_get("provider_type").map_sql_err()?,
+        row.try_get("provider_priority").map_sql_err()?,
+        row.try_get("is_active").map_sql_err()?,
+    )
+}
+
 fn map_endpoint_row(row: &SqliteRow) -> Result<StoredProviderCatalogEndpoint, DataLayerError> {
     StoredProviderCatalogEndpoint::new(
         row.try_get("id").map_sql_err()?,
@@ -2798,6 +2871,17 @@ fn map_endpoint_row(row: &SqliteRow) -> Result<StoredProviderCatalogEndpoint, Da
             row.try_get("proxy").map_sql_err()?,
             "provider_endpoints.proxy",
         )?,
+    )
+}
+
+fn map_endpoint_identity_row(
+    row: &SqliteRow,
+) -> Result<StoredProviderCatalogEndpointIdentity, DataLayerError> {
+    StoredProviderCatalogEndpointIdentity::new(
+        row.try_get("provider_id").map_sql_err()?,
+        row.try_get("api_format").map_sql_err()?,
+        row.try_get("api_family").map_sql_err()?,
+        row.try_get("is_active").map_sql_err()?,
     )
 }
 
@@ -3050,12 +3134,29 @@ mod tests {
         assert_eq!(providers[0].monthly_quota_usd, Some(0.0));
         assert_eq!(providers[0].monthly_used_usd, Some(0.0));
 
+        let provider_identities = repository
+            .list_provider_identities(true)
+            .await
+            .expect("provider identities should list");
+        assert_eq!(provider_identities.len(), 1);
+        assert_eq!(provider_identities[0].id, "provider-1");
+        assert_eq!(provider_identities[0].provider_type, "custom");
+        assert_eq!(provider_identities[0].provider_priority, 10);
+
         let endpoints = repository
             .list_endpoints_by_provider_ids(&["provider-1".to_string()])
             .await
             .expect("endpoints should list");
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].health_score, 0.95);
+
+        let endpoint_identities = repository
+            .list_endpoint_identities_by_provider_ids(&["provider-1".to_string()])
+            .await
+            .expect("endpoint identities should list");
+        assert_eq!(endpoint_identities.len(), 1);
+        assert_eq!(endpoint_identities[0].provider_id, "provider-1");
+        assert_eq!(endpoint_identities[0].api_format, "openai:chat");
 
         let keys = repository
             .list_keys_by_provider_ids(&["provider-1".to_string()])

@@ -13,9 +13,11 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogProviderIdentity,
 };
 use aether_data_contracts::DataLayerError;
 use aether_data_query::{
@@ -193,6 +195,28 @@ impl MysqlProviderCatalogReadRepository {
         rows.iter().map(map_provider_row).collect()
     }
 
+    async fn load_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        let sql = if active_only {
+            r#"
+SELECT id, name, provider_type, provider_priority, is_active
+FROM providers
+WHERE is_active = 1
+ORDER BY provider_priority ASC, name ASC
+"#
+        } else {
+            r#"
+SELECT id, name, provider_type, provider_priority, is_active
+FROM providers
+ORDER BY provider_priority ASC, name ASC
+"#
+        };
+        let rows = sqlx::query(sql).fetch_all(&self.pool).await.map_sql_err()?;
+        rows.iter().map(map_provider_identity_row).collect()
+    }
+
     pub async fn list_endpoints_by_ids(
         &self,
         endpoint_ids: &[String],
@@ -233,6 +257,28 @@ impl MysqlProviderCatalogReadRepository {
         .await
         .map_sql_err()?;
         rows.iter().map(map_endpoint_row).collect()
+    }
+
+    async fn load_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder = QueryBuilder::<MySql>::new(
+            "SELECT provider_id, api_format, api_family, is_active \
+             FROM provider_endpoints WHERE api_format IS NOT NULL AND provider_id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for provider_id in provider_ids {
+                separated.push_bind(provider_id);
+            }
+        }
+        builder.push(") ORDER BY provider_id ASC, api_format ASC");
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
+        rows.iter().map(map_endpoint_identity_row).collect()
     }
 
     pub async fn list_keys_by_ids(
@@ -1763,6 +1809,13 @@ impl ProviderCatalogReadRepository for MysqlProviderCatalogReadRepository {
         Self::list_providers(self, active_only).await
     }
 
+    async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        self.load_provider_identities(active_only).await
+    }
+
     async fn list_providers_by_ids(
         &self,
         provider_ids: &[String],
@@ -1782,6 +1835,14 @@ impl ProviderCatalogReadRepository for MysqlProviderCatalogReadRepository {
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
         Self::list_endpoints_by_provider_ids(self, provider_ids).await
+    }
+
+    async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        self.load_endpoint_identities_by_provider_ids(provider_ids)
+            .await
     }
 
     async fn list_keys_by_ids(
@@ -2587,6 +2648,18 @@ fn map_provider_row(row: &MySqlRow) -> Result<StoredProviderCatalogProvider, Dat
     ))
 }
 
+fn map_provider_identity_row(
+    row: &MySqlRow,
+) -> Result<StoredProviderCatalogProviderIdentity, DataLayerError> {
+    StoredProviderCatalogProviderIdentity::new(
+        row.try_get("id").map_sql_err()?,
+        row.try_get("name").map_sql_err()?,
+        row.try_get("provider_type").map_sql_err()?,
+        row.try_get("provider_priority").map_sql_err()?,
+        row.try_get("is_active").map_sql_err()?,
+    )
+}
+
 fn map_endpoint_row(row: &MySqlRow) -> Result<StoredProviderCatalogEndpoint, DataLayerError> {
     StoredProviderCatalogEndpoint::new(
         row.try_get("id").map_sql_err()?,
@@ -2658,6 +2731,17 @@ fn map_key_maintenance_summary_row(
             "provider_api_keys.upstream_metadata",
         )?,
     })
+}
+
+fn map_endpoint_identity_row(
+    row: &MySqlRow,
+) -> Result<StoredProviderCatalogEndpointIdentity, DataLayerError> {
+    StoredProviderCatalogEndpointIdentity::new(
+        row.try_get("provider_id").map_sql_err()?,
+        row.try_get("api_format").map_sql_err()?,
+        row.try_get("api_family").map_sql_err()?,
+        row.try_get("is_active").map_sql_err()?,
+    )
 }
 
 fn map_key_row(row: &MySqlRow) -> Result<StoredProviderCatalogKey, DataLayerError> {

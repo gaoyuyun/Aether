@@ -2504,6 +2504,12 @@ mod tests {
 
         assert_eq!(resolved.user_role, "admin");
         assert_eq!(resolved.effective_allowed_providers(), Some(&[][..]));
+        assert_eq!(
+            resolved.preferred_allowed_providers(),
+            Some(&["anthropic".to_string()][..])
+        );
+        assert!(!resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+        assert!(!resolved.allows_provider("provider-openai", "OpenAI", "openai"));
         assert_eq!(resolved.effective_allowed_api_formats(), Some(&[][..]));
         assert_eq!(resolved.effective_allowed_models(), Some(&[][..]));
         assert_eq!(resolved.user_rate_limit, Some(1));
@@ -2539,6 +2545,12 @@ mod tests {
             resolved.effective_allowed_providers(),
             Some(&["anthropic".to_string()][..])
         );
+        assert_eq!(
+            resolved.preferred_allowed_providers(),
+            Some(&["anthropic".to_string()][..])
+        );
+        assert!(resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+        assert!(!resolved.allows_provider("provider-openai", "OpenAI", "openai"));
         assert_eq!(
             resolved.effective_allowed_api_formats(),
             Some(&["anthropic:messages".to_string()][..])
@@ -2620,7 +2632,7 @@ mod tests {
             .expect("snapshot should exist");
 
         assert_eq!(
-            resolved.effective_allowed_providers(),
+            resolved.preferred_allowed_providers(),
             Some(&["anthropic".to_string()][..])
         );
         assert_eq!(
@@ -2639,7 +2651,7 @@ mod tests {
             .expect("catalog policies should resolve");
         assert_eq!(
             catalog_policies.allowed_providers.as_deref(),
-            resolved.effective_allowed_providers()
+            resolved.preferred_allowed_providers()
         );
         assert_eq!(
             catalog_policies.allowed_api_formats.as_deref(),

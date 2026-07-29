@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
+use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, Transaction};
 
 use aether_data_contracts::repository::auth::{
     AuthApiKeyExportSummary, AuthApiKeyLookupKey, AuthApiKeyReadRepository,
@@ -106,11 +106,37 @@ impl SqliteAuthApiKeyReadRepository {
             .next())
     }
 
+    async fn reload_export_by_id_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        api_key_id: &str,
+        user_id: Option<&str>,
+        is_standalone: bool,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(EXPORT_COLUMNS);
+        builder
+            .push(" WHERE api_keys.id = ")
+            .push_bind(api_key_id)
+            .push(" AND api_keys.is_standalone = ")
+            .push_bind(is_standalone);
+        if let Some(user_id) = user_id {
+            builder.push(" AND api_keys.user_id = ").push_bind(user_id);
+        }
+        builder.push(" LIMIT 1");
+        let row = builder
+            .build()
+            .fetch_optional(&mut **tx)
+            .await
+            .map_sql_err()?;
+        row.as_ref().map(map_auth_api_key_export_row).transpose()
+    }
+
     async fn create_api_key(
         &self,
         record: CreateApiKeyInsertRecord,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
         let now = current_unix_secs();
+        let mut tx = self.pool.begin().await.map_sql_err()?;
         sqlx::query(
             r#"
 INSERT INTO api_keys (
@@ -120,7 +146,16 @@ INSERT INTO api_keys (
   total_requests, total_tokens, total_cost_usd, is_standalone,
   created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (
+  ?, ?, ?, ?, ?,
+  ?, ?, ?, ?,
+  ?, ?,
+  ?, ?,
+  ?, ?, ?,
+  ?, ?, ?,
+  ?,
+  ?, ?
+)
 "#,
         )
         .bind(&record.api_key_id)
@@ -150,6 +185,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             &record.force_capabilities,
             "api_keys.force_capabilities",
         )?)
+        .bind(optional_json_to_string(
+            &record.feature_settings,
+            "api_keys.feature_settings",
+        )?)
         .bind(record.is_active)
         .bind(optional_i64_from_u64(
             record.expires_at_unix_secs,
@@ -165,11 +204,25 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(record.is_standalone)
         .bind(now as i64)
         .bind(now as i64)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
-
-        self.reload_export_by_id(&record.api_key_id).await
+        let created = self
+            .reload_export_by_id_in_transaction(
+                &mut tx,
+                &record.api_key_id,
+                Some(&record.user_id),
+                record.is_standalone,
+            )
+            .await?
+            .ok_or_else(|| {
+                DataLayerError::UnexpectedValue(format!(
+                    "created api_keys row {} could not be reloaded",
+                    record.api_key_id
+                ))
+            })?;
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(created))
     }
 }
 
@@ -186,6 +239,7 @@ struct CreateApiKeyInsertRecord {
     rate_limit: Option<i32>,
     concurrent_limit: Option<i32>,
     force_capabilities: Option<serde_json::Value>,
+    feature_settings: Option<serde_json::Value>,
     is_active: bool,
     expires_at_unix_secs: Option<u64>,
     auto_delete_on_expiry: bool,
@@ -429,6 +483,7 @@ WHERE id = ?
             rate_limit: Some(record.rate_limit),
             concurrent_limit: record.concurrent_limit,
             force_capabilities: record.force_capabilities,
+            feature_settings: record.feature_settings,
             is_active: record.is_active,
             expires_at_unix_secs: record.expires_at_unix_secs,
             auto_delete_on_expiry: record.auto_delete_on_expiry,
@@ -457,6 +512,7 @@ WHERE id = ?
             rate_limit: record.rate_limit,
             concurrent_limit: record.concurrent_limit,
             force_capabilities: record.force_capabilities,
+            feature_settings: None,
             is_active: record.is_active,
             expires_at_unix_secs: record.expires_at_unix_secs,
             auto_delete_on_expiry: record.auto_delete_on_expiry,
@@ -473,6 +529,11 @@ WHERE id = ?
         record: UpdateUserApiKeyBasicRecord,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
         let now = current_unix_secs() as i64;
+        let feature_settings = match &record.feature_settings {
+            Some(inner) => inner.clone(),
+            None => None,
+        };
+        let mut tx = self.pool.begin().await.map_sql_err()?;
         sqlx::query(
             r#"
 UPDATE api_keys
@@ -480,6 +541,8 @@ SET name = COALESCE(?, name),
     rate_limit = COALESCE(?, rate_limit),
     concurrent_limit = COALESCE(?, concurrent_limit),
     ip_rules = CASE WHEN ? THEN ? ELSE ip_rules END,
+    allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
+    feature_settings = CASE WHEN ? THEN ? ELSE feature_settings END,
     updated_at = ?
 WHERE id = ?
   AND user_id = ?
@@ -494,13 +557,36 @@ WHERE id = ?
             &record.ip_rules,
             "api_keys.ip_rules",
         )?)
+        .bind(record.allowed_providers.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_providers,
+            "api_keys.allowed_providers",
+        )?)
+        .bind(record.feature_settings.is_some())
+        .bind(optional_json_to_string(
+            &feature_settings,
+            "api_keys.feature_settings",
+        )?)
         .bind(now)
         .bind(&record.api_key_id)
         .bind(&record.user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
-        self.reload_export_by_id(&record.api_key_id).await
+        let Some(updated) = self
+            .reload_export_by_id_in_transaction(
+                &mut tx,
+                &record.api_key_id,
+                Some(&record.user_id),
+                false,
+            )
+            .await?
+        else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        };
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(updated))
     }
 
     async fn update_standalone_api_key_basic(
@@ -508,6 +594,7 @@ WHERE id = ?
         record: UpdateStandaloneApiKeyBasicRecord,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
         let now = current_unix_secs() as i64;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
         sqlx::query(
             r#"
 UPDATE api_keys
@@ -559,10 +646,18 @@ WHERE id = ?
         .bind(record.auto_delete_on_expiry)
         .bind(now)
         .bind(&record.api_key_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
-        self.reload_export_by_id(&record.api_key_id).await
+        let Some(updated) = self
+            .reload_export_by_id_in_transaction(&mut tx, &record.api_key_id, None, true)
+            .await?
+        else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        };
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(updated))
     }
 
     async fn set_user_api_key_active(
@@ -615,6 +710,7 @@ WHERE id = ?
         api_key_id: &str,
         allowed_providers: Option<Vec<String>>,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let mut tx = self.pool.begin().await.map_sql_err()?;
         sqlx::query(
             r#"
 UPDATE api_keys
@@ -631,10 +727,18 @@ WHERE id = ?
         .bind(current_unix_secs() as i64)
         .bind(api_key_id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
-        self.reload_export_by_id(api_key_id).await
+        let Some(updated) = self
+            .reload_export_by_id_in_transaction(&mut tx, api_key_id, Some(user_id), false)
+            .await?
+        else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        };
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(updated))
     }
 
     async fn set_user_api_key_force_capabilities(
@@ -1145,6 +1249,7 @@ mod tests {
                 rate_limit: 100,
                 concurrent_limit: Some(5),
                 force_capabilities: Some(json!({"cache": true})),
+                feature_settings: Some(json!({"chat_pii_redaction": {"enabled": true}})),
                 is_active: true,
                 expires_at_unix_secs: Some(2_000_000_000),
                 auto_delete_on_expiry: false,
@@ -1156,7 +1261,57 @@ mod tests {
             .expect("user key should create")
             .expect("user key should reload");
         assert_eq!(user_key.allowed_models, Some(vec!["gpt-4.1".to_string()]));
+        assert_eq!(
+            user_key.feature_settings,
+            Some(json!({"chat_pii_redaction": {"enabled": true}}))
+        );
         assert_eq!(user_key.total_tokens, 42);
+
+        let wrong_owner_update = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                user_id: "user-other".to_string(),
+                api_key_id: "key-created-user".to_string(),
+                name: Some("must-not-apply".to_string()),
+                rate_limit: None,
+                concurrent_limit: None,
+                ip_rules: None,
+                allowed_providers: Some(Some(vec!["must-not-apply".to_string()])),
+                feature_settings: None,
+            })
+            .await
+            .expect("wrong owner update should not fail");
+        assert_eq!(wrong_owner_update, None);
+        let unchanged_after_wrong_owner = repository
+            .reload_export_by_id("key-created-user")
+            .await
+            .expect("user key should reload after rejected update")
+            .expect("user key should still exist");
+        assert_eq!(
+            unchanged_after_wrong_owner.name,
+            Some("Created User".to_string())
+        );
+        assert_eq!(
+            unchanged_after_wrong_owner.allowed_providers,
+            Some(vec!["openai".to_string()])
+        );
+        assert!(repository
+            .set_user_api_key_allowed_providers(
+                "user-other",
+                "key-created-user",
+                Some(vec!["must-not-apply".to_string()]),
+            )
+            .await
+            .expect("wrong owner provider update should not fail")
+            .is_none());
+        assert!(repository
+            .set_user_api_key_allowed_providers(
+                "user-1",
+                "key-created-user",
+                Some(vec!["openai".to_string()]),
+            )
+            .await
+            .expect("idempotent provider update should succeed")
+            .is_some());
 
         let updated_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
@@ -1166,12 +1321,82 @@ mod tests {
                 rate_limit: Some(150),
                 concurrent_limit: Some(6),
                 ip_rules: Some(Some(vec!["10.0.0.0/24".to_string()])),
+                allowed_providers: None,
+                feature_settings: None,
             })
             .await
             .expect("user key should update")
             .expect("user key should reload");
         assert_eq!(updated_user_key.name, Some("Updated User".to_string()));
         assert_eq!(updated_user_key.concurrent_limit, Some(6));
+        assert_eq!(
+            updated_user_key.allowed_providers,
+            Some(vec!["openai".to_string()])
+        );
+        assert_eq!(
+            updated_user_key.feature_settings,
+            Some(json!({"chat_pii_redaction": {"enabled": true}}))
+        );
+
+        let cleared_user_key = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created-user".to_string(),
+                name: None,
+                rate_limit: None,
+                concurrent_limit: None,
+                ip_rules: None,
+                allowed_providers: Some(None),
+                feature_settings: Some(None),
+            })
+            .await
+            .expect("user key restrictions should clear")
+            .expect("user key should reload after clear");
+        assert_eq!(cleared_user_key.allowed_providers, None);
+        assert_eq!(cleared_user_key.feature_settings, None);
+
+        let denied_user_key = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created-user".to_string(),
+                name: None,
+                rate_limit: None,
+                concurrent_limit: None,
+                ip_rules: None,
+                allowed_providers: Some(Some(Vec::new())),
+                feature_settings: Some(Some(json!({"chat_pii_redaction": {"enabled": false}}))),
+            })
+            .await
+            .expect("user key deny-all should update")
+            .expect("user key should reload after deny-all");
+        assert_eq!(denied_user_key.allowed_providers, Some(Vec::new()));
+        assert_eq!(
+            denied_user_key.feature_settings,
+            Some(json!({"chat_pii_redaction": {"enabled": false}}))
+        );
+
+        let restricted_user_key = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created-user".to_string(),
+                name: None,
+                rate_limit: None,
+                concurrent_limit: None,
+                ip_rules: None,
+                allowed_providers: Some(Some(vec!["anthropic".to_string()])),
+                feature_settings: None,
+            })
+            .await
+            .expect("user key restriction should update")
+            .expect("user key should reload after restriction");
+        assert_eq!(
+            restricted_user_key.allowed_providers,
+            Some(vec!["anthropic".to_string()])
+        );
+        assert_eq!(
+            restricted_user_key.feature_settings,
+            Some(json!({"chat_pii_redaction": {"enabled": false}}))
+        );
 
         assert!(repository
             .set_user_api_key_locked("user-1", "key-created-user", true)

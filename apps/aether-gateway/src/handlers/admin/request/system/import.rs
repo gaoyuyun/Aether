@@ -2978,6 +2978,8 @@ impl<'a> AdminAppState<'a> {
                                         },
                                         ip_rules: imported_ip_rules_present(key)
                                             .then(|| ip_rules.clone()),
+                                        allowed_providers: None,
+                                        feature_settings: None,
                                     },
                                 )
                                 .await?;
@@ -3072,6 +3074,7 @@ impl<'a> AdminAppState<'a> {
                         rate_limit,
                         concurrent_limit,
                         force_capabilities,
+                        feature_settings,
                         is_active,
                         expires_at_unix_secs,
                         auto_delete_on_expiry,
@@ -3086,15 +3089,6 @@ impl<'a> AdminAppState<'a> {
                         json!({ "detail": "Admin system data unavailable" }),
                     )));
                 };
-                if key.contains_key("feature_settings") {
-                    let _ = self
-                        .set_user_api_key_feature_settings(
-                            &user_id,
-                            &created.api_key_id,
-                            feature_settings.clone(),
-                        )
-                        .await?;
-                }
                 let created_api_key_id = created.api_key_id.clone();
                 existing_api_keys_by_hash.insert(key_hash, created);
                 if let Some(source_api_key_id) = source_api_key_id {
