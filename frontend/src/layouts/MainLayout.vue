@@ -396,6 +396,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { marked } from 'marked'
 import { useAuthStore } from '@/stores/auth'
 import { useModuleStore } from '@/stores/modules'
+import { inactiveModuleRouteRedirect } from '@/router/guards/moduleGuard'
 import { useSiteInfo } from '@/composables/useSiteInfo'
 import { useToast } from '@/composables/useToast'
 import { isDemoMode } from '@/config/demo'
@@ -476,9 +477,11 @@ const MANUAL_UPDATE_HINT: MessageKey = 'update.error.manualHint'
 const VERSION_STATUS_CACHE_KEY = 'aether_version_status_cache'
 const VERSION_STATUS_CACHE_TTL_MS = 20 * 60 * 1000
 const VERSION_STATUS_ERROR_CACHE_TTL_MS = 5 * 60 * 1000
+const RUNTIME_MODULE_REFRESH_INTERVAL_MS = 30_000
 let versionStatusLoadPromise: Promise<CheckUpdateResponse | null> | null = null
 let updateStatusPollTimer: number | null = null
 let updateCheckTimer: number | null = null
+let moduleRefreshTimer: number | null = null
 let requiredAnnouncementsPromise: Promise<void> | null = null
 const updateProgressPercent = computed(() => updateTaskStatus.value?.progress_percent ?? null)
 const updateProgressText = computed(() => formatUpdateProgressText(updateTaskStatus.value))
@@ -1000,6 +1003,11 @@ function handleStorageChange(event: StorageEvent) {
 function handleVisibilityChange() {
   if (!document.hidden) {
     syncAuthNotice()
+    if (!authStore.canAccessAdmin) {
+      void moduleStore.fetchRuntimeModules({ force: true }).catch(() => {
+        // Keep the last known menu state; module routes still fail closed.
+      })
+    }
   }
 }
 
@@ -1011,6 +1019,16 @@ watch(
       void loadRequiredAnnouncements()
     } else {
       requiredAnnouncements.value = []
+    }
+  },
+  { immediate: true }
+)
+
+watch(
+  () => inactiveModuleRouteRedirect(route, moduleStore),
+  (redirect) => {
+    if (redirect && route.path !== redirect) {
+      void router.replace(redirect)
     }
   },
   { immediate: true }
@@ -1060,12 +1078,22 @@ onMounted(() => {
   syncAuthNotice()
   applyCachedVersionStatus()
 
-  // 管理员预加载模块状态（路由守卫会按需加载，这里提前加载以避免菜单闪烁）
-  if (authStore.canAccessAdmin && !moduleStore.loaded && !moduleStore.loading) {
-    void moduleStore.fetchModules().catch(() => {
+  // 预加载当前角色可读取的模块状态（路由守卫仍会按需兜底）。
+  if (!moduleStore.loading) {
+    const moduleRequest = authStore.canAccessAdmin
+      ? (!moduleStore.loaded ? moduleStore.fetchModules() : null)
+      : moduleStore.fetchRuntimeModules()
+    void moduleRequest?.catch(() => {
       // 路由守卫会在需要模块状态时按需处理失败场景。
     })
   }
+  moduleRefreshTimer = window.setInterval(() => {
+    if (!document.hidden && !authStore.canAccessAdmin) {
+      void moduleStore.fetchRuntimeModules({ force: true }).catch(() => {
+        // Keep the last known menu state; module routes still fail closed.
+      })
+    }
+  }, RUNTIME_MODULE_REFRESH_INTERVAL_MS)
   void loadRequiredAnnouncements()
 
   // 延迟检查更新，避免 GitHub Releases 检查和首屏业务数据争抢资源。
@@ -1086,6 +1114,10 @@ onUnmounted(() => {
   if (updateCheckTimer !== null) {
     window.clearTimeout(updateCheckTimer)
     updateCheckTimer = null
+  }
+  if (moduleRefreshTimer !== null) {
+    window.clearInterval(moduleRefreshTimer)
+    moduleRefreshTimer = null
   }
   stopUpdateStatusPolling()
   if (import.meta.env.DEV && window.__aetherShowUpdateDialog === showDebugUpdateDialog) {

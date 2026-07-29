@@ -10,7 +10,10 @@
     <TableCell class="py-4">
       <UserIdentityCell :row="row" />
     </TableCell>
-    <TableCell class="py-4">
+    <TableCell
+      v-if="walletEnabled"
+      class="py-4"
+    >
       <UserWalletSummary :row="row" />
     </TableCell>
     <TableCell class="py-4">
@@ -51,6 +54,8 @@
       <UserActionButtons
         :can-operate-admin="canOperateAdmin"
         :is-active="row.user.is_active"
+        :wallet-enabled="walletEnabled"
+        :billing-plans-enabled="billingPlansEnabled"
         @edit="$emit('edit')"
         @wallet="$emit('wallet')"
         @plans="$emit('plans')"
@@ -80,6 +85,8 @@ defineProps<{
   selected: boolean
   selectionDisabled: boolean
   canOperateAdmin: boolean
+  walletEnabled: boolean
+  billingPlansEnabled: boolean
 }>()
 
 defineEmits<{

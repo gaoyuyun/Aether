@@ -242,6 +242,9 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    /// Wallet initialization is retained while the module is disabled. The
+    /// toggle pauses runtime billing/UI only, so re-enabling needs no repair
+    /// migration for users created during the pause.
     pub(crate) async fn initialize_auth_user_wallet(
         &self,
         user_id: &str,

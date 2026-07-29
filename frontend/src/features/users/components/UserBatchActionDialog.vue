@@ -2,7 +2,9 @@
   <Dialog
     :model-value="open"
     :title="legacyT('用户批量操作')"
-    :description="legacyT('按当前选择批量调整用户状态、角色和额度')"
+    :description="walletEnabled
+      ? legacyT('按当前选择批量调整用户状态、角色和额度')
+      : legacyT('按当前选择批量调整用户状态和角色')"
     size="2xl"
     persistent
     @update:model-value="handleDialogUpdate"
@@ -24,7 +26,7 @@
         />
         <UserBatchActionCards
           v-model="selectedAction"
-          :actions="USER_BATCH_ACTION_OPTIONS"
+          :actions="availableBatchActions"
         />
       </div>
 
@@ -102,6 +104,7 @@ const props = defineProps<{
   selectedCount: number
   filters: UserBatchSelectionFilters
   groups: UserGroup[]
+  walletEnabled: boolean
 }>()
 
 const emit = defineEmits<{
@@ -124,6 +127,9 @@ const executing = ref(false)
 const lastResult = ref<UserBatchActionResponse | null>(null)
 
 const hasAnyTarget = computed(() => props.selectedCount > 0 || selectedGroupIds.value.length > 0)
+const availableBatchActions = computed(() => props.walletEnabled
+  ? USER_BATCH_ACTION_OPTIONS
+  : USER_BATCH_ACTION_OPTIONS.filter(action => action.value !== 'update_access_control'))
 const impactCount = computed(() => resolvedTotal.value ?? props.selectedCount)
 const canExecute = computed(() => hasAnyTarget.value && !previewLoading.value && !executing.value)
 const selectedActionLabel = computed(() => (

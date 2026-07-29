@@ -106,27 +106,32 @@ impl SettlementWriteRepository for InMemorySettlementRepository {
         let mut final_billing_status =
             settlement_billing_status_for_usage_status(&input.status).to_string();
         let billable_cost_usd = settlement_billable_cost_usd(&input);
+        let skip_user_billing = input.skip_user_billing.unwrap_or(false);
         let mut settlement = self.wallets.with_mut(|wallets| {
-            let wallet_id = input
-                .api_key_id
-                .as_deref()
-                .and_then(|api_key_id| {
-                    wallets
-                        .values()
-                        .find(|wallet| wallet.api_key_id.as_deref() == Some(api_key_id))
-                        .map(|wallet| wallet.id.clone())
-                })
-                .or_else(|| {
-                    if input.api_key_is_standalone {
-                        return None;
-                    }
-                    input.user_id.as_deref().and_then(|user_id| {
+            let wallet_id = if skip_user_billing {
+                None
+            } else {
+                input
+                    .api_key_id
+                    .as_deref()
+                    .and_then(|api_key_id| {
                         wallets
                             .values()
-                            .find(|wallet| wallet.user_id.as_deref() == Some(user_id))
+                            .find(|wallet| wallet.api_key_id.as_deref() == Some(api_key_id))
                             .map(|wallet| wallet.id.clone())
                     })
-                });
+                    .or_else(|| {
+                        if input.api_key_is_standalone {
+                            return None;
+                        }
+                        input.user_id.as_deref().and_then(|user_id| {
+                            wallets
+                                .values()
+                                .find(|wallet| wallet.user_id.as_deref() == Some(user_id))
+                                .map(|wallet| wallet.id.clone())
+                        })
+                    })
+            };
             let wallet = wallet_id
                 .as_deref()
                 .and_then(|wallet_id| wallets.get_mut(wallet_id));
@@ -172,7 +177,8 @@ impl SettlementWriteRepository for InMemorySettlementRepository {
                 settlement.wallet_recharge_balance_after = Some(wallet.balance);
                 settlement.wallet_gift_balance_after = Some(wallet.gift_balance);
                 settlement.wallet_balance_after = Some(wallet.balance + wallet.gift_balance);
-            } else if final_billing_status == "settled"
+            } else if !skip_user_billing
+                && final_billing_status == "settled"
                 && billable_cost_usd > SETTLEMENT_EPSILON_USD
             {
                 final_billing_status = "insufficient_quota".to_string();
@@ -256,6 +262,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: Some("key-1".to_string()),
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -274,6 +282,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skipped_user_billing_preserves_wallet_and_tracks_provider_cost() {
+        let repository = InMemorySettlementRepository::seed(vec![sample_wallet()]);
+        let settlement = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: "req-unlimited-module".to_string(),
+                user_id: Some("user-1".to_string()),
+                api_key_id: Some("key-1".to_string()),
+                api_key_is_standalone: false,
+                skip_user_billing: Some(true),
+                skip_plan_billing: Some(true),
+                provider_id: Some("provider-1".to_string()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(200),
+            })
+            .await
+            .expect("settlement should succeed")
+            .expect("settlement should exist");
+
+        assert_eq!(settlement.billing_status, "settled");
+        assert_eq!(settlement.wallet_id, None);
+        assert_eq!(settlement.wallet_balance_before, None);
+        assert_eq!(settlement.wallet_balance_after, None);
+        assert_eq!(settlement.provider_monthly_used_usd, Some(6.0));
+    }
+
+    #[tokio::test]
     async fn normal_key_settlement_falls_back_to_user_wallet() {
         let repository =
             InMemorySettlementRepository::seed(vec![sample_user_wallet("wallet-user-1", "user-1")]);
@@ -283,6 +320,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: Some("normal-key-without-wallet".to_string()),
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: None,
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -308,6 +347,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: Some("key-1".to_string()),
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "cancelled".to_string(),
                 billing_status: "pending".to_string(),
@@ -337,6 +378,8 @@ mod tests {
                 user_id: Some("admin-owner".to_string()),
                 api_key_id: Some("standalone-key-without-wallet".to_string()),
                 api_key_is_standalone: true,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: None,
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -363,6 +406,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: Some("key-1".to_string()),
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -391,6 +436,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: Some("key-1".to_string()),
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -408,6 +455,8 @@ mod tests {
                 user_id: Some("user-1".to_string()),
                 api_key_id: Some("key-1".to_string()),
                 api_key_is_standalone: false,
+                skip_user_billing: Some(false),
+                skip_plan_billing: Some(false),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "settled".to_string(),

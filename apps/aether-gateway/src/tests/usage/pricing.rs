@@ -451,7 +451,11 @@ async fn start_local_billing_gateway(
         billing_repository,
         wallet_repository,
         DEVELOPMENT_ENCRYPTION_KEY,
-    );
+    )
+    .with_system_config_values_for_tests([
+        ("module.wallet.enabled".to_string(), json!(true)),
+        ("module.billing_plans.enabled".to_string(), json!(true)),
+    ]);
     let gateway_state = build_state_with_execution_runtime_override(execution_runtime_url)
         .with_data_state_for_tests(data_state)
         .with_usage_runtime_for_tests(UsageRuntimeConfig {

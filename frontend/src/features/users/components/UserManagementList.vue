@@ -15,7 +15,10 @@
             <TableHead class="w-[260px] h-12 font-semibold">
               {{ legacyT('用户信息') }}
             </TableHead>
-            <TableHead class="w-[240px] h-12 font-semibold">
+            <TableHead
+              v-if="walletEnabled"
+              class="w-[240px] h-12 font-semibold"
+            >
               {{ legacyT('钱包') }}
             </TableHead>
             <TableHead class="w-[170px] h-12 font-semibold">
@@ -48,6 +51,8 @@
             :selected="selectAllFiltered || selectedIdSet.has(row.user.id)"
             :selection-disabled="selectionDisabled"
             :can-operate-admin="canOperateAdmin"
+            :wallet-enabled="walletEnabled"
+            :billing-plans-enabled="billingPlansEnabled"
             @toggle-selected="(checked) => emit('toggle-selected', row.user.id, checked)"
             @edit="emit('edit', row.user)"
             @wallet="emit('wallet', row.user)"
@@ -78,6 +83,8 @@
           :selected="selectAllFiltered || selectedIdSet.has(row.user.id)"
           :selection-disabled="selectionDisabled"
           :can-operate-admin="canOperateAdmin"
+          :wallet-enabled="walletEnabled"
+          :billing-plans-enabled="billingPlansEnabled"
           @toggle-selected="(checked) => emit('toggle-selected', row.user.id, checked)"
           @edit="emit('edit', row.user)"
           @wallet="emit('wallet', row.user)"
@@ -118,6 +125,8 @@ const props = defineProps<{
   selectionDisabled: boolean
   loading: boolean
   canOperateAdmin: boolean
+  walletEnabled: boolean
+  billingPlansEnabled: boolean
   hasFilters: boolean
   sortBy: AdminUserSortBy | null
   sortOrder: AdminUserSortOrder
