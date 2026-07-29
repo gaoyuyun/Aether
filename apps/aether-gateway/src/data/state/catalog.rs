@@ -2,7 +2,8 @@ use super::{
     ApiKeyLastUsedDelta, DataLayerError, GatewayDataState, GeminiFileMappingListQuery,
     GeminiFileMappingStats, ProviderCatalogKeyListQuery, PublicHealthStatusCount,
     PublicHealthTimelineBucket, StoredGeminiFileMapping, StoredGeminiFileMappingListPage,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
+    StoredProviderCatalogAuthorizationSnapshot, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
     StoredProviderCatalogProviderIdentity, StoredRequestCandidate, UpsertGeminiFileMappingRecord,
@@ -291,6 +292,18 @@ impl GatewayDataState {
                     .await
             }
             None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) async fn read_provider_catalog_authorization_snapshot(
+        &self,
+    ) -> Result<StoredProviderCatalogAuthorizationSnapshot, DataLayerError> {
+        match &self.provider_catalog_reader {
+            Some(repository) => repository.read_authorization_snapshot().await,
+            None => Ok(StoredProviderCatalogAuthorizationSnapshot {
+                providers: Vec::new(),
+                endpoints: Vec::new(),
+            }),
         }
     }
 

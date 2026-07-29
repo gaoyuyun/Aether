@@ -5,7 +5,8 @@ pub use snapshot::ProviderCatalogSnapshot;
 pub use types::{
     ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
+    StoredProviderCatalogAuthorizationSnapshot, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
     StoredProviderCatalogProviderIdentity,

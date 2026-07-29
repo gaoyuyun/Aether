@@ -108,9 +108,10 @@ use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
     GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
     PublicCatalogModelSearchQuery, PublicGlobalModelQuery, StoredAdminGlobalModel,
-    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredProviderActiveGlobalModel,
-    StoredProviderModelStats, StoredPublicCatalogModel, StoredPublicGlobalModel,
-    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredGlobalModelIdentity,
+    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
+    StoredPublicGlobalModel, StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
+    UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::pool_scores::{
     GetPoolMemberScoresByIdsQuery, ListPoolMemberProbeCandidatesQuery, ListPoolMemberScoresQuery,
@@ -121,7 +122,8 @@ use aether_data_contracts::repository::pool_scores::{
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
+    StoredProviderCatalogAuthorizationSnapshot, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
     StoredProviderCatalogProviderIdentity,

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -7,9 +8,10 @@ use serde_json::{json, Map, Value};
 use super::{
     ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, ProviderCatalogSnapshot,
     ProviderCatalogUpstreamMetadataNamespaceUpdate, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogProviderIdentity,
 };
 use crate::repository::usage::{ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta};
 use crate::DataLayerError;
@@ -24,6 +26,9 @@ struct MemoryProviderCatalogIndex {
 #[derive(Debug, Default)]
 pub struct InMemoryProviderCatalogReadRepository {
     index: RwLock<MemoryProviderCatalogIndex>,
+    provider_identity_read_count: AtomicUsize,
+    endpoint_identity_read_count: AtomicUsize,
+    endpoint_by_provider_ids_read_count: AtomicUsize,
 }
 
 impl InMemoryProviderCatalogReadRepository {
@@ -44,7 +49,23 @@ impl InMemoryProviderCatalogReadRepository {
                     .collect(),
                 keys: keys.into_iter().map(|key| (key.id.clone(), key)).collect(),
             }),
+            provider_identity_read_count: AtomicUsize::new(0),
+            endpoint_identity_read_count: AtomicUsize::new(0),
+            endpoint_by_provider_ids_read_count: AtomicUsize::new(0),
         }
+    }
+
+    pub fn provider_identity_read_count(&self) -> usize {
+        self.provider_identity_read_count.load(Ordering::Acquire)
+    }
+
+    pub fn endpoint_identity_read_count(&self) -> usize {
+        self.endpoint_identity_read_count.load(Ordering::Acquire)
+    }
+
+    pub fn endpoint_by_provider_ids_read_count(&self) -> usize {
+        self.endpoint_by_provider_ids_read_count
+            .load(Ordering::Acquire)
     }
 
     fn snapshot(&self) -> ProviderCatalogSnapshot {
@@ -341,6 +362,20 @@ impl ProviderCatalogReadRepository for InMemoryProviderCatalogReadRepository {
         Ok(self.snapshot().list_providers(active_only))
     }
 
+    async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        self.provider_identity_read_count
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(self
+            .snapshot()
+            .list_providers(active_only)
+            .into_iter()
+            .map(StoredProviderCatalogProviderIdentity::from)
+            .collect())
+    }
+
     async fn list_providers_by_ids(
         &self,
         provider_ids: &[String],
@@ -359,7 +394,23 @@ impl ProviderCatalogReadRepository for InMemoryProviderCatalogReadRepository {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
+        self.endpoint_by_provider_ids_read_count
+            .fetch_add(1, Ordering::AcqRel);
         Ok(self.snapshot().list_endpoints_by_provider_ids(provider_ids))
+    }
+
+    async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        self.endpoint_identity_read_count
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(self
+            .snapshot()
+            .list_endpoints_by_provider_ids(provider_ids)
+            .into_iter()
+            .map(StoredProviderCatalogEndpointIdentity::from)
+            .collect())
     }
 
     async fn list_keys_by_ids(

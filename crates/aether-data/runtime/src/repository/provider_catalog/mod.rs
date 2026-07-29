@@ -4,9 +4,11 @@ mod memory;
 pub(crate) use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
     ProviderCatalogSnapshot, ProviderCatalogUpstreamMetadataNamespaceUpdate,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogWriteRepository, StoredProviderCatalogAuthorizationSnapshot,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogProviderIdentity,
 };
 #[cfg(feature = "mysql")]
 pub use aether_data_mysql::MysqlProviderCatalogReadRepository;
