@@ -408,6 +408,7 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260716000000,
             20260718000000,
             20260718010000,
+            20260718020000,
             20260720000000,
             20260727000000,
             20260731000000,
@@ -788,6 +789,9 @@ fn empty_database_snapshot_sql_includes_payment_gateway_and_plans() {
         .contains("purchase_limit_scope character varying(32) DEFAULT 'active_period'"));
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL
         .contains("CREATE TABLE IF NOT EXISTS public.user_plan_entitlements"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("'module.wallet.enabled'"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("'module.billing_plans.enabled'"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("'false'::json"));
 }
 
 #[test]
@@ -1059,6 +1063,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260527000000,
             20260528000000,
             20260528020000,
+            20260718000000,
             20260725010000,
             20260725020000,
             20260725030000,
@@ -1091,6 +1096,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260527000000,
             20260528000000,
             20260528020000,
+            20260718000000,
             20260725000000,
             20260725010000,
             20260725020000,
@@ -2201,6 +2207,7 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260716000000,
             20260718000000,
             20260718010000,
+            20260718020000,
             20260720000000,
             20260727000000,
             20260731000000,
@@ -2312,6 +2319,88 @@ async fn sqlite_migrations_create_core_config_tables() {
         upstream_is_stream_exists, 1,
         "missing sqlite usage.upstream_is_stream"
     );
+}
+
+#[tokio::test]
+async fn commerce_module_migration_preserves_upgrade_billing_and_new_install_defaults() {
+    const MIGRATION_VERSION: i64 = 20260718000000;
+
+    let fresh_pool = SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("fresh sqlite pool should connect");
+    super::run_sqlite_migrations(&fresh_pool)
+        .await
+        .expect("fresh sqlite migrations should run");
+
+    for key in ["module.wallet.enabled", "module.billing_plans.enabled"] {
+        let value: String = query_scalar("SELECT value FROM system_configs WHERE key = ?")
+            .bind(key)
+            .fetch_one(&fresh_pool)
+            .await
+            .expect("fresh commerce module flag should exist");
+        assert_eq!(value, "false", "fresh installation should disable {key}");
+    }
+    let fresh_marker_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_aether_fresh_installation'",
+    )
+    .fetch_one(&fresh_pool)
+    .await
+    .expect("fresh installation marker lookup should succeed");
+    assert_eq!(fresh_marker_count, 0, "fresh marker should be cleaned up");
+
+    let upgrade_pool = SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("upgrade sqlite pool should connect");
+    super::run_sqlite_migrations(&upgrade_pool)
+        .await
+        .expect("upgrade fixture migrations should run");
+    query("DELETE FROM system_configs WHERE key IN (?, ?)")
+        .bind("module.wallet.enabled")
+        .bind("module.billing_plans.enabled")
+        .execute(&upgrade_pool)
+        .await
+        .expect("upgrade fixture should remove new module flags");
+    query("DELETE FROM _sqlx_migrations WHERE version = ?")
+        .bind(MIGRATION_VERSION)
+        .execute(&upgrade_pool)
+        .await
+        .expect("commerce migration should be marked pending");
+
+    super::run_sqlite_migrations(&upgrade_pool)
+        .await
+        .expect("commerce upgrade migration should rerun");
+
+    for key in ["module.wallet.enabled", "module.billing_plans.enabled"] {
+        let value: String = query_scalar("SELECT value FROM system_configs WHERE key = ?")
+            .bind(key)
+            .fetch_one(&upgrade_pool)
+            .await
+            .expect("upgraded commerce module flag should exist");
+        assert_eq!(
+            value, "true",
+            "empty existing installation should preserve {key}"
+        );
+    }
+
+    query("UPDATE system_configs SET value = 'false' WHERE key = ?")
+        .bind("module.wallet.enabled")
+        .execute(&upgrade_pool)
+        .await
+        .expect("explicit wallet disable should persist");
+    query("DELETE FROM _sqlx_migrations WHERE version = ?")
+        .bind(MIGRATION_VERSION)
+        .execute(&upgrade_pool)
+        .await
+        .expect("commerce migration should be marked pending again");
+    super::run_sqlite_migrations(&upgrade_pool)
+        .await
+        .expect("commerce migration should remain idempotent");
+    let wallet_value: String =
+        query_scalar("SELECT value FROM system_configs WHERE key = 'module.wallet.enabled'")
+            .fetch_one(&upgrade_pool)
+            .await
+            .expect("explicit wallet flag should exist");
+    assert_eq!(wallet_value, "false");
 }
 
 #[tokio::test]

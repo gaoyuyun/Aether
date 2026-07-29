@@ -32,21 +32,39 @@
     </div>
 
     <div>
-      <!-- 内置工具 -->
+      <!-- 内置模块 -->
       <div
         v-if="filteredBuiltinTools.length > 0"
         class="mb-8"
       >
         <h3 class="text-sm font-semibold text-muted-foreground uppercase tracking-wider mb-4">
-          内置工具
+          内置模块
         </h3>
         <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
           <div
             v-for="tool in filteredBuiltinTools"
             :key="tool.name"
-            class="group relative border rounded-2xl p-6 transition-all duration-200 hover:shadow-lg border-border bg-card hover:border-primary/20 cursor-pointer"
+            class="group relative border rounded-2xl p-6 transition-all duration-200 hover:shadow-lg cursor-pointer"
+            :class="{
+              'bg-muted/40 border-muted': tool.module && !tool.module.available,
+              'border-primary/40 bg-gradient-to-br from-primary/5 to-primary/10 shadow-sm': tool.module?.active,
+              'border-border bg-card hover:border-primary/20': !tool.module?.active && tool.module?.available !== false,
+            }"
             @click="router.push(tool.href)"
           >
+            <div
+              v-if="tool.module"
+              class="absolute top-5 right-5"
+            >
+              <div
+                class="w-2.5 h-2.5 rounded-full ring-2 ring-offset-2 ring-offset-background"
+                :class="{
+                  'bg-green-500 ring-green-500/30': tool.module.active,
+                  'bg-gray-300 ring-gray-300/30': tool.module.available && !tool.module.enabled,
+                  'bg-red-400 ring-red-400/30': !tool.module.available,
+                }"
+              />
+            </div>
             <div class="flex items-start gap-4 mb-3">
               <div class="w-11 h-11 rounded-xl flex items-center justify-center shrink-0 transition-colors bg-primary/15 text-primary">
                 <component
@@ -54,7 +72,10 @@
                   class="w-5 h-5"
                 />
               </div>
-              <div class="flex-1 min-w-0 pt-1">
+              <div
+                class="flex-1 min-w-0 pt-1"
+                :class="{ 'pr-8': tool.module }"
+              >
                 <h4 class="font-semibold text-base truncate">
                   {{ tool.name }}
                 </h4>
@@ -63,7 +84,27 @@
             <p class="text-sm text-muted-foreground leading-relaxed line-clamp-2 min-h-[2.5rem]">
               {{ tool.description }}
             </p>
-            <div class="mt-5 pt-4 border-t border-border/50 flex items-center justify-end">
+            <div
+              class="mt-5 pt-4 border-t border-border/50 flex items-center"
+              :class="tool.module ? 'justify-between' : 'justify-end'"
+            >
+              <div
+                v-if="tool.module"
+                class="flex items-center gap-3"
+                @click.stop
+              >
+                <Switch
+                  :model-value="tool.module.enabled"
+                  :disabled="!tool.module.available || toggling[tool.module.name]"
+                  @update:model-value="(val: boolean) => toggleModule(tool.module.name, val)"
+                />
+                <span
+                  class="text-sm"
+                  :class="tool.module.enabled ? 'text-foreground' : 'text-muted-foreground'"
+                >
+                  {{ tool.module.enabled ? '启用' : '禁用' }}
+                </span>
+              </div>
               <Button
                 variant="outline"
                 size="sm"
@@ -181,7 +222,7 @@
             <div class="flex items-center gap-3">
               <Switch
                 :model-value="module.enabled"
-                :disabled="!module.available || !module.config_validated || toggling[module.name]"
+                :disabled="!module.available || (!module.config_validated && !module.enabled) || toggling[module.name]"
                 @update:model-value="(val: boolean) => toggleModule(module.name, val)"
               />
               <div class="flex flex-col">
@@ -275,14 +316,24 @@ const moduleOrder = ref<string[]>([])
 const orderSaving = ref(false)
 const draggedModuleName = ref<string | null>(null)
 const dragOverModuleName = ref<string | null>(null)
-const BUILTIN_BACKING_MODULES = new Set(['important_notification'])
+const BUILTIN_BACKING_MODULES = new Set([
+  'important_notification',
+  ...BUILTIN_TOOLS.flatMap(tool => tool.moduleName ? [tool.moduleName] : []),
+])
 
-// 过滤后的内置工具
+const builtinTools = computed(() => BUILTIN_TOOLS.map(tool => ({
+  ...tool,
+  module: tool.moduleName ? moduleStore.modules[tool.moduleName] ?? null : null,
+})))
+
+// 过滤后的内置模块
 const filteredBuiltinTools = computed(() => {
-  if (!searchQuery.value.trim()) return BUILTIN_TOOLS
+  if (!searchQuery.value.trim()) return builtinTools.value
   const query = searchQuery.value.toLowerCase()
-  return BUILTIN_TOOLS.filter(
-    t => t.name.toLowerCase().includes(query) || t.description.toLowerCase().includes(query)
+  return builtinTools.value.filter(
+    t => t.name.toLowerCase().includes(query) ||
+      t.description.toLowerCase().includes(query) ||
+      t.module?.name.toLowerCase().includes(query)
   )
 })
 

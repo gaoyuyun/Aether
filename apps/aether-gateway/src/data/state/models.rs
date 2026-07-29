@@ -2,12 +2,12 @@ use super::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
     DataLayerError, GatewayDataState, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
     PublicGlobalModelQuery, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
-    StoredAdminProviderModel, StoredApiFormatCandidateRowsQuery,
-    StoredGlobalModelIdentity, StoredMinimalCandidateSelectionRow,
-    StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
-    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
-    StoredPublicGlobalModel, StoredPublicGlobalModelPage, StoredRequestedModelCandidateRowsQuery,
-    UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    StoredAdminProviderModel, StoredApiFormatCandidateRowsQuery, StoredGlobalModelIdentity,
+    StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateRowsByKeyIdsQuery,
+    StoredPoolKeyCandidateRowsQuery, StoredProviderActiveGlobalModel, StoredProviderModelStats,
+    StoredPublicCatalogModel, StoredPublicGlobalModel, StoredPublicGlobalModelPage,
+    StoredRequestedModelCandidateRowsQuery, UpdateAdminGlobalModelRecord,
+    UpsertAdminProviderModelRecord,
 };
 
 impl GatewayDataState {

@@ -5,6 +5,7 @@ import apiClient from '@/api/client'
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
 import { getErrorStatus } from '@/types/api-error'
+import { useModuleStore } from '@/stores/modules'
 
 export const useAuthStore = defineStore('auth', () => {
   const CURRENT_USER_FAILURE_BACKOFF_MS = 15_000
@@ -30,6 +31,8 @@ export const useAuthStore = defineStore('auth', () => {
   function markAuthStateChanged() {
     authStateVersion += 1
     resetCurrentUserFailure()
+    // Module status contains role-specific data and must not survive an identity change.
+    useModuleStore().reset()
   }
 
   const isAuthenticated = computed(() => {

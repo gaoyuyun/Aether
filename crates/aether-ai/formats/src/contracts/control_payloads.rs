@@ -64,6 +64,8 @@ mod tests {
                 balance_remaining: Some(12.5),
                 access_allowed: true,
                 api_key_is_standalone: false,
+                wallet_billing_enabled: false,
+                billing_plans_enabled: false,
             }),
         );
 

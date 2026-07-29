@@ -171,6 +171,30 @@ pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
         admin_menu_order: 70,
     },
     AdminModuleDefinition {
+        name: "wallet",
+        display_name: "钱包管理",
+        description: "管理用户钱包、充值和额度结算；关闭后用户按无限额度运行",
+        category: "integration",
+        env_key: "WALLET_AVAILABLE",
+        default_available: true,
+        admin_route: Some("/admin/wallets"),
+        admin_menu_icon: Some("Wallet"),
+        admin_menu_group: Some("management"),
+        admin_menu_order: 65,
+    },
+    AdminModuleDefinition {
+        name: "billing_plans",
+        display_name: "套餐管理",
+        description: "配置每日额度和会员权益套餐；需要先启用钱包管理",
+        category: "integration",
+        env_key: "BILLING_PLANS_AVAILABLE",
+        default_available: true,
+        admin_route: Some("/admin/billing-plans"),
+        admin_menu_icon: Some("Package"),
+        admin_menu_group: Some("management"),
+        admin_menu_order: 66,
+    },
+    AdminModuleDefinition {
         name: "referral",
         display_name: "邀请返利",
         description: "管理用户邀请关系与返利记录，支持比例返利和人头返利",
@@ -361,7 +385,7 @@ pub(crate) async fn build_admin_module_status_payload(
     } else {
         false
     };
-    let (config_validated, config_error) = if available {
+    let (mut config_validated, mut config_error) = if available {
         build_admin_module_validation_result(module, runtime)
     } else {
         (false, None)
@@ -371,6 +395,20 @@ pub(crate) async fn build_admin_module_status_payload(
     } else {
         "unknown"
     };
+    if module.name == "billing_plans" {
+        let wallet_available = admin_module_by_name("wallet").is_some_and(admin_module_available);
+        let wallet_enabled = wallet_available
+            && state
+                .read_system_config_json_value(crate::commerce_modules::WALLET_MODULE_CONFIG_KEY)
+                .await?
+                .as_ref()
+                .map(|value| system_config_bool(Some(value), false))
+                .unwrap_or(false);
+        if !wallet_enabled {
+            config_validated = false;
+            config_error = Some("请先启用钱包管理模块".to_string());
+        }
+    }
     Ok(admin_system_kernel::build_admin_module_status_payload(
         module.name,
         module.display_name,

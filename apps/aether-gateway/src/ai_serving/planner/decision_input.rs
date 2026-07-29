@@ -1234,6 +1234,8 @@ mod tests {
             balance_remaining: None,
             access_allowed: true,
             api_key_is_standalone: false,
+            wallet_billing_enabled: false,
+            billing_plans_enabled: false,
         }
     }
 

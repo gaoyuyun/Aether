@@ -91,3 +91,21 @@ pub(crate) async fn build_public_auth_modules_status_payload(
 
     Ok(serde_json::Value::Array(items))
 }
+
+pub(crate) async fn build_public_runtime_modules_status_payload(
+    state: &AppState,
+) -> Result<serde_json::Value, GatewayError> {
+    let policy = crate::commerce_modules::commerce_billing_policy(state).await?;
+    Ok(json!([
+        {
+            "name": "wallet",
+            "display_name": "钱包管理",
+            "active": policy.wallet_enabled,
+        },
+        {
+            "name": "billing_plans",
+            "display_name": "套餐管理",
+            "active": policy.billing_plans_enabled,
+        }
+    ]))
+}

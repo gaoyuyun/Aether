@@ -77,6 +77,12 @@ Docker Compose 部署后，可在部署目录直接执行：
 
 标准 Docker Compose 使用 Docker named volumes 存放 Postgres/Redis/MySQL 数据；Single Node 使用部署目录下的 `./data` 存放 SQLite 数据。
 
+### 商业模块开关运维约定
+
+钱包和套餐开关面向个人及小范围单节点部署，按维护操作处理，不支持在持续业务流量下热切换。变更前应先停止入口流量并等待在途请求结束，变更完成后重启应用再恢复流量。若明确选择不重启，应在最后一次变更成功后继续保持流量停止至少 60 秒。多实例部署需要停止并重启全部应用实例。
+
+详细步骤和缓存边界见 [商业模块维护手册](docs/operations/commerce-modules-runbook.md)。
+
 如果是本地源码构建镜像的部署，继续使用：
 
 ```bash

@@ -348,11 +348,21 @@ pub(crate) async fn handle_auth_me(
             )
         }
     };
-    build_auth_json_response(
-        http::StatusCode::OK,
-        build_auth_me_payload(&auth.user, wallet.as_ref(), feature_settings),
-        None,
-    )
+    let wallet_enabled = match crate::commerce_modules::wallet_module_enabled(state).await {
+        Ok(value) => value,
+        Err(err) => {
+            return build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("wallet module status lookup failed: {err:?}"),
+                false,
+            )
+        }
+    };
+    let mut payload = build_auth_me_payload(&auth.user, wallet.as_ref(), feature_settings);
+    if !wallet_enabled {
+        crate::commerce_modules::mark_wallet_summary_unlimited(&mut payload["billing"]);
+    }
+    build_auth_json_response(http::StatusCode::OK, payload, None)
 }
 
 pub(super) async fn handle_auth_refresh(

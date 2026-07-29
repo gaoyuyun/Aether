@@ -1,4 +1,4 @@
-import { Mail, Shield, AlertTriangle, BellRing } from 'lucide-vue-next'
+import { Mail, Shield, AlertTriangle, BellRing, Package, Wallet } from 'lucide-vue-next'
 import type { LucideIcon } from 'lucide-vue-next'
 
 export interface BuiltinTool {
@@ -6,9 +6,24 @@ export interface BuiltinTool {
   description: string
   href: string
   icon: LucideIcon
+  moduleName?: string
 }
 
 export const BUILTIN_TOOLS: BuiltinTool[] = [
+  {
+    name: '钱包管理',
+    description: '管理用户钱包、充值和额度结算；关闭后用户按无限额度运行',
+    href: '/admin/wallets',
+    icon: Wallet,
+    moduleName: 'wallet',
+  },
+  {
+    name: '套餐管理',
+    description: '配置每日额度和会员权益套餐；需要先启用钱包管理',
+    href: '/admin/billing-plans',
+    icon: Package,
+    moduleName: 'billing_plans',
+  },
   {
     name: '邮件配置',
     description: '配置 SMTP 邮件服务，管理邮件模板和发送设置',

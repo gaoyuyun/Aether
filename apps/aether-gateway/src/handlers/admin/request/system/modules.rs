@@ -1,6 +1,6 @@
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::system::shared::modules as admin_system_modules;
-use crate::handlers::shared::module_available_from_env;
+use crate::handlers::shared::{module_available_from_env, system_config_bool};
 use crate::GatewayError;
 use axum::{body::Bytes, http};
 use serde_json::json;
@@ -69,6 +69,27 @@ impl<'a> AdminAppState<'a> {
 
         let runtime = admin_system_modules::build_admin_module_runtime_state(self).await?;
         if payload.enabled {
+            if module.name == "billing_plans" {
+                let wallet_available = admin_system_modules::admin_module_by_name("wallet")
+                    .is_some_and(|wallet| {
+                        module_available_from_env(wallet.env_key, wallet.default_available)
+                    });
+                let wallet_enabled = wallet_available
+                    && self
+                        .read_system_config_json_value(
+                            crate::commerce_modules::WALLET_MODULE_CONFIG_KEY,
+                        )
+                        .await?
+                        .as_ref()
+                        .map(|value| system_config_bool(Some(value), false))
+                        .unwrap_or(false);
+                if !wallet_enabled {
+                    return Ok(Err((
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "请先启用钱包管理模块" }),
+                    )));
+                }
+            }
             let (config_validated, config_error) =
                 admin_system_modules::build_admin_module_validation_result(module, &runtime);
             if !config_validated {

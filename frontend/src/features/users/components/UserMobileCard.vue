@@ -20,6 +20,7 @@
       />
 
       <UserWalletSummary
+        v-if="walletEnabled"
         :row="row"
         mobile
       />
@@ -53,6 +54,8 @@
       <UserActionButtons
         :can-operate-admin="canOperateAdmin"
         :is-active="row.user.is_active"
+        :wallet-enabled="walletEnabled"
+        :billing-plans-enabled="billingPlansEnabled"
         mobile
         @edit="$emit('edit')"
         @wallet="$emit('wallet')"
@@ -80,6 +83,8 @@ defineProps<{
   selected: boolean
   selectionDisabled: boolean
   canOperateAdmin: boolean
+  walletEnabled: boolean
+  billingPlansEnabled: boolean
 }>()
 
 defineEmits<{
