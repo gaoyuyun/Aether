@@ -58,4 +58,16 @@ describe('ProviderDetailDrawer loading priorities', () => {
   it('marks a transport-error stop policy as a configured failover rule', () => {
     expect(source).toContain('rules.stop_on_transport_errors === true')
   })
+
+  it('applies a saved key snapshot before refreshing the provider data', () => {
+    const handler = source
+      .split('async function handleKeyChanged(updatedKey?: EndpointAPIKey) {')[1]
+      ?.split('// 切换密钥启用状态')[0]
+
+    expect(handler).toBeTruthy()
+    expect(handler).toContain('providerKeys.value[keyIndex] = updatedKey')
+    expect(handler).toContain('editingKey.value = updatedKey')
+    expect(handler?.indexOf('providerKeys.value[keyIndex] = updatedKey'))
+      .toBeLessThan(handler?.indexOf('await Promise.all([loadEndpoints(), loadMappingPreview()])') ?? -1)
+  })
 })

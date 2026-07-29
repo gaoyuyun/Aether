@@ -99,6 +99,7 @@ vi.mock('@/components/ui', async () => {
       return () => h('input', {
         ...attrs,
         type: 'checkbox',
+        'data-switch': 'true',
         checked: props.modelValue,
         onChange: (event: Event) => emit('update:modelValue', (event.target as HTMLInputElement).checked),
       })
@@ -270,6 +271,11 @@ function findInput(root: HTMLElement, id: string) {
 function updateInput(input: HTMLInputElement, value: string) {
   input.value = value
   input.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+function updateSwitch(input: HTMLInputElement, checked: boolean) {
+  input.checked = checked
+  input.dispatchEvent(new Event('change', { bubbles: true }))
 }
 
 function updateTextarea(textarea: HTMLTextAreaElement, value: string) {
@@ -484,5 +490,90 @@ describe('provider key concurrent_limit form behavior', () => {
     expect(payload.concurrent_limit).toBe(0)
     expect(typeof payload.concurrent_limit).toBe('number')
     expect(payload.rpm_limit).toBe(11)
+  })
+})
+
+describe('provider key model fetch configuration feedback', () => {
+  it('emits the persisted normal key snapshot after updating model fetch rules', async () => {
+    const onSaved = vi.fn()
+    const updatedKey = createProviderKey({
+      auto_fetch_models: true,
+      model_include_patterns: ['gpt-*'],
+      model_exclude_patterns: ['*-preview'],
+      last_models_fetch_error: 'upstream unavailable',
+    })
+    endpointMocks.updateProviderKey.mockResolvedValue(updatedKey)
+
+    const root = mountDialog(KeyFormDialog, {
+      open: true,
+      endpoint: null,
+      editingKey: createProviderKey(),
+      providerId: 'provider-1',
+      providerType: 'openai',
+      availableApiFormats: ['openai:chat'],
+      onSaved,
+    })
+    await settle()
+
+    updateSwitch(root.querySelector<HTMLInputElement>('[data-switch="true"]') as HTMLInputElement, true)
+    await settle()
+    updateInput(
+      root.querySelector<HTMLInputElement>('input[placeholder="gpt-*, claude-*, 留空包含全部"]') as HTMLInputElement,
+      'gpt-*',
+    )
+    updateInput(
+      root.querySelector<HTMLInputElement>('input[placeholder="*-preview, *-beta"]') as HTMLInputElement,
+      '*-preview',
+    )
+    await submit(root)
+
+    expect(endpointMocks.updateProviderKey).toHaveBeenCalledWith(
+      'provider-key-1',
+      expect.objectContaining({
+        auto_fetch_models: true,
+        model_include_patterns: ['gpt-*'],
+        model_exclude_patterns: ['*-preview'],
+      }),
+    )
+    expect(onSaved).toHaveBeenCalledWith(updatedKey)
+  })
+
+  it('emits the persisted OAuth key snapshot after switching to manual models', async () => {
+    const onSaved = vi.fn()
+    const editingKey = createProviderKey({
+      id: 'oauth-key-models',
+      auth_type: 'oauth',
+      auto_fetch_models: true,
+      allowed_models: ['gpt-5'],
+      model_include_patterns: ['gpt-*'],
+      model_exclude_patterns: ['*-preview'],
+    })
+    const updatedKey = createProviderKey({
+      ...editingKey,
+      auto_fetch_models: false,
+      allowed_models: null,
+    })
+    endpointMocks.updateProviderKey.mockResolvedValue(updatedKey)
+
+    const root = mountDialog(OAuthKeyEditDialog, {
+      open: true,
+      editingKey,
+      onSaved,
+    })
+    await settle()
+
+    updateSwitch(root.querySelector<HTMLInputElement>('[data-switch="true"]') as HTMLInputElement, false)
+    await submit(root)
+
+    expect(endpointMocks.updateProviderKey).toHaveBeenCalledWith(
+      'oauth-key-models',
+      expect.objectContaining({
+        auto_fetch_models: false,
+        allowed_models: null,
+        model_include_patterns: ['gpt-*'],
+        model_exclude_patterns: ['*-preview'],
+      }),
+    )
+    expect(onSaved).toHaveBeenCalledWith(updatedKey)
   })
 })

@@ -877,7 +877,21 @@ WHERE request_id = 'request-1'
 
         assert_eq!(settlement.billing_status, "settled");
         assert_eq!(settlement.wallet_id, None);
-        assert_eq!(settlement.provider_monthly_used_usd, Some(11.0));
+        assert_eq!(settlement.provider_monthly_used_usd, None);
+
+        let provider_delta: (i64, f64) = sqlx::query_as(
+            r#"
+SELECT COUNT(*), CAST(COALESCE(SUM(total_cost_usd_delta), 0) AS REAL)
+FROM usage_counter_deltas
+WHERE request_id = 'request-1'
+  AND kind = 'provider_monthly'
+  AND target_id = 'provider-1'
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("provider delta should load");
+        assert_eq!(provider_delta, (1, 6.0));
 
         let wallet_total: f64 =
             sqlx::query_scalar("SELECT balance + gift_balance FROM wallets WHERE id = 'wallet-1'")

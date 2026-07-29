@@ -217,7 +217,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
-  saved: []
+  saved: [key: EndpointAPIKey]
 }>()
 
 const { success, error: showError } = useToast()
@@ -390,9 +390,9 @@ async function handleSave() {
       model_exclude_patterns: parsePatternText(form.value.model_exclude_patterns_text)
     }
 
-    await updateProviderKey(props.editingKey.id, updateData)
+    const updated = await updateProviderKey(props.editingKey.id, updateData)
     success('账号已更新', '成功')
-    emit('saved')
+    emit('saved', updated)
     emit('close')
   } catch (err: unknown) {
     const errorMessage = parseApiError(err, '保存失败')

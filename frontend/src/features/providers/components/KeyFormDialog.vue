@@ -407,7 +407,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
-  saved: []
+  saved: [key?: EndpointAPIKey]
 }>()
 
 const { success, error: showError } = useToast()
@@ -1001,11 +1001,12 @@ async function handleSave() {
         updateData.auth_config = authConfig
       }
 
-      await updateProviderKey(props.editingKey.id, updateData)
+      const updated = await updateProviderKey(props.editingKey.id, updateData)
       success(legacyT('密钥已更新'), legacyT('成功'))
+      emit('saved', updated)
     } else {
       // 新增模式
-      await addProviderKey(props.providerId, {
+      const created = await addProviderKey(props.providerId, {
         api_formats: form.value.api_formats,
         api_key: form.value.api_key,
         auth_type: form.value.auth_type,
@@ -1027,12 +1028,11 @@ async function handleSave() {
 
       success(legacyT('密钥已添加'), legacyT('成功'))
       // 添加模式：不关闭对话框，只清除名称和密钥以便继续添加
-      emit('saved')
+      emit('saved', created)
       clearForNextAdd()
       return
     }
 
-    emit('saved')
     emit('close')
   } catch (err: unknown) {
     const errorMessage = parseApiError(err, legacyT('保存密钥失败'))

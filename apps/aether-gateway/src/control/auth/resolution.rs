@@ -778,7 +778,7 @@ pub(crate) async fn refresh_execution_runtime_auth_context_with_snapshot(
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
         state
             .data
-            .read_auth_api_key_snapshot_with_commerce_policy(
+            .read_auth_api_key_snapshot_strong_with_commerce_policy(
                 &auth_context.user_id,
                 &auth_context.api_key_id,
                 current_unix_secs(),
@@ -954,7 +954,7 @@ pub(super) async fn resolve_data_backed_auth_context(
                 let _permit = state.acquire_auth_snapshot_load_gate().await?;
                 state
                     .data
-                    .read_auth_api_key_snapshot_by_key_hash_with_commerce_policy(
+                    .read_auth_api_key_snapshot_by_key_hash_strong_with_commerce_policy(
                         &key_hash,
                         now_unix_secs,
                         commerce_policy,
@@ -1081,7 +1081,7 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
         state
             .data
-            .read_auth_api_key_snapshot_with_commerce_policy(
+            .read_auth_api_key_snapshot_strong_with_commerce_policy(
                 user_id,
                 api_key_id,
                 now_unix_secs,
@@ -1157,7 +1157,7 @@ async fn resolve_trusted_auth_context(
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
         state
             .data
-            .read_auth_api_key_snapshot_with_commerce_policy(
+            .read_auth_api_key_snapshot_strong_with_commerce_policy(
                 &trusted_headers.user_id,
                 &trusted_headers.api_key_id,
                 now_unix_secs,

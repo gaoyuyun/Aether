@@ -769,7 +769,7 @@ VALUES (
     let imported = import_sqlite_jsonl(&target_pool, &encoded)
         .await
         .expect("sqlite import should load exported rows");
-    assert_eq!(imported, 20);
+    assert_eq!(imported, 22);
 
     let imported_api_key =
         sqlx::query_as::<_, (String,)>("SELECT key_encrypted FROM api_keys WHERE id = 'api-key-1'")
@@ -869,7 +869,7 @@ WHERE request_id = 'request-1'
         let imported = import_postgres_jsonl(&postgres_pool, &encoded)
             .await
             .expect("postgres import should load exported rows");
-        assert_eq!(imported, 20);
+        assert_eq!(imported, 22);
 
         let imported_api_key = sqlx::query_as::<_, (String,)>(
             "SELECT key_encrypted FROM api_keys WHERE id = 'api-key-1'",

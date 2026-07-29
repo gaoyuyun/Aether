@@ -122,27 +122,34 @@ pub(super) async fn maybe_handle(
     let should_overwrite_allowed_models_immediately =
         admin_provider_key_update_requires_immediate_model_fetch(&existing_key, &updated);
     let updated = if should_overwrite_allowed_models_immediately {
-        let summary =
-            perform_model_fetch_for_key(state.as_ref(), &provider.id, &updated.id).await?;
-        if summary.succeeded == 0 {
-            let detail = state
-                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id))
-                .await?
-                .into_iter()
-                .next()
-                .and_then(|key| key.last_models_fetch_error)
-                .unwrap_or_else(|| "未获取到可用上游模型".to_string());
-            return Err(GatewayError::Internal(format!(
-                "开启自动获取模型后同步上游模型失败: {detail}"
-            )));
-        }
-
-        state
+        let fetch_result =
+            perform_model_fetch_for_key(state.as_ref(), &provider.id, &updated.id).await;
+        let refreshed = state
             .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id))
             .await?
             .into_iter()
             .next()
-            .unwrap_or(updated)
+            .unwrap_or(updated);
+        match fetch_result {
+            Ok(summary) if summary.succeeded == 0 => {
+                tracing::warn!(
+                    provider_id = %provider.id,
+                    key_id = %key_id,
+                    error = refreshed.last_models_fetch_error.as_deref().unwrap_or("未获取到可用上游模型"),
+                    "gateway admin provider key update: saved configuration but immediate model fetch did not succeed"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    provider_id = %provider.id,
+                    key_id = %key_id,
+                    error = ?err,
+                    "gateway admin provider key update: saved configuration but immediate model fetch failed"
+                );
+            }
+            _ => {}
+        }
+        refreshed
     } else {
         updated
     };
