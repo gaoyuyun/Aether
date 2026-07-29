@@ -1467,6 +1467,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     const totalCost = userRecords.reduce((sum, r) => sum + r.cost, 0)
     const totalActualCost = userRecords.reduce((sum, r) => sum + (r.actual_cost || 0), 0)
     const avgResponseTime = userRecords.filter(r => r.response_time_ms).reduce((sum, r) => sum + (r.response_time_ms || 0), 0) / userRecords.filter(r => r.response_time_ms).length / 1000
+    const providerVisibilityEnabled = mockSystemConfigValue('show_provider_in_user_usage') !== false
 
     // 按模型聚合
     const modelStats = new Map<string, { requests: number; input_tokens: number; output_tokens: number; total_tokens: number; total_cost_usd: number; actual_total_cost_usd: number }>()
@@ -1489,6 +1490,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
       total_cost: Number((totalCost * 20).toFixed(2)),
       total_actual_cost: Number((totalActualCost * 20).toFixed(2)),
       avg_response_time: Number(avgResponseTime.toFixed(2)) || 1.23,
+      provider_visibility_enabled: providerVisibilityEnabled,
       billing: {
         id: 'wallet-demo-user',
         balance: Number((100 - totalCost * 20).toFixed(2)),
@@ -1517,7 +1519,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
       })),
       records: userRecords.slice(0, 10).map(r => ({
         id: r.id,
-        provider: r.provider,
+        ...(providerVisibilityEnabled ? { provider: r.provider } : {}),
         model: r.model,
         input_tokens: r.input_tokens,
         output_tokens: r.output_tokens,

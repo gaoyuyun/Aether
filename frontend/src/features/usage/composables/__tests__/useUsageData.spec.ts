@@ -121,6 +121,34 @@ describe('useUsageData', () => {
     expect(totalRecords.value).toBe(1)
   })
 
+  it('tracks provider visibility from the current-user usage response', async () => {
+    const isAdminPage = ref(false)
+    meGetUsageMock.mockResolvedValueOnce({
+      total_requests: 1,
+      total_tokens: 15,
+      total_cost: 0.01,
+      avg_response_time: 1,
+      provider_visibility_enabled: true,
+      records: [buildUsageRecord({ provider: 'OpenAI' })],
+      pagination: { total: 1 },
+      summary_by_model: [],
+      summary_by_api_format: [],
+    })
+
+    const {
+      loadStats,
+      currentRecords,
+      availableProviders,
+      providerVisibilityEnabled,
+    } = useUsageData({ isAdminPage })
+
+    await loadStats({ preset: 'today', tz_offset_minutes: 0 })
+
+    expect(providerVisibilityEnabled.value).toBe(true)
+    expect(currentRecords.value[0]?.provider).toBe('OpenAI')
+    expect(availableProviders.value).toEqual(['OpenAI'])
+  })
+
   it('keeps locally resolved failure fields when a stale active record refreshes', async () => {
     const isAdminPage = ref(true)
     const { loadRecords, currentRecords } = useUsageData({ isAdminPage })

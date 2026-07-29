@@ -21,7 +21,7 @@
           <Input
             id="usage-records-search"
             v-model="localSearch"
-            :placeholder="isAdmin ? '搜索用户/密钥' : '搜索密钥/模型'"
+            :placeholder="isAdmin ? '搜索用户/密钥' : (showProvider ? '搜索密钥/模型/Provider' : '搜索密钥/模型')"
             class="h-8 w-full text-xs border-border/60 pl-8"
           />
         </div>
@@ -95,9 +95,9 @@
           </SelectContent>
         </Select>
 
-        <!-- 提供商筛选（仅管理员可见） -->
+        <!-- 提供商筛选 -->
         <Select
-          v-if="isAdmin"
+          v-if="showProvider"
           :model-value="filterProvider"
           @update:model-value="$emit('update:filterProvider', $event)"
         >
@@ -330,19 +330,45 @@
           </template>
         </div>
 
-        <!-- 第三行：用户 + 提供商 -->
+        <!-- 第三行：管理员显示用户与 Provider，普通用户仅显示 Provider -->
         <div
-          v-if="isAdmin"
+          v-if="isAdmin || showProvider"
           class="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] leading-3.5 text-muted-foreground"
         >
           <span
+            v-if="isAdmin"
             class="min-w-0 truncate"
             :title="formatRecordUserProviderLine(record)"
           >
             {{ formatRecordUserSegment(record) }}
           </span>
-          <span class="shrink-0 text-muted-foreground/40">·</span>
-          <span class="min-w-0 truncate">{{ formatRecordProviderSegment(record) }}</span>
+          <span
+            v-if="isAdmin && showProvider"
+            class="shrink-0 text-muted-foreground/40"
+          >·</span>
+          <span
+            v-if="showProvider"
+            data-usage-provider-mobile
+            class="min-w-0 truncate"
+            :title="record.provider || '-'"
+          >
+            <span v-if="!isAdmin">Provider:</span>
+            {{ isAdmin ? formatRecordProviderSegment(record) : (record.provider || '-') }}
+          </span>
+          <Shuffle
+            v-if="showProvider && record.has_fallback"
+            data-usage-attempt-marker="fallback"
+            class="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400"
+            title="此请求发生了 Provider 故障转移"
+            aria-label="发生 Provider 故障转移"
+          />
+          <RefreshCcw
+            v-if="showProvider && record.has_retry"
+            data-usage-attempt-marker="retry"
+            class="h-3 w-3 shrink-0 text-blue-600 dark:text-blue-400"
+            title="此请求发生了重试"
+            aria-label="发生重试"
+          />
         </div>
 
         <!-- 第四行：性能指标 -->
@@ -448,19 +474,23 @@
       <colgroup v-else>
         <col
           v-if="isColumnVisible('time')"
-          class="w-[9%]"
+          :class="showProvider ? 'w-[8%]' : 'w-[9%]'"
         >
         <col
           v-if="isColumnVisible('key')"
-          class="w-[17%]"
+          :class="showProvider ? 'w-[14%]' : 'w-[17%]'"
         >
         <col
           v-if="isColumnVisible('model')"
-          class="w-[22%]"
+          :class="showProvider ? 'w-[16%]' : 'w-[22%]'"
+        >
+        <col
+          v-if="showProvider && isColumnVisible('provider')"
+          class="w-[14%]"
         >
         <col
           v-if="isColumnVisible('api_format')"
-          class="w-[14%]"
+          :class="showProvider ? 'w-[13%]' : 'w-[14%]'"
         >
         <col
           v-if="isColumnVisible('status')"
@@ -468,15 +498,15 @@
         >
         <col
           v-if="isColumnVisible('tokens')"
-          class="w-[11%]"
+          :class="showProvider ? 'w-[10%]' : 'w-[11%]'"
         >
         <col
           v-if="isColumnVisible('cost')"
-          class="w-[7%]"
+          :class="showProvider ? 'w-[6%]' : 'w-[7%]'"
         >
         <col
           v-if="isColumnVisible('performance')"
-          class="w-[10%]"
+          :class="showProvider ? 'w-[9%]' : 'w-[10%]'"
         >
         <col
           v-if="isColumnVisible('client_family')"
@@ -520,14 +550,15 @@
           </SortableTableHead>
           <TableHead
             v-if="!isAdmin && isColumnVisible('key')"
-            class="h-12 font-semibold w-[17%]"
+            class="h-12 font-semibold"
+            :class="showProvider ? 'w-[14%]' : 'w-[17%]'"
           >
             密钥
           </TableHead>
           <SortableTableHead
             v-if="isColumnVisible('model')"
             class="h-12 font-semibold"
-            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            :class="isAdmin ? 'w-[14%]' : (showProvider ? 'w-[16%]' : 'w-[22%]')"
             column-key="model"
             :sortable="false"
             :filter-active="filterModel !== '__all__'"
@@ -545,8 +576,9 @@
             </template>
           </SortableTableHead>
           <SortableTableHead
-            v-if="isAdmin && isColumnVisible('provider')"
-            class="h-12 font-semibold w-[16%]"
+            v-if="showProvider && isColumnVisible('provider')"
+            class="h-12 font-semibold"
+            :class="isAdmin ? 'w-[16%]' : 'w-[14%]'"
             column-key="provider"
             :sortable="false"
             :filter-active="filterProvider !== '__all__'"
@@ -566,7 +598,7 @@
           <SortableTableHead
             v-if="isColumnVisible('api_format')"
             class="h-12 font-semibold"
-            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            :class="isAdmin ? 'w-[15%]' : (showProvider ? 'w-[13%]' : 'w-[14%]')"
             column-key="api_format"
             :sortable="false"
             :filter-active="filterApiFormat !== '__all__'"
@@ -709,7 +741,8 @@
           <!-- 用户页面的密钥列 -->
           <TableCell
             v-if="!isAdmin && isColumnVisible('key')"
-            class="py-4 w-[17%]"
+            class="py-4"
+            :class="showProvider ? 'w-[14%]' : 'w-[17%]'"
             :title="record.api_key?.name || '-'"
           >
             <div class="flex flex-col text-xs gap-0.5">
@@ -725,7 +758,7 @@
           <TableCell
             v-if="isColumnVisible('model')"
             class="font-medium py-4"
-            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            :class="isAdmin ? 'w-[14%]' : (showProvider ? 'w-[16%]' : 'w-[22%]')"
             :title="getModelTooltip(record)"
           >
             <UsageModelDisplay
@@ -734,14 +767,16 @@
             />
           </TableCell>
           <TableCell
-            v-if="isAdmin && isColumnVisible('provider')"
-            class="py-4 w-[16%]"
+            v-if="showProvider && isColumnVisible('provider')"
+            data-usage-provider-cell
+            class="py-4"
+            :class="isAdmin ? 'w-[16%]' : 'w-[14%]'"
           >
             <div class="flex min-w-0 items-center gap-1">
               <div class="flex min-w-0 flex-col text-xs gap-0.5">
-                <span class="truncate">{{ record.provider }}</span>
+                <span class="truncate">{{ record.provider || '-' }}</span>
                 <span
-                  v-if="record.provider_key_name"
+                  v-if="isAdmin && record.provider_key_name"
                   class="text-muted-foreground truncate"
                   :title="record.provider_key_name"
                 >
@@ -771,7 +806,7 @@
           <TableCell
             v-if="isColumnVisible('api_format')"
             class="py-4"
-            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            :class="isAdmin ? 'w-[15%]' : (showProvider ? 'w-[13%]' : 'w-[14%]')"
             :title="getApiFormatTooltip(record)"
           >
             <!-- 有格式转换或同族格式差异：两行显示 -->
@@ -1087,11 +1122,13 @@ interface UsageRecordColumnOption {
   label: string
   adminOnly?: boolean
   userOnly?: boolean
+  requiresProviderVisibility?: boolean
 }
 
 const props = defineProps<{
   records: UsageRecord[]
   isAdmin: boolean
+  showProvider: boolean
   showActualCost: boolean
   loading: boolean
   // 时间范围
@@ -1141,7 +1178,7 @@ const USAGE_RECORD_COLUMN_OPTIONS: UsageRecordColumnOption[] = [
   { id: 'user', label: '用户', adminOnly: true },
   { id: 'key', label: '密钥', userOnly: true },
   { id: 'model', label: '模型' },
-  { id: 'provider', label: '提供商', adminOnly: true },
+  { id: 'provider', label: '提供商', requiresProviderVisibility: true },
   { id: 'api_format', label: 'API格式' },
   { id: 'status', label: '类型/状态' },
   { id: 'tokens', label: 'Tokens' },
@@ -1168,6 +1205,7 @@ const DEFAULT_USER_COLUMNS: UsageRecordColumnId[] = [
   'time',
   'key',
   'model',
+  'provider',
   'api_format',
   'status',
   'tokens',
@@ -1186,13 +1224,14 @@ const adminVisibleColumnIds = useLocalStorage<UsageRecordColumnId[]>(
   DEFAULT_ADMIN_COLUMNS,
 )
 const userVisibleColumnIds = useLocalStorage<UsageRecordColumnId[]>(
-  'usage-records-visible-columns-user',
+  'usage-records-visible-columns-user-v2',
   DEFAULT_USER_COLUMNS,
 )
 
 const roleColumnOptions = computed(() => USAGE_RECORD_COLUMN_OPTIONS.filter((column) => {
   if (column.adminOnly && !props.isAdmin) return false
   if (column.userOnly && props.isAdmin) return false
+  if (column.requiresProviderVisibility && !props.showProvider) return false
   return true
 }))
 
@@ -1240,7 +1279,7 @@ const desktopTableMinWidthClass = computed(() => {
   )).length
   if (metadataColumnCount >= 3) return 'min-w-[1520px]'
   if (metadataColumnCount > 0) return 'min-w-[1320px]'
-  return props.isAdmin ? 'min-w-[1120px]' : 'min-w-[960px]'
+  return props.isAdmin || props.showProvider ? 'min-w-[1120px]' : 'min-w-[960px]'
 })
 
 const columnSelectOptions = computed<MultiSelectOption[]>(() => roleColumnOptions.value.map(column => ({

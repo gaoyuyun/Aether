@@ -89,7 +89,7 @@ export interface UsageRecord {
     name: string | null
     display: string | null
   } | null
-  provider?: string  // 仅管理员可见
+  provider?: string
   api_key_name?: string
   provider_key_name?: string | null
   rate_multiplier?: number
