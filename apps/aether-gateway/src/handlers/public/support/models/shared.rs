@@ -88,20 +88,10 @@ fn auth_snapshot_allows_provider_for_models(
     provider_name: &str,
     provider_type: &str,
 ) -> bool {
-    let Some(allowed) = auth_snapshot
-        .and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_providers)
-    else {
+    let Some(auth_snapshot) = auth_snapshot else {
         return true;
     };
-
-    allowed.iter().any(|value| {
-        aether_scheduler_core::provider_matches_allowed_value(
-            value,
-            provider_id,
-            provider_name,
-            provider_type,
-        )
-    })
+    auth_snapshot.allows_provider(provider_id, provider_name, provider_type)
 }
 
 fn auth_snapshot_allows_model_for_models(

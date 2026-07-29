@@ -195,7 +195,45 @@ impl ResolvedAuthApiKeySnapshot {
         resolved
     }
 
-    pub fn effective_allowed_providers(&self) -> Option<&[String]> {
+    /// Provider allowlists that must **all** pass for a candidate (AND of layers).
+    ///
+    /// Each layer is an independent allowlist that may use provider id, name, or type
+    /// identifiers. Callers must not string-intersect layers; evaluate candidates with
+    /// [`Self::allows_provider`] (or equivalent semantic matching).
+    ///
+    /// - standalone: only the non-empty key layer (empty key list → unrestricted)
+    /// - non-standalone: key layer (including empty = deny-all) and user layer, both optional
+    pub fn provider_allowlist_layers(&self) -> [Option<&[String]>; 2] {
+        if self.api_key_is_standalone {
+            return [
+                non_empty_allowed_list(self.api_key_allowed_providers.as_deref()),
+                None,
+            ];
+        }
+        [
+            self.api_key_allowed_providers.as_deref(),
+            self.user_allowed_providers.as_deref(),
+        ]
+    }
+
+    /// Whether a concrete catalog provider is allowed under all policy layers.
+    pub fn allows_provider(
+        &self,
+        provider_id: &str,
+        provider_name: &str,
+        provider_type: &str,
+    ) -> bool {
+        for layer in self.provider_allowlist_layers() {
+            if !provider_allowlist_layer_allows(layer, provider_id, provider_name, provider_type) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Provider list preferred for display/export only: key-level when set, otherwise user-level.
+    /// This is not an authorization result because both layers may need to pass independently.
+    pub fn preferred_allowed_providers(&self) -> Option<&[String]> {
         if self.api_key_is_standalone {
             return non_empty_allowed_list(self.api_key_allowed_providers.as_deref());
         }
@@ -203,6 +241,13 @@ impl ResolvedAuthApiKeySnapshot {
         self.api_key_allowed_providers
             .as_deref()
             .or(self.user_allowed_providers.as_deref())
+    }
+
+    #[deprecated(
+        note = "not safe as an authorization result; use allows_provider/provider_allowlist_layers"
+    )]
+    pub fn effective_allowed_providers(&self) -> Option<&[String]> {
+        self.preferred_allowed_providers()
     }
 
     pub fn effective_allowed_api_formats(&self) -> Option<&[String]> {
@@ -243,10 +288,9 @@ impl ResolvedAuthApiKeySnapshot {
         if self.api_key_is_standalone {
             return;
         }
-        constrain_api_key_list_policy_to_user_policy(
-            &mut self.user_allowed_providers,
-            &mut self.api_key_allowed_providers,
-        );
+        // Providers intentionally keep both layers: user policy may use type/name while
+        // key policy stores catalog IDs. Authorization ANDs semantic matches across layers
+        // via `allows_provider` / `provider_allowlist_layers`.
         constrain_api_key_api_format_policy_to_user_policy(
             &mut self.user_allowed_api_formats,
             &mut self.api_key_allowed_api_formats,
@@ -260,6 +304,35 @@ impl ResolvedAuthApiKeySnapshot {
 
 fn non_empty_allowed_list(values: Option<&[String]>) -> Option<&[String]> {
     values.filter(|items| !items.is_empty())
+}
+
+/// Match a policy token against a concrete provider (id, display name, or type).
+fn provider_policy_value_matches(
+    allowed_value: &str,
+    provider_id: &str,
+    provider_name: &str,
+    provider_type: &str,
+) -> bool {
+    let allowed_value = allowed_value.trim();
+    !allowed_value.is_empty()
+        && (allowed_value.eq_ignore_ascii_case(provider_id.trim())
+            || allowed_value.eq_ignore_ascii_case(provider_name.trim())
+            || allowed_value.eq_ignore_ascii_case(provider_type.trim()))
+}
+
+fn provider_allowlist_layer_allows(
+    layer: Option<&[String]>,
+    provider_id: &str,
+    provider_name: &str,
+    provider_type: &str,
+) -> bool {
+    let Some(allowed) = layer else {
+        return true;
+    };
+    // Empty list is an explicit deny-all for that layer.
+    allowed.iter().any(|value| {
+        provider_policy_value_matches(value, provider_id, provider_name, provider_type)
+    })
 }
 
 fn constrain_api_key_list_policy_to_user_policy(
@@ -511,6 +584,7 @@ pub struct CreateUserApiKeyRecord {
     pub rate_limit: i32,
     pub concurrent_limit: Option<i32>,
     pub force_capabilities: Option<serde_json::Value>,
+    pub feature_settings: Option<serde_json::Value>,
     pub is_active: bool,
     pub expires_at_unix_secs: Option<u64>,
     pub auto_delete_on_expiry: bool,
@@ -519,7 +593,7 @@ pub struct CreateUserApiKeyRecord {
     pub total_cost_usd: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UpdateUserApiKeyBasicRecord {
     pub user_id: String,
     pub api_key_id: String,
@@ -527,6 +601,10 @@ pub struct UpdateUserApiKeyBasicRecord {
     pub rate_limit: Option<i32>,
     pub concurrent_limit: Option<i32>,
     pub ip_rules: Option<Option<Vec<String>>>,
+    /// `None` = leave unchanged; `Some(None)` = clear to inherit; `Some(Some(list))` = set.
+    pub allowed_providers: Option<Option<Vec<String>>>,
+    /// `None` = leave unchanged; `Some(None)` = clear; `Some(Some(value))` = set.
+    pub feature_settings: Option<Option<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -992,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn non_standalone_snapshot_intersects_api_key_and_user_allowed_lists() {
+    fn non_standalone_snapshot_keeps_provider_layers_and_ands_authorization() {
         let snapshot = StoredAuthApiKeySnapshot::new(
             "user-1".to_string(),
             "alice".to_string(),
@@ -1021,16 +1099,57 @@ mod tests {
         let resolved = ResolvedAuthApiKeySnapshot::from_stored(snapshot, 150);
 
         assert!(resolved.currently_usable);
+        // Prefer key list for effective display; do not collapse mixed identifier systems.
         assert_eq!(
-            resolved.effective_allowed_providers(),
-            Some(&["openai".to_string()][..])
+            resolved.preferred_allowed_providers(),
+            Some(&["anthropic".to_string(), "openai".to_string()][..])
         );
+        // Candidate must satisfy BOTH layers: key allows anthropic+openai tokens, user only openai.
+        assert!(resolved.allows_provider("provider-openai-1", "OpenAI Pool", "openai"));
+        assert!(!resolved.allows_provider("provider-claude-1", "Claude", "anthropic"));
         assert_eq!(resolved.effective_allowed_api_formats(), Some(&[][..]));
         assert_eq!(resolved.effective_allowed_models(), Some(&[][..]));
     }
 
     #[test]
-    fn applying_user_group_policy_keeps_non_standalone_key_at_intersection() {
+    fn non_standalone_key_provider_ids_work_with_user_type_policy() {
+        let snapshot = StoredAuthApiKeySnapshot::new(
+            "user-1".to_string(),
+            "alice".to_string(),
+            None,
+            "user".to_string(),
+            "local".to_string(),
+            true,
+            false,
+            Some(serde_json::json!(["openai"])),
+            None,
+            None,
+            "key-1".to_string(),
+            Some("default".to_string()),
+            true,
+            false,
+            false,
+            Some(60),
+            None,
+            None,
+            Some(serde_json::json!(["provider-openai-1"])),
+            None,
+            None,
+        )
+        .expect("snapshot should build");
+
+        let resolved = ResolvedAuthApiKeySnapshot::from_stored(snapshot, 150);
+        assert_eq!(
+            resolved.preferred_allowed_providers(),
+            Some(&["provider-openai-1".to_string()][..])
+        );
+        assert!(resolved.allows_provider("provider-openai-1", "OpenAI", "openai"));
+        assert!(!resolved.allows_provider("provider-openai-2", "OpenAI 2", "openai"));
+        assert!(!resolved.allows_provider("provider-claude-1", "Claude", "anthropic"));
+    }
+
+    #[test]
+    fn applying_user_group_policy_keeps_key_provider_layer_and_intersects_models() {
         let snapshot = StoredAuthApiKeySnapshot::new(
             "user-1".to_string(),
             "alice".to_string(),
@@ -1065,9 +1184,11 @@ mod tests {
         );
 
         assert_eq!(
-            resolved.effective_allowed_providers(),
-            Some(&["openai".to_string()][..])
+            resolved.preferred_allowed_providers(),
+            Some(&["openai".to_string(), "anthropic".to_string()][..])
         );
+        assert!(resolved.allows_provider("p-openai", "OpenAI", "openai"));
+        assert!(!resolved.allows_provider("p-claude", "Claude", "anthropic"));
         assert_eq!(
             resolved.effective_allowed_api_formats(),
             Some(&["openai:chat".to_string()][..])
@@ -1105,7 +1226,7 @@ mod tests {
         let resolved = ResolvedAuthApiKeySnapshot::from_stored(snapshot, 150);
 
         assert!(resolved.api_key_is_standalone);
-        assert_eq!(resolved.effective_allowed_providers(), None);
+        assert_eq!(resolved.preferred_allowed_providers(), None);
         assert_eq!(resolved.effective_allowed_api_formats(), None);
         assert_eq!(resolved.effective_allowed_models(), None);
     }
@@ -1140,7 +1261,7 @@ mod tests {
         let resolved = ResolvedAuthApiKeySnapshot::from_stored(snapshot, 150);
 
         assert_eq!(
-            resolved.effective_allowed_providers(),
+            resolved.preferred_allowed_providers(),
             Some(&["anthropic".to_string()][..])
         );
         assert_eq!(
@@ -1184,7 +1305,7 @@ mod tests {
 
         assert!(!resolved.api_key_is_standalone);
         assert_eq!(
-            resolved.effective_allowed_providers(),
+            resolved.preferred_allowed_providers(),
             Some(&["openai".to_string()][..])
         );
         assert_eq!(
@@ -1226,7 +1347,7 @@ mod tests {
 
         let resolved = ResolvedAuthApiKeySnapshot::from_stored(snapshot, 150);
 
-        assert_eq!(resolved.effective_allowed_providers(), Some(&[][..]));
+        assert_eq!(resolved.preferred_allowed_providers(), Some(&[][..]));
         assert_eq!(resolved.effective_allowed_api_formats(), Some(&[][..]));
         assert_eq!(resolved.effective_allowed_models(), Some(&[][..]));
     }
@@ -1260,7 +1381,7 @@ mod tests {
 
         let resolved = ResolvedAuthApiKeySnapshot::from_stored(snapshot, 150);
 
-        assert_eq!(resolved.effective_allowed_providers(), None);
+        assert_eq!(resolved.preferred_allowed_providers(), None);
         assert_eq!(resolved.effective_allowed_api_formats(), None);
         assert_eq!(resolved.effective_allowed_models(), None);
     }
@@ -1367,7 +1488,7 @@ mod tests {
             .expect("snapshot should exist");
 
         assert_eq!(
-            snapshot.effective_allowed_providers(),
+            snapshot.preferred_allowed_providers(),
             Some(&["openai".to_string()][..])
         );
         assert_eq!(

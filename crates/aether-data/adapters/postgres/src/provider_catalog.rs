@@ -14,9 +14,12 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
     ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
-    ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    ProviderCatalogWriteRepository,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogEndpointIdentity,
+    StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredProviderCatalogProviderIdentity,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -53,6 +56,17 @@ SELECT
   EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_unix_secs
 FROM providers
 WHERE id IN (
+"#;
+
+const LIST_PROVIDER_IDENTITIES_SQL: &str = r#"
+SELECT id, name, provider_type, provider_priority, is_active
+FROM providers
+"#;
+
+const LIST_ENDPOINT_IDENTITIES_BY_PROVIDER_IDS_PREFIX: &str = r#"
+SELECT provider_id, api_format, api_family, is_active
+FROM provider_endpoints
+WHERE provider_id IN (
 "#;
 
 const LIST_ENDPOINTS_BY_IDS_PREFIX: &str = r#"
@@ -660,6 +674,19 @@ impl SqlxProviderCatalogReadRepository {
         collect_query_rows(builder.build().fetch(&self.pool), map_provider_row).await
     }
 
+    pub async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        let mut builder = QueryBuilder::<Postgres>::new(LIST_PROVIDER_IDENTITIES_SQL);
+        let mut where_clause = WhereClause::new();
+        if active_only {
+            push_eq(&mut builder, &mut where_clause, "is_active", true);
+        }
+        builder.push(" ORDER BY provider_priority ASC, name ASC");
+        collect_query_rows(builder.build().fetch(&self.pool), map_provider_identity_row).await
+    }
+
     pub async fn list_endpoints_by_ids(
         &self,
         endpoint_ids: &[String],
@@ -736,6 +763,26 @@ impl SqlxProviderCatalogReadRepository {
             Err(error) => return Err(error),
         };
         Ok(rows)
+    }
+
+    pub async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        if provider_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        collect_query_rows(
+            build_list_query(
+                LIST_ENDPOINT_IDENTITIES_BY_PROVIDER_IDS_PREFIX,
+                provider_ids,
+                " AND api_format IS NOT NULL ORDER BY provider_id ASC, api_format ASC",
+            )
+            .build()
+            .fetch(&self.pool),
+            map_endpoint_identity_row,
+        )
+        .await
     }
 
     pub async fn list_keys_by_ids(
@@ -2780,6 +2827,13 @@ impl ProviderCatalogReadRepository for SqlxProviderCatalogReadRepository {
         Self::list_providers(self, active_only).await
     }
 
+    async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, DataLayerError> {
+        Self::list_provider_identities(self, active_only).await
+    }
+
     async fn list_providers_by_ids(
         &self,
         provider_ids: &[String],
@@ -2799,6 +2853,13 @@ impl ProviderCatalogReadRepository for SqlxProviderCatalogReadRepository {
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogEndpoint>, DataLayerError> {
         Self::list_endpoints_by_provider_ids(self, provider_ids).await
+    }
+
+    async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, DataLayerError> {
+        Self::list_endpoint_identities_by_provider_ids(self, provider_ids).await
     }
 
     async fn list_keys_by_ids(
@@ -3221,6 +3282,18 @@ fn map_provider_row(row: &PgRow) -> Result<StoredProviderCatalogProvider, DataLa
     .with_timestamps(created_at_unix_ms, updated_at_unix_secs))
 }
 
+fn map_provider_identity_row(
+    row: &PgRow,
+) -> Result<StoredProviderCatalogProviderIdentity, DataLayerError> {
+    StoredProviderCatalogProviderIdentity::new(
+        row.try_get("id").map_postgres_err()?,
+        row.try_get("name").map_postgres_err()?,
+        row.try_get("provider_type").map_postgres_err()?,
+        row.try_get("provider_priority").map_postgres_err()?,
+        row.try_get("is_active").map_postgres_err()?,
+    )
+}
+
 fn map_endpoint_row(row: &PgRow) -> Result<StoredProviderCatalogEndpoint, DataLayerError> {
     let created_at_unix_ms = row_get::<Option<i64>>(row, "created_at_unix_ms")?
         .map(|value| {
@@ -3264,6 +3337,17 @@ fn map_endpoint_row(row: &PgRow) -> Result<StoredProviderCatalogEndpoint, DataLa
         row_get(row, "config")?,
         row_get(row, "format_acceptance_config")?,
         row_get(row, "proxy")?,
+    )
+}
+
+fn map_endpoint_identity_row(
+    row: &PgRow,
+) -> Result<StoredProviderCatalogEndpointIdentity, DataLayerError> {
+    StoredProviderCatalogEndpointIdentity::new(
+        row.try_get("provider_id").map_postgres_err()?,
+        row.try_get("api_format").map_postgres_err()?,
+        row.try_get("api_family").map_postgres_err()?,
+        row.try_get("is_active").map_postgres_err()?,
     )
 }
 

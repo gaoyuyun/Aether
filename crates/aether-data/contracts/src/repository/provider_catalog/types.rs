@@ -201,6 +201,57 @@ pub struct StoredProviderCatalogProvider {
     pub updated_at_unix_secs: Option<u64>,
 }
 
+/// Narrow provider metadata used by authorization and selector endpoints.
+/// Keeps large transport/config JSON out of request-hot catalog reads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredProviderCatalogProviderIdentity {
+    pub id: String,
+    pub name: String,
+    pub provider_type: String,
+    pub provider_priority: i32,
+    pub is_active: bool,
+}
+
+impl StoredProviderCatalogProviderIdentity {
+    pub fn new(
+        id: String,
+        name: String,
+        provider_type: String,
+        provider_priority: i32,
+        is_active: bool,
+    ) -> Result<Self, crate::DataLayerError> {
+        if name.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "providers.name is empty".to_string(),
+            ));
+        }
+        if provider_type.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "providers.provider_type is empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            id,
+            name,
+            provider_type,
+            provider_priority,
+            is_active,
+        })
+    }
+}
+
+impl From<StoredProviderCatalogProvider> for StoredProviderCatalogProviderIdentity {
+    fn from(provider: StoredProviderCatalogProvider) -> Self {
+        Self {
+            id: provider.id,
+            name: provider.name,
+            provider_type: provider.provider_type,
+            provider_priority: provider.provider_priority,
+            is_active: provider.is_active,
+        }
+    }
+}
+
 impl StoredProviderCatalogProvider {
     pub fn new(
         id: String,
@@ -330,6 +381,47 @@ pub struct StoredProviderCatalogEndpoint {
     pub proxy: Option<serde_json::Value>,
     pub created_at_unix_ms: Option<u64>,
     pub updated_at_unix_secs: Option<u64>,
+}
+
+/// Narrow endpoint metadata required by the provider authorization gate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredProviderCatalogEndpointIdentity {
+    pub provider_id: String,
+    pub api_format: String,
+    pub api_family: Option<String>,
+    pub is_active: bool,
+}
+
+impl StoredProviderCatalogEndpointIdentity {
+    pub fn new(
+        provider_id: String,
+        api_format: String,
+        api_family: Option<String>,
+        is_active: bool,
+    ) -> Result<Self, crate::DataLayerError> {
+        if api_format.trim().is_empty() {
+            return Err(crate::DataLayerError::UnexpectedValue(
+                "provider_endpoints.api_format is empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            provider_id,
+            api_format,
+            api_family,
+            is_active,
+        })
+    }
+}
+
+impl From<StoredProviderCatalogEndpoint> for StoredProviderCatalogEndpointIdentity {
+    fn from(endpoint: StoredProviderCatalogEndpoint) -> Self {
+        Self {
+            provider_id: endpoint.provider_id,
+            api_format: endpoint.api_format,
+            api_family: endpoint.api_family,
+            is_active: endpoint.is_active,
+        }
+    }
 }
 
 impl StoredProviderCatalogEndpoint {
@@ -777,6 +869,18 @@ pub trait ProviderCatalogReadRepository: Send + Sync {
         active_only: bool,
     ) -> Result<Vec<StoredProviderCatalogProvider>, crate::DataLayerError>;
 
+    async fn list_provider_identities(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<StoredProviderCatalogProviderIdentity>, crate::DataLayerError> {
+        Ok(self
+            .list_providers(active_only)
+            .await?
+            .into_iter()
+            .map(StoredProviderCatalogProviderIdentity::from)
+            .collect())
+    }
+
     async fn list_providers_by_ids(
         &self,
         provider_ids: &[String],
@@ -791,6 +895,18 @@ pub trait ProviderCatalogReadRepository: Send + Sync {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<StoredProviderCatalogEndpoint>, crate::DataLayerError>;
+
+    async fn list_endpoint_identities_by_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogEndpointIdentity>, crate::DataLayerError> {
+        Ok(self
+            .list_endpoints_by_provider_ids(provider_ids)
+            .await?
+            .into_iter()
+            .map(StoredProviderCatalogEndpointIdentity::from)
+            .collect())
+    }
 
     async fn list_keys_by_ids(
         &self,

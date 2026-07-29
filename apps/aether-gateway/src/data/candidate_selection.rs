@@ -423,10 +423,10 @@ pub(crate) async fn read_global_model_names_for_api_format(
 pub(crate) fn auth_snapshot_constraints(
     snapshot: &GatewayAuthApiKeySnapshot,
 ) -> SchedulerAuthConstraints {
+    let layers = snapshot.provider_allowlist_layers();
     SchedulerAuthConstraints {
-        allowed_providers: snapshot
-            .effective_allowed_providers()
-            .map(|items| items.to_vec()),
+        allowed_providers: layers[0].map(|items| items.to_vec()),
+        allowed_providers_and: layers[1].map(|items| items.to_vec()),
         allowed_api_formats: snapshot
             .effective_allowed_api_formats()
             .map(|items| items.to_vec()),

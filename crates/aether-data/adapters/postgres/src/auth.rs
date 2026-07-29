@@ -407,15 +407,15 @@ VALUES (
   $10,
   $11,
   $12,
-  NULL,
   $13,
   $14,
   $15,
-  FALSE,
-  FALSE,
   $16,
+  FALSE,
+  FALSE,
   $17,
   $18,
+  $19,
   NOW(),
   NOW()
 )
@@ -529,6 +529,8 @@ SET
   rate_limit = COALESCE($4, rate_limit),
   concurrent_limit = COALESCE($5, concurrent_limit),
   ip_rules = CASE WHEN $6 THEN $7::jsonb ELSE ip_rules END,
+  allowed_providers = CASE WHEN $8 THEN $9::json ELSE allowed_providers END,
+  feature_settings = CASE WHEN $10 THEN $11::jsonb ELSE feature_settings END,
   updated_at = NOW()
 WHERE user_id = $1
   AND id = $2
@@ -1192,6 +1194,7 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             .bind(record.rate_limit)
             .bind(record.concurrent_limit)
             .bind(record.force_capabilities)
+            .bind(record.feature_settings)
             .bind(record.is_active)
             .bind(expires_at)
             .bind(record.auto_delete_on_expiry)
@@ -1272,6 +1275,15 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+        let allowed_providers = record
+            .allowed_providers
+            .clone()
+            .flatten()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+        // Some(None) clears to NULL; Some(Some(v)) sets; None leaves unchanged via CASE.
+        let feature_settings = record.feature_settings.clone().flatten();
         let row = sqlx::query(UPDATE_USER_API_KEY_BASIC_SQL)
             .bind(record.user_id)
             .bind(record.api_key_id)
@@ -1280,6 +1292,10 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             .bind(record.concurrent_limit)
             .bind(record.ip_rules.is_some())
             .bind(ip_rules)
+            .bind(record.allowed_providers.is_some())
+            .bind(allowed_providers)
+            .bind(record.feature_settings.is_some())
+            .bind(feature_settings)
             .fetch_optional(&self.pool)
             .await
             .map_postgres_err()?;
@@ -1620,9 +1636,8 @@ mod tests {
     fn create_api_key_sql_orders_expiry_before_standalone_flags() {
         assert!(CREATE_USER_API_KEY_SQL
             .contains("expires_at,\n  auto_delete_on_expiry,\n  is_locked,\n  is_standalone,"));
-        assert!(
-            CREATE_USER_API_KEY_SQL.contains("$13,\n  $14,\n  $15,\n  FALSE,\n  FALSE,\n  $16,")
-        );
+        assert!(CREATE_USER_API_KEY_SQL
+            .contains("$13,\n  $14,\n  $15,\n  $16,\n  FALSE,\n  FALSE,\n  $17,"));
         assert!(CREATE_STANDALONE_API_KEY_SQL
             .contains("expires_at,\n  auto_delete_on_expiry,\n  is_locked,\n  is_standalone,"));
         assert!(CREATE_STANDALONE_API_KEY_SQL
@@ -1655,6 +1670,12 @@ mod tests {
     fn update_user_api_key_basic_sql_casts_ip_rules_as_jsonb() {
         assert!(UPDATE_USER_API_KEY_BASIC_SQL
             .contains("ip_rules = CASE WHEN $6 THEN $7::jsonb ELSE ip_rules END"));
+        // allowed_providers column is json (not jsonb); match standalone update cast.
+        assert!(UPDATE_USER_API_KEY_BASIC_SQL
+            .contains("allowed_providers = CASE WHEN $8 THEN $9::json ELSE allowed_providers END"));
+        assert!(UPDATE_USER_API_KEY_BASIC_SQL.contains(
+            "feature_settings = CASE WHEN $10 THEN $11::jsonb ELSE feature_settings END"
+        ));
     }
 
     #[tokio::test]
