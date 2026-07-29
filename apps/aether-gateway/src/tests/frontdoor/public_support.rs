@@ -7118,7 +7118,8 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
         .header("user-agent", "AetherTest/1.0")
         .json(&json!({
             "name": "writer-key",
-            "rate_limit": 120
+            "rate_limit": 120,
+            "allowed_providers": ["provider-openai"]
         }))
         .send()
         .await
@@ -7136,6 +7137,10 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
     assert_eq!(create_payload["name"], "writer-key");
     assert_eq!(create_payload["rate_limit"], 120);
     assert_eq!(create_payload["concurrent_limit"], serde_json::Value::Null);
+    assert_eq!(
+        create_payload["allowed_providers"],
+        json!(["provider-openai"])
+    );
     assert_eq!(create_payload["feature_settings"], serde_json::Value::Null);
     assert_eq!(create_payload["message"], "API密钥创建成功");
     let created_at = create_payload["created_at"]
@@ -7161,7 +7166,8 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
                 "chat_pii_redaction": {
                     "enabled": true
                 }
-            }
+            },
+            "allowed_providers": []
         }))
         .send()
         .await
@@ -7174,6 +7180,7 @@ async fn gateway_handles_users_me_api_key_writes_locally_without_proxying_upstre
     assert_eq!(update_payload["name"], "writer-key-renamed");
     assert_eq!(update_payload["rate_limit"], 30);
     assert_eq!(update_payload["concurrent_limit"], 4);
+    assert_eq!(update_payload["allowed_providers"], json!([]));
     assert_eq!(
         update_payload["feature_settings"]["chat_pii_redaction"]["enabled"],
         true
@@ -8363,6 +8370,28 @@ async fn gateway_handles_users_me_providers_locally_without_proxying_upstream() 
     assert_eq!(providers[0]["endpoints"][0]["id"], "endpoint-openai-1");
     assert!(providers[0]["endpoints"][0].get("base_url").is_none());
     assert_eq!(providers[0]["models"][0]["name"], "gpt-5");
+
+    let options_response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/users/me/providers?view=options"))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-providers")
+        .header("user-agent", "AetherTest/1.0")
+        .send()
+        .await
+        .expect("provider options request should succeed");
+    assert_eq!(options_response.status(), StatusCode::OK);
+    let options_payload: serde_json::Value = options_response
+        .json()
+        .await
+        .expect("provider options body should parse");
+    let options = options_payload
+        .as_array()
+        .expect("provider options should be array");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0]["id"], "provider-openai");
+    assert_eq!(options[0]["name"], "OpenAI");
+    assert!(options[0].get("endpoints").is_none());
+    assert!(options[0].get("models").is_none());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

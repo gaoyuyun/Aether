@@ -1,7 +1,7 @@
 use std::{sync::OnceLock, time::Duration};
 
 use aether_data_contracts::repository::provider_catalog::{
-    StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
+    StoredProviderCatalogEndpointIdentity, StoredProviderCatalogProviderIdentity,
 };
 use axum::http::Uri;
 use base64::Engine as _;
@@ -1137,9 +1137,18 @@ async fn auth_snapshot_allows_requested_provider(
     snapshot: &crate::data::auth::GatewayAuthApiKeySnapshot,
     auth_endpoint_signature: &str,
 ) -> bool {
-    let Some(allowed_providers) = snapshot.effective_allowed_providers() else {
+    let layers = snapshot.provider_allowlist_layers();
+    if layers.iter().all(|layer| layer.is_none()) {
         return true;
-    };
+    }
+    // Empty allowlist on any required layer is an explicit deny-all.
+    if layers
+        .iter()
+        .any(|layer| matches!(layer, Some(items) if items.is_empty()))
+    {
+        return false;
+    }
+
     let requested_api_format = normalize_api_format_alias(auth_endpoint_signature);
     let requested_provider = requested_api_format
         .split_once(':')
@@ -1149,20 +1158,22 @@ async fn auth_snapshot_allows_requested_provider(
     if requested_provider.is_empty() {
         return true;
     }
-    if allowed_providers.is_empty() {
-        return false;
-    }
-    if allowed_providers
-        .iter()
-        .any(|value| allowed_provider_value_matches_requested_provider(value, requested_provider))
-    {
+
+    // Fast path: every present layer has a token that directly matches the request provider slug.
+    let direct_ok = layers.iter().all(|layer| match layer {
+        None => true,
+        Some(allowed) => allowed.iter().any(|value| {
+            allowed_provider_value_matches_requested_provider(value, requested_provider)
+        }),
+    });
+    if direct_ok {
         return true;
     }
     if !state.has_provider_catalog_data_reader() {
         return true;
     }
 
-    let providers = match state.list_provider_catalog_providers(true).await {
+    let providers = match state.list_provider_catalog_provider_identities(true).await {
         Ok(value) => value,
         Err(err) => {
             debug!(
@@ -1174,17 +1185,11 @@ async fn auth_snapshot_allows_requested_provider(
         }
     };
 
+    // Catalog providers must satisfy all policy layers (id/name/type semantic AND).
     let allowed_catalog_providers = providers
         .into_iter()
         .filter(|provider| {
-            allowed_providers.iter().any(|value| {
-                aether_scheduler_core::provider_matches_allowed_value(
-                    value,
-                    &provider.id,
-                    &provider.name,
-                    &provider.provider_type,
-                )
-            })
+            snapshot.allows_provider(&provider.id, &provider.name, &provider.provider_type)
         })
         .collect::<Vec<_>>();
     if allowed_catalog_providers
@@ -1203,7 +1208,7 @@ async fn auth_snapshot_allows_requested_provider(
     }
 
     let endpoints = match state
-        .list_provider_catalog_endpoints_by_provider_ids(&allowed_provider_ids)
+        .list_provider_catalog_endpoint_identities_by_provider_ids(&allowed_provider_ids)
         .await
     {
         Ok(value) => value,
@@ -1234,7 +1239,7 @@ fn allowed_provider_value_matches_requested_provider(
 }
 
 fn provider_matches_requested_provider(
-    provider: &StoredProviderCatalogProvider,
+    provider: &StoredProviderCatalogProviderIdentity,
     requested_provider: &str,
 ) -> bool {
     aether_scheduler_core::provider_matches_allowed_value(
@@ -1246,7 +1251,7 @@ fn provider_matches_requested_provider(
 }
 
 fn endpoint_matches_requested_provider(
-    endpoint: &StoredProviderCatalogEndpoint,
+    endpoint: &StoredProviderCatalogEndpointIdentity,
     requested_api_format: &str,
     requested_provider: &str,
 ) -> bool {

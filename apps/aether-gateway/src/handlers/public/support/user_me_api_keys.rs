@@ -25,6 +25,7 @@ use super::{
 };
 
 const USERS_ME_API_KEY_WRITE_UNAVAILABLE_DETAIL: &str = "用户 API 密钥写入暂不可用";
+const USERS_ME_PROVIDER_CATALOG_UNAVAILABLE_DETAIL: &str = "用户提供商目录暂不可用";
 
 #[derive(Debug, Deserialize)]
 struct UsersMeCreateApiKeyRequest {
@@ -37,6 +38,11 @@ struct UsersMeCreateApiKeyRequest {
     feature_settings: Option<serde_json::Value>,
     #[serde(default, alias = "allowed_ips")]
     ip_rules: Option<Vec<String>>,
+    /// `null`/omitted = inherit the user's full provider allowance; list = key-level subset.
+    #[serde(default, deserialize_with = "deserialize_optional_provider_list_patch")]
+    allowed_providers: Option<Option<Vec<UsersMeApiKeyProviderValue>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    providers: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +61,22 @@ struct UsersMeUpdateApiKeyRequest {
         deserialize_with = "deserialize_optional_string_list_patch"
     )]
     ip_rules: Option<Option<Vec<String>>>,
+    /// Present when the client patches providers in the same request as basic fields.
+    /// `null` = inherit account allowance; list = key-level subset (including empty deny-all).
+    #[serde(default, deserialize_with = "deserialize_optional_provider_list_patch")]
+    allowed_providers: Option<Option<Vec<UsersMeApiKeyProviderValue>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    providers: Option<Option<Vec<String>>>,
+}
+
+fn deserialize_optional_provider_list_patch<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<Vec<UsersMeApiKeyProviderValue>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<Vec<UsersMeApiKeyProviderValue>> as serde::Deserialize>::deserialize(deserializer)
+        .map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,10 +102,10 @@ enum UsersMeApiKeyProviderValue {
 
 #[derive(Debug, Deserialize)]
 struct UsersMeUpdateApiKeyProvidersRequest {
-    #[serde(default)]
-    allowed_providers: Option<Vec<UsersMeApiKeyProviderValue>>,
-    #[serde(default)]
-    providers: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_provider_list_patch")]
+    allowed_providers: Option<Option<Vec<UsersMeApiKeyProviderValue>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    providers: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,10 +244,11 @@ fn hash_users_me_api_key(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn normalize_users_me_api_key_providers(
-    payload: UsersMeUpdateApiKeyProvidersRequest,
+fn normalize_users_me_api_key_provider_values(
+    allowed_providers: Option<Vec<UsersMeApiKeyProviderValue>>,
+    providers: Option<Vec<String>>,
 ) -> Result<Option<Vec<String>>, String> {
-    let values = if let Some(values) = payload.allowed_providers {
+    let values = if let Some(values) = allowed_providers {
         values
             .into_iter()
             .map(|value| match value {
@@ -233,7 +256,7 @@ fn normalize_users_me_api_key_providers(
                 UsersMeApiKeyProviderValue::ProviderConfig { provider_id, .. } => provider_id,
             })
             .collect::<Vec<_>>()
-    } else if let Some(values) = payload.providers {
+    } else if let Some(values) = providers {
         values
     } else {
         return Ok(None);
@@ -251,6 +274,162 @@ fn normalize_users_me_api_key_providers(
         }
     }
     Ok(Some(normalized))
+}
+
+fn normalize_users_me_api_key_providers(
+    payload: UsersMeUpdateApiKeyProvidersRequest,
+) -> Result<Option<Vec<String>>, String> {
+    normalize_users_me_api_key_provider_patch_values(payload.allowed_providers, payload.providers)
+}
+
+fn normalize_users_me_api_key_provider_patch_values(
+    allowed_providers: Option<Option<Vec<UsersMeApiKeyProviderValue>>>,
+    providers: Option<Option<Vec<String>>>,
+) -> Result<Option<Vec<String>>, String> {
+    if allowed_providers.is_some() && providers.is_some() {
+        return Err("allowed_providers 与 providers 不能同时提供".to_string());
+    }
+    normalize_users_me_api_key_provider_values(allowed_providers.flatten(), providers.flatten())
+}
+
+fn catalog_provider_allowed_by_user_policy(
+    provider_id: &str,
+    provider_name: &str,
+    provider_type: &str,
+    user_allowed_providers: Option<&[String]>,
+) -> bool {
+    let Some(allowed) = user_allowed_providers else {
+        return true;
+    };
+    allowed.iter().any(|value| {
+        aether_scheduler_core::provider_matches_allowed_value(
+            value,
+            provider_id,
+            provider_name,
+            provider_type,
+        )
+    })
+}
+
+fn filter_catalog_providers_to_user_allowed(
+    providers: &[(String, String, String)],
+    requested_ids: &[String],
+    user_allowed_providers: Option<&[String]>,
+) -> Result<Vec<String>, Vec<String>> {
+    let by_id = providers
+        .iter()
+        .map(|(id, name, provider_type)| (id.as_str(), (name.as_str(), provider_type.as_str())))
+        .collect::<BTreeMap<_, _>>();
+    let mut allowed = Vec::new();
+    let mut denied = Vec::new();
+    for provider_id in requested_ids {
+        let Some((name, provider_type)) = by_id.get(provider_id.as_str()).copied() else {
+            denied.push(provider_id.clone());
+            continue;
+        };
+        if catalog_provider_allowed_by_user_policy(
+            provider_id,
+            name,
+            provider_type,
+            user_allowed_providers,
+        ) {
+            allowed.push(provider_id.clone());
+        } else {
+            denied.push(provider_id.clone());
+        }
+    }
+    if denied.is_empty() {
+        Ok(allowed)
+    } else {
+        Err(denied)
+    }
+}
+
+async fn resolve_users_me_api_key_allowed_providers(
+    state: &AppState,
+    user: &aether_data::repository::users::StoredUserAuthRecord,
+    requested: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, Response<Body>> {
+    let Some(providers) = requested else {
+        return Ok(None);
+    };
+
+    // An explicit empty list is always safe: it is a key-level deny-all and
+    // does not require provider metadata to validate.
+    if providers.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    if !state.has_provider_catalog_data_reader() {
+        return Err(build_auth_error_response(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            USERS_ME_PROVIDER_CATALOG_UNAVAILABLE_DETAIL,
+            false,
+        ));
+    }
+
+    let catalog_providers = match state.list_provider_catalog_provider_identities(true).await {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("provider validation failed: {err:?}"),
+                false,
+            ))
+        }
+    };
+    let mut by_key = BTreeMap::new();
+    for provider in &catalog_providers {
+        by_key.insert(provider.id.to_ascii_lowercase(), provider.id.clone());
+        by_key.insert(provider.name.to_ascii_lowercase(), provider.id.clone());
+    }
+    let mut invalid = Vec::new();
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for provider_id in providers {
+        let key = provider_id.trim().to_ascii_lowercase();
+        if let Some(mapped) = by_key.get(&key) {
+            if seen.insert(mapped.clone()) {
+                normalized.push(mapped.clone());
+            }
+        } else {
+            invalid.push(provider_id);
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(build_auth_error_response(
+            http::StatusCode::BAD_REQUEST,
+            format!("无效的提供商ID: {}", invalid.join(", ")),
+            false,
+        ));
+    }
+    let catalog_meta = catalog_providers
+        .into_iter()
+        .map(|provider| (provider.id, provider.name, provider.provider_type))
+        .collect::<Vec<_>>();
+
+    let effective_policies = match state.data.resolve_user_effective_list_policies(user).await {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("user policy lookup failed: {err:?}"),
+                false,
+            ))
+        }
+    };
+
+    match filter_catalog_providers_to_user_allowed(
+        &catalog_meta,
+        &normalized,
+        effective_policies.allowed_providers.as_deref(),
+    ) {
+        Ok(allowed) => Ok(Some(allowed)),
+        Err(denied) => Err(build_auth_error_response(
+            http::StatusCode::BAD_REQUEST,
+            format!("以下提供商不在您的可用范围内: {}", denied.join(", ")),
+            false,
+        )),
+    }
 }
 
 fn normalize_users_me_api_key_force_capabilities(
@@ -563,6 +742,22 @@ pub(super) async fn handle_users_me_api_key_create(
             return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
         }
     };
+    let requested_providers = match normalize_users_me_api_key_provider_patch_values(
+        payload.allowed_providers,
+        payload.providers,
+    ) {
+        Ok(value) => value,
+        Err(detail) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+        }
+    };
+    let allowed_providers =
+        match resolve_users_me_api_key_allowed_providers(state, &auth.user, requested_providers)
+            .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
 
     let plaintext_key = generate_users_me_api_key_plaintext();
     let Some(key_encrypted) = encrypt_catalog_secret_with_fallbacks(state, &plaintext_key) else {
@@ -578,13 +773,14 @@ pub(super) async fn handle_users_me_api_key_create(
         key_hash: hash_users_me_api_key(&plaintext_key),
         key_encrypted: Some(key_encrypted),
         name: Some(name.clone()),
-        allowed_providers: None,
+        allowed_providers,
         allowed_api_formats: None,
         allowed_models: None,
         ip_rules,
         rate_limit,
         concurrent_limit,
         force_capabilities: None,
+        feature_settings,
         is_active: true,
         expires_at_unix_secs: None,
         auto_delete_on_expiry: false,
@@ -604,29 +800,6 @@ pub(super) async fn handle_users_me_api_key_create(
     }) else {
         return build_users_me_api_key_writer_unavailable_response();
     };
-    let created = if feature_settings.is_some() {
-        match state
-            .set_user_api_key_feature_settings(
-                &auth.user.id,
-                &created.api_key_id,
-                feature_settings.clone(),
-            )
-            .await
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => return build_users_me_api_key_writer_unavailable_response(),
-            Err(err) => {
-                return build_auth_error_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("user api key feature settings update failed: {err:?}"),
-                    false,
-                )
-            }
-        }
-    } else {
-        created
-    };
-
     Json(json!({
         "id": created.api_key_id,
         "name": created.name,
@@ -637,6 +810,7 @@ pub(super) async fn handle_users_me_api_key_create(
         "rate_limit": created.rate_limit,
         "concurrent_limit": created.concurrent_limit,
         "ip_rules": created.ip_rules,
+        "allowed_providers": created.allowed_providers,
         "feature_settings": created.feature_settings,
         "last_used_at": format_users_me_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
         "created_at": format_users_me_optional_unix_secs_iso8601(created.created_at_unix_secs),
@@ -727,6 +901,28 @@ pub(super) async fn handle_users_me_api_key_update(
         },
         None => None,
     };
+    // Resolve providers before any write so invalid provider patches fail without partial saves.
+    let allowed_providers = {
+        let providers_patch_present =
+            payload.allowed_providers.is_some() || payload.providers.is_some();
+        if !providers_patch_present {
+            None
+        } else {
+            let requested = match normalize_users_me_api_key_provider_patch_values(
+                payload.allowed_providers,
+                payload.providers,
+            ) {
+                Ok(value) => value,
+                Err(detail) => {
+                    return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false);
+                }
+            };
+            match resolve_users_me_api_key_allowed_providers(state, &auth.user, requested).await {
+                Ok(value) => Some(value),
+                Err(response) => return response,
+            }
+        }
+    };
 
     let Some(updated) = (match state
         .update_user_api_key_basic(aether_data::repository::auth::UpdateUserApiKeyBasicRecord {
@@ -736,6 +932,9 @@ pub(super) async fn handle_users_me_api_key_update(
             rate_limit,
             concurrent_limit,
             ip_rules,
+            allowed_providers,
+            // Same write as basic fields so partial "success then 500" cannot occur.
+            feature_settings,
         })
         .await
     {
@@ -749,28 +948,6 @@ pub(super) async fn handle_users_me_api_key_update(
         }
     }) else {
         return build_users_me_api_key_writer_unavailable_response();
-    };
-    let updated = if let Some(feature_settings) = feature_settings {
-        match state
-            .set_user_api_key_feature_settings(
-                &auth.user.id,
-                &snapshot.api_key_id,
-                feature_settings,
-            )
-            .await
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => return build_users_me_api_key_writer_unavailable_response(),
-            Err(err) => {
-                return build_auth_error_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("user api key feature settings update failed: {err:?}"),
-                    false,
-                )
-            }
-        }
-    } else {
-        updated
     };
 
     let mut payload =
@@ -922,77 +1099,19 @@ pub(super) async fn handle_users_me_api_key_providers_put(
             )
         }
     };
-    let allowed_providers = match normalize_users_me_api_key_providers(payload) {
+    let requested_providers = match normalize_users_me_api_key_providers(payload) {
         Ok(value) => value,
         Err(detail) => {
             return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
         }
     };
-
-    let allowed_providers = if let Some(providers) = allowed_providers {
-        if state.has_provider_catalog_data_reader() {
-            let catalog_providers = match state.list_provider_catalog_providers(true).await {
-                Ok(value) => value,
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("provider validation failed: {err:?}"),
-                        false,
-                    )
-                }
-            };
-            let mut by_key = BTreeMap::new();
-            for provider in catalog_providers {
-                by_key.insert(provider.id.to_ascii_lowercase(), provider.id.clone());
-                by_key.insert(provider.name.to_ascii_lowercase(), provider.id);
-            }
-            let mut invalid = Vec::new();
-            let mut normalized = Vec::new();
-            for provider_id in providers {
-                let key = provider_id.trim().to_ascii_lowercase();
-                if let Some(mapped) = by_key.get(&key) {
-                    if !normalized.iter().any(|value| value == mapped) {
-                        normalized.push(mapped.clone());
-                    }
-                } else {
-                    invalid.push(provider_id);
-                }
-            }
-            if !invalid.is_empty() {
-                return build_auth_error_response(
-                    http::StatusCode::BAD_REQUEST,
-                    format!("无效的提供商ID: {}", invalid.join(", ")),
-                    false,
-                );
-            }
-            Some(normalized)
-        } else {
-            let mut invalid = Vec::new();
-            for provider_id in &providers {
-                match state.find_active_provider_name(provider_id).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => invalid.push(provider_id.clone()),
-                    Err(err) => {
-                        return build_auth_error_response(
-                            http::StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("provider validation failed: {err:?}"),
-                            false,
-                        )
-                    }
-                }
-            }
-            if !invalid.is_empty() {
-                return build_auth_error_response(
-                    http::StatusCode::BAD_REQUEST,
-                    format!("无效的提供商ID: {}", invalid.join(", ")),
-                    false,
-                );
-            }
-            Some(providers)
-        }
-    } else {
-        None
-    };
+    let allowed_providers =
+        match resolve_users_me_api_key_allowed_providers(state, &auth.user, requested_providers)
+            .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
 
     let Some(updated) = (match state
         .set_user_api_key_allowed_providers(&auth.user.id, &snapshot.api_key_id, allowed_providers)
@@ -1093,8 +1212,196 @@ pub(super) async fn handle_users_me_api_key_capabilities_put(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_users_me_ip_rules, UsersMeUpdateApiKeyRequest};
+    use super::{
+        catalog_provider_allowed_by_user_policy, filter_catalog_providers_to_user_allowed,
+        normalize_users_me_api_key_provider_patch_values,
+        normalize_users_me_api_key_provider_values, normalize_users_me_ip_rules,
+        resolve_users_me_api_key_allowed_providers, UsersMeCreateApiKeyRequest,
+        UsersMeUpdateApiKeyRequest,
+    };
+    use axum::http;
     use serde_json::json;
+
+    #[test]
+    fn catalog_provider_policy_allows_unrestricted_user() {
+        assert!(catalog_provider_allowed_by_user_policy(
+            "provider-openai",
+            "OpenAI",
+            "openai",
+            None,
+        ));
+    }
+
+    #[test]
+    fn catalog_provider_policy_matches_id_name_or_type() {
+        let allowed = vec!["openai".to_string()];
+        assert!(catalog_provider_allowed_by_user_policy(
+            "provider-openai",
+            "OpenAI Pool",
+            "openai",
+            Some(allowed.as_slice()),
+        ));
+        assert!(!catalog_provider_allowed_by_user_policy(
+            "provider-claude",
+            "Claude",
+            "claude",
+            Some(allowed.as_slice()),
+        ));
+    }
+
+    #[test]
+    fn filter_catalog_providers_rejects_providers_outside_user_allowance() {
+        let catalog = vec![
+            (
+                "provider-openai".to_string(),
+                "OpenAI".to_string(),
+                "openai".to_string(),
+            ),
+            (
+                "provider-claude".to_string(),
+                "Claude".to_string(),
+                "claude".to_string(),
+            ),
+        ];
+        let err = filter_catalog_providers_to_user_allowed(
+            &catalog,
+            &["provider-openai".to_string(), "provider-claude".to_string()],
+            Some(&["openai".to_string()]),
+        )
+        .expect_err("providers outside user allowance should fail");
+        assert_eq!(err, vec!["provider-claude".to_string()]);
+
+        let ok = filter_catalog_providers_to_user_allowed(
+            &catalog,
+            &["provider-openai".to_string()],
+            Some(&["openai".to_string()]),
+        )
+        .expect("allowed provider should pass");
+        assert_eq!(ok, vec!["provider-openai".to_string()]);
+    }
+
+    #[test]
+    fn normalize_provider_values_accepts_string_or_object_entries() {
+        let values = normalize_users_me_api_key_provider_values(
+            Some(vec![
+                super::UsersMeApiKeyProviderValue::ProviderId(" provider-a ".to_string()),
+                super::UsersMeApiKeyProviderValue::ProviderConfig {
+                    provider_id: "provider-b".to_string(),
+                    priority: None,
+                    weight: None,
+                    enabled: None,
+                },
+            ]),
+            None,
+        )
+        .expect("provider values should normalize");
+        assert_eq!(
+            values,
+            Some(vec!["provider-a".to_string(), "provider-b".to_string()])
+        );
+
+        let omitted = normalize_users_me_api_key_provider_values(None, None)
+            .expect("omitted providers mean inherit");
+        assert_eq!(omitted, None);
+    }
+
+    #[test]
+    fn update_payload_distinguishes_provider_patch_states() {
+        let missing = serde_json::from_value::<UsersMeUpdateApiKeyRequest>(json!({
+            "name": "unchanged-providers",
+        }))
+        .expect("missing allowed_providers should deserialize");
+        assert!(missing.allowed_providers.is_none());
+
+        let inherited = serde_json::from_value::<UsersMeUpdateApiKeyRequest>(json!({
+            "allowed_providers": null,
+        }))
+        .expect("null allowed_providers should deserialize");
+        assert!(matches!(inherited.allowed_providers, Some(None)));
+
+        let denied = serde_json::from_value::<UsersMeUpdateApiKeyRequest>(json!({
+            "allowed_providers": [],
+        }))
+        .expect("empty allowed_providers should deserialize");
+        assert!(matches!(
+            denied.allowed_providers,
+            Some(Some(values)) if values.is_empty()
+        ));
+
+        let selected = serde_json::from_value::<UsersMeUpdateApiKeyRequest>(json!({
+            "allowed_providers": [" provider-a ", {"provider_id": "provider-b"}],
+        }))
+        .expect("selected allowed_providers should deserialize");
+        let normalized = normalize_users_me_api_key_provider_values(
+            selected.allowed_providers.flatten(),
+            selected.providers.flatten(),
+        )
+        .expect("selected providers should normalize");
+        assert_eq!(
+            normalized,
+            Some(vec!["provider-a".to_string(), "provider-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn provider_payload_rejects_new_and_legacy_fields_together_even_when_new_field_is_null() {
+        let payload = serde_json::from_value::<UsersMeCreateApiKeyRequest>(json!({
+            "name": "conflicting-providers",
+            "allowed_providers": null,
+            "providers": ["provider-a"],
+        }))
+        .expect("provider field presence should deserialize");
+        assert!(payload.allowed_providers.is_some());
+        assert!(payload.providers.is_some());
+        let err = normalize_users_me_api_key_provider_patch_values(
+            payload.allowed_providers,
+            payload.providers,
+        )
+        .expect_err("conflicting provider aliases should fail");
+        assert_eq!(err, "allowed_providers 与 providers 不能同时提供");
+    }
+
+    #[tokio::test]
+    async fn provider_resolution_without_catalog_allows_inherit_and_deny_all_but_rejects_subset() {
+        let state = crate::AppState::new().expect("test app state should build");
+        let user = aether_data::repository::users::StoredUserAuthRecord::new(
+            "user-1".to_string(),
+            Some("alice@example.com".to_string()),
+            true,
+            "alice".to_string(),
+            None,
+            "user".to_string(),
+            "local".to_string(),
+            None,
+            None,
+            None,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("test user should build");
+
+        let inherited = resolve_users_me_api_key_allowed_providers(&state, &user, None)
+            .await
+            .expect("inherit should not need catalog");
+        assert_eq!(inherited, None);
+        let denied = resolve_users_me_api_key_allowed_providers(&state, &user, Some(Vec::new()))
+            .await
+            .expect("deny-all should not need catalog");
+        assert_eq!(denied, Some(Vec::new()));
+        let response = match resolve_users_me_api_key_allowed_providers(
+            &state,
+            &user,
+            Some(vec!["provider-a".to_string()]),
+        )
+        .await
+        {
+            Err(response) => response,
+            Ok(value) => panic!("non-empty subset should require catalog, got {value:?}"),
+        };
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn normalize_ip_rules_trims_ip_and_cidr_values() {

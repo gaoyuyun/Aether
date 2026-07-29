@@ -1781,13 +1781,6 @@ impl GatewayDataState {
         let Some(mut snapshot) = snapshot else {
             return Ok(None);
         };
-        if snapshot.user_role.eq_ignore_ascii_case("admin") && !snapshot.api_key_is_standalone {
-            apply_admin_unrestricted_auth_snapshot(&mut snapshot);
-            return Ok(Some(GatewayAuthApiKeySnapshot::from_stored(
-                snapshot,
-                now_unix_secs,
-            )));
-        }
         let Some(repository) = self.user_reader.as_ref() else {
             return Ok(Some(GatewayAuthApiKeySnapshot::from_stored(
                 snapshot,
@@ -1806,14 +1799,7 @@ impl GatewayDataState {
                 now_unix_secs,
             )));
         };
-        if user.role.eq_ignore_ascii_case("admin") && !snapshot.api_key_is_standalone {
-            snapshot.user_role = user.role;
-            apply_admin_unrestricted_auth_snapshot(&mut snapshot);
-            return Ok(Some(GatewayAuthApiKeySnapshot::from_stored(
-                snapshot,
-                now_unix_secs,
-            )));
-        }
+        snapshot.user_role = user.role;
         let groups = self
             .effective_user_groups_for_user(&snapshot.user_id)
             .await?;
@@ -1923,18 +1909,6 @@ impl GatewayDataState {
         }
         Ok(group_ids.into_iter().collect())
     }
-}
-
-fn apply_admin_unrestricted_auth_snapshot(snapshot: &mut StoredAuthApiKeySnapshot) {
-    snapshot.user_allowed_providers = None;
-    snapshot.user_allowed_api_formats = None;
-    snapshot.user_allowed_models = None;
-    snapshot.user_rate_limit = None;
-    snapshot.api_key_allowed_providers = None;
-    snapshot.api_key_allowed_api_formats = None;
-    snapshot.api_key_allowed_models = None;
-    snapshot.api_key_rate_limit = None;
-    snapshot.api_key_concurrent_limit = None;
 }
 
 // Per-user list policy columns are retained only for legacy import/export compatibility.
@@ -2482,7 +2456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_non_standalone_snapshot_bypasses_group_and_key_policies() {
+    async fn admin_non_standalone_snapshot_applies_group_and_key_policies() {
         let mut snapshot = sample_snapshot_with_role("key-admin", "admin-1", "admin")
             .with_user_rate_limit(Some(120));
         snapshot.api_key_allowed_providers = Some(vec!["anthropic".to_string()]);
@@ -2528,16 +2502,22 @@ mod tests {
             .expect("snapshot should resolve")
             .expect("snapshot should exist");
 
-        assert_eq!(resolved.effective_allowed_providers(), None);
-        assert_eq!(resolved.effective_allowed_api_formats(), None);
-        assert_eq!(resolved.effective_allowed_models(), None);
-        assert_eq!(resolved.user_rate_limit, None);
-        assert_eq!(resolved.api_key_rate_limit, None);
-        assert_eq!(resolved.api_key_concurrent_limit, None);
+        assert_eq!(resolved.user_role, "admin");
+        assert_eq!(
+            resolved.preferred_allowed_providers(),
+            Some(&["anthropic".to_string()][..])
+        );
+        assert!(!resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+        assert!(!resolved.allows_provider("provider-openai", "OpenAI", "openai"));
+        assert_eq!(resolved.effective_allowed_api_formats(), Some(&[][..]));
+        assert_eq!(resolved.effective_allowed_models(), Some(&[][..]));
+        assert_eq!(resolved.user_rate_limit, Some(1));
+        assert_eq!(resolved.api_key_rate_limit, Some(5));
+        assert_eq!(resolved.api_key_concurrent_limit, Some(1));
     }
 
     #[tokio::test]
-    async fn current_admin_role_bypasses_stored_user_and_key_policies() {
+    async fn current_admin_role_refreshes_without_bypassing_key_policies() {
         let mut snapshot = sample_snapshot("key-admin", "admin-1");
         snapshot.api_key_allowed_providers = Some(vec!["anthropic".to_string()]);
         snapshot.api_key_allowed_api_formats = Some(vec!["anthropic:messages".to_string()]);
@@ -2560,12 +2540,45 @@ mod tests {
             .expect("snapshot should exist");
 
         assert_eq!(resolved.user_role, "admin");
-        assert_eq!(resolved.effective_allowed_providers(), None);
-        assert_eq!(resolved.effective_allowed_api_formats(), None);
-        assert_eq!(resolved.effective_allowed_models(), None);
+        assert_eq!(
+            resolved.preferred_allowed_providers(),
+            Some(&["anthropic".to_string()][..])
+        );
+        assert!(resolved.allows_provider("provider-anthropic", "Anthropic", "anthropic"));
+        assert!(!resolved.allows_provider("provider-openai", "OpenAI", "openai"));
+        assert_eq!(
+            resolved.effective_allowed_api_formats(),
+            Some(&["anthropic:messages".to_string()][..])
+        );
+        assert_eq!(
+            resolved.effective_allowed_models(),
+            Some(&["claude-sonnet-4-5".to_string()][..])
+        );
         assert_eq!(resolved.user_rate_limit, None);
-        assert_eq!(resolved.api_key_rate_limit, None);
-        assert_eq!(resolved.api_key_concurrent_limit, None);
+        assert_eq!(resolved.api_key_rate_limit, Some(60));
+        assert_eq!(resolved.api_key_concurrent_limit, Some(5));
+    }
+
+    #[tokio::test]
+    async fn current_user_role_replaces_stored_admin_role() {
+        let snapshot = sample_snapshot_with_role("key-user", "user-1", "admin");
+        let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some("hash-user".to_string()),
+            snapshot,
+        )]));
+        let user_repository = Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![
+            sample_auth_user("user-1", "user"),
+        ]));
+        let state = GatewayDataState::with_auth_api_key_reader_for_tests(auth_repository)
+            .with_user_reader(user_repository);
+
+        let resolved = state
+            .read_auth_api_key_snapshot_by_key_hash("hash-user", 100)
+            .await
+            .expect("snapshot should resolve")
+            .expect("snapshot should exist");
+
+        assert_eq!(resolved.user_role, "user");
     }
 
     #[tokio::test]
@@ -2614,7 +2627,7 @@ mod tests {
             .expect("snapshot should exist");
 
         assert_eq!(
-            resolved.effective_allowed_providers(),
+            resolved.preferred_allowed_providers(),
             Some(&["anthropic".to_string()][..])
         );
         assert_eq!(
@@ -2633,7 +2646,7 @@ mod tests {
             .expect("catalog policies should resolve");
         assert_eq!(
             catalog_policies.allowed_providers.as_deref(),
-            resolved.effective_allowed_providers()
+            resolved.preferred_allowed_providers()
         );
         assert_eq!(
             catalog_policies.allowed_api_formats.as_deref(),

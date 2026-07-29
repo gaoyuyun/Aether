@@ -193,6 +193,7 @@ mod tests {
 
         let constraints = SchedulerAuthConstraints {
             allowed_providers: Some(vec!["provider-1".to_string()]),
+            allowed_providers_and: None,
             allowed_api_formats: Some(vec!["OPENAI:CHAT".to_string()]),
             allowed_models: Some(vec!["gpt-5".to_string()]),
         };
@@ -270,6 +271,7 @@ mod tests {
 
         let constraints = SchedulerAuthConstraints {
             allowed_providers: Some(vec!["provider-1".to_string()]),
+            allowed_providers_and: None,
             allowed_api_formats: Some(vec!["openai:chat".to_string()]),
             allowed_models: Some(vec!["gpt-5".to_string()]),
         };

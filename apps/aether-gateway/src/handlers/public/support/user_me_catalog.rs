@@ -288,6 +288,12 @@ pub(super) async fn handle_users_me_available_models(
     .into_response()
 }
 
+fn users_me_providers_view_is_options(query: Option<&str>) -> bool {
+    query_param_value(query, "view")
+        .map(|value| value.eq_ignore_ascii_case("options"))
+        .unwrap_or(false)
+}
+
 pub(super) async fn handle_users_me_providers_get(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
@@ -305,8 +311,10 @@ pub(super) async fn handle_users_me_providers_get(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let expose_provider_details = auth.user.role.eq_ignore_ascii_case("admin");
-    let allowed_provider_names = if expose_provider_details {
+    let options_only =
+        users_me_providers_view_is_options(request_context.request_query_string.as_deref());
+    let expose_provider_details = !options_only && auth.user.role.eq_ignore_ascii_case("admin");
+    let allowed_provider_names = if auth.user.role.eq_ignore_ascii_case("admin") {
         None
     } else {
         let effective_policies = match state
@@ -325,6 +333,44 @@ pub(super) async fn handle_users_me_providers_get(
         };
         users_me_allowed_provider_names(effective_policies.allowed_providers.as_deref())
     };
+
+    if options_only {
+        let mut providers = match state.list_provider_catalog_provider_identities(true).await {
+            Ok(value) => value,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("user provider option lookup failed: {err:?}"),
+                    false,
+                )
+            }
+        };
+        if let Some(allowed_provider_names) = allowed_provider_names.as_ref() {
+            providers.retain(|provider| {
+                allowed_provider_names.contains(&provider.id.to_ascii_lowercase())
+                    || allowed_provider_names.contains(&provider.name.to_ascii_lowercase())
+                    || allowed_provider_names.contains(&provider.provider_type.to_ascii_lowercase())
+            });
+        }
+        providers.sort_by(|left, right| {
+            left.provider_priority
+                .cmp(&right.provider_priority)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        return Json(
+            providers
+                .into_iter()
+                .map(|provider| {
+                    json!({
+                        "id": provider.id,
+                        "name": provider.name,
+                        "provider_priority": provider.provider_priority,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response();
+    }
 
     let mut providers = match state.list_provider_catalog_providers(true).await {
         Ok(value) => value,
@@ -431,6 +477,8 @@ pub(super) async fn handle_users_me_providers_get(
             .into_iter()
             .map(|provider| {
                 let provider_id = provider.id.clone();
+                // Full view: name/description remain admin-only. Key allowlist
+                // selectors should use ?view=options for id/name without endpoints.
                 let mut payload = json!({
                     "id": provider_id.clone(),
                     "provider_priority": provider.provider_priority,

@@ -74,7 +74,7 @@ pub(crate) async fn build_admin_create_user_api_key_response(
     {
         return Ok((
             http::StatusCode::BAD_REQUEST,
-            Json(json!({ "detail": "当前仅支持 name、rate_limit、concurrent_limit、allowed_providers、ip_rules 字段" })),
+            Json(json!({ "detail": "当前仅支持 name、rate_limit、concurrent_limit、allowed_providers、ip_rules、feature_settings 字段" })),
         )
             .into_response());
     }
@@ -156,13 +156,14 @@ pub(crate) async fn build_admin_create_user_api_key_response(
             key_hash: hash_admin_user_api_key(&plaintext_key),
             key_encrypted: Some(key_encrypted),
             name: Some(name.clone()),
-            allowed_providers: None,
+            allowed_providers,
             allowed_api_formats: None,
             allowed_models: None,
             ip_rules,
             rate_limit,
             concurrent_limit,
             force_capabilities: None,
+            feature_settings,
             is_active: true,
             expires_at_unix_secs: None,
             auto_delete_on_expiry: false,
@@ -175,37 +176,6 @@ pub(crate) async fn build_admin_create_user_api_key_response(
         return Ok(build_admin_users_data_unavailable_response());
     };
 
-    let created = if allowed_providers.is_some() {
-        match state
-            .set_user_api_key_allowed_providers(
-                &target_user_id,
-                &created.api_key_id,
-                allowed_providers,
-            )
-            .await?
-        {
-            Some(updated) => updated,
-            None => created,
-        }
-    } else {
-        created
-    };
-    let created = if feature_settings.is_some() {
-        match state
-            .set_user_api_key_feature_settings(
-                &target_user_id,
-                &created.api_key_id,
-                feature_settings.clone(),
-            )
-            .await?
-        {
-            Some(updated) => updated,
-            None => created,
-        }
-    } else {
-        created
-    };
-
     Ok(attach_audit_response(
         Json(json!({
             "id": created.api_key_id,
@@ -215,6 +185,7 @@ pub(crate) async fn build_admin_create_user_api_key_response(
             "rate_limit": created.rate_limit,
             "concurrent_limit": created.concurrent_limit,
             "ip_rules": created.ip_rules,
+            "allowed_providers": created.allowed_providers,
             "expires_at": format_optional_unix_secs_iso8601(created.expires_at_unix_secs),
             "last_used_at": format_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
             "created_at": format_optional_unix_secs_iso8601(created.created_at_unix_secs),
