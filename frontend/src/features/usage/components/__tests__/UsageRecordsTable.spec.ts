@@ -57,8 +57,12 @@ vi.mock('@/components/common', async () => {
   return {
     MultiSelect: defineComponent({
       name: 'MultiSelectStub',
-      setup() {
-        return () => h('div')
+      emits: ['update:modelValue'],
+      setup(_, { emit }) {
+        return () => h('button', {
+          'data-test': 'compact-usage-columns',
+          'onClick': () => emit('update:modelValue', ['time', 'model', 'cost']),
+        })
       },
     }),
     TimeRangePicker: defineComponent({
@@ -176,10 +180,29 @@ afterEach(() => {
     app.unmount()
     root.remove()
   }
+  window.localStorage.clear()
   vi.useRealTimers()
 })
 
 describe('UsageRecordsTable', () => {
+  it('shrinks and redistributes the desktop table when columns are hidden', async () => {
+    const root = mountUsageRecordsTable([buildRecord()])
+    const table = root.querySelector('table') as HTMLTableElement
+
+    expect(table.style.getPropertyValue('--usage-records-table-min-width')).toBe('932px')
+    expect(table.querySelectorAll('col[data-usage-column]')).toHaveLength(9)
+
+    const compactColumnsButton = root.querySelector('[data-test="compact-usage-columns"]') as HTMLButtonElement
+    compactColumnsButton.click()
+    await nextTick()
+
+    expect(table.style.getPropertyValue('--usage-records-table-min-width')).toBe('276px')
+    const columns = [...table.querySelectorAll<HTMLElement>('col[data-usage-column]')]
+    expect(columns.map(column => column.dataset.usageColumn)).toEqual(['time', 'model', 'cost'])
+    expect(columns.reduce((total, column) => total + Number.parseFloat(column.style.width), 0)).toBeCloseTo(100)
+    expect(Number.parseFloat(columns[1].style.width)).toBeGreaterThan(Number.parseFloat(columns[2].style.width))
+  })
+
   it('shows output TPS after the request completes', () => {
     const root = mountUsageRecordsTable([buildRecord()])
 

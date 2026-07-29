@@ -1,7 +1,7 @@
 <template>
-  <Card class="p-4 overflow-hidden">
-    <div class="flex items-center justify-between mb-3">
-      <p class="text-sm font-semibold">
+  <Card class="p-4 overflow-hidden min-w-0">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+      <p class="text-sm font-semibold min-w-0">
         {{ title }}
       </p>
       <div
