@@ -54,7 +54,7 @@
         </p>
       </div>
 
-      <div>
+      <div class="md:col-span-2 md:max-w-[calc(50%_-_0.75rem)]">
         <Label
           for="password-policy-level"
           class="block text-sm font-medium mb-2"
@@ -88,107 +88,135 @@
         </p>
       </div>
 
-      <div class="flex items-center h-full">
-        <div class="flex items-center space-x-2">
-          <Checkbox
-            id="enable-registration"
-            :checked="enableRegistration"
-            @update:checked="$emit('update:enableRegistration', $event)"
-          />
-          <div>
-            <Label
-              for="enable-registration"
-              class="cursor-pointer"
-            >
-              开放用户注册
-            </Label>
-            <p class="text-xs text-muted-foreground">
-              允许新用户自助注册账户
-            </p>
-          </div>
+      <div class="md:col-span-2 border-t pt-5">
+        <div class="mb-3">
+          <h3 class="text-sm font-medium">
+            功能开关
+          </h3>
+          <p class="mt-0.5 text-xs text-muted-foreground">
+            控制注册、日志透明度与网关兼容行为
+          </p>
         </div>
-      </div>
 
-      <div class="flex items-center h-full">
-        <div class="flex items-center space-x-2">
-          <Checkbox
-            id="auto-delete-expired-keys"
-            :checked="autoDeleteExpiredKeys"
-            @update:checked="$emit('update:autoDeleteExpiredKeys', $event)"
-          />
-          <div>
-            <Label
-              for="auto-delete-expired-keys"
-              class="cursor-pointer"
-            >
-              自动删除过期 Key
-            </Label>
-            <p class="text-xs text-muted-foreground">
-              关闭时仅禁用过期的独立余额 Key
-            </p>
+        <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div class="flex items-start gap-3 rounded-lg border border-border/60 bg-muted/10 p-4 transition-colors hover:bg-muted/20">
+            <Checkbox
+              id="enable-registration"
+              class="mt-0.5"
+              :checked="enableRegistration"
+              @update:checked="$emit('update:enableRegistration', $event)"
+            />
+            <div class="min-w-0">
+              <Label
+                for="enable-registration"
+                class="cursor-pointer"
+              >
+                开放用户注册
+              </Label>
+              <p class="mt-1 text-xs leading-5 text-muted-foreground">
+                允许新用户自助注册账户
+              </p>
+            </div>
           </div>
-        </div>
-      </div>
 
-      <div class="flex items-center h-full">
-        <div class="flex items-center space-x-2">
-          <Checkbox
-            id="enable-format-conversion"
-            :checked="enableFormatConversion"
-            @update:checked="$emit('update:enableFormatConversion', $event)"
-          />
-          <div>
-            <Label
-              for="enable-format-conversion"
-              class="cursor-pointer"
-            >
-              全局格式转换
-            </Label>
-            <p class="text-xs text-muted-foreground">
-              开启后强制允许所有提供商接受跨格式请求
-            </p>
+          <div class="flex items-start gap-3 rounded-lg border border-border/60 bg-muted/10 p-4 transition-colors hover:bg-muted/20">
+            <Checkbox
+              id="show-provider-in-user-usage"
+              class="mt-0.5"
+              :checked="showProviderInUserUsage"
+              @update:checked="$emit('update:showProviderInUserUsage', $event)"
+            />
+            <div class="min-w-0">
+              <Label
+                for="show-provider-in-user-usage"
+                class="cursor-pointer"
+              >
+                用户日志显示 Provider
+              </Label>
+              <p class="mt-1 text-xs leading-5 text-muted-foreground">
+                允许普通用户在自己的使用记录中查看最终实际使用的 Provider
+              </p>
+            </div>
           </div>
-        </div>
-      </div>
 
-      <div class="flex items-center h-full">
-        <div class="flex items-center space-x-2">
-          <Checkbox
-            id="enable-openai-image-sync-heartbeat"
-            :checked="enableOpenaiImageSyncHeartbeat"
-            @update:checked="$emit('update:enableOpenaiImageSyncHeartbeat', $event)"
-          />
-          <div>
-            <Label
-              for="enable-openai-image-sync-heartbeat"
-              class="cursor-pointer"
-            >
-              同步生图心跳
-            </Label>
-            <p class="text-xs text-muted-foreground">
-              开启后同步生图外层 HTTP 状态固定为 200，上游失败需读取响应体 error.upstream_status
-            </p>
+          <div class="flex items-start gap-3 rounded-lg border border-border/60 bg-muted/10 p-4 transition-colors hover:bg-muted/20">
+            <Checkbox
+              id="auto-delete-expired-keys"
+              class="mt-0.5"
+              :checked="autoDeleteExpiredKeys"
+              @update:checked="$emit('update:autoDeleteExpiredKeys', $event)"
+            />
+            <div class="min-w-0">
+              <Label
+                for="auto-delete-expired-keys"
+                class="cursor-pointer"
+              >
+                自动删除过期 Key
+              </Label>
+              <p class="mt-1 text-xs leading-5 text-muted-foreground">
+                关闭时仅禁用过期的独立余额 Key
+              </p>
+            </div>
           </div>
-        </div>
-      </div>
 
-      <div class="flex items-center h-full">
-        <div class="flex items-center space-x-2">
-          <Checkbox
-            id="enable-standard-text-sync-heartbeat"
-            :checked="enableStandardTextSyncHeartbeat"
-            @update:checked="$emit('update:enableStandardTextSyncHeartbeat', $event)"
-          />
-          <div>
-            <Label
-              for="enable-standard-text-sync-heartbeat"
-              class="cursor-pointer"
-            >
-              标准文本非流式心跳
-            </Label>
-            <p class="text-xs text-muted-foreground">
-              开启后标准文本非流式接口外层 HTTP 状态固定为 200，上游失败需读取响应体 error.upstream_status
-            </p>
+          <div class="flex items-start gap-3 rounded-lg border border-border/60 bg-muted/10 p-4 transition-colors hover:bg-muted/20">
+            <Checkbox
+              id="enable-format-conversion"
+              class="mt-0.5"
+              :checked="enableFormatConversion"
+              @update:checked="$emit('update:enableFormatConversion', $event)"
+            />
+            <div class="min-w-0">
+              <Label
+                for="enable-format-conversion"
+                class="cursor-pointer"
+              >
+                全局格式转换
+              </Label>
+              <p class="mt-1 text-xs leading-5 text-muted-foreground">
+                开启后强制允许所有提供商接受跨格式请求
+              </p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-3 rounded-lg border border-border/60 bg-muted/10 p-4 transition-colors hover:bg-muted/20">
+            <Checkbox
+              id="enable-openai-image-sync-heartbeat"
+              class="mt-0.5"
+              :checked="enableOpenaiImageSyncHeartbeat"
+              @update:checked="$emit('update:enableOpenaiImageSyncHeartbeat', $event)"
+            />
+            <div class="min-w-0">
+              <Label
+                for="enable-openai-image-sync-heartbeat"
+                class="cursor-pointer"
+              >
+                同步生图心跳
+              </Label>
+              <p class="mt-1 text-xs leading-5 text-muted-foreground">
+                开启后同步生图外层 HTTP 状态固定为 200，上游失败需读取响应体 error.upstream_status
+              </p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-3 rounded-lg border border-border/60 bg-muted/10 p-4 transition-colors hover:bg-muted/20">
+            <Checkbox
+              id="enable-standard-text-sync-heartbeat"
+              class="mt-0.5"
+              :checked="enableStandardTextSyncHeartbeat"
+              @update:checked="$emit('update:enableStandardTextSyncHeartbeat', $event)"
+            />
+            <div class="min-w-0">
+              <Label
+                for="enable-standard-text-sync-heartbeat"
+                class="cursor-pointer"
+              >
+                标准文本非流式心跳
+              </Label>
+              <p class="mt-1 text-xs leading-5 text-muted-foreground">
+                开启后标准文本非流式接口外层 HTTP 状态固定为 200，上游失败需读取响应体 error.upstream_status
+              </p>
+            </div>
           </div>
         </div>
       </div>
@@ -522,6 +550,7 @@ defineProps<{
   defaultUserInitialGiftUsd: number
   rateLimitPerMinute: number
   enableRegistration: boolean
+  showProviderInUserUsage: boolean
   passwordPolicyLevel: string
   turnstileEnabled: boolean
   turnstileSiteKey: string | null
@@ -551,6 +580,7 @@ defineEmits<{
   'update:defaultUserInitialGiftUsd': [value: number]
   'update:rateLimitPerMinute': [value: number]
   'update:enableRegistration': [value: boolean]
+  'update:showProviderInUserUsage': [value: boolean]
   'update:passwordPolicyLevel': [value: string]
   'update:turnstileEnabled': [value: boolean]
   'update:turnstileSiteKey': [value: string | null]

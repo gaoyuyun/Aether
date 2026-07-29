@@ -62,7 +62,7 @@ export interface AvailableProvider {
 // 使用记录接口
 export interface UsageRecordDetail {
   id: string
-  provider?: string // 仅管理员可见
+  provider?: string
   model: string
   request_type?: string | null
   requested_reasoning_effort?: string | null
@@ -165,6 +165,7 @@ export interface UsageResponse {
   total_cost: number  // 官方费率
   total_actual_cost?: number  // 倍率消耗（仅管理员可见）
   avg_response_time: number
+  provider_visibility_enabled?: boolean
   billing: BillingSummary
   summary_by_model: ModelSummary[]
   summary_by_provider?: ProviderSummary[]
@@ -378,6 +379,7 @@ export const meApi = {
 
   // 获取活跃请求状态（用于轮询更新）
   async getActiveRequests(ids?: string): Promise<{
+    provider_visibility_enabled?: boolean
     requests: Array<{
       id: string
       status: 'pending' | 'streaming' | 'completed' | 'failed' | 'cancelled'
@@ -405,6 +407,7 @@ export const meApi = {
       client_is_stream?: boolean | null
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
+      provider?: string | null
       target_model?: string | null
       request_type?: string | null
       requested_reasoning_effort?: string | null

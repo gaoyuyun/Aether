@@ -539,6 +539,7 @@ export const usageApi = {
     ids?: string[],
     timeRange?: Pick<UsageFilters, 'start_date' | 'end_date' | 'preset' | 'timezone' | 'tz_offset_minutes'>
   ): Promise<{
+    provider_visibility_enabled?: boolean
     requests: Array<{
       id: string
       status: 'pending' | 'streaming' | 'completed' | 'failed' | 'cancelled'

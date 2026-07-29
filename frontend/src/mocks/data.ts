@@ -913,6 +913,7 @@ export const MOCK_USAGE_RESPONSE: UsageResponse = {
 // ========== 系统配置 ==========
 
 export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; description?: string }> = [
+  { key: 'show_provider_in_user_usage', value: true, description: '是否允许普通用户在自己的使用记录中查看 Provider' },
   { key: 'rate_limit_enabled', value: true, description: '是否启用速率限制' },
   { key: 'default_rate_limit', value: 60, description: '默认速率限制（请求/分钟）' },
   { key: 'cache_enabled', value: true, description: '是否启用缓存' },
