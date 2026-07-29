@@ -206,6 +206,12 @@ impl From<StoredProviderCatalogProvider> for StoredProviderCatalogProviderIdenti
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredProviderCatalogAuthorizationSnapshot {
+    pub providers: Vec<StoredProviderCatalogProviderIdentity>,
+    pub endpoints: Vec<StoredProviderCatalogEndpointIdentity>,
+}
+
 impl StoredProviderCatalogProvider {
     pub fn new(
         id: String,
@@ -860,6 +866,23 @@ pub trait ProviderCatalogReadRepository: Send + Sync {
             .into_iter()
             .map(StoredProviderCatalogEndpointIdentity::from)
             .collect())
+    }
+
+    async fn read_authorization_snapshot(
+        &self,
+    ) -> Result<StoredProviderCatalogAuthorizationSnapshot, crate::DataLayerError> {
+        let providers = self.list_provider_identities(true).await?;
+        let provider_ids = providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect::<Vec<_>>();
+        let endpoints = self
+            .list_endpoint_identities_by_provider_ids(&provider_ids)
+            .await?;
+        Ok(StoredProviderCatalogAuthorizationSnapshot {
+            providers,
+            endpoints,
+        })
     }
 
     async fn list_keys_by_ids(

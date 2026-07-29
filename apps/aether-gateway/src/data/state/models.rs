@@ -3,11 +3,11 @@ use super::{
     DataLayerError, GatewayDataState, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
     PublicGlobalModelQuery, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
     StoredAdminProviderModel, StoredApiFormatCandidateRowsQuery,
-    StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateRowsByKeyIdsQuery,
-    StoredPoolKeyCandidateRowsQuery, StoredProviderActiveGlobalModel, StoredProviderModelStats,
-    StoredPublicCatalogModel, StoredPublicGlobalModel, StoredPublicGlobalModelPage,
-    StoredRequestedModelCandidateRowsQuery, UpdateAdminGlobalModelRecord,
-    UpsertAdminProviderModelRecord,
+    StoredGlobalModelIdentity, StoredMinimalCandidateSelectionRow,
+    StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
+    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
+    StoredPublicGlobalModel, StoredPublicGlobalModelPage, StoredRequestedModelCandidateRowsQuery,
+    UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
 };
 
 impl GatewayDataState {
@@ -146,6 +146,16 @@ impl GatewayDataState {
                 items: Vec::new(),
                 total: 0,
             }),
+        }
+    }
+
+    pub(crate) async fn list_active_global_model_identities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredGlobalModelIdentity>, DataLayerError> {
+        match &self.global_model_reader {
+            Some(repository) => repository.list_active_global_model_identities(limit).await,
+            None => Ok(Vec::new()),
         }
     }
 

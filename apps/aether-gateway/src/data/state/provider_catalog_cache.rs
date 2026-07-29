@@ -7,7 +7,8 @@ use std::time::Duration;
 use aether_cache::ExpiringMap;
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, StoredProviderCatalogEndpoint,
+    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository,
+    StoredProviderCatalogAuthorizationSnapshot, StoredProviderCatalogEndpoint,
     StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
@@ -20,6 +21,7 @@ const PROVIDER_CATALOG_CACHE_TTL: Duration = Duration::from_secs(5);
 const PROVIDER_CATALOG_CACHE_MAX_ENTRIES: usize = 1024;
 const PROVIDER_CATALOG_CACHE_MAX_INFLIGHT: usize = 1024;
 const PROVIDER_CATALOG_CACHE_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_AUTHORIZATION_SNAPSHOT_CACHE_TTL: Duration = Duration::MAX;
 
 pub(super) struct CachedProviderCatalogReadRepository {
     inner: Arc<dyn ProviderCatalogReadRepository>,
@@ -53,8 +55,22 @@ impl CachedProviderCatalogReadRepository {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<ProviderCatalogCacheValue, DataLayerError>>,
     {
+        self.get_or_load_with_ttl(key, PROVIDER_CATALOG_CACHE_TTL, load)
+            .await
+    }
+
+    async fn get_or_load_with_ttl<F, Fut>(
+        &self,
+        key: ProviderCatalogCacheKey,
+        ttl: Duration,
+        load: F,
+    ) -> Result<ProviderCatalogCacheValue, DataLayerError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<ProviderCatalogCacheValue, DataLayerError>>,
+    {
         loop {
-            if let Some(value) = self.entries.get_fresh(&key, PROVIDER_CATALOG_CACHE_TTL) {
+            if let Some(value) = self.entries.get_fresh(&key, ttl) {
                 return Ok(value);
             }
 
@@ -79,7 +95,7 @@ impl CachedProviderCatalogReadRepository {
                     }
                 }
                 InflightRegistration::Leader(mut guard) => {
-                    if let Some(value) = self.entries.get_fresh(&key, PROVIDER_CATALOG_CACHE_TTL) {
+                    if let Some(value) = self.entries.get_fresh(&key, ttl) {
                         guard.finish(ProviderCatalogInflightCompletion::Loaded(value.clone()));
                         return Ok(value);
                     }
@@ -95,7 +111,7 @@ impl CachedProviderCatalogReadRepository {
                         };
                     match result {
                         Ok(value) => {
-                            guard.finish_loaded(value.clone());
+                            guard.finish_loaded_with_ttl(value.clone(), ttl);
                             return Ok(value);
                         }
                         Err(error) => {
@@ -157,7 +173,7 @@ impl CachedProviderCatalogReadRepository {
         state: &Arc<ProviderCatalogInflightState>,
         admission: tokio::sync::OwnedSemaphorePermit,
         completion: ProviderCatalogInflightCompletion,
-        cache_value: Option<ProviderCatalogCacheValue>,
+        cache_value: Option<(ProviderCatalogCacheValue, Duration)>,
     ) {
         let _mutation = self
             .mutation
@@ -175,11 +191,11 @@ impl CachedProviderCatalogReadRepository {
                 .is_some_and(|current| Arc::ptr_eq(current, state))
                 && self.epoch.load(Ordering::Acquire) == state.epoch
             {
-                if let Some(value) = cache_value {
+                if let Some((value, ttl)) = cache_value {
                     self.entries.insert(
                         key.clone(),
                         value,
-                        PROVIDER_CATALOG_CACHE_TTL,
+                        ttl,
                         PROVIDER_CATALOG_CACHE_MAX_ENTRIES,
                     );
                 }
@@ -358,6 +374,41 @@ impl ProviderCatalogReadRepository for CachedProviderCatalogReadRepository {
         }
     }
 
+    async fn read_authorization_snapshot(
+        &self,
+    ) -> Result<StoredProviderCatalogAuthorizationSnapshot, DataLayerError> {
+        match self
+            .get_or_load_with_ttl(
+                ProviderCatalogCacheKey::AuthorizationSnapshot,
+                PROVIDER_AUTHORIZATION_SNAPSHOT_CACHE_TTL,
+                || async move {
+                    let providers = self.inner.list_provider_identities(true).await?;
+                    let provider_ids = providers
+                        .iter()
+                        .map(|provider| provider.id.clone())
+                        .collect::<Vec<_>>();
+                    let endpoints = self
+                        .inner
+                        .list_endpoint_identities_by_provider_ids(&provider_ids)
+                        .await?;
+                    Ok(ProviderCatalogCacheValue::AuthorizationSnapshot(
+                        StoredProviderCatalogAuthorizationSnapshot {
+                            providers,
+                            endpoints,
+                        },
+                    ))
+                },
+            )
+            .await?
+        {
+            ProviderCatalogCacheValue::AuthorizationSnapshot(snapshot) => Ok(snapshot),
+            _ => Ok(StoredProviderCatalogAuthorizationSnapshot {
+                providers: Vec::new(),
+                endpoints: Vec::new(),
+            }),
+        }
+    }
+
     async fn list_keys_by_ids(
         &self,
         key_ids: &[String],
@@ -471,6 +522,7 @@ enum ProviderCatalogCacheKey {
     EndpointsByIds(Vec<String>),
     EndpointsByProviderIds(Vec<String>),
     EndpointIdentitiesByProviderIds(Vec<String>),
+    AuthorizationSnapshot,
     KeysByIds(Vec<String>),
     KeysByProviderIds(Vec<String>),
     KeySummariesByProviderIds(Vec<String>),
@@ -484,6 +536,7 @@ enum ProviderCatalogCacheValue {
     ProviderIdentities(Vec<StoredProviderCatalogProviderIdentity>),
     Endpoints(Vec<StoredProviderCatalogEndpoint>),
     EndpointIdentities(Vec<StoredProviderCatalogEndpointIdentity>),
+    AuthorizationSnapshot(StoredProviderCatalogAuthorizationSnapshot),
     Keys(Vec<StoredProviderCatalogKey>),
     KeyMaintenanceSummaries(Vec<StoredProviderCatalogKeyMaintenanceSummary>),
     KeyStats(Vec<StoredProviderCatalogKeyStats>),
@@ -539,8 +592,12 @@ struct InflightGuard<'a> {
 
 impl InflightGuard<'_> {
     fn finish_loaded(&mut self, value: ProviderCatalogCacheValue) {
+        self.finish_loaded_with_ttl(value, PROVIDER_CATALOG_CACHE_TTL);
+    }
+
+    fn finish_loaded_with_ttl(&mut self, value: ProviderCatalogCacheValue, ttl: Duration) {
         let completion = ProviderCatalogInflightCompletion::Loaded(value.clone());
-        self.finish_with_cache(completion, Some(value));
+        self.finish_with_cache(completion, Some((value, ttl)));
     }
 
     fn finish(&mut self, completion: ProviderCatalogInflightCompletion) {
@@ -550,7 +607,7 @@ impl InflightGuard<'_> {
     fn finish_with_cache(
         &mut self,
         completion: ProviderCatalogInflightCompletion,
-        cache_value: Option<ProviderCatalogCacheValue>,
+        cache_value: Option<(ProviderCatalogCacheValue, Duration)>,
     ) {
         if let Some(key) = self.key.take() {
             let admission = self

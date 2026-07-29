@@ -7,9 +7,10 @@ use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
     GlobalModelReadRepository, GlobalModelWriteRepository, PublicCatalogModelListQuery,
     PublicCatalogModelSearchQuery, PublicGlobalModelQuery, StoredAdminGlobalModel,
-    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredProviderActiveGlobalModel,
-    StoredProviderModelStats, StoredPublicCatalogModel, StoredPublicGlobalModel,
-    StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
+    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredGlobalModelIdentity,
+    StoredProviderActiveGlobalModel, StoredProviderModelStats, StoredPublicCatalogModel,
+    StoredPublicGlobalModel, StoredPublicGlobalModelPage, UpdateAdminGlobalModelRecord,
+    UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -791,6 +792,23 @@ impl GlobalModelReadRepository for SqlxGlobalModelReadRepository {
         query: &PublicGlobalModelQuery,
     ) -> Result<StoredPublicGlobalModelPage, DataLayerError> {
         Self::list_public_models(self, query).await
+    }
+
+    async fn list_active_global_model_identities(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredGlobalModelIdentity>, DataLayerError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, name FROM global_models WHERE is_active = TRUE ORDER BY name ASC LIMIT $1",
+        )
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_postgres_err()?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name)| StoredGlobalModelIdentity { id, name })
+            .collect())
     }
 
     async fn get_public_model_by_name(

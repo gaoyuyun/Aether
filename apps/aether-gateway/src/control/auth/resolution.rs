@@ -1,4 +1,4 @@
-use std::{sync::OnceLock, time::Duration};
+use std::{collections::HashSet, sync::OnceLock, time::Duration};
 
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpointIdentity, StoredProviderCatalogProviderIdentity,
@@ -1268,7 +1268,7 @@ async fn auth_snapshot_allows_requested_provider(
         return true;
     }
 
-    let providers = match state.list_provider_catalog_provider_identities(true).await {
+    let authorization_snapshot = match state.read_provider_catalog_authorization_snapshot().await {
         Ok(value) => value,
         Err(err) => {
             debug!(
@@ -1281,8 +1281,9 @@ async fn auth_snapshot_allows_requested_provider(
     };
 
     // Catalog providers must satisfy all policy layers (id/name/type semantic AND).
-    let allowed_catalog_providers = providers
-        .into_iter()
+    let allowed_catalog_providers = authorization_snapshot
+        .providers
+        .iter()
         .filter(|provider| {
             snapshot.allows_provider(&provider.id, &provider.name, &provider.provider_type)
         })
@@ -1296,28 +1297,19 @@ async fn auth_snapshot_allows_requested_provider(
 
     let allowed_provider_ids = allowed_catalog_providers
         .iter()
-        .map(|provider| provider.id.clone())
-        .collect::<Vec<_>>();
+        .map(|provider| provider.id.as_str())
+        .collect::<HashSet<_>>();
     if allowed_provider_ids.is_empty() {
         return false;
     }
 
-    let endpoints = match state
-        .list_provider_catalog_endpoint_identities_by_provider_ids(&allowed_provider_ids)
-        .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            debug!(
-                "skip local provider auth gate for requested provider {}: provider endpoint lookup failed: {:?}",
-                requested_provider, err
-            );
-            return true;
-        }
-    };
-
-    endpoints.iter().any(|endpoint| {
-        endpoint_matches_requested_provider(endpoint, &requested_api_format, requested_provider)
+    authorization_snapshot.endpoints.iter().any(|endpoint| {
+        allowed_provider_ids.contains(endpoint.provider_id.as_str())
+            && endpoint_matches_requested_provider(
+                endpoint,
+                &requested_api_format,
+                requested_provider,
+            )
     })
 }
 
@@ -2508,6 +2500,92 @@ mod tests {
             1,
             "a revoked bearer must be rejected before its mapped API key is reloaded"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_authorization_catalog_is_shared_across_allowlist_combinations() {
+        let keys_and_providers = [
+            (
+                "sk-auth-catalog-1",
+                "key-auth-catalog-1",
+                "provider-custom-1",
+            ),
+            (
+                "sk-auth-catalog-2",
+                "key-auth-catalog-2",
+                "provider-custom-2",
+            ),
+            (
+                "sk-auth-catalog-3",
+                "key-auth-catalog-3",
+                "provider-custom-3",
+            ),
+        ];
+        let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(
+            keys_and_providers
+                .iter()
+                .map(|(api_key, api_key_id, provider_id)| {
+                    let mut snapshot = sample_snapshot(api_key_id, api_key_id);
+                    snapshot.user_allowed_providers = None;
+                    snapshot.api_key_allowed_providers = Some(vec![provider_id.to_string()]);
+                    snapshot.user_allowed_api_formats = None;
+                    snapshot.api_key_allowed_api_formats = None;
+                    (Some(hash_api_key(api_key)), snapshot)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            keys_and_providers
+                .iter()
+                .map(|(_, _, provider_id)| {
+                    sample_provider(provider_id, &format!("Custom {provider_id}"), "custom")
+                })
+                .collect(),
+            keys_and_providers
+                .iter()
+                .map(|(_, _, provider_id)| {
+                    sample_endpoint(
+                        &format!("endpoint-{provider_id}"),
+                        provider_id,
+                        "openai:chat",
+                    )
+                })
+                .collect(),
+            Vec::new(),
+        ));
+        let data = GatewayDataState::with_auth_api_key_reader_for_tests(auth_repository)
+            .with_cached_provider_catalog_reader_for_tests(provider_catalog.clone());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+
+        for (api_key, _, _) in keys_and_providers {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", api_key.parse().unwrap());
+            let auth_context = resolve_data_backed_auth_context(
+                &state,
+                &headers,
+                &uri("/v1/chat/completions"),
+                Some("openai:chat"),
+            )
+            .await
+            .expect("resolution should succeed")
+            .expect("auth context should exist");
+            assert_eq!(auth_context.local_rejection, None);
+        }
+
+        assert_eq!(provider_catalog.provider_identity_read_count(), 1);
+        assert_eq!(provider_catalog.endpoint_identity_read_count(), 1);
+        assert_eq!(provider_catalog.endpoint_by_provider_ids_read_count(), 0);
+
+        state.data.clear_provider_catalog_cache();
+        let snapshot = state
+            .read_provider_catalog_authorization_snapshot()
+            .await
+            .expect("authorization snapshot should rebuild after invalidation");
+        assert_eq!(snapshot.providers.len(), 3);
+        assert_eq!(provider_catalog.provider_identity_read_count(), 2);
+        assert_eq!(provider_catalog.endpoint_identity_read_count(), 2);
     }
 
     #[tokio::test]

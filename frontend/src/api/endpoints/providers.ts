@@ -1,5 +1,6 @@
 import client from '../client'
 import { buildCacheKey, cachedRequest, dedupedRequest } from '@/utils/cache'
+import { markAccessControlCatalogChanged } from '@/utils/accessControlCatalog'
 import type {
   ClaudeCodeAdvancedConfig,
   FailoverRulesConfig,
@@ -137,6 +138,7 @@ export async function updateProvider(
   requestOptions?: ProviderRequestOptions,
 ): Promise<ProviderWithEndpointsSummary> {
   const response = await client.patch(`/api/admin/providers/${providerId}`, data, requestOptions)
+  markAccessControlCatalogChanged()
   return normalizeProviderSummary(response.data)
 }
 
@@ -170,6 +172,7 @@ export async function createProvider(
   }
 ): Promise<{ id: string; name: string; message?: string }> {
   const response = await client.post('/api/admin/providers/', data)
+  markAccessControlCatalogChanged()
   return response.data
 }
 
@@ -196,6 +199,7 @@ export interface ProviderDeleteTaskResponse {
 
 export async function deleteProvider(providerId: string): Promise<ProviderDeleteSubmitResponse> {
   const response = await client.delete<ProviderDeleteSubmitResponse>(`/api/admin/providers/${providerId}`)
+  markAccessControlCatalogChanged()
   return response.data
 }
 

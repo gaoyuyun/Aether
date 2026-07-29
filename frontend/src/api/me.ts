@@ -460,6 +460,16 @@ export const meApi = {
     return response.data
   },
 
+  async getAvailableModelOptions(params?: { limit?: number }): Promise<{
+    models: Array<{ id: string; name: string }>
+    total: number
+  }> {
+    const response = await apiClient.get('/api/users/me/available-models', {
+      params: { view: 'options', limit: params?.limit ?? 1000 },
+    })
+    return response.data
+  },
+
   // 获取端点状态（不包含敏感信息）
   async getEndpointStatus(): Promise<Array<Record<string, unknown>>> {
     const response = await apiClient.get('/api/users/me/endpoint-status')
