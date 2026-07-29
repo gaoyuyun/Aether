@@ -1,5 +1,5 @@
 <template>
-  <div class="space-y-4 w-full">
+  <div class="space-y-4 w-full min-w-0">
     <!-- Tooltip 使用 Teleport 确保不受父容器 overflow 影响 -->
     <Teleport to="body">
       <div
@@ -51,53 +51,40 @@
 
     <div
       v-if="weekColumns.length > 0"
-      class="flex w-full gap-3"
+      class="flex w-full min-w-0 gap-3"
+      :style="heatmapBodyStyle"
     >
       <div
-        class="flex flex-col text-[10px] text-muted-foreground flex-shrink-0"
-        :style="verticalGapStyle"
+        class="flex h-full flex-col text-[10px] text-muted-foreground flex-shrink-0"
       >
         <!-- Placeholder to align with month markers -->
-        <div class="text-[10px] mb-3 invisible">
+        <div
+          class="mb-3 invisible"
+          :style="monthHeaderStyle"
+        >
           M
         </div>
-        <span
-          :style="dayLabelStyle"
-          class="flex items-center invisible"
-        >周日</span>
-        <span
-          :style="dayLabelStyle"
-          class="flex items-center"
-        >一</span>
-        <span
-          :style="dayLabelStyle"
-          class="flex items-center invisible"
-        >周二</span>
-        <span
-          :style="dayLabelStyle"
-          class="flex items-center"
-        >三</span>
-        <span
-          :style="dayLabelStyle"
-          class="flex items-center invisible"
-        >周四</span>
-        <span
-          :style="dayLabelStyle"
-          class="flex items-center"
-        >五</span>
-        <span
-          :style="dayLabelStyle"
-          class="flex items-center invisible"
-        >周六</span>
+        <div
+          class="grid min-h-0 flex-1"
+          :style="dayRowsStyle"
+        >
+          <span class="flex min-h-0 items-center leading-none invisible">周日</span>
+          <span class="flex min-h-0 items-center leading-none">一</span>
+          <span class="flex min-h-0 items-center leading-none invisible">周二</span>
+          <span class="flex min-h-0 items-center leading-none">三</span>
+          <span class="flex min-h-0 items-center leading-none invisible">周四</span>
+          <span class="flex min-h-0 items-center leading-none">五</span>
+          <span class="flex min-h-0 items-center leading-none invisible">周六</span>
+        </div>
       </div>
-      <div class="flex-1 min-w-[200px]">
+      <div class="h-full flex-1 min-w-0">
         <div
           ref="heatmapWrapper"
-          class="relative block w-full"
+          class="relative flex h-full w-full flex-col"
         >
           <div
             class="flex text-[10px] text-muted-foreground/80 mb-3"
-            :style="horizontalGapStyle"
+            :style="[horizontalGapStyle, monthHeaderStyle]"
           >
             <div
               v-for="(week, weekIndex) in weekColumns"
@@ -105,35 +92,38 @@
               :style="monthCellStyle"
               class="text-center"
             >
-              <span v-if="monthMarkers[weekIndex]">{{ monthMarkers[weekIndex] }}</span>
+              <span
+                v-if="monthMarkers[weekIndex]"
+                class="inline-block whitespace-nowrap"
+              >{{ monthMarkers[weekIndex] }}</span>
             </div>
           </div>
           <div
-            class="flex"
+            class="flex min-h-0 flex-1"
             :style="horizontalGapStyle"
           >
             <div
               v-for="(week, weekIndex) in weekColumns"
               :key="weekIndex"
-              class="flex flex-col"
-              :style="verticalGapStyle"
+              class="grid h-full"
+              :style="dayRowsStyle"
             >
               <div
                 v-for="(day, dayIndex) in week"
                 :key="dayIndex"
-                class="relative group"
+                class="relative group min-h-0 flex-1"
               >
                 <div
                   v-if="day"
                   class="rounded-[4px] transition-all duration-200 hover:shadow-lg cursor-pointer cell-emerge"
-                  :style="[cellSquareStyle, getCellStyle(day.requests), getCellAnimationDelay(weekIndex, dayIndex)]"
+                  :style="[cellStyle, getCellStyle(day.requests), getCellAnimationDelay(weekIndex, dayIndex)]"
                   :title="buildTooltip(day)"
                   @mouseenter="handleHover(day, $event)"
                   @mouseleave="clearHover"
                 />
                 <div
                   v-else
-                  :style="cellSquareStyle"
+                  :style="cellStyle"
                   class="rounded-[4px] bg-transparent"
                 />
               </div>
@@ -152,9 +142,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { ActivityHeatmap, ActivityHeatmapDay } from '@/types/activity'
 import { formatCurrency, formatTokens } from '@/utils/format'
+import {
+  ACTIVITY_HEATMAP_MONTH_HEADER_HEIGHT,
+  ACTIVITY_HEATMAP_ROW_GAP,
+  calculateActivityHeatmapBodyHeight,
+  calculateActivityHeatmapLayout,
+} from './activityHeatmapLayout'
 
 const props = withDefaults(defineProps<{
   data?: ActivityHeatmap | null
@@ -188,15 +184,19 @@ const tooltipStyle = computed(() => ({
   transform: tooltip.value.below ? 'translate(-50%, 0)' : 'translate(-50%, -100%)',
 }))
 
-const cellSquareStyle = computed(() => ({
+const cellStyle = computed(() => ({
   width: `${cellSize.value}px`,
-  height: `${cellSize.value}px`,
+  height: '100%',
 }))
 
-const dayLabelStyle = computed(() => ({
-  height: `${cellSize.value}px`,
-  lineHeight: `${cellSize.value}px`,
+const heatmapBodyStyle = computed(() => ({
+  height: `${calculateActivityHeatmapBodyHeight(cellSize.value)}px`,
 }))
+
+const monthHeaderStyle = {
+  height: `${ACTIVITY_HEATMAP_MONTH_HEADER_HEIGHT}px`,
+  lineHeight: `${ACTIVITY_HEATMAP_MONTH_HEADER_HEIGHT}px`,
+}
 
 const monthCellStyle = computed(() => ({
   width: `${cellSize.value}px`,
@@ -206,9 +206,10 @@ const horizontalGapStyle = computed(() => ({
   gap: `${cellGap.value}px`,
 }))
 
-const verticalGapStyle = computed(() => ({
-  rowGap: `${cellGap.value}px`,
-}))
+const dayRowsStyle = {
+  gridTemplateRows: 'repeat(7, minmax(0, 1fr))',
+  rowGap: `${ACTIVITY_HEATMAP_ROW_GAP}px`,
+}
 
 const weekColumns = computed(() => {
   if (!props.data || !props.data.days || props.data.days.length === 0) {
@@ -278,8 +279,6 @@ const monthMarkers = computed(() => {
 })
 
 let resizeObserver: ResizeObserver | null = null
-let mediaQuery: MediaQueryList | null = null
-let mediaQueryHandler: ((event?: MediaQueryListEvent) => void) | null = null
 
 const recalcCellSize = () => {
   const columnCount = weekColumns.value.length
@@ -287,15 +286,13 @@ const recalcCellSize = () => {
     return
   }
 
-  const totalGap = Math.max(columnCount - 1, 0) * cellGap.value
-  const availableSpace = Math.max(heatmapWidth.value - totalGap, 0)
-  const rawSize = availableSpace / columnCount
-  // 自适应尺寸，最小 6px
-  cellSize.value = Math.max(6, rawSize)
+  const layout = calculateActivityHeatmapLayout(heatmapWidth.value, columnCount)
+  cellSize.value = layout.cellSize
+  cellGap.value = layout.cellGap
 }
 
 watch(
-  [() => heatmapWidth.value, () => weekColumns.value.length, () => cellGap.value],
+  [() => heatmapWidth.value, () => weekColumns.value.length],
   () => {
     recalcCellSize()
   },
@@ -322,25 +319,8 @@ watch(
   { immediate: true }
 )
 
-onMounted(() => {
-  if (typeof window === 'undefined') {
-    return
-  }
-  mediaQuery = window.matchMedia('(min-width: 640px)')
-  const updateGap = () => {
-    cellGap.value = mediaQuery && mediaQuery.matches ? 4 : 2
-    recalcCellSize()
-  }
-  mediaQueryHandler = () => updateGap()
-  updateGap()
-  mediaQuery?.addEventListener('change', mediaQueryHandler)
-})
-
 onBeforeUnmount(() => {
   resizeObserver?.disconnect()
-  if (mediaQuery && mediaQueryHandler) {
-    mediaQuery.removeEventListener('change', mediaQueryHandler)
-  }
 })
 
 function handleHover(day: ActivityHeatmapDay, event: MouseEvent) {
