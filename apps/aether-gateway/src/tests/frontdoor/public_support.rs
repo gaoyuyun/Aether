@@ -5725,6 +5725,7 @@ async fn gateway_handles_users_me_usage_locally_without_proxying_upstream() {
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["total_requests"], 2);
+    assert_eq!(payload["provider_visibility_enabled"], true);
     assert_eq!(payload["total_input_tokens"], 240);
     assert_eq!(payload["pagination"]["total"], 3);
     assert_eq!(
@@ -5745,6 +5746,7 @@ async fn gateway_handles_users_me_usage_locally_without_proxying_upstream() {
     assert_eq!(payload["records"][0]["cache_creation_price_per_1m"], 3.75);
     assert_eq!(payload["records"][0]["cache_read_price_per_1m"], 0.3);
     assert_eq!(payload["records"][0]["has_fallback"], true);
+    assert_eq!(payload["records"][0]["provider"], "OpenAI");
     assert_eq!(payload["records"][0]["api_key"]["name"], "renamed-key");
     assert_eq!(payload["records"][0]["api_key"]["display"], "renamed-key");
     assert_eq!(
@@ -6042,8 +6044,10 @@ async fn gateway_handles_users_me_usage_active_locally_without_proxying_upstream
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let requests = payload["requests"].as_array().expect("requests array");
+    assert_eq!(payload["provider_visibility_enabled"], true);
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["status"], "streaming");
+    assert_eq!(requests[0]["provider"], "OpenAI");
     assert_eq!(requests[0]["rate_multiplier"], 0.5);
     assert_eq!(requests[0]["cache_creation_ephemeral_5m_input_tokens"], 4);
     assert_eq!(requests[0]["cache_creation_ephemeral_1h_input_tokens"], 6);

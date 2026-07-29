@@ -134,6 +134,7 @@ function mountUsageRecordsTable(records: UsageRecord[], overrides: Record<string
   const app = createApp(UsageRecordsTable, {
     records,
     isAdmin: true,
+    showProvider: true,
     showActualCost: false,
     loading: false,
     timeRange: { preset: 'today', tz_offset_minutes: 0 },
@@ -340,6 +341,36 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).toContain('100 tps')
     expect(root.textContent).toContain('0.50s / 1.00s')
     expect(root.textContent).toContain('gpt-5')
+  })
+
+  it('shows the final provider to a non-admin user when visibility is enabled', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      provider: 'OpenAI Primary',
+      provider_key_name: 'must-stay-hidden',
+      has_fallback: true,
+    })], {
+      isAdmin: false,
+      showProvider: true,
+      availableProviders: ['OpenAI Primary'],
+    })
+
+    expect(root.querySelector('[data-usage-provider-cell]')?.textContent).toContain('OpenAI Primary')
+    expect(root.querySelector('[data-usage-provider-mobile]')?.textContent).toContain('OpenAI Primary')
+    expect(root.textContent).not.toContain('must-stay-hidden')
+    expect(root.textContent).toContain('全部提供商')
+  })
+
+  it('hides provider UI from a non-admin user when visibility is disabled', () => {
+    const root = mountUsageRecordsTable([buildRecord({ provider: 'Hidden Provider' })], {
+      isAdmin: false,
+      showProvider: false,
+      availableProviders: [],
+    })
+
+    expect(root.querySelector('[data-usage-provider-cell]')).toBeNull()
+    expect(root.querySelector('[data-usage-provider-mobile]')).toBeNull()
+    expect(root.textContent).not.toContain('Hidden Provider')
+    expect(root.textContent).not.toContain('全部提供商')
   })
 
   it('shows reasoning effort next to the model name', () => {

@@ -115,6 +115,27 @@ describe('useSystemConfig', () => {
     expect(state.hasBasicConfigChanges.value).toBe(false)
   })
 
+  it('defaults provider visibility on and saves it with the basic settings', async () => {
+    getAllSystemConfigsMock.mockResolvedValue([])
+    updateSystemConfigMock.mockResolvedValue({})
+
+    const state = useSystemConfig()
+    await state.loadSystemConfig()
+
+    expect(state.systemConfig.value.show_provider_in_user_usage).toBe(true)
+    state.systemConfig.value.show_provider_in_user_usage = false
+    expect(state.hasBasicConfigChanges.value).toBe(true)
+
+    await state.saveBasicConfig()
+
+    expect(updateSystemConfigMock).toHaveBeenCalledWith(
+      'show_provider_in_user_usage',
+      false,
+      '是否允许普通用户在自己的使用记录中查看 Provider'
+    )
+    expect(state.hasBasicConfigChanges.value).toBe(false)
+  })
+
   it('uses backend-compatible defaults when config rows have not been persisted yet', async () => {
     getAllSystemConfigsMock.mockResolvedValue([])
 
