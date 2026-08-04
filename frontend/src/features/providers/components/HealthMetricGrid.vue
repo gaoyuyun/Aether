@@ -1,15 +1,15 @@
 <template>
-  <div class="grid w-full grid-cols-2 gap-2 sm:grid-cols-4">
+  <div class="grid w-full grid-cols-2 gap-2 2xl:grid-cols-4">
     <div
       v-for="metric in metrics"
       :key="metric.label"
-      class="rounded-lg border border-border/40 bg-muted/20 px-3 py-2"
+      class="min-w-0 rounded-lg border border-border/40 bg-muted/20 px-2.5 py-2"
     >
       <div class="text-[11px] leading-tight text-muted-foreground">
         {{ metric.label }}
       </div>
       <div
-        class="mt-1 text-sm font-semibold tabular-nums"
+        class="mt-1 min-w-0 text-[13px] font-medium leading-5 tabular-nums [overflow-wrap:anywhere]"
         :class="metric.valueClass"
       >
         {{ metric.value }}
