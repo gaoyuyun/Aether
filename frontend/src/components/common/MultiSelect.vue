@@ -39,7 +39,7 @@
       />
       <div
         v-if="isOpen"
-        class="z-[90] overflow-hidden rounded-2xl border border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
+        class="z-[90] flex max-h-[19rem] flex-col overflow-hidden rounded-2xl border border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
         :class="teleport ? 'fixed' : 'absolute mt-1 w-full'"
         :style="dropdownStyle"
       >
@@ -60,7 +60,7 @@
           </div>
         </div>
 
-        <div class="max-h-64 overflow-y-auto p-1">
+        <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain p-1">
           <div
             v-if="hasOptions"
             class="sticky top-0 z-10 flex cursor-pointer items-center gap-2 rounded-lg border-b border-border/60 bg-card/95 px-3 py-2 backdrop-blur hover:bg-muted/50 supports-[backdrop-filter]:bg-card/85"
@@ -176,6 +176,9 @@ const isOpen = ref(false)
 const searchQuery = ref('')
 const triggerElement = ref<HTMLElement | null>(null)
 const dropdownPosition = ref<Record<string, string>>({})
+const DROPDOWN_GAP_PX = 4
+const VIEWPORT_PADDING_PX = 8
+const DROPDOWN_MAX_HEIGHT_PX = 304
 
 const dropdownStyle = computed(() => {
   const style: Record<string, string> = { ...dropdownPosition.value }
@@ -186,12 +189,33 @@ const dropdownStyle = computed(() => {
 })
 
 function updateDropdownPosition() {
-  if (!props.teleport || !triggerElement.value) return
+  if (!props.teleport || !triggerElement.value || typeof window === 'undefined') return
   const rect = triggerElement.value.getBoundingClientRect()
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth
+  const spaceBelow = Math.max(
+    0,
+    viewportHeight - rect.bottom - DROPDOWN_GAP_PX - VIEWPORT_PADDING_PX,
+  )
+  const spaceAbove = Math.max(
+    0,
+    rect.top - DROPDOWN_GAP_PX - VIEWPORT_PADDING_PX,
+  )
+  const openAbove = spaceBelow < DROPDOWN_MAX_HEIGHT_PX && spaceAbove > spaceBelow
+  const availableHeight = openAbove ? spaceAbove : spaceBelow
+  const width = Math.max(0, Math.min(rect.width, viewportWidth - VIEWPORT_PADDING_PX * 2))
+  const left = Math.min(
+    Math.max(rect.left, VIEWPORT_PADDING_PX),
+    Math.max(VIEWPORT_PADDING_PX, viewportWidth - width - VIEWPORT_PADDING_PX),
+  )
+
   dropdownPosition.value = {
-    top: `${rect.bottom + 4}px`,
-    left: `${rect.left}px`,
-    width: `${rect.width}px`,
+    left: `${left}px`,
+    width: `${width}px`,
+    maxHeight: `${Math.min(DROPDOWN_MAX_HEIGHT_PX, availableHeight)}px`,
+    ...(openAbove
+      ? { bottom: `${viewportHeight - rect.top + DROPDOWN_GAP_PX}px` }
+      : { top: `${rect.bottom + DROPDOWN_GAP_PX}px` }),
   }
 }
 
