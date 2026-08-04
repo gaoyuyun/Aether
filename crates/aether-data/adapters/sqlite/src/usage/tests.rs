@@ -4,7 +4,7 @@ use aether_data_contracts::repository::usage::{
     ProviderApiKeyWindowUsageRequest, UpsertUsageRecord, UsageAuditAggregationGroupBy,
     UsageAuditAggregationQuery, UsageAuditListQuery, UsageAuditSummaryQuery, UsageBodyCaptureState,
     UsageBreakdownGroupBy, UsageBreakdownSummaryQuery, UsageCleanupExecutionMode,
-    UsageCleanupTargets, UsageCleanupWindow, UsageDailyHeatmapQuery,
+    UsageCleanupTargets, UsageCleanupWindow, UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery,
     UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery, UsageProviderPerformanceQuery,
     UsageReadRepository, UsageTimeSeriesGranularity, UsageWriteRepository,
 };
@@ -107,6 +107,63 @@ async fn sqlite_provider_performance_can_skip_timeline() {
     assert_eq!(without_timeline.summary, with_timeline.summary);
     assert_eq!(without_timeline.providers, with_timeline.providers);
     assert!(without_timeline.timeline.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_cost_savings_prefers_canonical_settlement_values() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    seed_stats_targets(&pool).await;
+
+    SqliteUsageWriteRepository::new(pool.clone())
+        .upsert(sample_usage(
+            "cost-savings-settlement",
+            "completed",
+            "settled",
+            1_000,
+        ))
+        .await
+        .expect("usage should upsert");
+    sqlx::query(
+        r#"
+UPDATE "usage"
+SET cache_read_input_tokens = 0,
+    cache_read_cost_usd = 0,
+    cache_creation_cost_usd = 0
+WHERE request_id = 'cost-savings-settlement';
+UPDATE usage_settlement_snapshots
+SET billing_cache_read_tokens = 200000,
+    billing_cache_read_cost_usd = 0.04,
+    billing_cache_creation_cost_usd = 0.05,
+    input_price_per_1m = 1.5
+WHERE request_id = 'cost-savings-settlement';
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("canonical settlement costs should seed");
+
+    let summary = SqliteUsageReadRepository::new(pool)
+        .summarize_usage_cost_savings(&UsageCostSavingsSummaryQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 2_000,
+            user_id: Some("user-1".to_string()),
+            provider_name: Some("Provider One".to_string()),
+            model: Some("model-1".to_string()),
+        })
+        .await
+        .expect("cost savings should load");
+
+    assert_eq!(summary.cache_read_tokens, 200_000);
+    assert!((summary.cache_read_cost_usd - 0.04).abs() < 1e-9);
+    assert!((summary.cache_creation_cost_usd - 0.05).abs() < 1e-9);
+    assert!((summary.estimated_full_cost_usd - 0.3).abs() < 1e-9);
 }
 
 #[tokio::test]
