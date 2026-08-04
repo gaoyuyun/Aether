@@ -82,4 +82,26 @@ describe('adminApi analytics cache options', () => {
     })
     expect(getMock).toHaveBeenNthCalledWith(4, '/api/admin/stats/errors/distribution', { params })
   })
+
+  it('allows cost analysis requests to skip stale cached values', async () => {
+    const options = { skipCache: true }
+
+    await adminApi.getCostSavings(params, options)
+    await adminApi.getQuotaUsage(options)
+
+    expect(cachedRequestMock).toHaveBeenNthCalledWith(
+      1,
+      expect.any(String),
+      expect.any(Function),
+      0
+    )
+    expect(cachedRequestMock).toHaveBeenNthCalledWith(
+      2,
+      expect.any(String),
+      expect.any(Function),
+      0
+    )
+    expect(getMock).toHaveBeenNthCalledWith(1, '/api/admin/stats/cost/savings', { params })
+    expect(getMock).toHaveBeenNthCalledWith(2, '/api/admin/stats/providers/quota-usage')
+  })
 })

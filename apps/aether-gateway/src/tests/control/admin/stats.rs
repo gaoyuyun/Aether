@@ -294,6 +294,14 @@ async fn gateway_handles_admin_stats_provider_quota_usage_locally_with_trusted_a
                 Some(1_711_000_000),
                 Some(4_102_444_800),
             ),
+            sample_provider("provider-payg", "openai", 30).with_billing_fields(
+                Some("pay_as_you_go".to_string()),
+                Some(100.0),
+                Some(25.0),
+                Some(1),
+                Some(1_711_000_000),
+                Some(4_102_444_800),
+            ),
         ],
         vec![],
         vec![],
@@ -327,6 +335,11 @@ async fn gateway_handles_admin_stats_provider_quota_usage_locally_with_trusted_a
     assert_eq!(payload["providers"][1]["quota_usd"], 100.0);
     assert_eq!(payload["providers"][1]["used_usd"], 25.0);
     assert_eq!(payload["providers"][1]["remaining_usd"], 75.0);
+    assert!(payload["providers"]
+        .as_array()
+        .is_some_and(|providers| providers
+            .iter()
+            .all(|provider| provider["id"] != "provider-payg")));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

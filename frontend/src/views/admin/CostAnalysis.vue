@@ -171,7 +171,7 @@ async function loadForecast() {
 
 async function loadSavings() {
   const requestId = ++savingsRequestId
-  const data = await adminApi.getCostSavings(buildTimeRangeParams())
+  const data = await adminApi.getCostSavings(buildTimeRangeParams(), { skipCache: true })
   if (requestId !== savingsRequestId) return
   costSavings.value = data
 }
@@ -180,7 +180,7 @@ async function loadQuotaUsage() {
   const requestId = ++quotaRequestId
   quotaLoading.value = true
   try {
-    const response = await adminApi.getQuotaUsage()
+    const response = await adminApi.getQuotaUsage({ skipCache: true })
     if (requestId !== quotaRequestId) return
     quotaProviders.value = response.providers
   } finally {
