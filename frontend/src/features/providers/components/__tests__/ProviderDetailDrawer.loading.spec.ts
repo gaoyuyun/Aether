@@ -6,6 +6,10 @@ const source = readFileSync(
   resolve(process.cwd(), 'src/features/providers/components/ProviderDetailDrawer.vue'),
   'utf8',
 )
+const keyPermissionsSource = readFileSync(
+  resolve(process.cwd(), 'src/features/providers/components/KeyAllowedModelsEditDialog.vue'),
+  'utf8',
+)
 
 describe('ProviderDetailDrawer loading priorities', () => {
   it('plays the drawer transition when the lazily mounted component first appears', () => {
@@ -69,5 +73,15 @@ describe('ProviderDetailDrawer loading priorities', () => {
     expect(handler).toContain('editingKey.value = updatedKey')
     expect(handler?.indexOf('providerKeys.value[keyIndex] = updatedKey'))
       .toBeLessThan(handler?.indexOf('await Promise.all([loadEndpoints(), loadMappingPreview()])') ?? -1)
+  })
+
+  it('initializes the model permission dialog when it is mounted on demand', () => {
+    const watcher = keyPermissionsSource
+      .split('watch([() => props.open, () => props.apiKey], async ([open, apiKey]) => {')[1]
+      ?.split('// 组件卸载时取消所有异步操作')[0]
+
+    expect(watcher).toBeTruthy()
+    expect(watcher).toContain('await initializeDialogState(apiKey)')
+    expect(watcher).toContain('{ immediate: true }')
   })
 })

@@ -761,7 +761,7 @@ watch([() => props.open, () => props.apiKey], async ([open, apiKey]) => {
   } else {
     loadingCancelled = true
   }
-})
+}, { immediate: true })
 
 // 组件卸载时取消所有异步操作
 onUnmounted(() => {
