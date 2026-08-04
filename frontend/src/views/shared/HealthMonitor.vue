@@ -29,12 +29,12 @@
             class="rounded-xl border border-border/60 bg-card/70 p-4"
           >
             <div class="flex items-start justify-between gap-3">
-              <div>
+              <div class="min-w-0">
                 <p class="text-xs text-muted-foreground">
                   {{ card.label }}
                 </p>
                 <div
-                  class="mt-2 text-2xl font-semibold tabular-nums"
+                  class="mt-2 min-w-0 text-xl font-semibold leading-7 tabular-nums [overflow-wrap:anywhere]"
                   :class="card.valueClass"
                 >
                   {{ card.value }}

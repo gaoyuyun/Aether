@@ -117,18 +117,6 @@
                   <div class="text-xs text-muted-foreground mt-0.5 truncate">
                     IP 限制：{{ formatIpRules(apiKey.ip_rules) }}
                   </div>
-                  <div
-                    class="text-xs text-muted-foreground mt-0.5 truncate"
-                    :title="formatProvidersSummary(apiKey.allowed_providers)"
-                  >
-                    提供商：{{ formatProvidersSummary(apiKey.allowed_providers) }}
-                  </div>
-                  <div
-                    class="text-xs text-muted-foreground mt-0.5 truncate"
-                    :title="`${formatApiFormatsSummary(apiKey.allowed_api_formats)}；${formatModelsSummary(apiKey.allowed_models)}`"
-                  >
-                    端点：{{ formatApiFormatsSummary(apiKey.allowed_api_formats) }} · 模型：{{ formatModelsSummary(apiKey.allowed_models) }}
-                  </div>
                 </div>
               </TableCell>
 
@@ -392,18 +380,6 @@
               </div>
               <div class="text-xs text-muted-foreground truncate">
                 IP 限制：{{ formatIpRules(apiKey.ip_rules) }}
-              </div>
-              <div
-                class="text-xs text-muted-foreground truncate"
-                :title="formatProvidersSummary(apiKey.allowed_providers)"
-              >
-                提供商：{{ formatProvidersSummary(apiKey.allowed_providers) }}
-              </div>
-              <div
-                class="text-xs text-muted-foreground truncate"
-                :title="`${formatApiFormatsSummary(apiKey.allowed_api_formats)}；${formatModelsSummary(apiKey.allowed_models)}`"
-              >
-                端点：{{ formatApiFormatsSummary(apiKey.allowed_api_formats) }} · 模型：{{ formatModelsSummary(apiKey.allowed_models) }}
               </div>
             </div>
           </div>
@@ -1101,8 +1077,6 @@ import {
 import {
   buildUserApiKeyAllowedList,
   buildUserApiKeyAllowedProviders,
-  formatUserApiKeyAllowedListSummary,
-  formatUserApiKeyProvidersSummary,
   normalizeUserApiKeyAllowedList,
   normalizeUserApiKeyAllowedProviders,
   userApiKeyAllowedListsEqual,
@@ -1193,13 +1167,6 @@ const modelOptions = computed(() =>
   availableModels.value.map((value) => ({ value, label: value })),
 )
 
-const providerNameById = computed(() => {
-  const map = new Map<string, string>()
-  for (const provider of availableProviders.value) {
-    map.set(provider.id, (provider.name || '').trim() || provider.id)
-  }
-  return map
-})
 const selectedInstallApiKey = ref<ApiKey | null>(null)
 const pendingFirstInstallApiKey = ref<ApiKey | null>(null)
 const installCli = ref<InstallTargetCli>('claude_code')
@@ -1943,21 +1910,6 @@ function formatConcurrentLimitSimple(concurrentLimit?: number | null): string {
 
 function formatIpRules(ipRules?: string[] | null): string {
   return ipRules && ipRules.length > 0 ? ipRules.join(', ') : '不限制'
-}
-
-function formatProvidersSummary(allowedProviders?: string[] | null): string {
-  return formatUserApiKeyProvidersSummary(
-    normalizeUserApiKeyAllowedProviders(allowedProviders),
-    providerNameById.value,
-  )
-}
-
-function formatApiFormatsSummary(values?: string[] | null): string {
-  return formatUserApiKeyAllowedListSummary(values, '跟随账户可用端点', '端点')
-}
-
-function formatModelsSummary(values?: string[] | null): string {
-  return formatUserApiKeyAllowedListSummary(values, '跟随账户可用模型', '模型')
 }
 
 function parseIpRulesInput(value: string): string[] | null {
