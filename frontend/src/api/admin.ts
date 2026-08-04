@@ -1389,7 +1389,7 @@ export const adminApi = {
     tz_offset_minutes?: number
     provider_name?: string
     model?: string
-  }): Promise<CostSavingsResponse> {
+  }, options?: AdminAnalyticsRequestOptions): Promise<CostSavingsResponse> {
     const cacheKey = buildCacheKey('admin:stats:cost:savings', params)
     return cachedRequest(
       cacheKey,
@@ -1399,18 +1399,18 @@ export const adminApi = {
         })
         return response.data
       },
-      30 * 1000
+      options?.skipCache ? 0 : 30 * 1000
     )
   },
 
-  async getQuotaUsage(): Promise<QuotaUsageResponse> {
+  async getQuotaUsage(options?: AdminAnalyticsRequestOptions): Promise<QuotaUsageResponse> {
     return cachedRequest(
       'admin:stats:providers:quota-usage',
       async () => {
         const response = await apiClient.get<QuotaUsageResponse>('/api/admin/stats/providers/quota-usage')
         return response.data
       },
-      30 * 1000
+      options?.skipCache ? 0 : 30 * 1000
     )
   },
 

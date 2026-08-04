@@ -3687,15 +3687,33 @@ AND LOWER(TRIM(COALESCE(provider_name, ''))) NOT IN ('unknown', 'pending')",
         let mut builder = QueryBuilder::<Sqlite>::new(format!(
             r#"
 SELECT
-  COALESCE(SUM(MAX(COALESCE(cache_read_input_tokens, 0), 0)), 0) AS cache_read_tokens,
-  COALESCE(SUM(COALESCE(CAST(cache_read_cost_usd AS REAL), 0)), 0) AS cache_read_cost_usd,
-  COALESCE(SUM(COALESCE(CAST(cache_creation_cost_usd AS REAL), 0)), 0)
+  COALESCE(SUM(MAX(COALESCE(
+    settlement.billing_cache_read_tokens,
+    "usage".cache_read_input_tokens,
+    0
+  ), 0)), 0) AS cache_read_tokens,
+  COALESCE(SUM(COALESCE(
+    CAST(settlement.billing_cache_read_cost_usd AS REAL),
+    CAST("usage".cache_read_cost_usd AS REAL),
+    0
+  )), 0) AS cache_read_cost_usd,
+  COALESCE(SUM(COALESCE(
+    CAST(settlement.billing_cache_creation_cost_usd AS REAL),
+    CAST("usage".cache_creation_cost_usd AS REAL),
+    0
+  )), 0)
     AS cache_creation_cost_usd,
   COALESCE(SUM(
-    {input_price_expr}
-    * MAX(COALESCE(cache_read_input_tokens, 0), 0) / 1000000.0
+    COALESCE(CAST(settlement.input_price_per_1m AS REAL), {input_price_expr})
+    * MAX(COALESCE(
+      settlement.billing_cache_read_tokens,
+      "usage".cache_read_input_tokens,
+      0
+    ), 0) / 1000000.0
   ), 0) AS estimated_full_cost_usd
 FROM "usage"
+LEFT JOIN usage_settlement_snapshots AS settlement
+  ON settlement.request_id = "usage".request_id
 "#,
             input_price_expr = sqlite_usage_metadata_input_price_expr()
         ));
@@ -3709,19 +3727,19 @@ FROM "usage"
         push_sqlite_usage_optional_text_filter(
             &mut builder,
             &mut has_where,
-            "user_id",
+            "\"usage\".user_id",
             query.user_id.as_deref(),
         );
         push_sqlite_usage_optional_text_filter(
             &mut builder,
             &mut has_where,
-            "provider_name",
+            "\"usage\".provider_name",
             query.provider_name.as_deref(),
         );
         push_sqlite_usage_optional_text_filter(
             &mut builder,
             &mut has_where,
-            "model",
+            "\"usage\".model",
             query.model.as_deref(),
         );
 

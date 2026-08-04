@@ -730,10 +730,7 @@ pub fn build_admin_stats_provider_quota_usage_response(
     let now_day = u64::from(now.day());
     let mut payload: Vec<_> = providers
         .iter()
-        .filter(|provider| {
-            provider.billing_type.as_deref() == Some("monthly_quota")
-                || provider.monthly_quota_usd.is_some()
-        })
+        .filter(|provider| provider.billing_type.as_deref() == Some("monthly_quota"))
         .map(|provider| {
             let quota = provider.monthly_quota_usd.unwrap_or(0.0);
             let used = provider.monthly_used_usd.unwrap_or(0.0);
