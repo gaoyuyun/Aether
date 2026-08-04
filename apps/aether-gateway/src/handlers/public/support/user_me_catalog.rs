@@ -4,6 +4,7 @@ use aether_data_contracts::repository::global_models::{
     PublicCatalogModelListQuery, PublicGlobalModelQuery, StoredPublicGlobalModel,
     StoredPublicGlobalModelPage,
 };
+use aether_data_contracts::repository::usage::{UsageBreakdownGroupBy, UsageBreakdownSummaryQuery};
 use axum::{
     body::Body,
     http,
@@ -11,6 +12,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     build_admin_endpoint_health_status_payload, build_auth_error_response, query_param_value,
@@ -25,6 +27,7 @@ const USERS_ME_ENDPOINT_STATUS_UNAVAILABLE_DETAIL: &str = "用户端点健康数
 fn build_users_me_available_model_payload(
     model: StoredPublicGlobalModel,
     hide_mapping_config: bool,
+    usage_count: u64,
 ) -> serde_json::Value {
     let config = if hide_mapping_config {
         sanitize_public_model_config_for_user(model.config)
@@ -40,8 +43,47 @@ fn build_users_me_available_model_payload(
         "default_tiered_pricing": model.default_tiered_pricing,
         "supported_capabilities": model.supported_capabilities,
         "config": config,
-        "usage_count": model.usage_count,
+        "usage_count": usage_count,
     })
+}
+
+async fn resolve_users_me_model_usage_counts(
+    state: &AppState,
+    user_id: &str,
+) -> Result<BTreeMap<String, u64>, Response<Body>> {
+    if !state.has_usage_data_reader() {
+        return Ok(BTreeMap::new());
+    }
+
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+        .saturating_add(1);
+    let rows = state
+        .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: now_unix_secs,
+            user_id: Some(user_id.to_string()),
+            provider_name: None,
+            model: None,
+            api_format: None,
+            exclude_status_codes: Vec::new(),
+            group_by: UsageBreakdownGroupBy::Model,
+        })
+        .await
+        .map_err(|err| {
+            build_auth_error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("user model usage lookup failed: {err:?}"),
+                false,
+            )
+        })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.group_key, row.request_count))
+        .collect())
 }
 
 fn parse_users_me_available_models_query(query: Option<&str>) -> (usize, usize, Option<String>) {
@@ -318,12 +360,19 @@ pub(super) async fn handle_users_me_available_models(
             .collect::<Vec<_>>();
         StoredPublicGlobalModelPage { items, total }
     };
+    let usage_counts = match resolve_users_me_model_usage_counts(state, &auth.user.id).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
 
     Json(json!({
         "models": page
             .items
             .into_iter()
-            .map(|model| build_users_me_available_model_payload(model, hide_mapping_config))
+            .map(|model| {
+                let usage_count = usage_counts.get(&model.name).copied().unwrap_or_default();
+                build_users_me_available_model_payload(model, hide_mapping_config, usage_count)
+            })
             .collect::<Vec<_>>(),
         "total": page.total,
     }))
