@@ -1140,7 +1140,7 @@ const canRemoveCurrentModel = computed(() => {
 function syncEditorStateFromConfig(config: RoutingGroupConfig): void {
   const normalized = normalizeRoutingGroupConfig(config)
   sortingScope.value = hasPerModelSorting(normalized) ? 'per_model' : 'unified'
-  syncSelectedPerModelPolicy()
+  selectedPerModelName.value = null
 }
 
 function hasPerModelSorting(config: RoutingGroupConfig): boolean {
