@@ -1,13 +1,13 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    hash_api_key, sample_endpoint, sample_key, sample_models_candidate_row, sample_provider,
-    sample_public_catalog_model, sample_public_global_model,
-    sample_public_global_model_with_capabilities, sample_request_candidate,
-    InMemoryAnnouncementReadRepository, InMemoryGlobalModelReadRepository,
-    InMemoryMinimalCandidateSelectionReadRepository, InMemoryProviderCatalogReadRepository,
-    InMemoryRequestCandidateRepository, RequestCandidateStatus, StoredAnnouncement,
-    StoredPublicGlobalModel,
+    hash_api_key, run_frontdoor_async_test, sample_endpoint, sample_key,
+    sample_models_candidate_row, sample_provider, sample_public_catalog_model,
+    sample_public_global_model, sample_public_global_model_with_capabilities,
+    sample_request_candidate, InMemoryAnnouncementReadRepository,
+    InMemoryGlobalModelReadRepository, InMemoryMinimalCandidateSelectionReadRepository,
+    InMemoryProviderCatalogReadRepository, InMemoryRequestCandidateRepository,
+    RequestCandidateStatus, StoredAnnouncement, StoredPublicGlobalModel,
 };
 use crate::data::GatewayDataState;
 use crate::tests::{
@@ -9965,6 +9965,118 @@ async fn gateway_handles_users_me_available_models_locally_without_proxying_upst
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[test]
+fn gateway_returns_current_user_model_usage_counts() {
+    run_frontdoor_async_test("users-me-model-usage-counts", async move {
+        let now = Utc::now();
+        let mut user = sample_auth_user(now);
+        user.allowed_providers = None;
+        user.allowed_providers_mode = "unrestricted".to_string();
+        let access_token = build_test_auth_token(
+            "access",
+            serde_json::Map::from_iter([
+                ("user_id".to_string(), json!(user.id)),
+                ("role".to_string(), json!(user.role)),
+                (
+                    "created_at".to_string(),
+                    json!(user.created_at.map(|value| value.to_rfc3339())),
+                ),
+                (
+                    "session_id".to_string(),
+                    json!("session-users-me-model-usage"),
+                ),
+            ]),
+            now + chrono::Duration::hours(1),
+        );
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+            sample_user_usage_audit(
+                "usage-current-completed",
+                "request-current-completed",
+                "user-auth-1",
+                "gpt-5",
+                "OpenAI",
+                "completed",
+                now - chrono::Duration::minutes(3),
+            ),
+            sample_user_usage_audit(
+                "usage-current-failed",
+                "request-current-failed",
+                "user-auth-1",
+                "gpt-5",
+                "OpenAI",
+                "failed",
+                now - chrono::Duration::minutes(2),
+            ),
+            sample_user_usage_audit(
+                "usage-other-user",
+                "request-other-user",
+                "user-auth-2",
+                "gpt-5",
+                "OpenAI",
+                "completed",
+                now - chrono::Duration::minutes(1),
+            ),
+            sample_user_usage_audit(
+                "usage-current-streaming",
+                "request-current-streaming",
+                "user-auth-1",
+                "gpt-5",
+                "OpenAI",
+                "streaming",
+                now,
+            ),
+        ]));
+        let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(vec![
+            sample_public_global_model("gm-1", "gpt-5", "GPT 5", true),
+        ]));
+        let user_repository: Arc<dyn UserReadRepository> =
+            Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![user]));
+        let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![sample_auth_wallet(
+            "user-auth-1",
+            now,
+        )]));
+        let data_state = crate::data::GatewayDataState::with_user_wallet_and_usage_for_tests(
+            user_repository,
+            wallet_repository,
+            usage_repository,
+        )
+        .with_global_model_reader(global_model_repository);
+        let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
+            start_auth_gateway_with_builder(|| {
+                AppState::new()
+                    .expect("gateway should build")
+                    .with_data_state_for_tests(data_state)
+                    .with_auth_sessions_for_tests([sample_auth_session(
+                        "user-auth-1",
+                        "session-users-me-model-usage",
+                        "device-users-me-model-usage",
+                        "refresh-token-placeholder",
+                        now,
+                    )])
+            })
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{gateway_url}/api/users/me/available-models"))
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("x-client-device-id", "device-users-me-model-usage")
+            .header("user-agent", "AetherTest/1.0")
+            .send()
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.expect("json body should parse");
+        assert_eq!(payload["total"], 1);
+        assert_eq!(payload["models"][0]["name"], "gpt-5");
+        assert_eq!(payload["models"][0]["usage_count"], 2);
+        assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+        gateway_handle.abort();
+        upstream_handle.abort();
+    });
 }
 
 #[tokio::test]
