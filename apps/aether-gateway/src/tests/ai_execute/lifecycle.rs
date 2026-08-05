@@ -224,7 +224,9 @@ async fn gateway_completes_sync_response_on_local_execution_runtime_path_impl() 
                         "id": "chatcmpl-async-report-123",
                         "object": "chat.completion",
                         "model": "gpt-5",
-                        "choices": [],
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "done"}
+                        }],
                         "usage": {
                             "prompt_tokens": 1,
                             "completion_tokens": 2,

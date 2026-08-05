@@ -380,7 +380,7 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
                                 "type": "message",
                                 "model": "claude-sonnet-4-5-upstream",
                                 "role": "assistant",
-                                "content": [],
+                                "content": [{"type": "text", "text": "done"}],
                                 "usage": {
                                     "input_tokens": 2,
                                     "output_tokens": 3

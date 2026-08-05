@@ -414,7 +414,10 @@ async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_loc
                             "id": "resp-cli-local-123",
                             "object": "response",
                             "model": "gpt-5-upstream",
-                            "output": [],
+                            "output": [{
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "done"}]
+                            }],
                             "usage": {
                                 "input_tokens": 1,
                                 "output_tokens": 2,
@@ -825,7 +828,10 @@ async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_respons
                             "id": "resp-cli-local-limit-123",
                             "object": "response",
                             "model": "gpt-5-upstream",
-                            "output": [],
+                            "output": [{
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "done"}]
+                            }],
                             "usage": {
                                 "input_tokens": 1,
                                 "output_tokens": 2,
@@ -1190,7 +1196,10 @@ async fn gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_b
                             "id": "resp-cli-local-timeout-123",
                             "object": "response",
                             "model": "gpt-5-upstream",
-                            "output": [],
+                            "output": [{
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "done"}]
+                            }],
                             "usage": {
                                 "input_tokens": 1,
                                 "output_tokens": 2,

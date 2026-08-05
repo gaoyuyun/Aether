@@ -261,7 +261,9 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
                             "id": "chatcmpl-local-skip-123",
                             "object": "chat.completion",
                             "model": "gpt-5-upstream-backup",
-                            "choices": [],
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "done"}
+                            }],
                             "usage": {
                                 "prompt_tokens": 2,
                                 "completion_tokens": 3,
@@ -1001,7 +1003,9 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
                             "id": "chatcmpl-local-failover-123",
                             "object": "chat.completion",
                             "model": "gpt-5-upstream-backup",
-                            "choices": [],
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "done"}
+                            }],
                             "usage": {
                                 "prompt_tokens": 2,
                                 "completion_tokens": 4,

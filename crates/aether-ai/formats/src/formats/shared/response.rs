@@ -5,6 +5,174 @@ use serde_json::Value;
 use crate::contracts::core_success_background_report_kind;
 use crate::formats::shared::request::UPSTREAM_IS_STREAM_KEY;
 
+pub fn generation_api_format_requires_visible_output(api_format: &str) -> bool {
+    matches!(
+        crate::normalize_api_format_alias(api_format).as_str(),
+        "openai:chat"
+            | "openai:responses"
+            | "openai:responses:compact"
+            | "openai:search"
+            | "claude:messages"
+            | "gemini:generate_content"
+    )
+}
+
+pub fn generation_response_has_visible_output(api_format: &str, body: &Value) -> Option<bool> {
+    match crate::normalize_api_format_alias(api_format).as_str() {
+        "openai:chat" => Some(openai_chat_response_has_visible_output(body)),
+        "openai:responses" | "openai:responses:compact" => {
+            Some(openai_responses_body_has_visible_output(body))
+        }
+        "openai:search" => Some(
+            body.get("output")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty()),
+        ),
+        "claude:messages" => Some(claude_message_has_visible_output(body)),
+        "gemini:generate_content" => Some(
+            crate::formats::gemini::generate_content::response::from_raw(body).is_some()
+                || openai_chat_response_has_visible_output(body)
+                || openai_responses_body_has_visible_output(body),
+        ),
+        _ => None,
+    }
+}
+
+fn openai_chat_response_has_visible_output(body: &Value) -> bool {
+    body.get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("message")
+                    .or_else(|| choice.get("delta"))
+                    .is_some_and(openai_message_has_visible_output)
+                    || value_has_non_empty_text(choice.get("text"))
+            })
+        })
+}
+
+fn openai_message_has_visible_output(message: &Value) -> bool {
+    value_has_non_empty_text(message.get("content"))
+        || value_has_non_empty_text(message.get("refusal"))
+        || message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        || message
+            .get("function_call")
+            .is_some_and(non_empty_structured_value)
+        || message.get("audio").is_some_and(non_empty_structured_value)
+}
+
+fn openai_responses_body_has_visible_output(body: &Value) -> bool {
+    value_has_non_empty_text(body.get("output_text"))
+        || body
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(openai_responses_item_has_visible_output))
+}
+
+fn openai_responses_item_has_visible_output(item: &Value) -> bool {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if item_type == "reasoning" {
+        return false;
+    }
+    if matches!(
+        item_type,
+        "function_call"
+            | "custom_tool_call"
+            | "image_generation_call"
+            | "computer_call"
+            | "file_search_call"
+            | "web_search_call"
+            | "code_interpreter_call"
+            | "local_shell_call"
+            | "shell_call"
+            | "apply_patch_call"
+            | "mcp_call"
+    ) {
+        return true;
+    }
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content
+                .iter()
+                .any(openai_responses_content_has_visible_output)
+        })
+        || value_has_non_empty_text(item.get("output"))
+        || (item_type != "message"
+            && !item_type.is_empty()
+            && item.as_object().is_some_and(|object| object.len() > 1))
+}
+
+fn openai_responses_content_has_visible_output(content: &Value) -> bool {
+    value_has_non_empty_text(content.get("text"))
+        || value_has_non_empty_text(content.get("refusal"))
+        || content
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "output_image" | "output_audio" | "output_file"))
+}
+
+fn claude_message_has_visible_output(body: &Value) -> bool {
+    match body.get("content") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(content)) => content.iter().any(|block| {
+            let Some(object) = block.as_object() else {
+                return false;
+            };
+            match object.get("type").and_then(Value::as_str) {
+                Some("text") => value_has_non_empty_text(object.get("text")),
+                Some("thinking" | "redacted_thinking") | None => false,
+                Some(_) => object.len() > 1,
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn value_has_non_empty_text(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(items)) => items.iter().any(|item| match item {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Object(object) => {
+                value_has_non_empty_text(object.get("text"))
+                    || value_has_non_empty_text(object.get("content"))
+                    || value_has_non_empty_text(object.get("refusal"))
+                    || object
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| {
+                            matches!(
+                                kind,
+                                "image_url"
+                                    | "input_image"
+                                    | "output_image"
+                                    | "input_audio"
+                                    | "output_audio"
+                                    | "file"
+                            )
+                        })
+            }
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+fn non_empty_structured_value(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => !object.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalSyncReportParts {
     pub trace_id: String,
@@ -171,6 +339,7 @@ mod tests {
     use super::{
         build_generated_tool_call_id, build_local_success_background_report,
         build_local_success_conversion_background_report, canonicalize_tool_arguments,
+        generation_api_format_requires_visible_output, generation_response_has_visible_output,
         prepare_local_success_response_parts, prepare_local_success_response_parts_owned,
         remove_empty_pages_from_tool_arguments, sanitize_claude_read_tool_inputs,
         LocalSyncReportParts,
@@ -180,6 +349,100 @@ mod tests {
     #[test]
     fn generated_tool_call_ids_are_stable() {
         assert_eq!(build_generated_tool_call_id(3), "call_auto_3");
+    }
+
+    #[test]
+    fn generation_response_visibility_rejects_empty_standard_successes() {
+        let cases = [
+            (
+                "openai:chat",
+                serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "  "},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"completion_tokens": 0}
+                }),
+            ),
+            (
+                "openai:responses",
+                serde_json::json!({
+                    "status": "completed",
+                    "output": [{"type": "reasoning", "summary": []}],
+                    "usage": {"output_tokens": 0}
+                }),
+            ),
+            (
+                "claude:messages",
+                serde_json::json!({
+                    "type": "message",
+                    "content": [{"type": "thinking", "thinking": "internal only"}],
+                    "stop_reason": "end_turn"
+                }),
+            ),
+            (
+                "gemini:generate_content",
+                serde_json::json!({
+                    "candidates": [{"content": {"role": "model"}, "finishReason": "STOP"}],
+                    "usageMetadata": {"candidatesTokenCount": 0}
+                }),
+            ),
+            ("openai:search", serde_json::json!({"output": "  "})),
+        ];
+
+        for (api_format, body) in cases {
+            assert!(generation_api_format_requires_visible_output(api_format));
+            assert_eq!(
+                generation_response_has_visible_output(api_format, &body),
+                Some(false),
+                "{api_format} should reject an empty success response"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_response_visibility_accepts_text_refusals_tools_and_media() {
+        let cases = [
+            (
+                "openai:chat",
+                serde_json::json!({"choices": [{"message": {"refusal": "Cannot comply"}}]}),
+            ),
+            (
+                "openai:responses:compact",
+                serde_json::json!({"output": [{"type": "function_call", "name": "lookup"}]}),
+            ),
+            (
+                "openai:responses",
+                serde_json::json!({"output_text": "response text"}),
+            ),
+            (
+                "claude:messages",
+                serde_json::json!({"content": [{"type": "tool_use", "name": "lookup"}]}),
+            ),
+            (
+                "gemini:generate_content",
+                serde_json::json!({
+                    "candidates": [{
+                        "content": {"role": "model", "parts": [{"text": "hello"}]},
+                        "finishReason": "STOP"
+                    }]
+                }),
+            ),
+            ("openai:search", serde_json::json!({"output": "result"})),
+        ];
+
+        for (api_format, body) in cases {
+            assert_eq!(
+                generation_response_has_visible_output(api_format, &body),
+                Some(true),
+                "{api_format} should accept visible output"
+            );
+        }
+
+        assert_eq!(
+            generation_response_has_visible_output("openai:embedding", &serde_json::json!({})),
+            None
+        );
     }
 
     #[test]

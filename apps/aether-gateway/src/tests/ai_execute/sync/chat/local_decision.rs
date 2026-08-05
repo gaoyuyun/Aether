@@ -620,7 +620,9 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
                     "id": "chatcmpl-local-123",
                     "object": "chat.completion",
                     "model": "gpt-5-upstream",
-                    "choices": [],
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "done"}
+                    }],
                     "usage": {
                         "prompt_tokens": 2,
                         "completion_tokens": 3,
@@ -955,7 +957,9 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
                             "id": "chatcmpl-regex-mapping-123",
                             "object": "chat.completion",
                             "model": "gpt-5.4",
-                            "choices": [],
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "done"}
+                            }],
                             "usage": {
                                 "prompt_tokens": 2,
                                 "completion_tokens": 3,
@@ -3685,7 +3689,9 @@ async fn gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_g
                             "id": "chatcmpl-local-custom-path-123",
                             "object": "chat.completion",
                             "model": "gpt-5-upstream",
-                            "choices": [],
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "done"}
+                            }],
                             "usage": {
                                 "prompt_tokens": 2,
                                 "completion_tokens": 3,

@@ -162,7 +162,9 @@ async fn gateway_handles_local_openai_chat_sync_report_with_local_reporting_when
                         "id": "chatcmpl-local-report-sync-123",
                         "object": "chat.completion",
                         "model": "gpt-5-upstream",
-                        "choices": [],
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "done"}
+                        }],
                         "usage": {
                             "prompt_tokens": 2,
                             "completion_tokens": 3,
@@ -305,7 +307,9 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage_im
                         "id": "chatcmpl-local-report-sync-deep-123",
                         "object": "chat.completion",
                         "model": "gpt-5-upstream",
-                        "choices": [],
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "done"}
+                        }],
                         "usage": {
                             "prompt_tokens": 2,
                             "completion_tokens": 3,
@@ -466,7 +470,9 @@ async fn gateway_ignores_legacy_max_request_body_size_for_local_openai_chat_sync
                         "id": "chatcmpl-local-report-sync-request-limit-123",
                         "object": "chat.completion",
                         "model": "gpt-5-upstream",
-                        "choices": [],
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "done"}
+                        }],
                         "usage": {
                             "prompt_tokens": 2,
                             "completion_tokens": 3,

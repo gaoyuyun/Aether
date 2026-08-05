@@ -430,7 +430,7 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
                             "type": "message",
                             "model": "claude-code-upstream",
                             "role": "assistant",
-                            "content": [],
+                            "content": [{"type": "text", "text": "done"}],
                             "usage": {
                                 "input_tokens": 2,
                                 "output_tokens": 3

@@ -112,7 +112,7 @@ const SYNC_EXECUTION_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_BYTES: &[u8] = b"\n";
 const OPENAI_IMAGE_SYNC_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
-const INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE: &str = "Provider returned HTTP 200 but the Gemini response did not contain visible model output; refusing to finalize it as a successful response.";
+const INVALID_PROVIDER_SUCCESS_MESSAGE: &str = "Provider returned HTTP 200 but the response did not contain visible model output; retrying another candidate.";
 
 fn elapsed_ms_since(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
@@ -834,7 +834,7 @@ fn kiro_cache_usage_from_context_object(
     )
 }
 
-fn invalid_gemini_provider_success_message(
+fn invalid_provider_success_message(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     status_code: u16,
@@ -843,9 +843,7 @@ fn invalid_gemini_provider_success_message(
     if status_code >= 400 {
         return None;
     }
-    if !provider_api_format_is_gemini_generate_content(plan, report_context) {
-        return None;
-    }
+    let provider_api_format = resolve_provider_generation_api_format(plan, report_context);
     let body_json = body_json?;
     if body_json
         .as_object()
@@ -864,13 +862,15 @@ fn invalid_gemini_provider_success_message(
             crate::ai_serving::normalize_provider_private_response_value(body_json.clone(), context)
         });
     let body_json = normalized_body_json.as_ref().unwrap_or(body_json);
-    if crate::ai_serving::gemini_generate_content_response_has_visible_output(body_json) {
+    if crate::ai_serving::generation_response_has_visible_output(&provider_api_format, body_json)
+        != Some(false)
+    {
         return None;
     }
-    Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE)
+    Some(INVALID_PROVIDER_SUCCESS_MESSAGE)
 }
 
-fn invalid_gemini_provider_stream_success_message(
+fn invalid_provider_stream_success_message(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
     status_code: u16,
@@ -881,31 +881,43 @@ fn invalid_gemini_provider_stream_success_message(
     if status_code >= 400 || body_json.is_some() || !has_body_bytes {
         return None;
     }
-    if !provider_api_format_is_gemini_generate_content(plan, report_context) {
+    if report_context
+        .and_then(|context| context.get("has_envelope"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return None;
     }
-    let Some(body_json) = crate::ai_serving::aggregate_gemini_stream_sync_response(body_bytes)
-    else {
-        return Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE);
+    let provider_api_format = resolve_provider_generation_api_format(plan, report_context);
+    if !crate::ai_serving::generation_api_format_requires_visible_output(&provider_api_format) {
+        return None;
+    }
+    let Some(body_json) = crate::ai_serving::api::aggregate_standard_chat_stream_sync_response(
+        body_bytes,
+        &provider_api_format,
+    ) else {
+        return Some(INVALID_PROVIDER_SUCCESS_MESSAGE);
     };
-    if crate::ai_serving::gemini_generate_content_response_has_visible_output(&body_json) {
+    if crate::ai_serving::generation_response_has_visible_output(&provider_api_format, &body_json)
+        != Some(false)
+    {
         return None;
     }
-    Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE)
+    Some(INVALID_PROVIDER_SUCCESS_MESSAGE)
 }
 
-fn provider_api_format_is_gemini_generate_content(
+fn resolve_provider_generation_api_format(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
-) -> bool {
-    let provider_api_format = report_context
+) -> String {
+    report_context
         .and_then(|value| value.get("provider_api_format"))
         .and_then(Value::as_str)
-        .unwrap_or(plan.provider_api_format.as_str());
-    crate::ai_serving::normalize_api_format_alias(provider_api_format) == "gemini:generate_content"
+        .unwrap_or(plan.provider_api_format.as_str())
+        .to_string()
 }
 
-fn invalid_gemini_provider_success_execution_error(message: &str) -> ExecutionError {
+fn invalid_provider_success_execution_error(message: &str) -> ExecutionError {
     ExecutionError {
         kind: ExecutionErrorKind::Upstream5xx,
         phase: ExecutionPhase::Finalize,
@@ -2548,24 +2560,29 @@ async fn execute_execution_runtime_sync_impl(
         let mut headers = std::mem::take(&mut result.headers);
         let (body_bytes, mut body_json, body_base64) =
             decode_execution_result_body(result.body.take(), &mut headers)?;
-        if let Some(message) = invalid_gemini_provider_success_message(
-            &plan,
-            report_context.as_ref(),
-            result.status_code,
-            body_json.as_ref(),
-        )
-        .or_else(|| {
-            invalid_gemini_provider_stream_success_message(
+        let invalid_provider_success = if plan_kind == "claude_count_tokens_sync" {
+            None
+        } else {
+            invalid_provider_success_message(
                 &plan,
                 report_context.as_ref(),
                 result.status_code,
                 body_json.as_ref(),
-                &body_bytes,
-                body_base64.is_some(),
             )
-        }) {
+            .or_else(|| {
+                invalid_provider_stream_success_message(
+                    &plan,
+                    report_context.as_ref(),
+                    result.status_code,
+                    body_json.as_ref(),
+                    &body_bytes,
+                    body_base64.is_some(),
+                )
+            })
+        };
+        if let Some(message) = invalid_provider_success {
             result.status_code = StatusCode::BAD_GATEWAY.as_u16();
-            result.error = Some(invalid_gemini_provider_success_execution_error(message));
+            result.error = Some(invalid_provider_success_execution_error(message));
             if let Some(error_body) =
                 build_invalid_provider_success_body(&plan, report_context.as_ref(), message)
             {
@@ -3555,7 +3572,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_gemini_provider_success_uses_plan_format_when_context_is_missing() {
+    fn invalid_provider_success_uses_plan_format_when_context_is_missing() {
         let plan = test_gemini_chat_plan();
         let body = json!({
             "candidates": [{
@@ -3570,22 +3587,56 @@ mod tests {
             }
         });
 
-        let message = invalid_gemini_provider_success_message(
-            &plan,
-            None,
-            StatusCode::OK.as_u16(),
-            Some(&body),
-        )
-        .expect("empty Gemini 200 response should be rejected from plan format");
+        let message =
+            invalid_provider_success_message(&plan, None, StatusCode::OK.as_u16(), Some(&body))
+                .expect("empty Gemini 200 response should be rejected from plan format");
 
         assert!(message.contains("visible model output"));
     }
 
     #[test]
-    fn invalid_gemini_provider_success_error_is_retryable_candidate_failure() {
-        let error = invalid_gemini_provider_success_execution_error(
-            INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE,
-        );
+    fn invalid_provider_success_rejects_empty_non_gemini_generation_formats() {
+        let cases = [
+            (
+                "openai:chat",
+                json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop"
+                    }]
+                }),
+            ),
+            (
+                "openai:responses",
+                json!({"status": "completed", "output": []}),
+            ),
+            (
+                "claude:messages",
+                json!({
+                    "type": "message",
+                    "content": [],
+                    "stop_reason": "end_turn"
+                }),
+            ),
+            ("openai:search", json!({"output": ""})),
+        ];
+
+        for (api_format, body) in cases {
+            let mut plan = test_openai_image_plan(false);
+            plan.client_api_format = api_format.to_string();
+            plan.provider_api_format = api_format.to_string();
+
+            assert_eq!(
+                invalid_provider_success_message(&plan, None, StatusCode::OK.as_u16(), Some(&body),),
+                Some(INVALID_PROVIDER_SUCCESS_MESSAGE),
+                "{api_format} should retry an empty success response"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_provider_success_error_is_retryable_candidate_failure() {
+        let error = invalid_provider_success_execution_error(INVALID_PROVIDER_SUCCESS_MESSAGE);
 
         assert_eq!(error.kind, ExecutionErrorKind::Upstream5xx);
         assert_eq!(error.phase, ExecutionPhase::Finalize);
@@ -3595,7 +3646,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_gemini_provider_success_accepts_antigravity_chunks_with_visible_output() {
+    fn invalid_provider_success_accepts_antigravity_chunks_with_visible_output() {
         let plan = test_gemini_chat_plan();
         let report_context = json!({
             "has_envelope": true,
@@ -3630,7 +3681,7 @@ mod tests {
             }
         });
 
-        let message = invalid_gemini_provider_success_message(
+        let message = invalid_provider_success_message(
             &plan,
             Some(&report_context),
             StatusCode::OK.as_u16(),
@@ -3641,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_gemini_provider_success_unwraps_gemini_cli_v1internal_envelope() {
+    fn invalid_provider_success_unwraps_gemini_cli_v1internal_envelope() {
         let plan = test_gemini_chat_plan();
         let report_context = json!({
             "has_envelope": true,
@@ -3663,7 +3714,7 @@ mod tests {
             "traceId": "trace-upstream-sync-1"
         });
 
-        let message = invalid_gemini_provider_success_message(
+        let message = invalid_provider_success_message(
             &plan,
             Some(&report_context),
             StatusCode::OK.as_u16(),
@@ -3978,7 +4029,7 @@ mod tests {
             let _ = finish_rx.await;
             socket
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"done\"}}]}",
                 )
                 .await
                 .expect("response should write");

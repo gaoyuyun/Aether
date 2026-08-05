@@ -69,6 +69,9 @@ async fn gateway_records_usage_for_execution_runtime_sync_when_runtime_enabled_i
                 "body": {
                     "json_body": {
                         "id": "chatcmpl-usage-sync-123",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "done"}
+                        }],
                         "usage": {
                             "input_tokens": 3,
                             "output_tokens": 5,
@@ -198,6 +201,9 @@ async fn gateway_records_active_usage_before_execution_runtime_sync_result_arriv
                         "body": {
                             "json_body": {
                                 "id": "chatcmpl-usage-sync-pending-123",
+                                "choices": [{
+                                    "message": {"role": "assistant", "content": "done"}
+                                }],
                                 "usage": {
                                     "input_tokens": 3,
                                     "output_tokens": 5,
@@ -360,6 +366,9 @@ async fn gateway_keeps_active_sync_usage_lightweight_for_large_request_body_impl
                         "body": {
                             "json_body": {
                                 "id": "chatcmpl-usage-sync-large-pending-123",
+                                "choices": [{
+                                    "message": {"role": "assistant", "content": "done"}
+                                }],
                                 "usage": {
                                     "input_tokens": 3,
                                     "output_tokens": 5,

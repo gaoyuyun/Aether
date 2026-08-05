@@ -4207,13 +4207,15 @@ async fn gateway_handles_openai_responses_test_model_locally_impl() {
                 },
                 "body": {
                     "json_body": {
-                        "id": "chatcmpl-openai-cli-test-model",
-                        "object": "chat.completion",
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "Hello from OpenAI Responses"
-                            }
+                        "id": "resp-openai-cli-test-model",
+                        "object": "response",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Hello from OpenAI Responses"
+                            }]
                         }]
                     }
                 },
@@ -4275,7 +4277,7 @@ async fn gateway_handles_openai_responses_test_model_locally_impl() {
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], json!(true));
     assert_eq!(
-        payload["data"]["response"]["choices"][0]["message"]["content"],
+        payload["data"]["response"]["output"][0]["content"][0]["text"],
         json!("Hello from OpenAI Responses")
     );
 
@@ -5191,12 +5193,15 @@ async fn gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted_impl() 
                 },
                 "body": {
                     "json_body": {
-                        "id": "chatcmpl-cli-only-endpoint",
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "Selected compatible CLI endpoint"
-                            }
+                        "id": "resp-cli-only-endpoint",
+                        "object": "response",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Selected compatible CLI endpoint"
+                            }]
                         }]
                     }
                 },
@@ -5261,7 +5266,7 @@ async fn gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted_impl() 
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], json!(true));
     assert_eq!(
-        payload["data"]["response"]["choices"][0]["message"]["content"],
+        payload["data"]["response"]["output"][0]["content"][0]["text"],
         json!("Selected compatible CLI endpoint")
     );
 
@@ -5294,12 +5299,15 @@ async fn gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_forma
                 },
                 "body": {
                     "json_body": {
-                        "id": "chatcmpl-cli-runnable-after-chat-preference",
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "Selected runnable CLI endpoint after unsupported chat"
-                            }
+                        "id": "resp-cli-runnable-after-chat-preference",
+                        "object": "response",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "Selected runnable CLI endpoint after unsupported chat"
+                            }]
                         }]
                     }
                 },
@@ -5366,7 +5374,7 @@ async fn gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_forma
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], json!(true));
     assert_eq!(
-        payload["data"]["response"]["choices"][0]["message"]["content"],
+        payload["data"]["response"]["output"][0]["content"][0]["text"],
         json!("Selected runnable CLI endpoint after unsupported chat")
     );
 
@@ -5400,12 +5408,15 @@ async fn gateway_handles_openai_responses_test_model_failover_locally_impl() {
                 },
                 "body": {
                     "json_body": {
-                        "id": "chatcmpl-openai-cli-failover",
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "OpenAI Responses failover path succeeded"
-                            }
+                        "id": "resp-openai-cli-failover",
+                        "object": "response",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "OpenAI Responses failover path succeeded"
+                            }]
                         }]
                     }
                 },
@@ -5466,7 +5477,7 @@ async fn gateway_handles_openai_responses_test_model_failover_locally_impl() {
     assert_eq!(payload["success"], json!(true));
     assert_eq!(payload["total_attempts"], json!(1));
     assert_eq!(
-        payload["data"]["response"]["choices"][0]["message"]["content"],
+        payload["data"]["response"]["output"][0]["content"][0]["text"],
         json!("OpenAI Responses failover path succeeded")
     );
 
@@ -5501,12 +5512,12 @@ async fn gateway_handles_claude_cli_test_model_locally_impl() {
                 },
                 "body": {
                     "json_body": {
-                        "id": "chatcmpl-claude-cli-test-model",
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "Hello from Claude CLI"
-                            }
+                        "id": "msg-claude-cli-test-model",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "Hello from Claude CLI"
                         }]
                     }
                 },
@@ -5564,7 +5575,7 @@ async fn gateway_handles_claude_cli_test_model_locally_impl() {
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], json!(true));
     assert_eq!(
-        payload["data"]["response"]["choices"][0]["message"]["content"],
+        payload["data"]["response"]["content"][0]["text"],
         json!("Hello from Claude CLI")
     );
 
@@ -5596,12 +5607,12 @@ async fn gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted_
                 },
                 "body": {
                     "json_body": {
-                        "id": "chatcmpl-claude-cli-only-endpoint",
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "Selected compatible Claude CLI endpoint"
-                            }
+                        "id": "msg-claude-cli-only-endpoint",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "Selected compatible Claude CLI endpoint"
                         }]
                     }
                 },
@@ -5658,7 +5669,7 @@ async fn gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted_
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], json!(true));
     assert_eq!(
-        payload["data"]["response"]["choices"][0]["message"]["content"],
+        payload["data"]["response"]["content"][0]["text"],
         json!("Selected compatible Claude CLI endpoint")
     );
 
@@ -5692,12 +5703,12 @@ async fn gateway_handles_claude_cli_test_model_failover_locally_impl() {
                 },
                 "body": {
                     "json_body": {
-                        "id": "chatcmpl-claude-cli-failover",
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "Claude CLI failover path succeeded"
-                            }
+                        "id": "msg-claude-cli-failover",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "Claude CLI failover path succeeded"
                         }]
                     }
                 },
@@ -5758,7 +5769,7 @@ async fn gateway_handles_claude_cli_test_model_failover_locally_impl() {
     assert_eq!(payload["success"], json!(true));
     assert_eq!(payload["total_attempts"], json!(1));
     assert_eq!(
-        payload["data"]["response"]["choices"][0]["message"]["content"],
+        payload["data"]["response"]["content"][0]["text"],
         json!("Claude CLI failover path succeeded")
     );
 

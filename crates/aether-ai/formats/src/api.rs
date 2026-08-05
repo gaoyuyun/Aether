@@ -126,6 +126,7 @@ pub use crate::formats::shared::request_matrix::{
 pub use crate::formats::shared::response::{
     build_generated_tool_call_id, build_local_success_background_report,
     build_local_success_conversion_background_report, canonicalize_tool_arguments,
+    generation_api_format_requires_visible_output, generation_response_has_visible_output,
     prepare_local_success_response_parts, prepare_local_success_response_parts_owned,
     LocalSyncReportParts,
 };

@@ -786,6 +786,47 @@ fn provider_query_standard_test_rejects_gemini_success_without_visible_output() 
 }
 
 #[test]
+fn provider_query_standard_test_rejects_other_empty_generation_successes() {
+    fn result(body: Value) -> aether_contracts::ExecutionResult {
+        aether_contracts::ExecutionResult {
+            request_id: "provider-test-empty".to_string(),
+            candidate_id: Some("candidate-0".to_string()),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body: Some(aether_contracts::ResponseBody {
+                json_body: Some(body),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        }
+    }
+
+    let cases = [
+        (
+            "openai:chat",
+            json!({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}),
+        ),
+        (
+            "openai:responses",
+            json!({"status": "completed", "output": []}),
+        ),
+        (
+            "claude:messages",
+            json!({"content": [], "stop_reason": "end_turn"}),
+        ),
+    ];
+
+    for (api_format, body) in cases {
+        assert!(
+            provider_query_standard_execution_response_body(api_format, &result(body), None,)
+                .is_none(),
+            "{api_format} should fail the current model-test candidate"
+        );
+    }
+}
+
+#[test]
 fn provider_query_test_adapter_routes_fixed_provider_endpoint_types() {
     assert_eq!(
         provider_query_test_adapter_for_provider_api_format("custom", "openai:chat"),

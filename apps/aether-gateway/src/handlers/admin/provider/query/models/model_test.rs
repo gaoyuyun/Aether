@@ -1695,18 +1695,8 @@ fn provider_query_standard_execution_response_body(
         })
         .unwrap_or(body);
     if result.status_code < 400
-        && provider_query_normalize_api_format_alias(provider_api_format)
-            == "gemini:generate_content"
-        && !crate::ai_serving::gemini_generate_content_response_has_visible_output(&body)
-    {
-        return None;
-    }
-    if result.status_code < 400
-        && provider_query_normalize_api_format_alias(provider_api_format) == "openai:search"
-        && !body
-            .get("output")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
+        && crate::ai_serving::generation_response_has_visible_output(provider_api_format, &body)
+            == Some(false)
     {
         return None;
     }
