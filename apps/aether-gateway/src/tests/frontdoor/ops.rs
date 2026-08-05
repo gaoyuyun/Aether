@@ -384,7 +384,9 @@ async fn gateway_adds_cors_headers_to_proxied_responses_inner() {
                             "id": "chatcmpl-cors-proxy-123",
                             "object": "chat.completion",
                             "model": "gpt-5-upstream",
-                            "choices": []
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "done"}
+                            }]
                         }
                     }
                 }))

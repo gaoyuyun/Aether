@@ -163,7 +163,7 @@ fn maybe_build_invalid_provider_success_finalize_response(
     }
 
     let client_api_format = resolve_local_sync_client_api_format(payload);
-    let message = "Provider returned HTTP 200 but the Gemini response did not contain visible model output; refusing to finalize it as a successful response.";
+    let message = "Provider returned HTTP 200 but the response did not contain visible model output; refusing to finalize it as a successful response.";
     let body_json = build_core_error_body_for_client_format(
         &client_api_format,
         message,
@@ -204,18 +204,16 @@ fn local_core_sync_finalize_has_invalid_provider_success(
         return Ok(false);
     }
     let provider_api_format = resolve_local_sync_provider_api_format(payload);
-    if crate::ai_serving::normalize_api_format_alias(&provider_api_format)
-        != "gemini:generate_content"
-    {
-        return Ok(false);
-    }
     let Some(body_json) = resolve_local_sync_source_body_json(payload)? else {
         return Ok(false);
     };
     if has_nested_error(&body_json) {
         return Ok(false);
     }
-    Ok(!crate::ai_serving::gemini_generate_content_response_has_visible_output(&body_json))
+    Ok(
+        crate::ai_serving::generation_response_has_visible_output(&provider_api_format, &body_json)
+            == Some(false),
+    )
 }
 
 pub(crate) fn build_best_effort_local_core_error_body(

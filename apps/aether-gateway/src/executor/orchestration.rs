@@ -2201,7 +2201,10 @@ mod tests {
     async fn standard_text_sync_heartbeat_propagates_request_diagnostics_to_terminal_usage() {
         let (state, usage_repository) = heartbeat_usage_test_state(json!({
             "id": "resp_heartbeat",
-            "output": []
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
         }));
         let (parts, _) = http::Request::builder()
             .method(http::Method::POST)
@@ -2269,7 +2272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_text_sync_heartbeat_attempts_retry_first_candidate_then_return_second() {
+    async fn standard_text_sync_heartbeat_retries_empty_first_candidate_then_returns_second() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_for_override = Arc::clone(&call_count);
         let state = AppState::new()
@@ -2279,14 +2282,23 @@ mod tests {
                 if plan.endpoint_id == "endpoint-retry" {
                     Ok(test_openai_image_execution_result(
                         plan,
-                        StatusCode::TOO_MANY_REQUESTS.as_u16(),
-                        json!({"error": {"message": "retry this candidate"}}),
+                        StatusCode::OK.as_u16(),
+                        json!({"id": "resp_empty_first_candidate", "output": []}),
                     ))
                 } else {
                     Ok(test_openai_image_execution_result(
                         plan,
                         StatusCode::OK.as_u16(),
-                        json!({"id": "resp_second_candidate", "output": []}),
+                        json!({
+                            "id": "resp_second_candidate",
+                            "output": [{
+                                "type": "message",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": "second candidate succeeded"
+                                }]
+                            }]
+                        }),
                     ))
                 }
             });
@@ -2332,6 +2344,18 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).expect("body should decode");
 
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
-        assert_eq!(body, json!({"id": "resp_second_candidate", "output": []}));
+        assert_eq!(
+            body,
+            json!({
+                "id": "resp_second_candidate",
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "second candidate succeeded"
+                    }]
+                }]
+            })
+        );
     }
 }

@@ -101,6 +101,9 @@ async fn gateway_settles_wallet_for_completed_execution_runtime_sync_usage_impl(
                 "body": {
                     "json_body": {
                         "id": "chatcmpl-usage-wallet-sync-123",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "done"}
+                        }],
                         "usage": {
                             "input_tokens": 1000,
                             "output_tokens": 500,
