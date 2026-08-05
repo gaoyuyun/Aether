@@ -827,7 +827,9 @@ async fn gateway_records_openai_sync_usage_and_pricing_with_cache_tokens_impl() 
                 "id": "chatcmpl-openai-usage-pricing-sync-123",
                 "object": "chat.completion",
                 "model": OPENAI_SPEC.provider_model_name,
-                "choices": [],
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"}
+                }],
                 "usage": {
                     "prompt_tokens": expected.input_tokens,
                     "completion_tokens": expected.output_tokens,
@@ -1014,7 +1016,7 @@ async fn gateway_records_claude_sync_usage_and_pricing_with_cache_breakdown_impl
                 "type": "message",
                 "model": CLAUDE_SPEC.provider_model_name,
                 "role": "assistant",
-                "content": [],
+                "content": [{"type": "text", "text": "done"}],
                 "usage": {
                     "input_tokens": expected.input_tokens,
                     "output_tokens": expected.output_tokens,

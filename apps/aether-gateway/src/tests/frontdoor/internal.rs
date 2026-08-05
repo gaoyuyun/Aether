@@ -203,7 +203,9 @@ async fn gateway_handles_internal_gateway_execute_sync_locally_impl() {
                         "json_body": {
                             "id": "chatcmpl-local-execute-sync",
                             "object": "chat.completion",
-                            "choices": []
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "done"}
+                            }]
                         }
                     }
                 }))
@@ -735,7 +737,9 @@ async fn gateway_handles_internal_gateway_finalize_sync_locally() {
             "body_json": {
                 "id": "chatcmpl-local-finalize",
                 "object": "chat.completion",
-                "choices": [],
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"}
+                }],
             }
         }))
         .send()
@@ -756,7 +760,9 @@ async fn gateway_handles_internal_gateway_finalize_sync_locally() {
         json!({
             "id": "chatcmpl-local-finalize",
             "object": "chat.completion",
-            "choices": [],
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"}
+            }],
         })
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);

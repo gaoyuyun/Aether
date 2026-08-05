@@ -207,7 +207,9 @@ async fn gateway_exposes_request_id_header_for_local_execution_response_impl() {
                 "id": "chatcmpl-direct-audit-123",
                 "object": "chat.completion",
                 "model": "gpt-5-upstream",
-                "choices": [],
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"}
+                }],
                 "usage": {
                     "prompt_tokens": 2,
                     "completion_tokens": 3,

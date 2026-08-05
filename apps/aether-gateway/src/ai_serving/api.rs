@@ -155,81 +155,22 @@ pub(crate) fn aggregate_gemini_stream_sync_response(body: &[u8]) -> Option<serde
     aether_ai_formats::api::aggregate_gemini_stream_sync_response(body)
 }
 
-pub(crate) fn gemini_generate_content_response_has_visible_output(
+pub(crate) fn aggregate_standard_chat_stream_sync_response(
+    body: &[u8],
+    provider_api_format: &str,
+) -> Option<serde_json::Value> {
+    aether_ai_formats::api::aggregate_standard_chat_stream_sync_response(body, provider_api_format)
+}
+
+pub(crate) fn generation_api_format_requires_visible_output(api_format: &str) -> bool {
+    aether_ai_formats::api::generation_api_format_requires_visible_output(api_format)
+}
+
+pub(crate) fn generation_response_has_visible_output(
+    api_format: &str,
     body: &serde_json::Value,
-) -> bool {
-    if aether_ai_formats::formats::gemini::generate_content::response::from_raw(body).is_some() {
-        return true;
-    }
-
-    openai_chat_response_has_visible_output(body) || openai_responses_body_has_visible_output(body)
-}
-
-fn openai_chat_response_has_visible_output(body: &serde_json::Value) -> bool {
-    body.get("choices")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|choices| {
-            choices.iter().any(|choice| {
-                choice
-                    .get("message")
-                    .or_else(|| choice.get("delta"))
-                    .is_some_and(message_like_value_has_visible_output)
-                    || value_has_non_empty_text(choice.get("text"))
-                    || choice
-                        .get("finish_reason")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|value| !value.trim().is_empty() && value != "length")
-            })
-        })
-}
-
-fn openai_responses_body_has_visible_output(body: &serde_json::Value) -> bool {
-    body.get("output")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| matches!(kind, "function_call" | "image_generation_call"))
-                    || item
-                        .get("content")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|content| {
-                            content.iter().any(response_content_has_visible_output)
-                        })
-            })
-        })
-}
-
-fn message_like_value_has_visible_output(value: &serde_json::Value) -> bool {
-    value_has_non_empty_text(value.get("content"))
-        || value
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-}
-
-fn response_content_has_visible_output(value: &serde_json::Value) -> bool {
-    value_has_non_empty_text(value.get("text"))
-        || value
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| matches!(kind, "function_call" | "output_image"))
-}
-
-fn value_has_non_empty_text(value: Option<&serde_json::Value>) -> bool {
-    match value {
-        Some(serde_json::Value::String(text)) => !text.trim().is_empty(),
-        Some(serde_json::Value::Array(items)) => items.iter().any(|item| {
-            value_has_non_empty_text(item.get("text"))
-                || value_has_non_empty_text(item.get("content"))
-                || item
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| matches!(kind, "image_url" | "input_image"))
-        }),
-        _ => false,
-    }
+) -> Option<bool> {
+    aether_ai_formats::api::generation_response_has_visible_output(api_format, body)
 }
 
 #[cfg(test)]

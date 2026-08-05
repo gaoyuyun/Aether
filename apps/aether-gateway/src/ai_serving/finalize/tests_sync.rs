@@ -1499,7 +1499,7 @@ fn local_finalize_handles_openai_responses_compact_openai_family_stream_response
 ) {
     let body = concat!(
         "event: response.completed\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cli_family_stream_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cli_family_stream_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
     );
     let payload = GatewaySyncReportRequest {
         trace_id: "trace-openai-compact-family-stream-123".to_string(),

@@ -676,8 +676,10 @@ fn maybe_build_standard_same_format_sync_body(
     if is_error_like_sync_body(body_json) {
         return None;
     }
-    if api_format_is_gemini_generate_content(expected_api_format)
-        && !gemini_generate_content_body_has_visible_output(body_json)
+    if crate::formats::shared::response::generation_response_has_visible_output(
+        expected_api_format,
+        body_json,
+    ) == Some(false)
     {
         return None;
     }
@@ -756,8 +758,10 @@ fn maybe_build_standard_same_format_stream_sync_body(
     {
         sanitize_claude_read_tool_inputs(&mut body);
     }
-    if api_format_is_gemini_generate_content(&provider_stream_event_api_format)
-        && !gemini_generate_content_body_has_visible_output(&body)
+    if crate::formats::shared::response::generation_response_has_visible_output(
+        &provider_stream_event_api_format,
+        &body,
+    ) == Some(false)
     {
         return Ok(None);
     }
@@ -834,6 +838,13 @@ fn maybe_build_openai_responses_same_family_sync_body(
     if is_error_like_sync_body(body_json) {
         return None;
     }
+    if crate::formats::shared::response::generation_response_has_visible_output(
+        &normalized_provider_api_format,
+        body_json,
+    ) == Some(false)
+    {
+        return None;
+    }
 
     Some(client_body_with_report_context_model(
         body_json.clone(),
@@ -895,27 +906,30 @@ fn maybe_build_openai_responses_same_family_stream_sync_body(
     // output item fields, but unknown intermediate event types still fail closed.
     ensure_no_unknown_openai_responses_stream_events(&body_bytes, true)?;
     let terminal_body = validated_terminal_openai_responses_stream_response(&body_bytes)?;
-    if terminal_body.get("status").and_then(Value::as_str) != Some("completed")
+    let body = if terminal_body.get("status").and_then(Value::as_str) != Some("completed")
         || terminal_body
             .get("output")
             .and_then(Value::as_array)
             .is_some_and(|output| !output.is_empty())
     {
-        return Ok(Some(client_body_with_report_context_model(
-            terminal_body,
-            report_context,
-            &client_api_format,
-        )));
-    }
-    Ok(
+        Some(terminal_body)
+    } else {
         aggregate_openai_responses_stream_sync_response_from_validated_terminal(
             &body_bytes,
             terminal_body,
         )
+    };
+    Ok(body
+        .filter(|body| {
+            is_error_like_sync_body(body)
+                || crate::formats::shared::response::generation_response_has_visible_output(
+                    &normalized_provider_api_format,
+                    body,
+                ) != Some(false)
+        })
         .map(|body| {
             client_body_with_report_context_model(body, report_context, &client_api_format)
-        }),
-    )
+        }))
 }
 
 fn validated_terminal_openai_responses_stream_response(
@@ -1003,6 +1017,12 @@ fn maybe_build_openai_cross_format_provider_body_from_normalized_payload(
     let provider_body_json = aggregated_stream_body.or_else(|| body_json.cloned());
     Ok(provider_body_json
         .filter(|value| !is_error_like_sync_body(value))
+        .filter(|value| {
+            crate::formats::shared::response::generation_response_has_visible_output(
+                provider_api_format,
+                value,
+            ) != Some(false)
+        })
         .map(|body_json| OpenAiCrossFormatProviderBody {
             body_json,
             aggregated_from_stream,
@@ -1038,14 +1058,6 @@ fn is_error_like_sync_body(value: &Value) -> bool {
             })
 }
 
-fn gemini_generate_content_body_has_visible_output(value: &Value) -> bool {
-    crate::formats::gemini::generate_content::response::from_raw(value).is_some()
-}
-
-fn api_format_is_gemini_generate_content(api_format: &str) -> bool {
-    aether_ai_formats::normalize_api_format_alias(api_format) == "gemini:generate_content"
-}
-
 pub fn maybe_build_standard_cross_format_sync_product(
     report_kind: &str,
     provider_api_format: &str,
@@ -1055,6 +1067,14 @@ pub fn maybe_build_standard_cross_format_sync_product(
 ) -> Option<StandardCrossFormatSyncProduct> {
     let provider_api_format = provider_api_format.trim().to_ascii_lowercase();
     let client_api_format = client_api_format.trim().to_ascii_lowercase();
+
+    if crate::formats::shared::response::generation_response_has_visible_output(
+        &provider_api_format,
+        &provider_body_json,
+    ) == Some(false)
+    {
+        return None;
+    }
 
     if provider_api_format == "openai:image" && client_api_format == "gemini:generate_content" {
         let client_body_json = match (
@@ -4658,7 +4678,11 @@ mod tests {
             "object": "response",
             "model": "gpt-5.5",
             "status": "completed",
-            "output": []
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
         });
 
         let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
@@ -5340,7 +5364,7 @@ mod tests {
     fn accepts_openai_responses_same_family_stream_when_needs_conversion_is_true() {
         let body = concat!(
             "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n",
         );
         let report_context = json!({
             "provider_api_format": "openai:responses",
@@ -5372,7 +5396,11 @@ mod tests {
             "id": "resp_123",
             "object": "response",
             "status": "completed",
-            "output": []
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
         });
 
         let body_json = maybe_build_openai_responses_same_family_sync_body_from_normalized_payload(
@@ -5399,7 +5427,11 @@ mod tests {
             "id": "resp_family_123",
             "object": "response",
             "status": "completed",
-            "output": []
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
         });
 
         let body_json = maybe_build_openai_responses_same_family_sync_body_from_normalized_payload(
@@ -6302,7 +6334,11 @@ mod tests {
         });
         let provider_body_json = json!({
             "id": "chatcmpl_123",
-            "object": "chat.completion"
+            "object": "chat.completion",
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }]
         });
 
         let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
@@ -6459,6 +6495,64 @@ mod tests {
     }
 
     #[test]
+    fn standard_generation_finalize_rejects_empty_non_gemini_bodies() {
+        let cases = [
+            (
+                "openai_chat_sync_finalize",
+                "openai:chat",
+                json!({
+                    "id": "chatcmpl-empty",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop"
+                    }]
+                }),
+            ),
+            (
+                "claude_chat_sync_finalize",
+                "claude:messages",
+                json!({
+                    "id": "msg-empty",
+                    "type": "message",
+                    "content": [],
+                    "stop_reason": "end_turn"
+                }),
+            ),
+            (
+                "openai_responses_sync_finalize",
+                "openai:responses",
+                json!({
+                    "id": "resp-empty",
+                    "object": "response",
+                    "status": "completed",
+                    "output": []
+                }),
+            ),
+        ];
+
+        for (report_kind, api_format, provider_body_json) in cases {
+            let report_context = json!({
+                "provider_api_format": api_format,
+                "client_api_format": api_format,
+                "needs_conversion": false,
+            });
+            let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
+                report_kind,
+                200,
+                Some(&report_context),
+                Some(&provider_body_json),
+                None,
+            )
+            .expect("empty success response validation should not error");
+
+            assert_eq!(
+                product, None,
+                "{api_format} empty response must not finalize"
+            );
+        }
+    }
+
+    #[test]
     fn standard_cross_format_finalize_uses_explicit_stream_event_format_for_provider_body() {
         let body = concat!(
             "event: keepalive\n",
@@ -6505,7 +6599,11 @@ mod tests {
             "id": "resp_123",
             "object": "response",
             "status": "completed",
-            "output": []
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
         });
 
         let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
@@ -7132,7 +7230,11 @@ mod tests {
             "id": "resp_family_123",
             "object": "response",
             "status": "completed",
-            "output": []
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
         });
 
         let product = maybe_build_standard_sync_finalize_product_from_normalized_payload(
