@@ -243,6 +243,69 @@ struct StageElapsedGuard {
     started_at: Instant,
 }
 
+struct StreamAttemptTerminalGuard {
+    core: Option<StreamAttemptTerminalGuardCore>,
+}
+
+struct StreamAttemptTerminalGuardCore {
+    state: AppState,
+    plan: ExecutionPlan,
+    trace_id: String,
+    report_kind: Option<String>,
+    report_context: Option<Value>,
+    request_diagnostics: Option<Arc<RequestDiagnostics>>,
+    candidate_started_unix_ms: u64,
+    candidate_started_at: Instant,
+}
+
+impl StreamAttemptTerminalGuard {
+    fn new(
+        state: &AppState,
+        plan: &ExecutionPlan,
+        trace_id: &str,
+        report_kind: Option<String>,
+        report_context: Option<Value>,
+        candidate_started_unix_ms: u64,
+        candidate_started_at: Instant,
+    ) -> Self {
+        Self {
+            core: Some(StreamAttemptTerminalGuardCore {
+                state: state.clone(),
+                plan: plan.clone(),
+                trace_id: trace_id.to_string(),
+                report_kind,
+                report_context,
+                request_diagnostics: current_request_diagnostics(),
+                candidate_started_unix_ms,
+                candidate_started_at,
+            }),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.core.take();
+    }
+}
+
+impl Drop for StreamAttemptTerminalGuard {
+    fn drop(&mut self) {
+        let Some(core) = self.core.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(record_dropped_stream_attempt_cancelled(core));
+        } else {
+            warn!(
+                event_name = "local_stream_attempt_terminal_guard_no_runtime",
+                log_type = "ops",
+                request_id = %short_request_id(core.plan.request_id.as_str()),
+                candidate_id = ?core.plan.candidate_id,
+                "gateway could not finalize dropped local stream attempt because no Tokio runtime is available"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 enum InProcessStreamExecutionError {
     Transport(ExecutionRuntimeTransportError),
@@ -535,6 +598,74 @@ async fn record_stream_terminal_usage(
             cancelled,
         )
         .await;
+}
+
+async fn record_dropped_stream_attempt_cancelled(core: StreamAttemptTerminalGuardCore) {
+    let StreamAttemptTerminalGuardCore {
+        state,
+        plan,
+        trace_id,
+        report_kind,
+        report_context,
+        request_diagnostics,
+        candidate_started_unix_ms,
+        candidate_started_at,
+    } = core;
+    let error_type = "downstream_disconnect";
+    let error_message = "client disconnected before stream response was ready";
+    let terminal_telemetry = Some(ExecutionTelemetry {
+        ttfb_ms: None,
+        elapsed_ms: Some(stream_elapsed_ms_since(candidate_started_at)),
+        upstream_bytes: Some(0),
+    });
+    let report_context = report_context_with_request_diagnostics(
+        report_context,
+        request_diagnostics.as_ref(),
+        candidate_started_at,
+        terminal_telemetry.as_ref(),
+    );
+    let usage_payload = build_stream_usage_payload(
+        trace_id,
+        report_kind.unwrap_or_else(|| "local_stream_attempt_cancelled".to_string()),
+        report_context,
+        499,
+        BTreeMap::new(),
+        &[],
+        false,
+        &[],
+        false,
+        Some(ExecutionStreamTerminalSummary {
+            parser_error: Some(error_message.to_string()),
+            ..ExecutionStreamTerminalSummary::default()
+        }),
+        terminal_telemetry,
+    );
+    record_stream_terminal_usage(
+        &state,
+        &plan,
+        usage_payload.report_context.as_ref(),
+        &usage_payload,
+        true,
+    )
+    .await;
+    record_local_request_candidate_status(
+        &state,
+        &plan,
+        usage_payload.report_context.as_ref(),
+        SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Cancelled,
+            status_code: Some(499),
+            error_type: Some(error_type.to_string()),
+            error_message: Some(error_message.to_string()),
+            latency_ms: usage_payload
+                .telemetry
+                .as_ref()
+                .and_then(|value| value.elapsed_ms),
+            started_at_unix_ms: Some(candidate_started_unix_ms),
+            finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+        },
+    )
+    .await;
 }
 
 async fn record_stream_admission_timeout_candidate_failure(
@@ -3728,8 +3859,8 @@ async fn execute_execution_runtime_stream_inner(
     plan_kind: &str,
     report_kind: Option<String>,
     mut report_context: Option<serde_json::Value>,
-    mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
-    mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
+    retry_scope_out: Option<&mut AiAttemptRetryScope>,
+    retry_fallback_out: Option<&mut Option<Response<Body>>>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let stream_started_at = Instant::now();
     let mut stage_trace = RequestStageTrace::from_env();
@@ -3750,14 +3881,24 @@ async fn execute_execution_runtime_stream_inner(
     );
     // Inline passthrough records its lifecycle seed after upstream headers are
     // available. Avoid constructing a throwaway seed on the common path.
-    let mut lifecycle_seed = (!defer_stream_pending_for_direct_inline)
+    let lifecycle_seed = (!defer_stream_pending_for_direct_inline)
         .then(|| build_lifecycle_usage_seed(&plan, report_context.as_ref()));
+    let candidate_started_unix_secs = current_request_candidate_unix_ms();
+    let candidate_started_at = Instant::now();
+    let mut terminal_guard = StreamAttemptTerminalGuard::new(
+        state,
+        &plan,
+        trace_id,
+        report_kind.clone(),
+        report_context.clone(),
+        candidate_started_unix_secs,
+        candidate_started_at,
+    );
     let mut lifecycle_pending_recorded = false;
     if let Some(seed) = lifecycle_seed.as_ref() {
         record_stream_pending_lifecycle(state, seed, &mut stage_trace).await;
         lifecycle_pending_recorded = true;
     }
-    let candidate_started_unix_secs = current_request_candidate_unix_ms();
     if let Some(snapshot) = request_candidate_status_snapshot.clone() {
         record_local_request_candidate_status_snapshot(
             state,
@@ -3774,6 +3915,44 @@ async fn execute_execution_runtime_stream_inner(
         )
         .await;
     }
+    let result = execute_execution_runtime_stream_after_pending(
+        state,
+        plan,
+        trace_id,
+        decision,
+        plan_kind,
+        report_kind,
+        report_context,
+        stream_started_at,
+        stage_trace,
+        lifecycle_seed,
+        lifecycle_pending_recorded,
+        candidate_started_unix_secs,
+        retry_scope_out,
+        retry_fallback_out,
+    )
+    .await;
+    terminal_guard.disarm();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_execution_runtime_stream_after_pending(
+    state: &AppState,
+    mut plan: ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    report_kind: Option<String>,
+    report_context: Option<serde_json::Value>,
+    stream_started_at: Instant,
+    mut stage_trace: RequestStageTrace,
+    mut lifecycle_seed: Option<LifecycleUsageSeed>,
+    mut lifecycle_pending_recorded: bool,
+    candidate_started_unix_secs: u64,
+    mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
+    mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
+) -> Result<Option<Response<Body>>, GatewayError> {
     let plan_request_id_for_log = short_request_id(plan.request_id.as_str());
     let provider_name = plan
         .provider_name
@@ -4450,8 +4629,8 @@ async fn execute_execution_runtime_stream_inner(
             frame_stream,
             false,
             provider_pool_in_flight_guard.take(),
-            retry_scope_out.as_deref_mut(),
-            retry_fallback_out.as_deref_mut(),
+            retry_scope_out,
+            retry_fallback_out,
         )
         .await;
     }
@@ -9901,6 +10080,150 @@ mod tests {
 
         execution.abort();
         let _ = execution.await;
+    }
+
+    #[tokio::test]
+    async fn stream_attempt_cancelled_before_headers_records_terminal_state() {
+        let request_id = "req-stream-cancelled-before-headers";
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let request_received = Arc::new(Notify::new());
+        let request_received_for_route = Arc::clone(&request_received);
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1/execute/stream",
+                any(move |_request: Request| {
+                    let request_received = Arc::clone(&request_received_for_route);
+                    async move {
+                        request_received.notify_one();
+                        let frames = futures_util::stream::pending::<Result<Bytes, Infallible>>();
+                        let mut response = axum::http::Response::new(Body::from_stream(frames));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/x-ndjson"),
+                        );
+                        response
+                    }
+                }),
+            );
+            axum::serve(listener, app)
+                .await
+                .expect("server should start");
+        });
+
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_override_base_url(format!("http://{addr}"));
+        let plan = codex_cyber_policy_plan(request_id);
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("cli".to_string()),
+            Some("openai:responses".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let state_for_execution = state.clone();
+        let execution = tokio::spawn(async move {
+            execute_execution_runtime_stream(
+                &state_for_execution,
+                plan,
+                "trace-stream-cancelled-before-headers",
+                &decision,
+                "openai_responses_stream",
+                None,
+                Some(json!({
+                    "request_id": request_id,
+                    "candidate_id": format!("candidate-{request_id}"),
+                    "candidate_index": 0,
+                    "retry_index": 0,
+                    "provider_api_format": "openai:responses",
+                    "client_api_format": "openai:responses",
+                })),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), request_received.notified())
+            .await
+            .expect("execution runtime should receive the stream request");
+        let pending = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage should read")
+                {
+                    break usage;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending usage should be recorded before stream headers");
+        assert_eq!(pending.status, "pending");
+
+        execution.abort();
+        let _ = execution.await;
+
+        let cancelled_usage = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(usage) = usage_repository
+                    .find_by_request_id(request_id)
+                    .await
+                    .expect("usage should read")
+                {
+                    if usage.status == "cancelled" {
+                        break usage;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped stream attempt should persist cancelled usage");
+        assert_eq!(cancelled_usage.billing_status, "void");
+        assert_eq!(cancelled_usage.status_code, Some(499));
+        assert_eq!(cancelled_usage.error_category.as_deref(), Some("cancelled"));
+
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id(request_id)
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Cancelled)
+                {
+                    break candidates;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped stream attempt should persist cancelled candidate");
+        assert_eq!(candidates[0].status_code, Some(499));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("downstream_disconnect")
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

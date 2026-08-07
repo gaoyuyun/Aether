@@ -3,6 +3,7 @@ use super::analytics::admin_usage_api_key_names;
 use super::analytics::admin_usage_provider_key_names;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
+use crate::request_candidate_runtime::request_candidate_failure_is_retryable_transition;
 use crate::GatewayError;
 use aether_admin::observability::usage::{
     admin_usage_bad_request_response, admin_usage_data_unavailable_response,
@@ -305,7 +306,7 @@ pub(super) fn admin_usage_terminal_candidate_state_override(
     candidates: &[StoredRequestCandidate],
 ) -> Option<serde_json::Value> {
     let candidate = admin_usage_current_candidate(candidates)?;
-    if admin_usage_candidate_failure_is_retryable_transition(candidate) {
+    if request_candidate_failure_is_retryable_transition(candidate) {
         return None;
     }
 
@@ -344,30 +345,6 @@ pub(super) fn admin_usage_terminal_candidate_state_override(
         payload["error_message"] = json!(error_message);
     }
     Some(payload)
-}
-
-fn admin_usage_candidate_failure_is_retryable_transition(
-    candidate: &StoredRequestCandidate,
-) -> bool {
-    if candidate.status != RequestCandidateStatus::Failed {
-        return false;
-    }
-    let Some(error_flow) = candidate
-        .extra_data
-        .as_ref()
-        .and_then(|value| value.get("error_flow"))
-    else {
-        return false;
-    };
-    let retryable = error_flow
-        .get("retryable")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let retry_next_candidate = error_flow
-        .get("decision")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value == "retry_next_candidate");
-    retryable && retry_next_candidate
 }
 
 pub(super) fn apply_admin_usage_state_override(
