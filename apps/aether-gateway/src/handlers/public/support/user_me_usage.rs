@@ -23,6 +23,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use crate::handlers::shared::system_config_bool;
+use crate::request_candidate_runtime::request_candidate_failure_is_retryable_transition;
 use crate::GatewayError;
 
 use super::{
@@ -684,6 +685,9 @@ fn users_me_usage_terminal_candidate_state_override(
     candidates: &[StoredRequestCandidate],
 ) -> Option<Value> {
     let candidate = users_me_usage_current_candidate(candidates)?;
+    if request_candidate_failure_is_retryable_transition(candidate) {
+        return None;
+    }
 
     let status = match candidate.status {
         RequestCandidateStatus::Success => "completed",
@@ -1893,6 +1897,28 @@ mod tests {
         streaming.finished_at_unix_ms = None;
 
         let payload = users_me_usage_terminal_candidate_state_override(&[failed, streaming]);
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn user_usage_active_override_ignores_retryable_candidate_failure() {
+        let mut failed = sample_candidate(
+            RequestCandidateStatus::Failed,
+            Some(400),
+            Some(1_000),
+            Some("first attempt failed"),
+        );
+        failed.extra_data = Some(json!({
+            "error_flow": {
+                "decision": "retry_next_candidate",
+                "retryable": true,
+                "propagation": "suppressed",
+                "classification": "retry_upstream_failure"
+            }
+        }));
+
+        let payload = users_me_usage_terminal_candidate_state_override(&[failed]);
 
         assert!(payload.is_none());
     }

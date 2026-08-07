@@ -2273,14 +2273,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_text_sync_heartbeat_retries_empty_first_candidate_then_returns_second() {
+    async fn standard_text_sync_heartbeat_returns_only_success_after_retryable_failures() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_for_override = Arc::clone(&call_count);
         let state = AppState::new()
             .expect("state should build")
             .with_execution_runtime_sync_override_for_tests(move |plan| {
                 call_count_for_override.fetch_add(1, Ordering::SeqCst);
-                if plan.endpoint_id == "endpoint-retry" {
+                if plan.endpoint_id == "endpoint-http-failure" {
+                    Ok(test_openai_image_execution_result(
+                        plan,
+                        StatusCode::BAD_REQUEST.as_u16(),
+                        json!({"error": {"message": "retry this candidate"}}),
+                    ))
+                } else if plan.endpoint_id == "endpoint-empty" {
                     Ok(test_openai_image_execution_result(
                         plan,
                         StatusCode::OK.as_u16(),
@@ -2306,12 +2312,18 @@ mod tests {
         let attempts = vec![
             test_standard_text_heartbeat_attempt(
                 0,
-                "endpoint-retry",
-                "candidate-retry",
+                "endpoint-http-failure",
+                "candidate-http-failure",
                 "openai:responses:compact",
             ),
             test_standard_text_heartbeat_attempt(
                 1,
+                "endpoint-empty",
+                "candidate-empty",
+                "openai:responses:compact",
+            ),
+            test_standard_text_heartbeat_attempt(
+                2,
                 "endpoint-success",
                 "candidate-success",
                 "openai:responses:compact",
@@ -2344,7 +2356,7 @@ mod tests {
         .await;
         let body: Value = serde_json::from_slice(&bytes).expect("body should decode");
 
-        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
         assert_eq!(
             body,
             json!({
