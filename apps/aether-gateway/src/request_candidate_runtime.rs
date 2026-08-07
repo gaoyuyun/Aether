@@ -63,6 +63,30 @@ fn request_candidate_status_is_terminal(status: RequestCandidateStatus) -> bool 
     )
 }
 
+pub(crate) fn request_candidate_failure_is_retryable_transition(
+    candidate: &StoredRequestCandidate,
+) -> bool {
+    if candidate.status != RequestCandidateStatus::Failed {
+        return false;
+    }
+    let Some(error_flow) = candidate
+        .extra_data
+        .as_ref()
+        .and_then(|value| value.get("error_flow"))
+    else {
+        return false;
+    };
+    let retryable = error_flow
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let retry_next_candidate = error_flow
+        .get("decision")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "retry_next_candidate");
+    retryable && retry_next_candidate
+}
+
 fn should_persist_request_candidate_status(status: RequestCandidateStatus) -> bool {
     match request_candidate_persistence_mode() {
         RequestCandidatePersistenceMode::Full => true,

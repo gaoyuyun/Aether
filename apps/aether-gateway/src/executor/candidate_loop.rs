@@ -1386,6 +1386,7 @@ where
             if watchdog_progress.terminal_started() {
                 Some(execution.await)
             } else {
+                watchdog_progress.mark_timed_out();
                 None
             }
         }
