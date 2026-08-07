@@ -936,7 +936,7 @@
             <SelectTrigger class="h-auto w-auto gap-1.5 !border-0 bg-transparent !shadow-none p-0 font-medium rounded-none flex-row-reverse !ring-0 !ring-offset-0 !outline-none [&>svg]:h-4 [&>svg]:w-4 [&>svg]:opacity-70">
               <SelectValue placeholder="选择格式..." />
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent :disable-portal="false">
               <SelectItem
                 v-for="format in availableFormats"
                 :key="format.value"
