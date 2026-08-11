@@ -4017,6 +4017,7 @@ async fn execute_execution_runtime_stream_after_pending(
         "stream_provider_in_flight",
         provider_in_flight_started_at.elapsed().as_millis() as u64,
     );
+    crate::execution_runtime::mark_stream_candidate_watchdog_upstream_started();
     match maybe_execute_grok_stream(&plan, report_context.as_ref()).await {
         Ok(Some(grok_stream)) => {
             return execute_stream_from_frame_stream_with_retry_scope(

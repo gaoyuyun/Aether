@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -9,6 +9,7 @@ use aether_usage_runtime::{build_usage_event_data_seed, UsageEvent, UsageEventTy
 use axum::body::Body;
 use axum::http::Response;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 
 use crate::ai_serving::{build_core_error_body_for_client_format, LocalCoreSyncErrorKind};
 use crate::api::response::{attach_control_metadata_headers, build_client_response_from_parts};
@@ -23,6 +24,9 @@ const TRANSPORT_ERROR_CLIENT_MESSAGE: &str =
 pub(crate) struct StreamCandidateWatchdogProgress {
     terminal_started: AtomicBool,
     timed_out: AtomicBool,
+    precise_timeout_armed: AtomicBool,
+    deadline_generation: AtomicU64,
+    deadline_changed: Notify,
 }
 
 tokio::task_local! {
@@ -46,6 +50,29 @@ impl StreamCandidateWatchdogProgress {
         self.timed_out.store(true, Ordering::Release);
     }
 
+    pub(crate) fn precise_timeout_armed(&self) -> bool {
+        self.precise_timeout_armed.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn deadline_changed_since(&self, observed_generation: u64) -> u64 {
+        loop {
+            let notified = self.deadline_changed.notified();
+            let generation = self.deadline_generation.load(Ordering::Acquire);
+            if generation != observed_generation {
+                return generation;
+            }
+            notified.await;
+        }
+    }
+
+    fn restart_deadline(&self, precise_timeout_armed: bool) {
+        if precise_timeout_armed {
+            self.precise_timeout_armed.store(true, Ordering::Release);
+        }
+        self.deadline_generation.fetch_add(1, Ordering::AcqRel);
+        self.deadline_changed.notify_waiters();
+    }
+
     pub(crate) async fn scope<F>(self: Arc<Self>, future: F) -> F::Output
     where
         F: Future,
@@ -57,6 +84,18 @@ impl StreamCandidateWatchdogProgress {
 pub(crate) fn current_stream_candidate_watchdog_progress(
 ) -> Option<Arc<StreamCandidateWatchdogProgress>> {
     STREAM_CANDIDATE_WATCHDOG_PROGRESS.try_with(Arc::clone).ok()
+}
+
+pub(crate) fn mark_stream_candidate_watchdog_upstream_started() {
+    let _ = STREAM_CANDIDATE_WATCHDOG_PROGRESS.try_with(|progress| {
+        progress.restart_deadline(false);
+    });
+}
+
+pub(crate) fn mark_stream_candidate_watchdog_precise_timeout_armed() {
+    let _ = STREAM_CANDIDATE_WATCHDOG_PROGRESS.try_with(|progress| {
+        progress.restart_deadline(true);
+    });
 }
 
 pub(crate) fn mark_stream_candidate_watchdog_terminal_started() {

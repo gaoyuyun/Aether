@@ -25,6 +25,8 @@ use crate::execution_runtime::{
     execute_execution_runtime_sync_with_retry_scope,
     mark_stream_candidate_watchdog_terminal_started, StreamCandidateWatchdogProgress,
     UpstreamExecutionGateProvider, UPSTREAM_EXECUTION_GATE_NAME,
+    mark_stream_candidate_watchdog_precise_timeout_armed,
+    mark_stream_candidate_watchdog_upstream_started,
 };
 use crate::executor::{
     build_local_execution_exhaustion, mark_deferred_upstream_response, LocalExecutionRequestOutcome,
@@ -45,6 +47,7 @@ use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::{AppState, GatewayError};
 
 const DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS: u64 = 30_000;
+const PRECISE_STREAM_TIMEOUT_WATCHDOG_GRACE: Duration = Duration::from_secs(1);
 const UPSTREAM_TARGET_GATE_NAME: &str = "gateway_upstream_target";
 const UPSTREAM_EXECUTION_GATE_HOLD_STREAM_RESPONSE_ENV: &str =
     "AETHER_GATEWAY_UPSTREAM_EXECUTION_GATE_HOLD_STREAM_RESPONSE";
@@ -1230,6 +1233,17 @@ fn resolve_stream_candidate_watchdog_timeout(
     Duration::from_millis(timeout_ms)
 }
 
+fn stream_candidate_watchdog_deadline_duration(
+    timeout: Duration,
+    precise_timeout_armed: bool,
+) -> Duration {
+    if precise_timeout_armed {
+        timeout.saturating_add(PRECISE_STREAM_TIMEOUT_WATCHDOG_GRACE)
+    } else {
+        timeout
+    }
+}
+
 fn stream_candidate_watchdog_timeout_message() -> &'static str {
     "Stream first byte timeout"
 }
@@ -1378,17 +1392,48 @@ where
     let watchdog_progress = StreamCandidateWatchdogProgress::shared();
     let execution = watchdog_progress.clone().scope(execute());
     tokio::pin!(execution);
+    // Candidate bookkeeping and provider-pool admission happen before the upstream first-byte
+    // phase. The execution runtime explicitly arms (or refreshes) this deadline at that boundary.
     let deadline = tokio::time::sleep(timeout_duration);
     tokio::pin!(deadline);
-    let execution_result = tokio::select! {
-        biased;
-        result = &mut execution => Some(result),
-        () = &mut deadline => {
-            if watchdog_progress.terminal_started() {
-                Some(execution.await)
-            } else {
-                watchdog_progress.mark_timed_out();
-                None
+    let mut deadline_armed = false;
+    let mut deadline_generation = 0;
+    let execution_result = loop {
+        let deadline_change = watchdog_progress.deadline_changed_since(deadline_generation);
+        tokio::pin!(deadline_change);
+        if deadline_armed {
+            tokio::select! {
+                biased;
+                result = &mut execution => break Some(result),
+                generation = &mut deadline_change => {
+                    deadline_generation = generation;
+                    let deadline_duration = stream_candidate_watchdog_deadline_duration(
+                        timeout_duration,
+                        watchdog_progress.precise_timeout_armed(),
+                    );
+                    deadline.as_mut().reset(Instant::now() + deadline_duration);
+                }
+                () = &mut deadline => {
+                    if watchdog_progress.terminal_started() {
+                        break Some(execution.await);
+                    }
+                    watchdog_progress.mark_timed_out();
+                    break None;
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                result = &mut execution => break Some(result),
+                generation = &mut deadline_change => {
+                    deadline_generation = generation;
+                    let deadline_duration = stream_candidate_watchdog_deadline_duration(
+                        timeout_duration,
+                        watchdog_progress.precise_timeout_armed(),
+                    );
+                    deadline.as_mut().reset(Instant::now() + deadline_duration);
+                    deadline_armed = true;
+                }
             }
         }
     };
@@ -1656,7 +1701,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use serde_json::json;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     use super::*;
 
@@ -2363,10 +2408,12 @@ mod tests {
                 &plan,
                 Some(&report_context),
                 false,
-                || {
+                || async {
+                    mark_stream_candidate_watchdog_upstream_started();
                     std::future::pending::<
                         Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
                     >()
+                    .await
                 },
             )
             .await
@@ -2416,10 +2463,12 @@ mod tests {
             &plan,
             Some(&report_context),
             true,
-            || {
+            || async {
+                mark_stream_candidate_watchdog_upstream_started();
                 std::future::pending::<
                     Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
                 >()
+                .await
             },
         )
         .await;
@@ -2454,10 +2503,106 @@ mod tests {
             Some(&report_context),
             true,
             || async {
+                mark_stream_candidate_watchdog_upstream_started();
                 mark_stream_candidate_watchdog_terminal_started();
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 Ok(AiAttemptExecutionOutcome::Responded(Response::new(
                     Body::from("terminal response"),
+                )))
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(StreamCandidateWatchdogOutcome::Executed(
+                AiAttemptExecutionOutcome::Responded(_)
+            ))
+        ));
+        assert!(writer.records.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_candidate_watchdog_starts_after_upstream_phase_begins() {
+        let writer = Arc::new(TestRequestCandidateWriter::default());
+        let plan = test_plan(Some(ExecutionTimeouts {
+            first_byte_ms: Some(20),
+            ..ExecutionTimeouts::default()
+        }));
+        let report_context = test_report_context();
+        let preflight_started = Arc::new(Notify::new());
+        let release_preflight = Arc::new(Notify::new());
+        let preflight_started_for_execution = Arc::clone(&preflight_started);
+        let release_preflight_for_execution = Arc::clone(&release_preflight);
+        let writer_for_task = Arc::clone(&writer);
+
+        let task = tokio::spawn(async move {
+            execute_stream_candidate_with_watchdog(
+                writer_for_task.as_ref(),
+                "trace_preflight_budget",
+                "claude_cli_stream",
+                &plan,
+                Some(&report_context),
+                false,
+                || async move {
+                    preflight_started_for_execution.notify_one();
+                    release_preflight_for_execution.notified().await;
+                    mark_stream_candidate_watchdog_upstream_started();
+                    std::future::pending::<
+                        Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
+                    >()
+                    .await
+                },
+            )
+            .await
+        });
+
+        preflight_started.notified().await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !task.is_finished(),
+            "preflight work must not consume the first-byte timeout budget"
+        );
+        release_preflight.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("watchdog should expire after the upstream phase starts")
+            .expect("watchdog task should join");
+        assert!(matches!(
+            result,
+            Ok(StreamCandidateWatchdogOutcome::Executed(
+                AiAttemptExecutionOutcome::Retry {
+                    scope: AiAttemptRetryScope::Candidate,
+                    fallback_response: None,
+                }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_candidate_watchdog_yields_to_precise_transport_timeout() {
+        let writer = Arc::new(TestRequestCandidateWriter::default());
+        let plan = test_plan(Some(ExecutionTimeouts {
+            first_byte_ms: Some(10),
+            ..ExecutionTimeouts::default()
+        }));
+        let report_context = test_report_context();
+
+        let result = execute_stream_candidate_with_watchdog(
+            writer.as_ref(),
+            "trace_precise_transport_timeout",
+            "claude_cli_stream",
+            &plan,
+            Some(&report_context),
+            false,
+            || async {
+                mark_stream_candidate_watchdog_upstream_started();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                mark_stream_candidate_watchdog_precise_timeout_armed();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(AiAttemptExecutionOutcome::Responded(Response::new(
+                    Body::from("transport completed within watchdog grace"),
                 )))
             },
         )

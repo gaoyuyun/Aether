@@ -44,6 +44,7 @@ pub(crate) async fn post_stream_plan_to_remote_execution_runtime(
     trace_id: Option<&str>,
     plan: &ExecutionPlan,
 ) -> Result<reqwest::Response, GatewayError> {
+    crate::execution_runtime::mark_stream_candidate_watchdog_precise_timeout_armed();
     build_remote_execution_runtime_request(
         state,
         remote_execution_runtime_base_url,
