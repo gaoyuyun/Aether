@@ -2113,6 +2113,9 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse(['wallet', 'billing_plans', 'announcements'].map(name => ({
       name,
       display_name: MOCK_MODULE_STATUSES[name].display_name,
+      kind: MOCK_MODULE_STATUSES[name].kind,
+      group: MOCK_MODULE_STATUSES[name].group,
+      depends_on: MOCK_MODULE_STATUSES[name].depends_on,
       active: MOCK_MODULE_STATUSES[name].active,
     })))
   },

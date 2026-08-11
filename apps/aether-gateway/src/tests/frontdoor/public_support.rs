@@ -1421,8 +1421,14 @@ async fn gateway_handles_public_runtime_modules_status_without_admin_access() {
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload[0]["name"], "wallet");
+    assert_eq!(payload[0]["kind"], "builtin");
+    assert_eq!(payload[0]["group"], "commerce");
+    assert_eq!(payload[0]["depends_on"], json!([]));
     assert_eq!(payload[0]["active"], true);
     assert_eq!(payload[1]["name"], "billing_plans");
+    assert_eq!(payload[1]["kind"], "builtin");
+    assert_eq!(payload[1]["group"], "commerce");
+    assert_eq!(payload[1]["depends_on"], json!(["wallet"]));
     assert_eq!(payload[1]["active"], true);
     assert_eq!(payload[2]["name"], "announcements");
     assert_eq!(payload[2]["active"], true);

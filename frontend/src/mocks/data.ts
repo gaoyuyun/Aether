@@ -1036,7 +1036,10 @@ export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; descripti
   { key: 'proxy_node_metrics_cleanup_batch_size', value: 5000, description: '代理节点指标每批次清理条数' }
 ]
 
-const MOCK_MODULE_DEFINITIONS: Array<Omit<ModuleStatus, 'active' | 'health'> & { health?: ModuleStatus['health'] }> = [
+type MockModuleDefinition = Omit<ModuleStatus, 'active' | 'health' | 'kind' | 'group' | 'depends_on'> &
+  Partial<Pick<ModuleStatus, 'kind' | 'group' | 'depends_on'>> & { health?: ModuleStatus['health'] }
+
+const MOCK_MODULE_DEFINITIONS: MockModuleDefinition[] = [
   {
     name: 'management_tokens',
     display_name: '访问令牌',
@@ -1064,6 +1067,9 @@ const MOCK_MODULE_DEFINITIONS: Array<Omit<ModuleStatus, 'active' | 'health'> & {
     admin_menu_icon: 'Megaphone',
     admin_menu_group: null,
     admin_menu_order: 57,
+    kind: 'builtin',
+    group: 'system',
+    depends_on: [],
   },
   {
     name: 'ldap',
@@ -1106,6 +1112,9 @@ const MOCK_MODULE_DEFINITIONS: Array<Omit<ModuleStatus, 'active' | 'health'> & {
     admin_menu_icon: 'BellRing',
     admin_menu_group: null,
     admin_menu_order: 58,
+    kind: 'builtin',
+    group: 'system',
+    depends_on: [],
   },
   {
     name: 'server_chan_push',
@@ -1219,6 +1228,43 @@ const MOCK_MODULE_DEFINITIONS: Array<Omit<ModuleStatus, 'active' | 'health'> & {
     admin_menu_icon: 'KeyRound',
     admin_menu_group: 'management',
     admin_menu_order: 60,
+    kind: 'builtin',
+    group: 'security',
+    depends_on: [],
+  },
+  {
+    name: 'wallet',
+    display_name: '钱包管理',
+    description: '管理用户钱包、充值和额度结算；关闭后用户按无限额度运行',
+    category: 'integration',
+    available: true,
+    enabled: false,
+    config_validated: true,
+    config_error: null,
+    admin_route: '/admin/wallets',
+    admin_menu_icon: 'Wallet',
+    admin_menu_group: 'management',
+    admin_menu_order: 65,
+    kind: 'builtin',
+    group: 'commerce',
+    depends_on: [],
+  },
+  {
+    name: 'billing_plans',
+    display_name: '套餐管理',
+    description: '配置每日额度和会员权益套餐；需要先启用钱包管理',
+    category: 'integration',
+    available: true,
+    enabled: false,
+    config_validated: false,
+    config_error: '请先启用钱包管理模块',
+    admin_route: '/admin/billing-plans',
+    admin_menu_icon: 'Package',
+    admin_menu_group: 'management',
+    admin_menu_order: 66,
+    kind: 'builtin',
+    group: 'commerce',
+    depends_on: ['wallet'],
   },
   {
     name: 'payment_gateways',
@@ -1256,6 +1302,9 @@ export const MOCK_MODULE_STATUSES: Record<string, ModuleStatus> = Object.fromEnt
     {
       ...module,
       active: module.available && module.enabled && module.config_validated,
+      kind: module.kind ?? 'extension',
+      group: module.group ?? module.category,
+      depends_on: module.depends_on ?? [],
       health: module.health ?? 'healthy',
     },
   ])

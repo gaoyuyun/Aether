@@ -1,20 +1,59 @@
 import { describe, expect, it } from 'vitest'
 
-import { BUILTIN_TOOLS } from '@/config/builtin-tools'
+import type { ModuleStatus } from '@/api/modules'
+import { buildBuiltinTools } from '@/config/builtin-tools'
+
+function moduleStatus(overrides: Partial<ModuleStatus>): ModuleStatus {
+  return {
+    name: 'module',
+    available: true,
+    enabled: false,
+    active: false,
+    config_validated: true,
+    config_error: null,
+    display_name: 'Module',
+    description: 'Module description',
+    category: 'integration',
+    kind: 'extension',
+    group: 'integration',
+    depends_on: [],
+    admin_route: '/admin/module',
+    admin_menu_icon: null,
+    admin_menu_group: null,
+    admin_menu_order: 1,
+    health: 'healthy',
+    ...overrides,
+  }
+}
 
 describe('built-in module tools', () => {
-  it('exposes wallet and billing plans as toggleable built-in modules', () => {
-    expect(BUILTIN_TOOLS).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        name: '钱包管理',
-        href: '/admin/wallets',
-        moduleName: 'wallet',
-      }),
-      expect.objectContaining({
-        name: '套餐管理',
-        href: '/admin/billing-plans',
-        moduleName: 'billing_plans',
-      }),
-    ]))
+  it('derives built-in cards from backend module metadata', () => {
+    const wallet = moduleStatus({
+      name: 'wallet',
+      display_name: '钱包管理',
+      kind: 'builtin',
+      group: 'commerce',
+      admin_route: '/admin/wallets',
+      admin_menu_icon: 'Wallet',
+      admin_menu_order: 65,
+    })
+    const plans = moduleStatus({
+      name: 'billing_plans',
+      display_name: '套餐管理',
+      kind: 'builtin',
+      group: 'commerce',
+      depends_on: ['wallet'],
+      admin_route: '/admin/billing-plans',
+      admin_menu_icon: 'Package',
+      admin_menu_order: 66,
+    })
+    const extension = moduleStatus({ name: 's3_backup' })
+
+    const cards = buildBuiltinTools([extension, plans, wallet])
+    const moduleNames = cards.flatMap(card => card.module ? [card.module.name] : [])
+
+    expect(moduleNames).toEqual(['wallet', 'billing_plans'])
+    expect(cards.find(card => card.module?.name === 'billing_plans')?.module?.depends_on)
+      .toEqual(['wallet'])
   })
 })

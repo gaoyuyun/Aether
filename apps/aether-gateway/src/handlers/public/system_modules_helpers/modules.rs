@@ -109,16 +109,25 @@ pub(crate) async fn build_public_runtime_modules_status_payload(
         {
             "name": "wallet",
             "display_name": "钱包管理",
+            "kind": "builtin",
+            "group": "commerce",
+            "depends_on": [],
             "active": policy.wallet_enabled,
         },
         {
             "name": "billing_plans",
             "display_name": "套餐管理",
+            "kind": "builtin",
+            "group": "commerce",
+            "depends_on": ["wallet"],
             "active": policy.billing_plans_enabled,
         },
         {
             "name": "announcements",
             "display_name": "公告管理",
+            "kind": "builtin",
+            "group": "system",
+            "depends_on": [],
             "active": announcements_enabled,
         }
     ]))
