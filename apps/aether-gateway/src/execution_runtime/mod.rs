@@ -136,7 +136,9 @@ pub(crate) use transport::{
 };
 pub(crate) use transport_failure::{
     build_transport_error_stop_response, current_stream_candidate_watchdog_progress,
-    mark_stream_candidate_watchdog_terminal_started, StreamCandidateWatchdogProgress,
+    mark_stream_candidate_watchdog_precise_timeout_armed,
+    mark_stream_candidate_watchdog_terminal_started,
+    mark_stream_candidate_watchdog_upstream_started, StreamCandidateWatchdogProgress,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

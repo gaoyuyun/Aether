@@ -2064,6 +2064,9 @@ async fn send_hyper_h2c_request(
     request: hyper::Request<DirectHyperH2cRequestBody>,
     stream_first_byte_timeout: Option<Duration>,
 ) -> Result<hyper::Response<HyperIncomingBody>, ExecutionRuntimeTransportError> {
+    if stream_first_byte_timeout.is_some() {
+        crate::execution_runtime::mark_stream_candidate_watchdog_precise_timeout_armed();
+    }
     let started_at = Instant::now();
     let deadline = stream_first_byte_timeout.map(|timeout| (timeout, Instant::now() + timeout));
 
@@ -2323,6 +2326,7 @@ async fn send_relay_request(
     first_byte_timeout: Option<Duration>,
 ) -> Result<reqwest::Response, String> {
     if let Some(timeout) = first_byte_timeout {
+        crate::execution_runtime::mark_stream_candidate_watchdog_precise_timeout_armed();
         return match tokio::time::timeout(timeout, request.send()).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(error)) => Err(error.to_string()),
@@ -2511,6 +2515,7 @@ async fn send_reqwest_request(
 ) -> Result<reqwest::Response, ExecutionRuntimeTransportError> {
     let started_at = Instant::now();
     if let Some(timeout) = stream_first_byte_timeout {
+        crate::execution_runtime::mark_stream_candidate_watchdog_precise_timeout_armed();
         return match tokio::time::timeout(timeout, request.send()).await {
             Ok(Ok(response)) => {
                 observe_gateway_stage_ms(
@@ -2543,6 +2548,7 @@ async fn send_wreq_request(
     stream_first_byte_timeout: Option<Duration>,
 ) -> Result<wreq::Response, ExecutionRuntimeTransportError> {
     if let Some(timeout) = stream_first_byte_timeout {
+        crate::execution_runtime::mark_stream_candidate_watchdog_precise_timeout_armed();
         return match tokio::time::timeout(timeout, request.send()).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(error)) => Err(ExecutionRuntimeTransportError::UpstreamRequest(
