@@ -29,6 +29,27 @@ use crate::data::GatewayDataState;
 const ADMIN_ENDPOINT_HEALTH_DATA_UNAVAILABLE_DETAIL: &str =
     "Admin endpoint health data unavailable";
 
+fn run_health_access_async_test<F>(name: &'static str, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("health access test runtime should build")
+                .block_on(future);
+        })
+        .expect("large-stack health access test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 #[tokio::test]
 async fn gateway_returns_service_unavailable_for_admin_health_api_formats_when_readers_unavailable()
 {
@@ -810,8 +831,15 @@ async fn gateway_handles_admin_health_status_locally_with_trusted_admin_principa
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_modules_status_locally_with_trusted_admin_principal() {
+    run_health_access_async_test(
+        "admin-modules-status-trusted-principal",
+        gateway_handles_admin_modules_status_locally_with_trusted_admin_principal_impl(),
+    );
+}
+
+async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -933,8 +961,15 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_modules_status_locally_with_bearer_admin_session() {
+#[test]
+fn gateway_handles_admin_modules_status_locally_with_bearer_admin_session() {
+    run_health_access_async_test(
+        "admin-modules-status-bearer-session",
+        gateway_handles_admin_modules_status_locally_with_bearer_admin_session_impl(),
+    );
+}
+
+async fn gateway_handles_admin_modules_status_locally_with_bearer_admin_session_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
