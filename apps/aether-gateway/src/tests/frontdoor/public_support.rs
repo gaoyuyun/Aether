@@ -1303,8 +1303,15 @@ async fn gateway_handles_public_health_api_formats_without_proxying_upstream() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_public_auth_modules_status_without_proxying_upstream() {
+#[test]
+fn gateway_handles_public_auth_modules_status_without_proxying_upstream() {
+    run_frontdoor_async_test(
+        "public-auth-modules-status",
+        gateway_handles_public_auth_modules_status_without_proxying_upstream_impl(),
+    );
+}
+
+async fn gateway_handles_public_auth_modules_status_without_proxying_upstream_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -1384,8 +1391,15 @@ async fn gateway_handles_public_auth_modules_status_without_proxying_upstream() 
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_public_runtime_modules_status_without_admin_access() {
+#[test]
+fn gateway_handles_public_runtime_modules_status_without_admin_access() {
+    run_frontdoor_async_test(
+        "public-runtime-modules-status",
+        gateway_handles_public_runtime_modules_status_without_admin_access_impl(),
+    );
+}
+
+async fn gateway_handles_public_runtime_modules_status_without_admin_access_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
