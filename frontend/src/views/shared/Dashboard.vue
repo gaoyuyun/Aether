@@ -15,7 +15,10 @@
         </Badge>
 
         <!-- 主要统计卡片 -->
-        <div class="grid grid-cols-2 gap-3 sm:gap-4 xl:grid-cols-4">
+        <div
+          class="grid grid-cols-2 gap-3 sm:gap-4"
+          :class="announcementsModuleActive ? 'xl:grid-cols-4' : 'lg:grid-cols-4'"
+        >
           <!-- 加载中骨架屏 -->
           <template v-if="loading">
             <Card
@@ -148,7 +151,10 @@
               Monthly
             </Badge>
           </div>
-          <div class="grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
+          <div
+            class="grid grid-cols-2 gap-2 sm:gap-3"
+            :class="announcementsModuleActive ? 'xl:grid-cols-4' : 'lg:grid-cols-4'"
+          >
             <Card class="relative p-3 sm:p-4 border-book-cloth/30">
               <Clock
                 class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
@@ -254,7 +260,10 @@
               Monthly
             </Badge>
           </div>
-          <div class="grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
+          <div
+            class="grid grid-cols-2 gap-2 sm:gap-3"
+            :class="announcementsModuleActive ? 'xl:grid-cols-4' : 'lg:grid-cols-4'"
+          >
             <Card
               v-if="cacheStats"
               class="relative p-3 sm:p-4 border-book-cloth/30"
@@ -341,6 +350,7 @@
 
       <!-- 右侧系统公告 -->
       <div
+        v-if="announcementsModuleActive"
         id="announcements-section"
         class="w-full lg:w-[300px] xl:w-[320px] flex-shrink-0 flex flex-col min-h-0"
         :style="announcementsContainerStyle"
@@ -829,6 +839,7 @@
 
   <!-- 公告详情对话框 -->
   <Dialog
+    v-if="announcementsModuleActive"
     v-model="detailDialogOpen"
     size="lg"
   >
@@ -895,6 +906,7 @@ import {
 } from "vue";
 import type { Component } from "vue";
 import { useAuthStore } from "@/stores/auth";
+import { useModuleStore } from "@/stores/modules";
 import {
   dashboardApi,
   type DashboardStat,
@@ -951,6 +963,10 @@ import type {
 } from "chart.js";
 
 const authStore = useAuthStore();
+const moduleStore = useModuleStore();
+const announcementsModuleActive = computed(() =>
+  moduleStore.isActive("announcements"),
+);
 
 type DashboardStatCard = Omit<DashboardStat, "icon"> & {
   icon: Component;
@@ -983,6 +999,10 @@ let announcementsTimelineObserver: ResizeObserver | null = null;
 
 function updateAnnouncementsHeight() {
   if (typeof window === "undefined") return;
+  if (!announcementsModuleActive.value) {
+    announcementsHeight.value = null;
+    return;
+  }
   const panel = statsPanelRef.value;
   if (!panel) return;
   const { height } = panel.getBoundingClientRect();
@@ -1473,7 +1493,6 @@ onMounted(async () => {
   await Promise.all([
     loadDashboardData(),
     loadDailyStats(),
-    loadAnnouncements(),
   ]);
   await nextTick();
   setupTimelineResizeObserver();
@@ -1608,22 +1627,50 @@ function formatResponseTime(seconds: number): string {
 
 // 公告相关
 async function loadAnnouncements() {
+  if (!announcementsModuleActive.value) {
+    announcements.value = [];
+    loadingAnnouncements.value = false;
+    return;
+  }
   loadingAnnouncements.value = true;
   try {
     const response = await announcementApi.getAnnouncements({
       active_only: true,
       limit: 100,
     });
-    announcements.value = response.items;
+    if (announcementsModuleActive.value) {
+      announcements.value = response.items;
+    }
   } catch {
     announcements.value = [];
   } finally {
     loadingAnnouncements.value = false;
-    await nextTick();
-    setupTimelineResizeObserver();
-    updateTimelineLine();
+    if (announcementsModuleActive.value) {
+      await nextTick();
+      setupTimelineResizeObserver();
+      updateAnnouncementsHeight();
+      updateTimelineLine();
+    }
   }
 }
+
+watch(
+  announcementsModuleActive,
+  (active) => {
+    if (active) {
+      void loadAnnouncements();
+      return;
+    }
+    announcements.value = [];
+    selectedAnnouncement.value = null;
+    detailDialogOpen.value = false;
+    loadingAnnouncements.value = false;
+    announcementsHeight.value = null;
+    announcementsTimelineObserver?.disconnect();
+    announcementsTimelineObserver = null;
+  },
+  { immediate: true },
+);
 
 watch(
   () => announcements.value.length,

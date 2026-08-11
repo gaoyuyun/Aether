@@ -1440,9 +1440,8 @@ pub fn build_admin_module_validation_result(
                 )
             }
         }
-        "management_tokens" | "model_directives" | "proxy_nodes" | "wallet" | "billing_plans" => {
-            (true, None)
-        }
+        "management_tokens" | "announcements" | "model_directives" | "proxy_nodes" | "wallet"
+        | "billing_plans" => (true, None),
         _ => (true, None),
     }
 }
@@ -1453,6 +1452,7 @@ pub fn build_admin_module_health(
 ) -> &'static str {
     match module_name {
         "management_tokens"
+        | "announcements"
         | "model_directives"
         | "proxy_nodes"
         | "important_notification"
@@ -1764,6 +1764,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "smtp_from_email" => Some(serde_json::Value::Null),
         "smtp_from_name" => Some(json!("Aether")),
         "enable_oauth_token_refresh" => Some(json!(true)),
+        "module.announcements.enabled" => Some(json!(false)),
         "module.important_notification.enabled" => Some(json!(false)),
         "module.important_notification.email_enabled" => Some(json!(false)),
         "module.important_notification.email_recipients" => Some(json!("")),
@@ -2232,6 +2233,7 @@ pub fn parse_admin_system_config_update(
         "cyber_continue_failover"
         | "enable_model_directives"
         | "show_provider_in_user_usage"
+        | "module.announcements.enabled"
         | "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
         | "module.server_chan_push.enabled"

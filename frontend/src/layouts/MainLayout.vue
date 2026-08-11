@@ -539,10 +539,11 @@ const mobileMenuOpen = ref(false)
 const sidebarCollapsed = useLocalStorage('aether-sidebar-collapsed', false)
 const requiredAnnouncements = ref<Announcement[]>([])
 const acknowledgingRequiredAnnouncement = ref(false)
+const announcementsModuleActive = computed(() => moduleStore.isActive('announcements'))
 const requiredAnnouncementOpen = computed({
   get: () => requiredAnnouncements.value.length > 0,
   set: (value) => {
-    if (value) void loadRequiredAnnouncements()
+    if (value && announcementsModuleActive.value) void loadRequiredAnnouncements()
   }
 })
 const currentRequiredAnnouncement = computed(() => requiredAnnouncements.value[0] ?? null)
@@ -1107,10 +1108,10 @@ function handleVisibilityChange() {
 }
 
 watch(
-  () => [authStore.user, authStore.token] as const,
+  () => [authStore.user, authStore.token, announcementsModuleActive.value] as const,
   () => {
     showAuthError.value = !!authStore.user && !authStore.token
-    if (authStore.user && authStore.token) {
+    if (authStore.user && authStore.token && announcementsModuleActive.value) {
       void loadRequiredAnnouncements()
     } else {
       requiredAnnouncements.value = []
@@ -1130,13 +1131,18 @@ watch(
 )
 
 async function loadRequiredAnnouncements() {
-  if (!authStore.user || !authStore.token) return
+  if (!authStore.user || !authStore.token || !announcementsModuleActive.value) {
+    requiredAnnouncements.value = []
+    return
+  }
   if (requiredAnnouncementsPromise) return requiredAnnouncementsPromise
 
   requiredAnnouncementsPromise = (async () => {
     try {
       const response = await announcementApi.getRequiredUnreadAnnouncements()
-      requiredAnnouncements.value = response.items.filter(item => item.requires_ack && !item.is_read)
+      requiredAnnouncements.value = announcementsModuleActive.value
+        ? response.items.filter(item => item.requires_ack && !item.is_read)
+        : []
     } catch {
       requiredAnnouncements.value = []
     } finally {
@@ -1189,8 +1195,6 @@ onMounted(() => {
       })
     }
   }, RUNTIME_MODULE_REFRESH_INTERVAL_MS)
-  void loadRequiredAnnouncements()
-
   // 延迟检查更新，避免 GitHub Releases 检查和首屏业务数据争抢资源。
   updateCheckTimer = window.setTimeout(() => {
     updateCheckTimer = null

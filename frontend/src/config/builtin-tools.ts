@@ -1,4 +1,4 @@
-import { Mail, Shield, AlertTriangle, BellRing, Package, Wallet } from 'lucide-vue-next'
+import { Mail, Shield, AlertTriangle, BellRing, Megaphone, Package, Wallet } from 'lucide-vue-next'
 import type { LucideIcon } from 'lucide-vue-next'
 
 export interface BuiltinTool {
@@ -35,6 +35,13 @@ export const BUILTIN_TOOLS: BuiltinTool[] = [
     description: '管理通知项、模板和推送服务策略',
     href: '/admin/notification-service',
     icon: BellRing,
+  },
+  {
+    name: '公告管理',
+    description: '发布和管理系统公告，并控制仪表盘公告展示',
+    href: '/admin/announcements',
+    icon: Megaphone,
+    moduleName: 'announcements',
   },
   {
     name: 'IP 安全',

@@ -24,7 +24,6 @@ import {
   Users,
   Wallet,
   Zap,
-  Megaphone,
 } from 'lucide-vue-next'
 import type { NavigationGroup } from '@/components/layout/SidebarNav.vue'
 import type { ModuleStatus } from '@/api/modules'
@@ -105,7 +104,6 @@ export function buildNavigation(options: {
   }
 
   const systemItems: NavItem[] = [
-    { name: t('nav.announcements'), href: '/admin/announcements', icon: Megaphone },
     { name: t('nav.cacheMonitoring'), href: '/admin/cache-monitoring', icon: Gauge },
     ...activeModuleItems(modules, 'system'),
     { name: t('nav.moduleManagement'), href: '/admin/modules', icon: Puzzle },

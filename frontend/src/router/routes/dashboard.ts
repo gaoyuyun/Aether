@@ -26,7 +26,8 @@ export const dashboardRoutes: RouteRecordRaw[] = [
       {
         path: 'announcements',
         name: 'Announcements',
-        component: view(() => import('@/views/user/Announcements.vue'))
+        component: view(() => import('@/views/user/Announcements.vue')),
+        meta: { module: 'announcements' }
       },
       {
         path: 'usage',

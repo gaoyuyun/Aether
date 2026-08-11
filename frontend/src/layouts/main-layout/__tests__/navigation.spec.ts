@@ -83,6 +83,8 @@ describe('main layout navigation builder', () => {
     expect(managementItems.findIndex(item => item.name === 'Second module')).toBeLessThan(
       managementItems.findIndex(item => item.name === 'First module')
     )
+    expect(navigation.flatMap(group => group.items.map(item => item.name)))
+      .not.toContain('tx:nav.announcements')
   })
 
   it('builds translated breadcrumbs for settings and routing detail pages', () => {
