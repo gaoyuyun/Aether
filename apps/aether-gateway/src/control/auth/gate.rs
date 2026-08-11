@@ -17,6 +17,7 @@ const AUTH_CAPACITY_CACHE_STALE_TTL: std::time::Duration = std::time::Duration::
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GatewayLocalAuthRejection {
     InvalidApiKey,
+    StandaloneKeysDisabled,
     LockedApiKey,
     WalletUnavailable,
     BalanceDenied { remaining: Option<f64> },

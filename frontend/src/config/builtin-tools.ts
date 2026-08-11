@@ -1,4 +1,4 @@
-import { Mail, Shield, AlertTriangle, BellRing, Megaphone, Package, Wallet } from 'lucide-vue-next'
+import { Mail, Shield, AlertTriangle, BellRing, KeyRound, Megaphone, Package, Wallet } from 'lucide-vue-next'
 import type { LucideIcon } from 'lucide-vue-next'
 
 export interface BuiltinTool {
@@ -10,6 +10,13 @@ export interface BuiltinTool {
 }
 
 export const BUILTIN_TOOLS: BuiltinTool[] = [
+  {
+    name: '独立密钥',
+    description: '管理不绑定用户账号的独立 API 密钥；关闭后全部停止鉴权，但保留相关数据',
+    href: '/admin/keys',
+    icon: KeyRound,
+    moduleName: 'standalone_keys',
+  },
   {
     name: '钱包管理',
     description: '管理用户钱包、充值和额度结算；关闭后用户按无限额度运行',

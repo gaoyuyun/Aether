@@ -4810,6 +4810,10 @@ async fn gateway_handles_ccswitch_usage_for_standalone_key_without_owner_usage()
             .with_system_config_values_for_tests([
                 ("module.wallet.enabled".to_string(), json!(true)),
                 ("module.billing_plans.enabled".to_string(), json!(true)),
+                (
+                    crate::standalone_keys::STANDALONE_KEYS_MODULE_CONFIG_KEY.to_string(),
+                    json!(true),
+                ),
             ])
             .with_auth_api_key_reader(auth_repository);
             AppState::new()

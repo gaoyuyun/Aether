@@ -319,6 +319,12 @@ pub(crate) fn build_local_auth_rejection_response(
             StatusCode::UNAUTHORIZED,
             "无效的API密钥",
         ),
+        GatewayLocalAuthRejection::StandaloneKeysDisabled => build_local_http_error_response(
+            trace_id,
+            control_decision,
+            StatusCode::FORBIDDEN,
+            "独立密钥功能未启用",
+        ),
         GatewayLocalAuthRejection::LockedApiKey => build_local_http_error_response(
             trace_id,
             control_decision,

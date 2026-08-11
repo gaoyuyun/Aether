@@ -171,6 +171,19 @@ pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
         admin_menu_order: 60,
     },
     AdminModuleDefinition {
+        name: "standalone_keys",
+        display_name: "独立密钥",
+        description:
+            "管理不绑定用户账号的独立 API 密钥；关闭后全部停止鉴权，但保留密钥、钱包与策略数据",
+        category: "security",
+        env_key: "STANDALONE_KEYS_AVAILABLE",
+        default_available: true,
+        admin_route: Some("/admin/keys"),
+        admin_menu_icon: Some("KeyRound"),
+        admin_menu_group: Some("management"),
+        admin_menu_order: 60,
+    },
+    AdminModuleDefinition {
         name: "payment_gateways",
         display_name: "支付配置",
         description: "配置易支付、支付宝官方、微信支付官方和 Stripe 等支付网关",

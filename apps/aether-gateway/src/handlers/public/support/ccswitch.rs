@@ -22,6 +22,9 @@ fn ccswitch_usage_auth_error_response(
         Some(GatewayLocalAuthRejection::InvalidApiKey) | None => {
             build_auth_error_response(http::StatusCode::UNAUTHORIZED, "无效的 API Key", false)
         }
+        Some(GatewayLocalAuthRejection::StandaloneKeysDisabled) => {
+            build_auth_error_response(http::StatusCode::FORBIDDEN, "独立密钥功能未启用", false)
+        }
         Some(GatewayLocalAuthRejection::LockedApiKey) => {
             build_auth_error_response(http::StatusCode::FORBIDDEN, "API Key 已被锁定", false)
         }
