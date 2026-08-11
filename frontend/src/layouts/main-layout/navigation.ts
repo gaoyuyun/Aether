@@ -130,7 +130,6 @@ export function buildNavigation(options: {
         { name: t('nav.modelManagement'), href: '/admin/models', icon: Layers },
         { name: t('nav.routing'), href: '/admin/routing', icon: SlidersHorizontal },
         { name: t('nav.pool'), href: '/admin/pool', icon: Database },
-        { name: t('nav.standaloneKeys'), href: '/admin/keys', icon: Key },
         ...activeModuleItems(modules, 'management'),
         { name: t('nav.asyncTasks'), href: '/admin/async-tasks', icon: Zap },
         { name: t('nav.usageRecords'), href: '/admin/usage', icon: BarChart3 },

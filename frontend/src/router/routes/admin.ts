@@ -25,7 +25,8 @@ export const adminRoutes: RouteRecordRaw[] = [
       {
         path: 'keys',
         name: 'ApiKeys',
-        component: view(() => import('@/views/admin/ApiKeys.vue'))
+        component: view(() => import('@/views/admin/ApiKeys.vue')),
+        meta: { module: 'standalone_keys' }
       },
       {
         path: 'wallets',

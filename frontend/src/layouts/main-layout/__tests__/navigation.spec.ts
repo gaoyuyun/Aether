@@ -87,6 +87,40 @@ describe('main layout navigation builder', () => {
       .not.toContain('tx:nav.announcements')
   })
 
+  it('shows the standalone keys entry only while its built-in module is active', () => {
+    const standaloneModule = {
+      active: true,
+      admin_route: '/admin/keys',
+      admin_menu_group: 'management',
+      admin_menu_order: 60,
+      admin_menu_icon: 'KeyRound',
+      display_name: '独立密钥',
+    }
+    const activeNavigation = buildNavigation({
+      canAccessAdmin: true,
+      modules: { standalone_keys: standaloneModule },
+      isModuleActive: () => false,
+      t: translate,
+    })
+    const inactiveNavigation = buildNavigation({
+      canAccessAdmin: true,
+      modules: { standalone_keys: { ...standaloneModule, active: false } },
+      isModuleActive: () => false,
+      t: translate,
+    })
+
+    const activeEntries = activeNavigation
+      .flatMap(group => group.items)
+      .filter(item => item.href === '/admin/keys')
+    const inactiveEntries = inactiveNavigation
+      .flatMap(group => group.items)
+      .filter(item => item.href === '/admin/keys')
+
+    expect(activeEntries).toHaveLength(1)
+    expect(activeEntries[0]?.name).toBe('独立密钥')
+    expect(inactiveEntries).toHaveLength(0)
+  })
+
   it('builds translated breadcrumbs for settings and routing detail pages', () => {
     const navigation = buildNavigation({
       canAccessAdmin: true,

@@ -262,6 +262,9 @@ fn log_local_auth_rejection(trace_id: &str, decision: &GatewayControlDecision) {
     };
     let (rejection_kind, rejection_detail) = match rejection {
         GatewayLocalAuthRejection::InvalidApiKey => ("invalid_api_key", "-".to_string()),
+        GatewayLocalAuthRejection::StandaloneKeysDisabled => {
+            ("standalone_keys_disabled", "-".to_string())
+        }
         GatewayLocalAuthRejection::LockedApiKey => ("locked_api_key", "-".to_string()),
         GatewayLocalAuthRejection::WalletUnavailable => ("wallet_unavailable", "-".to_string()),
         GatewayLocalAuthRejection::BalanceDenied { remaining } => (
@@ -772,7 +775,10 @@ pub(crate) async fn refresh_execution_runtime_auth_context_with_snapshot(
     {
         return Ok((auth_context, None));
     }
-    let commerce_policy = crate::commerce_modules::commerce_billing_policy(state).await?;
+    let (commerce_policy, standalone_keys_enabled) = tokio::try_join!(
+        crate::commerce_modules::commerce_billing_policy(state),
+        crate::standalone_keys::standalone_keys_module_enabled(state),
+    )?;
 
     let snapshot = {
         let _permit = state.acquire_auth_snapshot_load_gate().await?;
@@ -795,9 +801,12 @@ pub(crate) async fn refresh_execution_runtime_auth_context_with_snapshot(
         return Ok((denied, None));
     };
 
-    let wallet_access =
+    let wallet_access = if snapshot.api_key_is_standalone && !standalone_keys_enabled {
+        None
+    } else {
         resolve_wallet_auth_gate_uncached_with_commerce_policy(state, &snapshot, commerce_policy)
             .await?;
+    };
     let refreshed = build_data_backed_auth_context(
         state,
         snapshot.clone(),
@@ -806,6 +815,7 @@ pub(crate) async fn refresh_execution_runtime_auth_context_with_snapshot(
         auth_context.balance_remaining,
         wallet_access,
         commerce_policy,
+        standalone_keys_enabled,
     )
     .await;
     Ok((refreshed, Some(snapshot)))
@@ -933,7 +943,10 @@ pub(super) async fn resolve_data_backed_auth_context(
     if !state.has_auth_api_key_reader() {
         return Ok(None);
     }
-    let commerce_policy = crate::commerce_modules::commerce_billing_policy(state).await?;
+    let (commerce_policy, standalone_keys_enabled) = tokio::try_join!(
+        crate::commerce_modules::commerce_billing_policy(state),
+        crate::standalone_keys::standalone_keys_module_enabled(state),
+    )?;
     let extracted = extract_request_credentials(headers, uri, signature);
     let principal = derive_principal_candidate(&extracted);
     let now_unix_secs = current_unix_secs();
@@ -946,6 +959,7 @@ pub(super) async fn resolve_data_backed_auth_context(
                 trusted_headers,
                 now_unix_secs,
                 commerce_policy,
+                standalone_keys_enabled,
             )
             .await
         }
@@ -982,16 +996,24 @@ pub(super) async fn resolve_data_backed_auth_context(
                 }));
             };
 
-            state
-                .touch_auth_api_key_last_used_best_effort(&snapshot.api_key_id)
-                .await;
+            let standalone_keys_disabled =
+                snapshot.api_key_is_standalone && !standalone_keys_enabled;
+            if !standalone_keys_disabled {
+                state
+                    .touch_auth_api_key_last_used_best_effort(&snapshot.api_key_id)
+                    .await;
+            }
 
-            let wallet_access = resolve_wallet_auth_gate_uncached_with_commerce_policy(
-                state,
-                &snapshot,
-                commerce_policy,
-            )
-            .await?;
+            let wallet_access = if standalone_keys_disabled {
+                None
+            } else {
+                resolve_wallet_auth_gate_uncached_with_commerce_policy(
+                    state,
+                    &snapshot,
+                    commerce_policy,
+                )
+                .await?
+            };
             Ok(Some(
                 build_data_backed_auth_context(
                     state,
@@ -1001,6 +1023,7 @@ pub(super) async fn resolve_data_backed_auth_context(
                     None,
                     wallet_access,
                     commerce_policy,
+                    standalone_keys_enabled,
                 )
                 .await?,
             ))
@@ -1013,6 +1036,7 @@ pub(super) async fn resolve_data_backed_auth_context(
                 carrier,
                 now_unix_secs,
                 commerce_policy,
+                standalone_keys_enabled,
             )
             .await?
             {
@@ -1032,6 +1056,7 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
     carrier: GatewayCredentialCarrier,
     now_unix_secs: u64,
     commerce_policy: CommerceBillingPolicy,
+    standalone_keys_enabled: bool,
 ) -> Result<Option<GatewayControlAuthContext>, GatewayError> {
     if carrier != GatewayCredentialCarrier::AuthorizationBearer
         || !auth_endpoint_signature
@@ -1110,9 +1135,12 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
         }));
     };
 
-    let wallet_access =
+    let wallet_access = if snapshot.api_key_is_standalone && !standalone_keys_enabled {
+        None
+    } else {
         resolve_wallet_auth_gate_uncached_with_commerce_policy(state, &snapshot, commerce_policy)
-            .await?;
+            .await?
+    };
     let auth_context = build_data_backed_auth_context(
         state,
         snapshot,
@@ -1121,6 +1149,7 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
         None,
         wallet_access,
         commerce_policy,
+        standalone_keys_enabled,
     )
     .await?;
     info!(
@@ -1142,6 +1171,7 @@ async fn resolve_trusted_auth_context(
     trusted_headers: GatewayTrustedAuthHeaders,
     now_unix_secs: u64,
     commerce_policy: CommerceBillingPolicy,
+    standalone_keys_enabled: bool,
 ) -> Result<Option<GatewayControlAuthContext>, GatewayError> {
     // Trusted billing headers aggregate wallet and plan checks. If either module is disabled,
     // only the local snapshot and enabled local billing gates are authoritative.
@@ -1186,9 +1216,12 @@ async fn resolve_trusted_auth_context(
         }));
     };
 
-    let wallet_access =
+    let wallet_access = if snapshot.api_key_is_standalone && !standalone_keys_enabled {
+        None
+    } else {
         resolve_wallet_auth_gate_uncached_with_commerce_policy(state, &snapshot, commerce_policy)
-            .await?;
+            .await?
+    };
     Ok(Some(
         build_data_backed_auth_context(
             state,
@@ -1198,6 +1231,7 @@ async fn resolve_trusted_auth_context(
             trusted_balance_remaining,
             wallet_access,
             commerce_policy,
+            standalone_keys_enabled,
         )
         .await?,
     ))
@@ -1211,6 +1245,7 @@ async fn build_data_backed_auth_context(
     balance_remaining: Option<f64>,
     wallet_access: Option<aether_wallet::WalletAccessDecision>,
     commerce_policy: CommerceBillingPolicy,
+    standalone_keys_enabled: bool,
 ) -> Result<GatewayControlAuthContext, GatewayError> {
     let allowed_models = snapshot
         .effective_allowed_models()
@@ -1222,6 +1257,7 @@ async fn build_data_backed_auth_context(
             .api_key_expires_at_unix_secs
             .is_some_and(|expires_at| expires_at < current_unix_secs());
     let locked_api_key = snapshot.api_key_is_locked && !snapshot.api_key_is_standalone;
+    let standalone_keys_disabled = snapshot.api_key_is_standalone && !standalone_keys_enabled;
     let key_access_allowed = header_access_allowed
         .map(|value| value && snapshot.currently_usable)
         .unwrap_or(snapshot.currently_usable);
@@ -1234,12 +1270,15 @@ async fn build_data_backed_auth_context(
         .unwrap_or(auth_endpoint_signature)
         .trim();
     let identity_only = auth_gate_identity_only(auth_endpoint_signature);
-    let requested_provider_allowed = identity_only
+    let requested_provider_allowed = standalone_keys_disabled
+        || identity_only
         || auth_snapshot_allows_requested_provider(state, &snapshot, auth_endpoint_signature).await;
     let local_rejection = if invalid_api_key {
         Some(GatewayLocalAuthRejection::InvalidApiKey)
     } else if locked_api_key {
         Some(GatewayLocalAuthRejection::LockedApiKey)
+    } else if standalone_keys_disabled {
+        Some(GatewayLocalAuthRejection::StandaloneKeysDisabled)
     } else if let Some(rejection) = wallet_access
         .as_ref()
         .and_then(local_rejection_from_wallet_access)
@@ -1827,6 +1866,110 @@ mod tests {
         .expect("auth context should exist");
         assert_eq!(second.api_key_id, "key-1");
         assert_eq!(repository.touch_count("key-1"), 1);
+    }
+
+    #[tokio::test]
+    async fn standalone_key_auth_follows_module_toggle_without_mutating_key() {
+        let api_key = "sk-test-standalone-module-toggle";
+        let mut snapshot = sample_snapshot("key-standalone-toggle", "user-standalone-toggle");
+        snapshot.api_key_is_standalone = true;
+        let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some(hash_api_key(api_key)),
+            snapshot,
+        )]));
+        let data =
+            GatewayDataState::with_auth_api_key_repository_for_tests(Arc::clone(&repository))
+                .with_system_config_values_for_tests([]);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {api_key}").parse().unwrap(),
+        );
+        let request_uri = uri("/v1/chat/completions");
+        let decision = || {
+            GatewayControlDecision::synthetic(
+                "/v1/chat/completions",
+                Some("ai_public".to_string()),
+                Some("openai".to_string()),
+                Some("chat".to_string()),
+                Some("openai:chat".to_string()),
+            )
+        };
+
+        let ControlDecisionAuthResolution::Resolved(disabled) = resolve_control_decision_auth(
+            &state,
+            &headers,
+            &request_uri,
+            "trace-standalone-module-disabled",
+            decision(),
+        )
+        .await
+        .expect("disabled standalone auth resolution should succeed");
+        let disabled_context = disabled
+            .auth_context
+            .expect("disabled standalone key identity should still resolve");
+        assert!(!disabled_context.access_allowed);
+        assert_eq!(
+            disabled_context.local_rejection,
+            Some(GatewayLocalAuthRejection::StandaloneKeysDisabled)
+        );
+        assert_eq!(repository.touch_count("key-standalone-toggle"), 0);
+
+        state
+            .upsert_system_config_json_value(
+                crate::standalone_keys::STANDALONE_KEYS_MODULE_CONFIG_KEY,
+                &json!(true),
+                None,
+            )
+            .await
+            .expect("standalone module should enable");
+        let ControlDecisionAuthResolution::Resolved(enabled) = resolve_control_decision_auth(
+            &state,
+            &headers,
+            &request_uri,
+            "trace-standalone-module-enabled",
+            decision(),
+        )
+        .await
+        .expect("enabled standalone auth resolution should succeed");
+        let enabled_context = enabled
+            .auth_context
+            .expect("enabled standalone key should resolve");
+        assert!(enabled_context.access_allowed);
+        assert_eq!(enabled_context.local_rejection, None);
+        assert!(enabled_context.api_key_is_standalone);
+        assert_eq!(repository.touch_count("key-standalone-toggle"), 1);
+
+        state
+            .upsert_system_config_json_value(
+                crate::standalone_keys::STANDALONE_KEYS_MODULE_CONFIG_KEY,
+                &json!(false),
+                None,
+            )
+            .await
+            .expect("standalone module should disable");
+        let ControlDecisionAuthResolution::Resolved(disabled_again) =
+            resolve_control_decision_auth(
+                &state,
+                &headers,
+                &request_uri,
+                "trace-standalone-module-disabled-again",
+                decision(),
+            )
+            .await
+            .expect("disabled standalone auth resolution should succeed");
+        let disabled_again_context = disabled_again
+            .auth_context
+            .expect("disabled standalone key identity should still resolve");
+        assert!(!disabled_again_context.access_allowed);
+        assert_eq!(
+            disabled_again_context.local_rejection,
+            Some(GatewayLocalAuthRejection::StandaloneKeysDisabled)
+        );
+        assert_eq!(repository.touch_count("key-standalone-toggle"), 1);
     }
 
     async fn resolve_trusted_billing_denial_with_config(
@@ -2840,7 +2983,11 @@ mod tests {
             Vec::new(),
         ));
         let data = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
-            .with_provider_catalog_reader(provider_catalog);
+            .with_provider_catalog_reader(provider_catalog)
+            .with_system_config_values_for_tests([(
+                crate::standalone_keys::STANDALONE_KEYS_MODULE_CONFIG_KEY.to_string(),
+                json!(true),
+            )]);
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data);
@@ -2930,7 +3077,11 @@ mod tests {
             Vec::new(),
         ));
         let data = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
-            .with_provider_catalog_reader(provider_catalog);
+            .with_provider_catalog_reader(provider_catalog)
+            .with_system_config_values_for_tests([(
+                crate::standalone_keys::STANDALONE_KEYS_MODULE_CONFIG_KEY.to_string(),
+                json!(true),
+            )]);
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data);

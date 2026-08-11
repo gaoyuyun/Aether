@@ -1440,8 +1440,8 @@ pub fn build_admin_module_validation_result(
                 )
             }
         }
-        "management_tokens" | "announcements" | "model_directives" | "proxy_nodes" | "wallet"
-        | "billing_plans" => (true, None),
+        "management_tokens" | "announcements" | "model_directives" | "proxy_nodes"
+        | "standalone_keys" | "wallet" | "billing_plans" => (true, None),
         _ => (true, None),
     }
 }
@@ -1455,6 +1455,7 @@ pub fn build_admin_module_health(
         | "announcements"
         | "model_directives"
         | "proxy_nodes"
+        | "standalone_keys"
         | "important_notification"
         | "bark_push"
         | "server_chan_push"

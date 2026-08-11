@@ -90,6 +90,7 @@ const AUTH_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &[
     crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY,
     crate::commerce_modules::WALLET_MODULE_CONFIG_KEY,
     crate::commerce_modules::BILLING_PLANS_MODULE_CONFIG_KEY,
+    crate::standalone_keys::STANDALONE_KEYS_MODULE_CONFIG_KEY,
 ];
 const FRONTDOOR_RPM_AFFECTING_SYSTEM_CONFIG_KEYS: &[&str] = &["rate_limit_per_minute"];
 const CHAT_PII_REDACTION_SYSTEM_CONFIG_PREFIX: &str = "module.chat_pii_redaction.";

@@ -869,6 +869,10 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
     assert_eq!(payload["oauth"]["active"], json!(true));
     assert_eq!(payload["oauth"]["config_validated"], json!(true));
     assert_eq!(payload["management_tokens"]["active"], json!(true));
+    assert_eq!(payload["standalone_keys"]["enabled"], json!(false));
+    assert_eq!(payload["standalone_keys"]["active"], json!(false));
+    assert_eq!(payload["standalone_keys"]["admin_route"], "/admin/keys");
+    assert_eq!(payload["standalone_keys"]["admin_menu_group"], "management");
     assert_eq!(payload["announcements"]["enabled"], json!(false));
     assert_eq!(payload["announcements"]["active"], json!(false));
     assert_eq!(payload["announcements"]["config_validated"], json!(true));

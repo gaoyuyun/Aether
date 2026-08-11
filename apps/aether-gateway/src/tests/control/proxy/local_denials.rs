@@ -341,6 +341,78 @@ async fn gateway_locally_denies_invalid_bearer_api_key_without_hitting_control_o
 }
 
 #[tokio::test]
+async fn gateway_locally_denies_standalone_key_when_module_is_disabled() {
+    let auth_context_hits = Arc::new(Mutex::new(0usize));
+    let auth_context_hits_clone = Arc::clone(&auth_context_hits);
+    let public_hits = Arc::new(Mutex::new(0usize));
+    let public_hits_clone = Arc::clone(&public_hits);
+
+    let upstream = Router::new()
+        .route(
+            "/api/internal/gateway/auth-context",
+            any(move |_request: Request| {
+                let auth_context_hits_inner = Arc::clone(&auth_context_hits_clone);
+                async move {
+                    *auth_context_hits_inner.lock().expect("mutex should lock") += 1;
+                    Json(json!({"auth_context": null}))
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            any(move |_request: Request| {
+                let public_hits_inner = Arc::clone(&public_hits_clone);
+                async move {
+                    *public_hits_inner.lock().expect("mutex should lock") += 1;
+                    (StatusCode::OK, Body::from("unexpected upstream hit"))
+                }
+            }),
+        );
+
+    let mut snapshot =
+        sample_currently_usable_auth_snapshot("key-standalone-disabled", "user-standalone");
+    snapshot.api_key_is_standalone = true;
+    let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key("sk-standalone-disabled")),
+        snapshot,
+    )]));
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway state should build")
+            .with_auth_api_key_data_reader_for_tests(repository),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::AUTHORIZATION, "Bearer sk-standalone-disabled")
+        .header(TRACE_ID_HEADER, "trace-control-standalone-disabled")
+        .body("{\"model\":\"gpt-5\",\"messages\":[]}")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .headers()
+            .get(EXECUTION_PATH_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(EXECUTION_PATH_LOCAL_AUTH_DENIED)
+    );
+    let payload: serde_json::Value = response.json().await.expect("response json should parse");
+    assert_eq!(payload["error"]["type"], "http_error");
+    assert_eq!(payload["error"]["message"], "独立密钥功能未启用");
+    assert_eq!(*auth_context_hits.lock().expect("mutex should lock"), 0);
+    assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_claude_routes_use_anthropic_authentication_error_for_invalid_api_key() {
     let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
         Some(hash_api_key("sk-other-claude-key")),

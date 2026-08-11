@@ -74,6 +74,7 @@ mod routing;
 mod scheduler;
 mod server_chan_push;
 mod stage_metrics;
+mod standalone_keys;
 mod state;
 mod system_features;
 mod task_runtime;
