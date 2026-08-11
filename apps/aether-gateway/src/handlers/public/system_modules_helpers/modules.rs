@@ -96,6 +96,15 @@ pub(crate) async fn build_public_runtime_modules_status_payload(
     state: &AppState,
 ) -> Result<serde_json::Value, GatewayError> {
     let policy = crate::commerce_modules::commerce_billing_policy(state).await?;
+    let announcements_available = module_available_from_env("ANNOUNCEMENTS_AVAILABLE", true);
+    let announcements_enabled = if announcements_available {
+        let value = state
+            .read_system_config_json_value("module.announcements.enabled")
+            .await?;
+        system_config_bool(value.as_ref(), false)
+    } else {
+        false
+    };
     Ok(json!([
         {
             "name": "wallet",
@@ -106,6 +115,11 @@ pub(crate) async fn build_public_runtime_modules_status_payload(
             "name": "billing_plans",
             "display_name": "套餐管理",
             "active": policy.billing_plans_enabled,
+        },
+        {
+            "name": "announcements",
+            "display_name": "公告管理",
+            "active": announcements_enabled,
         }
     ]))
 }

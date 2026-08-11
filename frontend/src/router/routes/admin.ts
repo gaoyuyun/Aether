@@ -203,7 +203,8 @@ export const adminRoutes: RouteRecordRaw[] = [
       {
         path: 'announcements',
         name: 'AnnouncementManagement',
-        component: view(() => import('@/views/user/Announcements.vue'))
+        component: view(() => import('@/views/user/Announcements.vue')),
+        meta: { module: 'announcements' }
       },
       {
         path: 'async-tasks',

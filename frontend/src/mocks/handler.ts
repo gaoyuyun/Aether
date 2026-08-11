@@ -2108,6 +2108,15 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     return createMockResponse(MOCK_MODULE_STATUSES)
   },
 
+  'GET /api/modules/status': async () => {
+    await delay()
+    return createMockResponse(['wallet', 'billing_plans', 'announcements'].map(name => ({
+      name,
+      display_name: MOCK_MODULE_STATUSES[name].display_name,
+      active: MOCK_MODULE_STATUSES[name].active,
+    })))
+  },
+
   // ========== Admin: System ==========
   'GET /api/admin/system/configs': async () => {
     await delay()

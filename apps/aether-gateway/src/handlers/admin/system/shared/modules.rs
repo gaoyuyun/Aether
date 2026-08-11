@@ -63,6 +63,18 @@ pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
         admin_menu_order: 0,
     },
     AdminModuleDefinition {
+        name: "announcements",
+        display_name: "公告管理",
+        description: "发布和管理系统公告，并在仪表盘向用户展示最新通知",
+        category: "integration",
+        env_key: "ANNOUNCEMENTS_AVAILABLE",
+        default_available: true,
+        admin_route: Some("/admin/announcements"),
+        admin_menu_icon: Some("Megaphone"),
+        admin_menu_group: None,
+        admin_menu_order: 57,
+    },
+    AdminModuleDefinition {
         name: "chat_pii_redaction",
         display_name: "敏感信息保护",
         description: "发送给供应商前将聊天消息中的敏感信息替换为占位符，返回客户端前自动还原。",

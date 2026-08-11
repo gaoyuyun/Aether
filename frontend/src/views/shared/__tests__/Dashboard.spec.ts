@@ -8,6 +8,15 @@ const dashboardApiMocks = vi.hoisted(() => ({
   getDailyStats: vi.fn(),
 }))
 
+const announcementApiMocks = vi.hoisted(() => ({
+  getAnnouncements: vi.fn(),
+  markAsRead: vi.fn(),
+}))
+
+const moduleStoreMocks = vi.hoisted(() => ({
+  announcementsActive: false,
+}))
+
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
     canAccessAdmin: false,
@@ -21,10 +30,13 @@ vi.mock('@/api/dashboard', () => ({
 }))
 
 vi.mock('@/api/announcements', () => ({
-  announcementApi: {
-    getAnnouncements: vi.fn().mockResolvedValue({ items: [] }),
-    markAsRead: vi.fn().mockResolvedValue({}),
-  },
+  announcementApi: announcementApiMocks,
+}))
+
+vi.mock('@/stores/modules', () => ({
+  useModuleStore: () => ({
+    isActive: (name: string) => name === 'announcements' && moduleStoreMocks.announcementsActive,
+  }),
 }))
 
 vi.mock('@/components/charts/BarChart.vue', async () => {
@@ -125,10 +137,40 @@ async function settle() {
 beforeEach(() => {
   dashboardApiMocks.getStats.mockReset()
   dashboardApiMocks.getDailyStats.mockReset()
+  announcementApiMocks.getAnnouncements.mockReset()
+  announcementApiMocks.markAsRead.mockReset()
+  announcementApiMocks.getAnnouncements.mockResolvedValue({ items: [] })
+  announcementApiMocks.markAsRead.mockResolvedValue({})
+  moduleStoreMocks.announcementsActive = false
   dashboardApiMocks.getDailyStats.mockResolvedValue({
     daily_stats: [],
     model_summary: [],
     period: { start_date: '2026-05-01', end_date: '2026-05-15', days: 15 },
+  })
+})
+
+describe('Dashboard announcements module', () => {
+  it('hides announcements and expands statistics while the module is disabled', async () => {
+    dashboardApiMocks.getStats.mockResolvedValue({ stats: [] })
+
+    const root = mountDashboard()
+    await settle()
+
+    expect(root.querySelector('#announcements-section')).toBeNull()
+    expect(announcementApiMocks.getAnnouncements).not.toHaveBeenCalled()
+    expect(root.querySelector('.lg\\:grid-cols-4')).not.toBeNull()
+  })
+
+  it('shows and loads announcements while the module is enabled', async () => {
+    moduleStoreMocks.announcementsActive = true
+    dashboardApiMocks.getStats.mockResolvedValue({ stats: [] })
+
+    const root = mountDashboard()
+    await settle()
+
+    expect(root.querySelector('#announcements-section')).not.toBeNull()
+    expect(announcementApiMocks.getAnnouncements).toHaveBeenCalledTimes(1)
+    expect(root.querySelector('.xl\\:grid-cols-4')).not.toBeNull()
   })
 })
 

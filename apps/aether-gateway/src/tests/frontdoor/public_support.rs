@@ -1403,6 +1403,7 @@ async fn gateway_handles_public_runtime_modules_status_without_admin_access() {
     let data = crate::data::GatewayDataState::disabled().with_system_config_values_for_tests([
         ("module.wallet.enabled".to_string(), json!(true)),
         ("module.billing_plans.enabled".to_string(), json!(true)),
+        ("module.announcements.enabled".to_string(), json!(true)),
     ]);
     let gateway = build_router_with_state(
         AppState::new()
@@ -1423,6 +1424,8 @@ async fn gateway_handles_public_runtime_modules_status_without_admin_access() {
     assert_eq!(payload[0]["active"], true);
     assert_eq!(payload[1]["name"], "billing_plans");
     assert_eq!(payload[1]["active"], true);
+    assert_eq!(payload[2]["name"], "announcements");
+    assert_eq!(payload[2]["active"], true);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
