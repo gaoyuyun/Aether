@@ -14,6 +14,9 @@ export interface ModuleStatus {
   display_name: string
   description: string
   category: 'auth' | 'monitoring' | 'security' | 'integration'
+  kind: 'builtin' | 'extension'
+  group: string
+  depends_on: string[]
   admin_route: string | null
   admin_menu_icon: string | null
   admin_menu_group: string | null
@@ -30,6 +33,9 @@ export interface AuthModuleInfo {
 export interface RuntimeModuleInfo {
   name: string
   display_name: string
+  kind: 'builtin' | 'extension'
+  group: string
+  depends_on: string[]
   active: boolean
 }
 

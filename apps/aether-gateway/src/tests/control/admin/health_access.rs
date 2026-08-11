@@ -871,10 +871,13 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
     assert_eq!(payload["management_tokens"]["active"], json!(true));
     assert_eq!(payload["standalone_keys"]["enabled"], json!(false));
     assert_eq!(payload["standalone_keys"]["active"], json!(false));
+    assert_eq!(payload["standalone_keys"]["kind"], "builtin");
+    assert_eq!(payload["standalone_keys"]["group"], "security");
     assert_eq!(payload["standalone_keys"]["admin_route"], "/admin/keys");
     assert_eq!(payload["standalone_keys"]["admin_menu_group"], "management");
     assert_eq!(payload["announcements"]["enabled"], json!(false));
     assert_eq!(payload["announcements"]["active"], json!(false));
+    assert_eq!(payload["announcements"]["kind"], "builtin");
     assert_eq!(payload["announcements"]["config_validated"], json!(true));
     assert_eq!(
         payload["announcements"]["admin_route"],
@@ -909,6 +912,7 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
     assert_eq!(payload["bark_push"]["display_name"], "Bark 推送");
     assert_eq!(payload["bark_push"]["admin_route"], "/admin/modules/bark");
     assert_eq!(payload["s3_backup"]["display_name"], "S3 备份");
+    assert_eq!(payload["s3_backup"]["kind"], "extension");
     assert_eq!(
         payload["s3_backup"]["admin_route"],
         "/admin/modules/s3-backup"
@@ -917,6 +921,12 @@ async fn gateway_handles_admin_modules_status_locally_with_trusted_admin_princip
         payload["s3_backup"]["admin_menu_group"],
         serde_json::Value::Null
     );
+    assert_eq!(payload["wallet"]["kind"], "builtin");
+    assert_eq!(payload["wallet"]["group"], "commerce");
+    assert_eq!(payload["wallet"]["depends_on"], json!([]));
+    assert_eq!(payload["billing_plans"]["kind"], "builtin");
+    assert_eq!(payload["billing_plans"]["group"], "commerce");
+    assert_eq!(payload["billing_plans"]["depends_on"], json!(["wallet"]));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
