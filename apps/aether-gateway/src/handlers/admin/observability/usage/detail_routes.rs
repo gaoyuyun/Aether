@@ -8,7 +8,7 @@ use super::replay::{
     build_admin_usage_detail_payload, build_admin_usage_replay_response,
 };
 use super::summary_routes::{
-    admin_usage_terminal_candidate_state_override, apply_admin_usage_state_override,
+    apply_admin_usage_state_override, clear_admin_usage_active_failure_signal,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::{attach_admin_audit_response, query_param_bool};
@@ -244,10 +244,13 @@ pub(super) async fn maybe_build_local_admin_usage_detail_response(
                     .read_request_candidates_by_request_id(&detail_item.request_id)
                     .await?;
                 if let Some(override_payload) =
-                    admin_usage_terminal_candidate_state_override(&candidates)
+                    crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override(
+                        &candidates,
+                    )
                 {
                     apply_admin_usage_state_override(&mut detail_item, &override_payload);
                 }
+                clear_admin_usage_active_failure_signal(&mut detail_item);
             }
             let mut body_load_errors = serde_json::Map::new();
             let request_body = if include_bodies {

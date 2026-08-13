@@ -9,7 +9,8 @@ use aether_scheduler_core::{
     resolve_report_request_candidate_slot as resolve_report_request_candidate_slot_from_candidates,
     LocalRequestCandidateStatusRecordInput, ReportRequestCandidateStatusRecordInput,
     SchedulerMinimalCandidateSelectionCandidate, SchedulerRequestCandidateStatusUpdate,
-    SchedulerResolvedReportRequestCandidateSlot,
+    SchedulerResolvedReportRequestCandidateSlot, REQUEST_CANDIDATE_LIFECYCLE_KEY,
+    REQUEST_CANDIDATE_LIFECYCLE_REQUEST_TERMINAL,
 };
 use aether_usage_runtime::build_locally_actionable_report_context_from_request_candidate;
 use async_trait::async_trait;
@@ -63,28 +64,128 @@ fn request_candidate_status_is_terminal(status: RequestCandidateStatus) -> bool 
     )
 }
 
-pub(crate) fn request_candidate_failure_is_retryable_transition(
-    candidate: &StoredRequestCandidate,
-) -> bool {
-    if candidate.status != RequestCandidateStatus::Failed {
-        return false;
-    }
-    let Some(error_flow) = candidate
+pub(crate) fn request_candidate_marks_request_terminal(candidate: &StoredRequestCandidate) -> bool {
+    candidate
         .extra_data
         .as_ref()
-        .and_then(|value| value.get("error_flow"))
-    else {
-        return false;
-    };
-    let retryable = error_flow
-        .get("retryable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let retry_next_candidate = error_flow
-        .get("decision")
+        .and_then(|value| value.get(REQUEST_CANDIDATE_LIFECYCLE_KEY))
         .and_then(Value::as_str)
-        .is_some_and(|value| value == "retry_next_candidate");
-    retryable && retry_next_candidate
+        .is_some_and(|value| value.trim() == REQUEST_CANDIDATE_LIFECYCLE_REQUEST_TERMINAL)
+}
+
+/// Stamps the request-level terminal conclusion onto a report context.
+///
+/// Only the commit points that own the client response may call this: a candidate that finished
+/// while the loop can still switch to another candidate is an intermediate outcome, not a request
+/// terminal state, and must stay unmarked so the usage APIs keep reporting the request as active.
+pub(crate) fn with_request_terminal_lifecycle_report_context(
+    report_context: Option<&Value>,
+) -> Value {
+    let mut object = report_context
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    object.insert(
+        REQUEST_CANDIDATE_LIFECYCLE_KEY.to_string(),
+        Value::String(REQUEST_CANDIDATE_LIFECYCLE_REQUEST_TERMINAL.to_string()),
+    );
+    Value::Object(object)
+}
+
+fn request_candidate_current(
+    candidates: &[StoredRequestCandidate],
+) -> Option<&StoredRequestCandidate> {
+    let is_attempted = |candidate: &&StoredRequestCandidate| {
+        !matches!(
+            candidate.status,
+            RequestCandidateStatus::Available
+                | RequestCandidateStatus::Unused
+                | RequestCandidateStatus::Skipped
+        )
+    };
+    let order_key = |candidate: &&StoredRequestCandidate| {
+        (
+            candidate.candidate_index,
+            candidate.retry_index,
+            candidate
+                .started_at_unix_ms
+                .or(candidate.finished_at_unix_ms)
+                .unwrap_or(candidate.created_at_unix_ms),
+        )
+    };
+    let request_terminal = candidates
+        .iter()
+        .filter(is_attempted)
+        .filter(|candidate| request_candidate_marks_request_terminal(candidate))
+        .max_by_key(order_key);
+    request_terminal.or_else(|| candidates.iter().filter(is_attempted).max_by_key(order_key))
+}
+
+fn request_candidate_unix_millis_to_rfc3339(unix_ms: u64) -> Option<String> {
+    let secs = i64::try_from(unix_ms / 1_000).ok()?;
+    let nanos = u32::try_from(unix_ms % 1_000)
+        .ok()?
+        .saturating_mul(1_000_000);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+/// Resolves the request-level terminal state an active usage row should adopt, if any.
+///
+/// A terminal candidate only concludes the request when it also owns the client response. Success
+/// and cancellation are always owned by the request: a successful candidate is the response the
+/// downstream client received, and cancellation is a client-side event. A failed candidate is only
+/// conclusive when the commit point stamped it as request terminal; otherwise the candidate loop
+/// is still allowed to continue with the next candidate and the request stays active.
+pub(crate) fn resolve_request_terminal_candidate_state_override(
+    candidates: &[StoredRequestCandidate],
+) -> Option<Value> {
+    let candidate = request_candidate_current(candidates)?;
+    let status = match candidate.status {
+        RequestCandidateStatus::Success => "completed",
+        RequestCandidateStatus::Cancelled => "cancelled",
+        RequestCandidateStatus::Failed if request_candidate_marks_request_terminal(candidate) => {
+            "failed"
+        }
+        _ => return None,
+    };
+
+    let latency_ms = candidate.latency_ms.or_else(|| {
+        Some(
+            candidate
+                .finished_at_unix_ms?
+                .saturating_sub(candidate.started_at_unix_ms?),
+        )
+    });
+    let mut payload = serde_json::json!({ "status": status });
+    if let Some(latency_ms) = latency_ms {
+        payload["response_time_ms"] = serde_json::json!(latency_ms);
+        if let Some(response_time_updated_at) = candidate
+            .finished_at_unix_ms
+            .or_else(|| {
+                candidate
+                    .started_at_unix_ms
+                    .map(|started_at| started_at.saturating_add(latency_ms))
+            })
+            .and_then(request_candidate_unix_millis_to_rfc3339)
+        {
+            payload["response_time_updated_at"] = serde_json::json!(response_time_updated_at);
+        }
+    }
+    if candidate.status == RequestCandidateStatus::Success {
+        // A successful response is authoritative over any failure fields the active usage row may
+        // still carry from an earlier candidate while the terminal usage write is catching up.
+        payload["status_code"] = candidate.status_code.map_or(Value::Null, Value::from);
+        payload["error_message"] = Value::Null;
+    } else {
+        if let Some(status_code) = candidate.status_code {
+            payload["status_code"] = serde_json::json!(status_code);
+        }
+        if let Some(error_message) = candidate.error_message.as_ref() {
+            payload["error_message"] = serde_json::json!(error_message);
+        }
+    }
+    Some(payload)
 }
 
 fn should_persist_request_candidate_status(status: RequestCandidateStatus) -> bool {
@@ -399,6 +500,27 @@ pub(crate) async fn record_local_request_candidate_status(
     persist_local_request_candidate_status_record(state, record).await;
 }
 
+/// Records a local candidate outcome that also owns the terminal client response.
+///
+/// Intermediate failures must keep using [`record_local_request_candidate_status`] so a later
+/// candidate can still determine the request-level outcome.
+pub(crate) async fn record_request_terminal_local_request_candidate_status(
+    state: &(impl RequestCandidateRuntimeWriter + ?Sized),
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    status_update: SchedulerRequestCandidateStatusUpdate,
+) {
+    let request_terminal_report_context =
+        with_request_terminal_lifecycle_report_context(report_context);
+    record_local_request_candidate_status(
+        state,
+        plan,
+        Some(&request_terminal_report_context),
+        status_update,
+    )
+    .await;
+}
+
 pub(crate) async fn record_local_request_candidate_extra_data(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     plan: &ExecutionPlan,
@@ -583,6 +705,22 @@ pub(crate) async fn record_report_request_candidate_status(
             );
         }
     }
+}
+
+/// Records a report-driven candidate outcome that also owns the terminal client response.
+pub(crate) async fn record_request_terminal_report_request_candidate_status(
+    state: &(impl RequestCandidateRuntimeReader + RequestCandidateRuntimeWriter + ?Sized),
+    report_context: Option<&Value>,
+    status_update: SchedulerRequestCandidateStatusUpdate,
+) {
+    let request_terminal_report_context =
+        with_request_terminal_lifecycle_report_context(report_context);
+    record_report_request_candidate_status(
+        state,
+        Some(&request_terminal_report_context),
+        status_update,
+    )
+    .await;
 }
 
 pub(crate) async fn ensure_execution_request_candidate_slot(
@@ -982,7 +1120,10 @@ mod tests {
 
     use super::{
         ensure_execution_request_candidate_slot, persist_available_local_candidate,
-        record_report_request_candidate_status, resolve_request_candidate_required_capabilities,
+        record_report_request_candidate_status,
+        record_request_terminal_local_request_candidate_status,
+        record_request_terminal_report_request_candidate_status,
+        request_candidate_marks_request_terminal, resolve_request_candidate_required_capabilities,
         select_requested_model_capabilities, snapshot_local_request_candidate_status,
         try_enqueue_local_request_candidate_status_snapshot, RequestCandidateRuntimeWriter,
         SchedulerRequestCandidateStatusUpdate,
@@ -1306,6 +1447,68 @@ mod tests {
         assert_eq!(stored[0].latency_ms, Some(25));
         assert_eq!(stored[0].started_at_unix_ms, Some(101));
         assert_eq!(stored[0].finished_at_unix_ms, Some(102));
+    }
+
+    #[tokio::test]
+    async fn request_terminal_candidate_helpers_stamp_local_and_report_updates() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = build_test_state(Arc::clone(&repository));
+        let mut local_plan = sample_plan();
+        local_plan.request_id = "req-terminal-local".to_string();
+        local_plan.candidate_id = Some("cand-terminal-local".to_string());
+        let local_context = json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+
+        record_request_terminal_local_request_candidate_status(
+            &state,
+            &local_plan,
+            Some(&local_context),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Failed,
+                status_code: Some(502),
+                error_type: Some("transport_error".to_string()),
+                error_message: Some("connection reset".to_string()),
+                latency_ms: Some(25),
+                started_at_unix_ms: Some(100),
+                finished_at_unix_ms: Some(125),
+            },
+        )
+        .await;
+
+        let report_context = json!({
+            "request_id": "req-terminal-report",
+            "candidate_id": "cand-terminal-report",
+            "candidate_index": 1,
+            "retry_index": 0,
+            "provider_id": "provider-terminal-report",
+            "endpoint_id": "endpoint-terminal-report",
+            "key_id": "key-terminal-report",
+        });
+        record_request_terminal_report_request_candidate_status(
+            &state,
+            Some(&report_context),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Failed,
+                status_code: Some(500),
+                error_type: Some("prefetch_error".to_string()),
+                error_message: Some("embedded error".to_string()),
+                latency_ms: Some(30),
+                started_at_unix_ms: Some(200),
+                finished_at_unix_ms: Some(230),
+            },
+        )
+        .await;
+
+        for request_id in ["req-terminal-local", "req-terminal-report"] {
+            let stored = repository
+                .list_by_request_id(request_id)
+                .await
+                .expect("request candidates should read");
+            assert_eq!(stored.len(), 1);
+            assert!(request_candidate_marks_request_terminal(&stored[0]));
+        }
     }
 
     #[tokio::test]

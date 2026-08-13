@@ -136,9 +136,13 @@ where
             AiAttemptLoopOutcome::Responded(response) => {
                 Ok(LocalExecutionRequestOutcome::responded(response))
             }
-            AiAttemptLoopOutcome::Deferred(response) => Ok(
-                LocalExecutionRequestOutcome::responded(mark_deferred_upstream_response(response)),
-            ),
+            AiAttemptLoopOutcome::Deferred {
+                response,
+                owner_plan,
+                owner_report_context,
+            } => Ok(LocalExecutionRequestOutcome::responded(
+                mark_deferred_upstream_response(response, owner_plan, owner_report_context),
+            )),
             AiAttemptLoopOutcome::Exhausted(exhaustion) => {
                 Ok(LocalExecutionRequestOutcome::Exhausted(exhaustion))
             }
@@ -415,9 +419,13 @@ where
             AiAttemptLoopOutcome::Responded(response) => {
                 Ok(LocalExecutionRequestOutcome::responded(response))
             }
-            AiAttemptLoopOutcome::Deferred(response) => Ok(
-                LocalExecutionRequestOutcome::responded(mark_deferred_upstream_response(response)),
-            ),
+            AiAttemptLoopOutcome::Deferred {
+                response,
+                owner_plan,
+                owner_report_context,
+            } => Ok(LocalExecutionRequestOutcome::responded(
+                mark_deferred_upstream_response(response, owner_plan, owner_report_context),
+            )),
             AiAttemptLoopOutcome::Exhausted(exhaustion) => {
                 Ok(LocalExecutionRequestOutcome::Exhausted(exhaustion))
             }
@@ -838,8 +846,12 @@ where
                 scope,
                 fallback_response: attempt_fallback_response,
             } => {
-                if attempt_fallback_response.is_some() {
-                    fallback_response = attempt_fallback_response;
+                if let Some(response) = attempt_fallback_response {
+                    fallback_response = Some((
+                        response,
+                        Box::new(attempt.execution_plan().clone()),
+                        attempt.report_context(),
+                    ));
                 }
                 apply_attempt_retry_scope(source, &attempt, scope).await?;
             }
@@ -857,9 +869,9 @@ where
         last_attempted = Some((attempt.execution_plan().clone(), attempt.report_context()));
     }
 
-    if let Some(response) = fallback_response {
+    if let Some((response, owner_plan, owner_report_context)) = fallback_response {
         return Ok(LocalExecutionRequestOutcome::responded(
-            mark_deferred_upstream_response(response),
+            mark_deferred_upstream_response(response, owner_plan, owner_report_context),
         ));
     }
 

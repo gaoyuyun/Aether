@@ -4,14 +4,11 @@ use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
-use aether_data_contracts::repository::{
-    candidates::{RequestCandidateStatus, StoredRequestCandidate},
-    usage::{
-        StoredRequestUsageAudit, StoredUsageBreakdownSummaryRow, StoredUsageDailySummary,
-        UsageAuditKeywordSearchQuery, UsageAuditListQuery, UsageBreakdownGroupBy,
-        UsageBreakdownSummaryQuery, UsageCacheAffinityIntervalGroupBy,
-        UsageCacheAffinityIntervalQuery, UsageDashboardSummaryQuery,
-    },
+use aether_data_contracts::repository::usage::{
+    StoredRequestUsageAudit, StoredUsageBreakdownSummaryRow, StoredUsageDailySummary,
+    UsageAuditKeywordSearchQuery, UsageAuditListQuery, UsageBreakdownGroupBy,
+    UsageBreakdownSummaryQuery, UsageCacheAffinityIntervalGroupBy, UsageCacheAffinityIntervalQuery,
+    UsageDashboardSummaryQuery,
 };
 use axum::{
     body::Body,
@@ -23,7 +20,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use crate::handlers::shared::system_config_bool;
-use crate::request_candidate_runtime::request_candidate_failure_is_retryable_transition;
+use crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override;
 use crate::GatewayError;
 
 use super::{
@@ -646,84 +643,6 @@ fn users_me_usage_response_time_updated_at(item: &StoredRequestUsageAudit) -> Op
     unix_secs_to_rfc3339(item.updated_at_unix_secs)
 }
 
-fn unix_millis_to_rfc3339(unix_ms: u64) -> Option<String> {
-    let secs = i64::try_from(unix_ms / 1_000).ok()?;
-    let nanos = u32::try_from(unix_ms % 1_000)
-        .ok()?
-        .saturating_mul(1_000_000);
-    chrono::DateTime::<Utc>::from_timestamp(secs, nanos).map(|timestamp| timestamp.to_rfc3339())
-}
-
-fn users_me_usage_current_candidate(
-    candidates: &[StoredRequestCandidate],
-) -> Option<&StoredRequestCandidate> {
-    candidates
-        .iter()
-        .filter(|candidate| {
-            !matches!(
-                candidate.status,
-                RequestCandidateStatus::Available
-                    | RequestCandidateStatus::Unused
-                    | RequestCandidateStatus::Skipped
-            )
-        })
-        .max_by_key(|candidate| {
-            (
-                candidate.candidate_index,
-                candidate.retry_index,
-                candidate
-                    .started_at_unix_ms
-                    .or(candidate.finished_at_unix_ms)
-                    .unwrap_or(candidate.created_at_unix_ms),
-            )
-        })
-}
-
-fn users_me_usage_terminal_candidate_state_override(
-    candidates: &[StoredRequestCandidate],
-) -> Option<Value> {
-    let candidate = users_me_usage_current_candidate(candidates)?;
-    if request_candidate_failure_is_retryable_transition(candidate) {
-        return None;
-    }
-
-    let status = match candidate.status {
-        RequestCandidateStatus::Success => "completed",
-        RequestCandidateStatus::Failed => "failed",
-        RequestCandidateStatus::Cancelled => "cancelled",
-        _ => return None,
-    };
-    let latency_ms = candidate.latency_ms.or_else(|| {
-        Some(
-            candidate
-                .finished_at_unix_ms?
-                .saturating_sub(candidate.started_at_unix_ms?),
-        )
-    });
-    let mut payload = json!({ "status": status });
-    if let Some(latency_ms) = latency_ms {
-        payload["response_time_ms"] = json!(latency_ms);
-        if let Some(response_time_updated_at) = candidate
-            .finished_at_unix_ms
-            .or_else(|| {
-                candidate
-                    .started_at_unix_ms
-                    .map(|started_at| started_at.saturating_add(latency_ms))
-            })
-            .and_then(unix_millis_to_rfc3339)
-        {
-            payload["response_time_updated_at"] = json!(response_time_updated_at);
-        }
-    }
-    if let Some(status_code) = candidate.status_code {
-        payload["status_code"] = json!(status_code);
-    }
-    if let Some(error_message) = candidate.error_message.as_ref() {
-        payload["error_message"] = json!(error_message);
-    }
-    Some(payload)
-}
-
 async fn resolve_users_me_usage_active_state_overrides_by_request_id(
     state: &AppState,
     items: &[StoredRequestUsageAudit],
@@ -743,7 +662,7 @@ async fn resolve_users_me_usage_active_state_overrides_by_request_id(
             .read_request_candidates_by_request_id(&request_id)
             .await?;
         if let Some(override_payload) =
-            users_me_usage_terminal_candidate_state_override(&candidates)
+            resolve_request_terminal_candidate_state_override(&candidates)
         {
             overrides.insert(request_id, override_payload);
         }
@@ -751,13 +670,66 @@ async fn resolve_users_me_usage_active_state_overrides_by_request_id(
     Ok(overrides)
 }
 
-fn users_me_usage_is_failed(item: &StoredRequestUsageAudit) -> bool {
-    let has_failure_signal = item.status_code.is_some_and(|value| value >= 400)
-        || item
-            .error_message
-            .as_deref()
+/// Drops candidate-level failure facts from an active request payload.
+///
+/// A request that is still `pending`/`streaming` after the candidate lifecycle has been resolved
+/// has no committed response yet, so any 4xx/5xx or error text on the row belongs to a candidate
+/// the loop already abandoned. Leaving it in the payload makes the UI render an in-flight request
+/// as failed and stop polling it before the next candidate answers.
+fn clear_users_me_usage_active_failure_signal(payload: &mut serde_json::Map<String, Value>) {
+    let is_active = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|status| matches!(status, "pending" | "streaming"));
+    if !is_active {
+        return;
+    }
+    if payload
+        .get("status_code")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value >= 400)
+    {
+        payload.insert("status_code".to_string(), Value::Null);
+    }
+    if payload.contains_key("error_message") {
+        payload.insert("error_message".to_string(), Value::Null);
+    }
+}
+
+fn apply_users_me_usage_state_override(
+    payload: &mut serde_json::Map<String, Value>,
+    overrides: &serde_json::Map<String, Value>,
+) {
+    for (key, value) in overrides {
+        if key == "status_code" && value.is_null() {
+            if payload
+                .get(key)
+                .and_then(Value::as_u64)
+                .is_some_and(|status_code| status_code >= 400)
+            {
+                payload.insert(key.clone(), Value::Null);
+            }
+            continue;
+        }
+        payload.insert(key.clone(), value.clone());
+    }
+}
+
+fn users_me_usage_payload_is_failed(payload: &serde_json::Map<String, Value>) -> bool {
+    let has_failure_signal = payload
+        .get("status_code")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value >= 400)
+        || payload
+            .get("error_message")
+            .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty());
-    let status = item.status.trim().to_ascii_lowercase();
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|status| status.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     if status.is_empty() {
         return has_failure_signal;
     }
@@ -1397,14 +1369,9 @@ pub(super) async fn handle_users_me_usage_active_get(
         },
     };
 
-    let items = if ids.is_some() {
-        items
-    } else {
-        items
-            .into_iter()
-            .filter(|item| !users_me_usage_is_failed(item))
-            .collect::<Vec<_>>()
-    };
+    // Resolve the request lifecycle from the request candidates before dropping anything: an
+    // active row that still carries a candidate's 4xx/5xx is not a failed request, and filtering
+    // on that signal first would hide requests whose next candidate is about to succeed.
     let active_state_overrides =
         match resolve_users_me_usage_active_state_overrides_by_request_id(state, &items).await {
             Ok(value) => value,
@@ -1417,25 +1384,28 @@ pub(super) async fn handle_users_me_usage_active_get(
             }
         };
 
+    let requests = items
+        .iter()
+        .filter_map(|item| {
+            let mut payload = build_users_me_usage_active_payload(item, include_provider);
+            let object = payload.as_object_mut()?;
+            if let Some(overrides) = active_state_overrides
+                .get(&item.request_id)
+                .and_then(Value::as_object)
+            {
+                apply_users_me_usage_state_override(object, overrides);
+            }
+            clear_users_me_usage_active_failure_signal(object);
+            if ids.is_none() && users_me_usage_payload_is_failed(object) {
+                return None;
+            }
+            Some(payload)
+        })
+        .collect::<Vec<_>>();
+
     Json(json!({
         "provider_visibility_enabled": include_provider,
-        "requests": items
-            .iter()
-            .map(|item| {
-                let mut payload = build_users_me_usage_active_payload(item, include_provider);
-                if let (Some(payload), Some(overrides)) = (
-                    payload.as_object_mut(),
-                    active_state_overrides
-                        .get(&item.request_id)
-                        .and_then(Value::as_object),
-                ) {
-                    for (key, value) in overrides {
-                        payload.insert(key.clone(), value.clone());
-                    }
-                }
-                payload
-            })
-            .collect::<Vec<_>>(),
+        "requests": requests,
     }))
     .into_response()
 }
@@ -1630,14 +1600,14 @@ mod tests {
         candidates::{RequestCandidateStatus, StoredRequestCandidate},
         usage::StoredRequestUsageAudit,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
-        build_users_me_usage_active_payload, build_users_me_usage_record_payload,
-        users_me_usage_client_is_stream, users_me_usage_is_failed,
-        users_me_usage_provider_visibility_enabled,
-        users_me_usage_terminal_candidate_state_override, users_me_usage_upstream_is_stream,
+        apply_users_me_usage_state_override, build_users_me_usage_active_payload,
+        build_users_me_usage_record_payload, users_me_usage_client_is_stream,
+        users_me_usage_provider_visibility_enabled, users_me_usage_upstream_is_stream,
     };
+    use crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override;
 
     fn sample_usage(status: &str) -> StoredRequestUsageAudit {
         StoredRequestUsageAudit::new(
@@ -1853,7 +1823,7 @@ mod tests {
         );
 
         let payload =
-            users_me_usage_terminal_candidate_state_override(&[candidate]).expect("override");
+            resolve_request_terminal_candidate_state_override(&[candidate]).expect("override");
 
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["response_time_ms"], 9_210);
@@ -1862,6 +1832,29 @@ mod tests {
             payload["response_time_updated_at"],
             "1970-01-01T00:00:10.210+00:00"
         );
+    }
+
+    #[test]
+    fn user_usage_success_override_keeps_existing_success_status_code() {
+        let mut payload = serde_json::Map::from_iter([
+            ("status".to_string(), json!("streaming")),
+            ("status_code".to_string(), json!(200)),
+            (
+                "error_message".to_string(),
+                json!("earlier candidate failed"),
+            ),
+        ]);
+        let overrides = serde_json::Map::from_iter([
+            ("status".to_string(), json!("completed")),
+            ("status_code".to_string(), Value::Null),
+            ("error_message".to_string(), Value::Null),
+        ]);
+
+        apply_users_me_usage_state_override(&mut payload, &overrides);
+
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["status_code"], 200);
+        assert_eq!(payload["error_message"], Value::Null);
     }
 
     #[test]
@@ -1877,7 +1870,7 @@ mod tests {
         streaming.started_at_unix_ms = Some(10_500);
         streaming.finished_at_unix_ms = None;
 
-        let payload = users_me_usage_terminal_candidate_state_override(&[failed, streaming]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed, streaming]);
 
         assert!(payload.is_none());
     }
@@ -1899,9 +1892,82 @@ mod tests {
             }
         }));
 
-        let payload = users_me_usage_terminal_candidate_state_override(&[failed]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
 
         assert!(payload.is_none());
+    }
+
+    #[test]
+    fn user_usage_active_override_ignores_unmarked_candidate_failure() {
+        // Transport errors, empty replies, oversized responses and control fallbacks all fail the
+        // candidate without any retry metadata while the loop keeps switching candidates.
+        let failed = sample_candidate(
+            RequestCandidateStatus::Failed,
+            None,
+            Some(1_000),
+            Some("upstream connection reset"),
+        );
+
+        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn user_usage_active_override_uses_request_terminal_candidate_failure() {
+        let mut failed = sample_candidate(
+            RequestCandidateStatus::Failed,
+            Some(502),
+            Some(1_000),
+            Some("upstream refused the request"),
+        );
+        failed.extra_data = Some(json!({ "request_lifecycle": "request_terminal" }));
+
+        let payload =
+            resolve_request_terminal_candidate_state_override(&[failed]).expect("override");
+
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["status_code"], 502);
+        assert_eq!(payload["error_message"], "upstream refused the request");
+    }
+
+    #[test]
+    fn user_usage_active_payload_failure_signal_is_cleared_while_request_is_active() {
+        let item = StoredRequestUsageAudit {
+            status_code: Some(503),
+            error_message: Some("candidate failed".to_string()),
+            ..sample_usage("pending")
+        };
+        let mut payload = build_users_me_usage_active_payload(&item, false);
+        let object = payload
+            .as_object_mut()
+            .expect("payload should be an object");
+
+        super::clear_users_me_usage_active_failure_signal(object);
+
+        assert_eq!(object["status_code"], Value::Null);
+        assert_eq!(object["error_message"], Value::Null);
+        assert!(!super::users_me_usage_payload_is_failed(object));
+    }
+
+    #[test]
+    fn user_usage_active_payload_keeps_failure_after_terminal_override() {
+        let item = StoredRequestUsageAudit {
+            status_code: Some(503),
+            error_message: Some("candidate failed".to_string()),
+            ..sample_usage("pending")
+        };
+        let mut payload = build_users_me_usage_active_payload(&item, false);
+        let object = payload
+            .as_object_mut()
+            .expect("payload should be an object");
+        object.insert("status".to_string(), json!("failed"));
+
+        super::clear_users_me_usage_active_failure_signal(object);
+
+        assert_eq!(object["status_code"], 503);
+        assert_eq!(object["error_message"], "candidate failed");
+        assert!(super::users_me_usage_payload_is_failed(object));
     }
 
     #[test]
@@ -1928,17 +1994,6 @@ mod tests {
         assert_eq!(payload["effective_input_tokens"], 4941);
         assert_eq!(payload["cache_creation_input_tokens"], 687);
         assert_eq!(payload["cache_read_input_tokens"], 52873);
-    }
-
-    #[test]
-    fn user_usage_active_pending_with_failure_signal_is_not_active() {
-        let item = StoredRequestUsageAudit {
-            status_code: Some(503),
-            error_message: Some("upstream failed".to_string()),
-            ..sample_usage("pending")
-        };
-
-        assert!(users_me_usage_is_failed(&item));
     }
 
     #[test]

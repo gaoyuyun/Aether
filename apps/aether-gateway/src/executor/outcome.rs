@@ -14,8 +14,7 @@ use aether_data_contracts::repository::usage::{
 use aether_usage_runtime::{
     build_usage_event_data_seed, UsageEvent, UsageEventData, UsageEventType,
 };
-use axum::body::Body;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::http::{self, HeaderMap, Response};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
@@ -36,8 +35,14 @@ pub(crate) enum LocalExecutionRequestOutcome {
     NoPath,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DeferredUpstreamResponse;
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredUpstreamResponse {
+    owner_plan: Box<ExecutionPlan>,
+    owner_report_context: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct DeferredUpstreamResponseCapture(Bytes);
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalExecutionExhaustion {
@@ -77,8 +82,27 @@ impl LocalExecutionRequestOutcome {
     }
 }
 
-pub(crate) fn mark_deferred_upstream_response(mut response: Response<Body>) -> Response<Body> {
-    response.extensions_mut().insert(DeferredUpstreamResponse);
+pub(crate) fn mark_deferred_upstream_response(
+    mut response: Response<Body>,
+    owner_plan: Box<ExecutionPlan>,
+    owner_report_context: Option<Value>,
+) -> Response<Body> {
+    response.extensions_mut().insert(DeferredUpstreamResponse {
+        owner_plan,
+        owner_report_context,
+    });
+    response
+}
+
+/// Retains already-buffered response bytes for terminal usage capture without consuming the body
+/// that will be returned to the client.
+pub(crate) fn attach_deferred_upstream_response_capture(
+    mut response: Response<Body>,
+    body: impl Into<Bytes>,
+) -> Response<Body> {
+    response
+        .extensions_mut()
+        .insert(DeferredUpstreamResponseCapture(body.into()));
     response
 }
 
@@ -369,6 +393,213 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
             UsageEvent::new(UsageEventType::Failed, request_id, data),
         )
         .await;
+}
+
+const DEFERRED_UPSTREAM_RESPONSE_DETAIL: &str =
+    "All candidates failed; the gateway returned the preserved upstream error response";
+
+/// Commits the request-level terminal state for a preserved upstream error response.
+///
+/// When every candidate failed but one of them produced an error the gateway forwards verbatim
+/// (Anthropic 429/5xx, oversized upstream bodies, …), the candidate loop answers the client from
+/// that stored response instead of reporting exhaustion. Nothing on that path writes a request
+/// terminal usage event, so without this the usage row stays `pending`/`streaming` forever even
+/// though the client already received its final error.
+pub(crate) async fn finalize_deferred_upstream_response(
+    state: &AppState,
+    mut response: Response<Body>,
+) -> Response<Body> {
+    let Some(deferred) = response
+        .extensions_mut()
+        .remove::<DeferredUpstreamResponse>()
+    else {
+        return response;
+    };
+    let DeferredUpstreamResponse {
+        owner_plan,
+        owner_report_context,
+    } = deferred;
+    let captured_body = response
+        .extensions_mut()
+        .remove::<DeferredUpstreamResponseCapture>()
+        .map(|capture| capture.0);
+    if captured_body.is_none() {
+        warn!(
+            request_id = %owner_plan.request_id,
+            candidate_id = ?owner_plan.candidate_id,
+            "gateway deferred response was missing its body capture"
+        );
+    }
+    let status_code = response.status().as_u16();
+    let response_headers =
+        serde_json::to_value(crate::headers::collect_control_headers(response.headers()))
+            .unwrap_or_else(|_| json!({}));
+    let response_body = captured_body
+        .as_deref()
+        .map(deferred_response_body_capture)
+        .unwrap_or(Value::Null);
+    let (captured_error_type, captured_error_message) =
+        deferred_response_error_fields(&response_body);
+
+    let owner_candidate_slot = owner_report_context.as_ref().and_then(|context| {
+        let candidate_index = context.get("candidate_index")?.as_u64()?;
+        let candidate_index = u32::try_from(candidate_index).ok()?;
+        let retry_index = context
+            .get("retry_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default();
+        Some((candidate_index, retry_index))
+    });
+    let owner_candidate = match state
+        .read_request_candidates_by_request_id(owner_plan.request_id.as_str())
+        .await
+    {
+        Ok(candidates) => {
+            let candidate = candidates.into_iter().find(|candidate| {
+                owner_plan.candidate_id.as_deref() == Some(candidate.id.as_str())
+                    || owner_candidate_slot
+                        == Some((candidate.candidate_index, candidate.retry_index))
+            });
+            if candidate.is_none() {
+                warn!(
+                    request_id = %owner_plan.request_id,
+                    candidate_id = ?owner_plan.candidate_id,
+                    candidate_slot = ?owner_candidate_slot,
+                    "gateway could not match the deferred response owner candidate"
+                );
+            }
+            candidate
+        }
+        Err(error) => {
+            warn!(
+                request_id = %owner_plan.request_id,
+                candidate_id = ?owner_plan.candidate_id,
+                error = ?error,
+                "gateway failed to load the deferred response owner candidate"
+            );
+            None
+        }
+    };
+    let upstream_error_type = captured_error_type.or_else(|| {
+        owner_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.error_type.clone())
+            .filter(|value| !value.trim().is_empty())
+    });
+    let error_message = captured_error_message
+        .or_else(|| {
+            owner_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.error_message.clone())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFERRED_UPSTREAM_RESPONSE_DETAIL.to_string());
+
+    let request_terminal_report_context =
+        crate::request_candidate_runtime::with_request_terminal_lifecycle_report_context(
+            owner_report_context.as_ref(),
+        );
+    crate::request_candidate_runtime::record_local_request_candidate_status(
+        state,
+        &owner_plan,
+        Some(&request_terminal_report_context),
+        aether_scheduler_core::SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Failed,
+            status_code: Some(status_code),
+            error_type: upstream_error_type.clone(),
+            error_message: Some(error_message.clone()),
+            latency_ms: owner_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.latency_ms),
+            started_at_unix_ms: owner_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.started_at_unix_ms),
+            finished_at_unix_ms: owner_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.finished_at_unix_ms),
+        },
+    )
+    .await;
+
+    if !state.usage_runtime.is_enabled() {
+        return response;
+    }
+
+    let request_id = owner_plan.request_id.clone();
+    let mut data = build_usage_event_data_seed(&owner_plan, owner_report_context.as_ref());
+    if let Some(candidate) = owner_candidate.as_ref() {
+        data.user_id = data.user_id.or_else(|| candidate.user_id.clone());
+        data.api_key_id = data.api_key_id.or_else(|| candidate.api_key_id.clone());
+        data.username = data.username.or_else(|| candidate.username.clone());
+        data.api_key_name = data.api_key_name.or_else(|| candidate.api_key_name.clone());
+        attach_runtime_miss_candidate_usage_metadata(&mut data, candidate);
+        data.response_time_ms = candidate.latency_ms;
+    }
+    data.status_code = Some(status_code);
+    data.error_message = Some(error_message.clone());
+    data.error_category = error_category_for_failed_status(status_code);
+    data.response_headers = Some(response_headers.clone());
+    data.response_body = Some(response_body.clone());
+    data.client_response_headers = Some(response_headers);
+    data.client_response_body = Some(response_body);
+
+    let mut request_metadata = match data.request_metadata.take() {
+        Some(Value::Object(object)) => object,
+        Some(other) => Map::from_iter([("seed".to_string(), other)]),
+        None => Map::new(),
+    };
+    request_metadata.insert("trace_id".to_string(), Value::String(request_id.clone()));
+    request_metadata.insert("deferred_upstream_response".to_string(), Value::Bool(true));
+    data.candidate_id = data
+        .candidate_id
+        .or_else(|| owner_plan.candidate_id.clone());
+    data.candidate_index = data.candidate_index.or_else(|| {
+        owner_report_context
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("candidate_index"))
+            .and_then(Value::as_u64)
+    });
+    data.request_metadata = Some(Value::Object(request_metadata));
+
+    state
+        .usage_runtime
+        .record_terminal_event_direct(
+            state.usage_lifecycle_data_state().as_ref(),
+            UsageEvent::new(UsageEventType::Failed, request_id, data),
+        )
+        .await;
+
+    response
+}
+
+fn deferred_response_body_capture(body: &[u8]) -> Value {
+    if body.is_empty() {
+        return Value::Null;
+    }
+    serde_json::from_slice(body).unwrap_or_else(|_| {
+        json!({
+            "body_bytes_b64": base64::engine::general_purpose::STANDARD.encode(body)
+        })
+    })
+}
+
+fn deferred_response_error_fields(body: &Value) -> (Option<String>, Option<String>) {
+    fn non_empty_string(value: Option<&Value>) -> Option<String> {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    let error_type = non_empty_string(body.pointer("/error/type"))
+        .or_else(|| non_empty_string(body.get("type")));
+    let error_message = non_empty_string(body.pointer("/error/message"))
+        .or_else(|| non_empty_string(body.get("message")))
+        .or_else(|| non_empty_string(body.pointer("/error")));
+    (error_type, error_message)
 }
 
 pub(crate) async fn record_failed_usage_for_runtime_miss_request(

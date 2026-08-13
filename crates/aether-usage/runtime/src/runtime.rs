@@ -1184,6 +1184,7 @@ enum LifecycleSubmissionPayload {
     },
     Active {
         seed: LifecycleUsageSeed,
+        telemetry: Option<ExecutionTelemetry>,
         observed_at_unix_secs: u64,
     },
     TerminalSeed {
@@ -1471,6 +1472,11 @@ where
                 LifecycleSubmissionPriority::FirstByte
             }
             LifecycleSubmissionPayload::Streaming { .. } => LifecycleSubmissionPriority::Streaming,
+            LifecycleSubmissionPayload::Active { telemetry, .. }
+                if telemetry.as_ref().and_then(|value| value.ttfb_ms).is_some() =>
+            {
+                LifecycleSubmissionPriority::FirstByte
+            }
             LifecycleSubmissionPayload::Active { .. } => LifecycleSubmissionPriority::Streaming,
             LifecycleSubmissionPayload::TerminalSeed { .. } => {
                 LifecycleSubmissionPriority::Terminal
@@ -1513,10 +1519,15 @@ where
             ),
             LifecycleSubmissionPayload::Active {
                 seed,
+                telemetry,
                 observed_at_unix_secs,
             } => (
                 "streaming",
-                crate::write::build_active_usage_event_from_owned_seed(seed, observed_at_unix_secs),
+                crate::write::build_active_usage_event_from_owned_seed(
+                    seed,
+                    telemetry,
+                    observed_at_unix_secs,
+                ),
             ),
             LifecycleSubmissionPayload::TerminalSeed {
                 seed,
@@ -3928,6 +3939,35 @@ impl UsageRuntime {
     where
         T: UsageRuntimeAccess + Clone + 'static,
     {
+        self.record_active_immediate_async(data, seed, None);
+    }
+
+    /// Records that a non-stream upstream response has started without promoting the candidate's
+    /// HTTP status to the request-level record.
+    ///
+    /// A candidate that answers with 429/503 headers may still be retried on the next candidate,
+    /// so the request keeps its active lifecycle state and only learns the status code once the
+    /// response owner is settled. The candidate's own status code is still recorded on the request
+    /// candidate row, which is what diagnostics read.
+    pub fn record_sync_response_started_immediate_async<T>(
+        &self,
+        data: &T,
+        seed: LifecycleUsageSeed,
+        telemetry: Option<ExecutionTelemetry>,
+    ) where
+        T: UsageRuntimeAccess + Clone + 'static,
+    {
+        self.record_active_immediate_async(data, seed, telemetry);
+    }
+
+    fn record_active_immediate_async<T>(
+        &self,
+        data: &T,
+        seed: LifecycleUsageSeed,
+        telemetry: Option<ExecutionTelemetry>,
+    ) where
+        T: UsageRuntimeAccess + Clone + 'static,
+    {
         if !self.is_enabled() {
             return;
         }
@@ -3939,6 +3979,7 @@ impl UsageRuntime {
                 request_id,
                 payload: LifecycleSubmissionPayload::Active {
                     seed,
+                    telemetry,
                     observed_at_unix_secs: now_unix_secs(),
                 },
             }));

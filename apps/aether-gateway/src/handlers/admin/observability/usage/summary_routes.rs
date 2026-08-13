@@ -3,7 +3,7 @@ use super::analytics::admin_usage_api_key_names;
 use super::analytics::admin_usage_provider_key_names;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
-use crate::request_candidate_runtime::request_candidate_failure_is_retryable_transition;
+use crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override;
 use crate::GatewayError;
 use aether_admin::observability::usage::{
     admin_usage_bad_request_response, admin_usage_data_unavailable_response,
@@ -231,7 +231,7 @@ async fn resolve_admin_usage_active_candidate_state(
         }
         if active_usage_by_request_id.contains_key(&request_id) {
             if let Some(override_payload) =
-                admin_usage_terminal_candidate_state_override(&candidates)
+                resolve_request_terminal_candidate_state_override(&candidates)
             {
                 candidate_state
                     .state_overrides_by_request_id
@@ -268,83 +268,20 @@ fn latest_admin_usage_image_progress(
         .map(|(_, _, _, progress)| progress)
 }
 
-fn admin_usage_current_candidate(
-    candidates: &[StoredRequestCandidate],
-) -> Option<&StoredRequestCandidate> {
-    candidates
-        .iter()
-        .filter(|candidate| {
-            !matches!(
-                candidate.status,
-                RequestCandidateStatus::Available
-                    | RequestCandidateStatus::Unused
-                    | RequestCandidateStatus::Skipped
-            )
-        })
-        .max_by_key(|candidate| {
-            (
-                candidate.candidate_index,
-                candidate.retry_index,
-                candidate
-                    .started_at_unix_ms
-                    .or(candidate.finished_at_unix_ms)
-                    .unwrap_or(candidate.created_at_unix_ms),
-            )
-        })
-}
-
-fn admin_usage_unix_millis_to_rfc3339(unix_ms: u64) -> Option<String> {
-    let secs = i64::try_from(unix_ms / 1_000).ok()?;
-    let nanos = u32::try_from(unix_ms % 1_000)
-        .ok()?
-        .saturating_mul(1_000_000);
-    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
-        .map(|timestamp| timestamp.to_rfc3339())
-}
-
-pub(super) fn admin_usage_terminal_candidate_state_override(
-    candidates: &[StoredRequestCandidate],
-) -> Option<serde_json::Value> {
-    let candidate = admin_usage_current_candidate(candidates)?;
-    if request_candidate_failure_is_retryable_transition(candidate) {
-        return None;
+/// Drops candidate-level failure facts from an active request row.
+///
+/// A request that is still `pending`/`streaming` after the candidate lifecycle has been resolved
+/// has no committed response yet, so any 4xx/5xx or error text on the row belongs to a candidate
+/// the loop already abandoned. Leaving it in the payload makes the UI render an in-flight request
+/// as failed and stop polling it before the next candidate answers.
+pub(super) fn clear_admin_usage_active_failure_signal(item: &mut StoredRequestUsageAudit) {
+    if !matches!(item.status.as_str(), "pending" | "streaming") {
+        return;
     }
-
-    let status = match candidate.status {
-        RequestCandidateStatus::Success => "completed",
-        RequestCandidateStatus::Failed => "failed",
-        RequestCandidateStatus::Cancelled => "cancelled",
-        _ => return None,
-    };
-    let latency_ms = candidate.latency_ms.or_else(|| {
-        Some(
-            candidate
-                .finished_at_unix_ms?
-                .saturating_sub(candidate.started_at_unix_ms?),
-        )
-    });
-    let mut payload = json!({ "status": status });
-    if let Some(latency_ms) = latency_ms {
-        payload["response_time_ms"] = json!(latency_ms);
-        if let Some(response_time_updated_at) = candidate
-            .finished_at_unix_ms
-            .or_else(|| {
-                candidate
-                    .started_at_unix_ms
-                    .map(|started_at| started_at.saturating_add(latency_ms))
-            })
-            .and_then(admin_usage_unix_millis_to_rfc3339)
-        {
-            payload["response_time_updated_at"] = json!(response_time_updated_at);
-        }
+    if item.status_code.is_some_and(|value| value >= 400) {
+        item.status_code = None;
     }
-    if let Some(status_code) = candidate.status_code {
-        payload["status_code"] = json!(status_code);
-    }
-    if let Some(error_message) = candidate.error_message.as_ref() {
-        payload["error_message"] = json!(error_message);
-    }
-    Some(payload)
+    item.error_message = None;
 }
 
 pub(super) fn apply_admin_usage_state_override(
@@ -367,12 +304,18 @@ pub(super) fn apply_admin_usage_state_override(
     {
         item.status = status.to_string();
     }
-    if let Some(status_code) = object
-        .get("status_code")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u16::try_from(value).ok())
-    {
-        item.status_code = Some(status_code);
+    if let Some(status_code) = object.get("status_code") {
+        if status_code.is_null() {
+            // A success candidate without a captured status code still disproves a stale failure,
+            // but it should not erase a valid 2xx already committed on the usage row.
+            if item.status_code.is_some_and(|value| value >= 400) {
+                item.status_code = None;
+            }
+        } else {
+            item.status_code = status_code
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok());
+        }
     }
     if let Some(response_time_ms) = object
         .get("response_time_ms")
@@ -380,13 +323,12 @@ pub(super) fn apply_admin_usage_state_override(
     {
         item.response_time_ms = Some(response_time_ms);
     }
-    if let Some(error_message) = object
-        .get("error_message")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        item.error_message = Some(error_message.to_string());
+    if let Some(error_message) = object.get("error_message") {
+        item.error_message = error_message
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
     }
 }
 
@@ -741,6 +683,29 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                     })
                     .await?
             };
+            // Resolve the request lifecycle from the request candidates before dropping anything:
+            // an active row that still carries a candidate's 4xx/5xx is not a failed request, and
+            // filtering on that signal first would hide requests whose next candidate is about to
+            // succeed.
+            let active_candidate_state =
+                resolve_admin_usage_active_candidate_state(state, &items).await?;
+            let mut items = items;
+            for item in items.iter_mut() {
+                if let Some(override_payload) = active_candidate_state
+                    .state_overrides_by_request_id
+                    .get(&item.request_id)
+                {
+                    apply_admin_usage_state_override(item, override_payload);
+                }
+                clear_admin_usage_active_failure_signal(item);
+            }
+            let mut image_progress_by_request_id =
+                active_candidate_state.image_progress_by_request_id;
+            for item in &items {
+                if item.status == "completed" {
+                    image_progress_by_request_id.remove(&item.request_id);
+                }
+            }
             let items = if requested_ids.is_some() {
                 items
             } else {
@@ -751,16 +716,14 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             };
             let api_key_names = admin_usage_api_key_names(state, &items).await?;
             let provider_key_names = admin_usage_provider_key_names(state, &items).await?;
-            let active_candidate_state =
-                resolve_admin_usage_active_candidate_state(state, &items).await?;
 
             return Ok(Some(build_admin_usage_active_requests_response(
                 &items,
                 &api_key_names,
                 state.has_auth_api_key_data_reader(),
                 &provider_key_names,
-                &active_candidate_state.image_progress_by_request_id,
-                &active_candidate_state.state_overrides_by_request_id,
+                &image_progress_by_request_id,
+                &BTreeMap::new(),
             )));
         }
         Some("records")
@@ -999,12 +962,55 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
 
 #[cfg(test)]
 mod tests {
-    use aether_data_contracts::repository::candidates::{
-        RequestCandidateStatus, StoredRequestCandidate,
+    use aether_data_contracts::repository::{
+        candidates::{RequestCandidateStatus, StoredRequestCandidate},
+        usage::StoredRequestUsageAudit,
     };
     use serde_json::json;
 
-    use super::admin_usage_terminal_candidate_state_override;
+    use crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override;
+
+    fn sample_usage_audit(status: &str) -> StoredRequestUsageAudit {
+        StoredRequestUsageAudit::new(
+            "usage-1".to_string(),
+            "req-1".to_string(),
+            Some("user-1".to_string()),
+            Some("api-key-1".to_string()),
+            Some("alice".to_string()),
+            Some("default".to_string()),
+            "OpenAI".to_string(),
+            "gpt-5".to_string(),
+            None,
+            Some("provider-1".to_string()),
+            Some("endpoint-1".to_string()),
+            Some("provider-key-1".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            false,
+            false,
+            10,
+            20,
+            30,
+            0.0,
+            0.0,
+            Some(200),
+            None,
+            None,
+            Some(120),
+            None,
+            status.to_string(),
+            "settled".to_string(),
+            100,
+            101,
+            Some(102),
+        )
+        .expect("usage should build")
+    }
 
     fn sample_candidate(
         candidate_index: i32,
@@ -1053,9 +1059,11 @@ mod tests {
         );
 
         let payload =
-            admin_usage_terminal_candidate_state_override(&[candidate]).expect("override");
+            resolve_request_terminal_candidate_state_override(&[candidate]).expect("override");
 
         assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["status_code"], 200);
+        assert_eq!(payload["error_message"], serde_json::Value::Null);
         assert_eq!(payload["response_time_ms"], 9_210);
         assert_eq!(
             payload["response_time_updated_at"],
@@ -1077,7 +1085,7 @@ mod tests {
         streaming.started_at_unix_ms = Some(10_500);
         streaming.finished_at_unix_ms = None;
 
-        let payload = admin_usage_terminal_candidate_state_override(&[failed, streaming]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed, streaming]);
 
         assert!(payload.is_none());
     }
@@ -1100,8 +1108,116 @@ mod tests {
             }
         }));
 
-        let payload = admin_usage_terminal_candidate_state_override(&[failed]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
 
         assert!(payload.is_none());
+    }
+
+    #[test]
+    fn admin_usage_active_override_ignores_unmarked_candidate_failure() {
+        // Transport errors, empty replies, oversized responses and control fallbacks all fail the
+        // candidate without any retry metadata while the loop keeps switching candidates.
+        let failed = sample_candidate(
+            0,
+            RequestCandidateStatus::Failed,
+            None,
+            Some(1_000),
+            Some("upstream connection reset"),
+        );
+
+        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn admin_usage_active_override_uses_request_terminal_candidate_failure() {
+        let mut failed = sample_candidate(
+            0,
+            RequestCandidateStatus::Failed,
+            Some(502),
+            Some(1_000),
+            Some("upstream refused the request"),
+        );
+        failed.extra_data = Some(json!({ "request_lifecycle": "request_terminal" }));
+
+        let payload =
+            resolve_request_terminal_candidate_state_override(&[failed]).expect("override");
+
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["status_code"], 502);
+        assert_eq!(payload["error_message"], "upstream refused the request");
+    }
+
+    #[test]
+    fn admin_usage_active_failure_signal_is_cleared_while_request_is_active() {
+        let mut item = StoredRequestUsageAudit {
+            status_code: Some(503),
+            error_message: Some("candidate failed".to_string()),
+            ..sample_usage_audit("pending")
+        };
+
+        super::clear_admin_usage_active_failure_signal(&mut item);
+
+        assert_eq!(item.status_code, None);
+        assert_eq!(item.error_message, None);
+    }
+
+    #[test]
+    fn admin_usage_active_failure_signal_is_kept_after_terminal_override() {
+        let mut item = StoredRequestUsageAudit {
+            status_code: Some(503),
+            error_message: Some("candidate failed".to_string()),
+            ..sample_usage_audit("failed")
+        };
+
+        super::clear_admin_usage_active_failure_signal(&mut item);
+
+        assert_eq!(item.status_code, Some(503));
+        assert_eq!(item.error_message.as_deref(), Some("candidate failed"));
+    }
+
+    #[test]
+    fn admin_usage_success_override_clears_stale_failure_fields() {
+        let mut item = StoredRequestUsageAudit {
+            status_code: Some(503),
+            error_message: Some("earlier candidate failed".to_string()),
+            ..sample_usage_audit("streaming")
+        };
+
+        super::apply_admin_usage_state_override(
+            &mut item,
+            &json!({
+                "status": "completed",
+                "status_code": null,
+                "error_message": null
+            }),
+        );
+
+        assert_eq!(item.status, "completed");
+        assert_eq!(item.status_code, None);
+        assert_eq!(item.error_message, None);
+    }
+
+    #[test]
+    fn admin_usage_success_override_keeps_existing_success_status_code() {
+        let mut item = StoredRequestUsageAudit {
+            status_code: Some(200),
+            error_message: Some("earlier candidate failed".to_string()),
+            ..sample_usage_audit("streaming")
+        };
+
+        super::apply_admin_usage_state_override(
+            &mut item,
+            &json!({
+                "status": "completed",
+                "status_code": null,
+                "error_message": null
+            }),
+        );
+
+        assert_eq!(item.status, "completed");
+        assert_eq!(item.status_code, Some(200));
+        assert_eq!(item.error_message, None);
     }
 }

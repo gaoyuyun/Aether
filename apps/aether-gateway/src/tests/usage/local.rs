@@ -1128,7 +1128,11 @@ async fn sync_transport_error_policy_stops_or_retries_candidates_end_to_end_impl
     let (stop_status, stop_hits, stop_failure_statuses) = run_case(true).await;
     assert_eq!(stop_status, StatusCode::BAD_GATEWAY);
     assert_eq!(stop_hits, 1);
-    assert_eq!(stop_failure_statuses, vec![None]);
+    assert_eq!(
+        stop_failure_statuses,
+        vec![Some(502)],
+        "a transport failure that owns the client response records the client-visible status"
+    );
 }
 
 #[test]
@@ -2295,4 +2299,431 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
         gateway_handle.abort();
         execution_runtime_handle.abort();
     });
+}
+
+#[test]
+fn gateway_keeps_request_usage_clean_when_retryable_candidate_precedes_success() {
+    run_async_test_on_large_stack(
+        "gateway_keeps_request_usage_clean_when_retryable_candidate_precedes_success",
+        gateway_keeps_request_usage_clean_when_retryable_candidate_precedes_success_impl(),
+    );
+}
+
+/// A standard (non-stream) request whose first candidate answers 429 and whose second answers 200.
+///
+/// The request-level usage record must describe the final client response only: the intermediate
+/// 429 belongs to the candidate row, and the downstream client must never see it.
+async fn gateway_keeps_request_usage_clean_when_retryable_candidate_precedes_success_impl() {
+    const TRACE_ID: &str = "trace-openai-chat-local-retry-then-success-123";
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let execution_hits = Arc::new(Mutex::new(0usize));
+    let execution_hits_clone = Arc::clone(&execution_hits);
+
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key("sk-client-openai-local-retry-then-success")),
+        sample_local_openai_auth_snapshot(
+            "api-key-openai-usage-local-retry-then-success-1",
+            "user-openai-usage-local-retry-then-success-1",
+        ),
+    )]));
+    let mut second_candidate_row = sample_local_openai_candidate_row();
+    second_candidate_row.key_id = "key-openai-usage-local-2".to_string();
+    second_candidate_row.key_name = "secondary".to_string();
+    second_candidate_row.key_internal_priority -= 1;
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_local_openai_candidate_row(),
+            second_candidate_row,
+        ]));
+    let mut second_key = sample_local_openai_key();
+    second_key.id = "key-openai-usage-local-2".to_string();
+    second_key.name = "secondary".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_local_openai_provider()],
+        vec![sample_local_openai_endpoint()],
+        vec![sample_local_openai_key(), second_key],
+    ));
+
+    let gateway_state = crate::AppState::new()
+        .expect("gateway should build")
+        .with_execution_runtime_sync_override_for_tests(move |plan| {
+            let mut hits = execution_hits_clone.lock().expect("mutex should lock");
+            *hits += 1;
+            let first_attempt = *hits == 1;
+            drop(hits);
+            let (status_code, body) = if first_attempt {
+                (
+                    429,
+                    json!({"error": {"message": "slow down", "type": "rate_limit_error"}}),
+                )
+            } else {
+                (
+                    200,
+                    json!({
+                        "id": "chatcmpl-retry-then-success",
+                        "choices": [{"message": {"role": "assistant", "content": "second candidate"}}]
+                    }),
+                )
+            };
+            Ok(aether_contracts::ExecutionResult {
+                request_id: plan.request_id.clone(),
+                candidate_id: plan.candidate_id.clone(),
+                status_code,
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: Some(aether_contracts::ResponseBody {
+                    json_body: Some(body),
+                    body_bytes_b64: None,
+                }),
+                telemetry: Some(aether_contracts::ExecutionTelemetry {
+                    ttfb_ms: Some(1),
+                    elapsed_ms: Some(1),
+                    upstream_bytes: None,
+                }),
+                error: None,
+            })
+        })
+        .with_data_state_for_tests(
+            GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
+                auth_repository,
+                candidate_selection_repository,
+                provider_catalog_repository,
+                Arc::clone(&request_candidate_repository),
+                Arc::clone(&usage_repository),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            ),
+        )
+        .with_usage_runtime_for_tests(UsageRuntimeConfig {
+            enabled: true,
+            ..UsageRuntimeConfig::default()
+        });
+    let gateway = build_router_with_state(gateway_state);
+    let request = Request::builder()
+        .method(http::Method::POST)
+        .uri("/v1/chat/completions")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            "Bearer sk-client-openai-local-retry-then-success",
+        )
+        .header(TRACE_ID_HEADER, TRACE_ID)
+        .body(Body::from("{\"model\":\"gpt-5\",\"messages\":[]}"))
+        .expect("request should build");
+    let response = send_request(gateway, request).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the downstream client must only see the final successful candidate"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("body should decode");
+    assert_eq!(body["id"], "chatcmpl-retry-then-success");
+    assert_eq!(*execution_hits.lock().expect("mutex should lock"), 2);
+
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), TRACE_ID, "completed").await;
+    assert_eq!(stored_usage.status_code, Some(200));
+    assert_eq!(
+        stored_usage.error_message, None,
+        "the intermediate candidate error must not remain on the request record"
+    );
+
+    let stored_candidates = request_candidate_repository
+        .list_by_request_id(TRACE_ID)
+        .await
+        .expect("request candidate trace should read");
+    let failed_candidate = stored_candidates
+        .iter()
+        .find(|candidate| candidate.status == RequestCandidateStatus::Failed)
+        .expect("the retried candidate should be recorded as failed");
+    assert_eq!(
+        failed_candidate.status_code,
+        Some(429),
+        "the intermediate failure must stay visible on the candidate timeline"
+    );
+    assert_eq!(
+        failed_candidate
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("request_lifecycle")),
+        None,
+        "a candidate the loop retried past must not claim the request lifecycle"
+    );
+    let success_candidate = stored_candidates
+        .iter()
+        .find(|candidate| candidate.status == RequestCandidateStatus::Success)
+        .expect("the final candidate should be recorded as successful");
+    assert_eq!(
+        success_candidate
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("request_lifecycle"))
+            .and_then(|value| value.as_str()),
+        Some("request_terminal"),
+        "the candidate that owns the client response concludes the request lifecycle"
+    );
+}
+
+#[test]
+fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_request() {
+    run_async_test_on_large_stack(
+        "gateway_records_failed_usage_when_preserved_upstream_error_ends_the_request",
+        gateway_records_failed_usage_when_preserved_upstream_error_ends_the_request_impl(),
+    );
+}
+
+/// Every candidate fails with an upstream error the gateway forwards verbatim.
+///
+/// Anthropic 429s are preserved rather than converted, so the candidate loop answers from the
+/// stored upstream response instead of reporting exhaustion. That path still ends the request, so
+/// the usage row must reach `failed` with the status code the client actually received — otherwise
+/// the UI shows the request as running forever.
+async fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_request_impl() {
+    const TRACE_ID: &str = "trace-claude-preserved-429-exhausted";
+
+    fn claude_auth_snapshot() -> StoredAuthApiKeySnapshot {
+        StoredAuthApiKeySnapshot::new(
+            "user-claude-429-1".to_string(),
+            "alice".to_string(),
+            Some("alice@example.com".to_string()),
+            "user".to_string(),
+            "local".to_string(),
+            true,
+            false,
+            Some(json!(["claude"])),
+            Some(json!(["claude:messages"])),
+            Some(json!(["claude-sonnet-4-5"])),
+            "api-key-claude-429-1".to_string(),
+            Some("default".to_string()),
+            true,
+            false,
+            false,
+            Some(60),
+            Some(5),
+            Some(4_102_444_800),
+            Some(json!(["claude"])),
+            Some(json!(["claude:messages"])),
+            Some(json!(["claude-sonnet-4-5"])),
+        )
+        .expect("auth snapshot should build")
+    }
+
+    fn claude_candidate_row() -> StoredMinimalCandidateSelectionRow {
+        StoredMinimalCandidateSelectionRow {
+            provider_id: "provider-claude-429-1".to_string(),
+            provider_name: "claude".to_string(),
+            provider_type: "custom".to_string(),
+            provider_priority: 10,
+            provider_is_active: true,
+            endpoint_id: "endpoint-claude-429-1".to_string(),
+            endpoint_api_format: "claude:messages".to_string(),
+            endpoint_api_family: Some("claude".to_string()),
+            endpoint_kind: Some("messages".to_string()),
+            endpoint_is_active: true,
+            key_id: "key-claude-429-1".to_string(),
+            key_name: "prod".to_string(),
+            key_auth_type: "api_key".to_string(),
+            key_is_active: true,
+            key_api_formats: Some(vec!["claude:messages".to_string()]),
+            key_allowed_models: None,
+            key_capabilities: None,
+            key_internal_priority: 5,
+            key_global_priority_by_format: Some(json!({"claude:messages": 1})),
+            model_id: "model-claude-429-1".to_string(),
+            global_model_id: "global-model-claude-429-1".to_string(),
+            global_model_name: "claude-sonnet-4-5".to_string(),
+            global_model_mappings: None,
+            global_model_supports_streaming: Some(true),
+            model_provider_model_name: "claude-sonnet-4-5-upstream".to_string(),
+            model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
+                name: "claude-sonnet-4-5-upstream".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["claude:messages".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            }]),
+            model_supports_streaming: Some(true),
+            model_is_active: true,
+            model_is_available: true,
+        }
+    }
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key("sk-client-claude-429")),
+        claude_auth_snapshot(),
+    )]));
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            claude_candidate_row(),
+        ]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-claude-429-1".to_string(),
+            "claude".to_string(),
+            Some("https://example.com".to_string()),
+            "custom".to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(
+            true,
+            false,
+            false,
+            None,
+            Some(2),
+            None,
+            Some(20.0),
+            None,
+            None,
+        )],
+        vec![StoredProviderCatalogEndpoint::new(
+            "endpoint-claude-429-1".to_string(),
+            "provider-claude-429-1".to_string(),
+            "claude:messages".to_string(),
+            Some("claude".to_string()),
+            Some("messages".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            "https://api.anthropic.example/v1".to_string(),
+            None,
+            None,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build")],
+        vec![StoredProviderCatalogKey::new(
+            "key-claude-429-1".to_string(),
+            "provider-claude-429-1".to_string(),
+            "prod".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["claude:messages"])),
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "sk-upstream-claude")
+                .expect("api key should encrypt"),
+            None,
+            None,
+            Some(json!({"claude:messages": 1})),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build")],
+    ));
+
+    let gateway_state = crate::AppState::new()
+        .expect("gateway should build")
+        .with_execution_runtime_sync_override_for_tests(move |plan| {
+            Ok(aether_contracts::ExecutionResult {
+                request_id: plan.request_id.clone(),
+                candidate_id: plan.candidate_id.clone(),
+                status_code: 429,
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: Some(aether_contracts::ResponseBody {
+                    json_body: Some(json!({
+                        "type": "error",
+                        "error": {"type": "rate_limit_error", "message": "slow down"}
+                    })),
+                    body_bytes_b64: None,
+                }),
+                telemetry: Some(aether_contracts::ExecutionTelemetry {
+                    ttfb_ms: Some(1),
+                    elapsed_ms: Some(1),
+                    upstream_bytes: None,
+                }),
+                error: None,
+            })
+        })
+        .with_data_state_for_tests(
+            GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
+                auth_repository,
+                candidate_selection_repository,
+                provider_catalog_repository,
+                Arc::clone(&request_candidate_repository),
+                Arc::clone(&usage_repository),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            ),
+        )
+        .with_usage_runtime_for_tests(UsageRuntimeConfig {
+            enabled: true,
+            ..UsageRuntimeConfig::default()
+        });
+    let gateway = build_router_with_state(gateway_state);
+    let request = Request::builder()
+        .method(http::Method::POST)
+        .uri("/v1/messages")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("x-api-key", "sk-client-claude-429")
+        .header(TRACE_ID_HEADER, TRACE_ID)
+        .body(Body::from(
+            "{\"model\":\"claude-sonnet-4-5\",\"messages\":[]}",
+        ))
+        .expect("request should build");
+    let response = send_request(gateway, request).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the preserved upstream error must still reach the client unchanged"
+    );
+    let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("preserved response body should read");
+    let response_body: serde_json::Value =
+        serde_json::from_slice(&response_body).expect("preserved response body should decode");
+    assert_eq!(response_body["error"]["type"], "rate_limit_error");
+    assert_eq!(response_body["error"]["message"], "slow down");
+
+    let stored_usage = wait_for_usage_status(usage_repository.as_ref(), TRACE_ID, "failed").await;
+    assert_eq!(
+        stored_usage.status_code,
+        Some(429),
+        "the request records the status the client received, not a synthetic exhaustion code"
+    );
+    assert_eq!(stored_usage.error_message.as_deref(), Some("slow down"));
+    assert_eq!(
+        stored_usage.client_response_body.as_ref(),
+        Some(&response_body),
+        "usage must capture the exact final response body instead of synthesizing another error"
+    );
+
+    let stored_candidates = request_candidate_repository
+        .list_by_request_id(TRACE_ID)
+        .await
+        .expect("request candidate trace should read");
+    let owner_candidate = stored_candidates
+        .iter()
+        .find(|candidate| {
+            candidate.status == RequestCandidateStatus::Failed && candidate.status_code == Some(429)
+        })
+        .expect("the candidate timeline keeps the upstream failure");
+    assert_eq!(
+        owner_candidate
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("request_lifecycle"))
+            .and_then(serde_json::Value::as_str),
+        Some("request_terminal"),
+        "the candidate owning the preserved response must own the request terminal state"
+    );
 }

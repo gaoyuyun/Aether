@@ -166,6 +166,7 @@ import {
 import {
   hasUsageFallback,
   isUsageRecordFailed,
+  isUsageRecordPollable,
   isUsageUpstreamStream,
   normalizeRequestStatus,
   resolveDisplayRequestStatus,
@@ -445,13 +446,12 @@ const filteredRecords = computed(() => {
   return records
 })
 
-// 获取活跃请求的 ID 列表
+// 获取活跃请求的 ID 列表。
+// 轮询资格只看后端生命周期 status：候选切换期间的中间错误码会让展示状态变为 failed，
+// 若据此停止轮询，界面会永久停留在中间候选的失败状态，等不到后续候选的最终结果。
 const activeRequestIds = computed(() => {
   return currentRecords.value
-    .filter((record) => {
-      const displayStatus = resolveDisplayRequestStatus(record)
-      return displayStatus === 'pending' || displayStatus === 'streaming'
-    })
+    .filter(record => isUsageRecordPollable(record))
     .map(record => record.id)
 })
 
@@ -474,7 +474,7 @@ const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hid
 
 let pollInFlight = false
 let activeDiscoveryInFlight = false
-const discoveredActiveRequestIds = new Set<string>()
+const discoveredActiveRequestMissCounts = new Map<string, number>()
 
 async function loadActiveRequestUpdates(ids?: string[]) {
   if (isAdminPage.value) {
@@ -668,19 +668,21 @@ async function discoverActiveRequests() {
   try {
     const { requests } = await loadActiveRequestUpdates()
     const {
-      retainedDiscoveredActiveRequestIds,
+      retainedDiscoveredActiveRequestMissCounts,
       unseenActiveRequestIds
     } = reconcileActiveRequestDiscovery({
       activeRequestIds: requests.map(request => request.id),
       knownRecordIds: currentRecords.value.map(record => record.id),
-      discoveredActiveRequestIds
+      discoveredActiveRequestMissCounts
     })
 
-    discoveredActiveRequestIds.clear()
-    retainedDiscoveredActiveRequestIds.forEach(id => discoveredActiveRequestIds.add(id))
+    discoveredActiveRequestMissCounts.clear()
+    retainedDiscoveredActiveRequestMissCounts.forEach(([id, missCount]) => {
+      discoveredActiveRequestMissCounts.set(id, missCount)
+    })
 
     if (unseenActiveRequestIds.length > 0) {
-      unseenActiveRequestIds.forEach(id => discoveredActiveRequestIds.add(id))
+      unseenActiveRequestIds.forEach(id => discoveredActiveRequestMissCounts.set(id, 0))
       await refreshData()
     }
   } catch (error) {
@@ -704,7 +706,7 @@ function scheduleNextActiveDiscovery() {
   if (activeDiscoveryTimer) return
   if (!isPageVisible.value) return
   if (!globalAutoRefresh.value) return
-  const interval = hasActiveRequests.value || discoveredActiveRequestIds.size > 0
+  const interval = hasActiveRequests.value || discoveredActiveRequestMissCounts.size > 0
     ? ACTIVE_DISCOVERY_HOT_INTERVAL
     : ACTIVE_DISCOVERY_IDLE_INTERVAL
   activeDiscoveryTimer = setTimeout(async () => {

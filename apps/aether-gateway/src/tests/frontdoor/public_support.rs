@@ -6159,6 +6159,144 @@ async fn gateway_handles_users_me_usage_active_locally_without_proxying_upstream
     upstream_handle.abort();
 }
 
+/// Mirrors `gateway_keeps_admin_usage_active_while_candidates_are_still_switching` for the user
+/// facing API: both surfaces must apply the same request lifecycle rule.
+#[test]
+fn gateway_keeps_users_me_usage_active_while_candidates_are_still_switching() {
+    run_async_public_support_test_on_large_stack(
+        "gateway_keeps_users_me_usage_active_while_candidates_are_still_switching",
+        gateway_keeps_users_me_usage_active_while_candidates_are_still_switching_impl(),
+    );
+}
+
+/// Runs an async gateway test on a dedicated large stack.
+///
+/// The end-to-end router futures are large in debug builds and overflow the default test stack.
+fn run_async_public_support_test_on_large_stack<F>(name: &'static str, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime should build")
+                .block_on(future);
+        })
+        .expect("large-stack public support test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn gateway_keeps_users_me_usage_active_while_candidates_are_still_switching_impl() {
+    let now = Utc::now();
+    let user = sample_auth_user(now);
+    let access_token = build_test_auth_token(
+        "access",
+        serde_json::Map::from_iter([
+            ("user_id".to_string(), json!(user.id)),
+            ("role".to_string(), json!(user.role)),
+            (
+                "created_at".to_string(),
+                json!(user.created_at.map(|value| value.to_rfc3339())),
+            ),
+            (
+                "session_id".to_string(),
+                json!("session-users-me-switching-1"),
+            ),
+        ]),
+        now + chrono::Duration::hours(1),
+    );
+    let mut switching_usage = sample_user_usage_audit(
+        "usage-users-me-switching-1",
+        "req-users-me-switching-1",
+        "user-auth-1",
+        "gpt-4.1",
+        "OpenAI",
+        "pending",
+        now - chrono::Duration::minutes(1),
+    );
+    switching_usage.status_code = Some(503);
+    switching_usage.error_message = Some("upstream failed".to_string());
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![switching_usage]));
+
+    let now_unix_secs = now.timestamp();
+    let mut retrying_candidate = sample_request_candidate(
+        "cand-users-me-switching-0",
+        "req-users-me-switching-1",
+        "endpoint-openai",
+        RequestCandidateStatus::Failed,
+        now_unix_secs - 60,
+        Some(now_unix_secs - 55),
+    );
+    retrying_candidate.status_code = Some(503);
+    retrying_candidate.error_message = Some("upstream failed".to_string());
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        retrying_candidate,
+    ]));
+
+    let user_repository = Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![user]));
+    let wallet_repository = Arc::new(InMemoryWalletRepository::seed(vec![sample_auth_wallet(
+        "user-auth-1",
+        now,
+    )]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_user_wallet_and_usage_for_tests(
+                    user_repository,
+                    wallet_repository,
+                    usage_repository,
+                )
+                .with_request_candidate_reader(request_candidate_repository),
+            )
+            .with_auth_sessions_for_tests([sample_auth_session(
+                "user-auth-1",
+                "session-users-me-switching-1",
+                "device-users-me-switching-1",
+                "refresh-token-placeholder",
+                now,
+            )]),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/users/me/usage/active"))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-switching-1")
+        .header("user-agent", "AetherTest/1.0")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let requests = payload["requests"].as_array().expect("requests array");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a request that is still switching candidates must stay in the active list"
+    );
+    assert_eq!(requests[0]["id"], "usage-users-me-switching-1");
+    assert_eq!(requests[0]["status"], "pending");
+    assert!(
+        requests[0]["status_code"].is_null(),
+        "the intermediate candidate status must not surface as a request status code"
+    );
+    assert!(
+        requests[0]["error_message"].is_null(),
+        "the intermediate candidate error must not surface as a request error"
+    );
+
+    gateway_handle.abort();
+}
+
 #[tokio::test]
 async fn gateway_handles_users_me_usage_interval_timeline_and_heatmap_locally_without_proxying_upstream(
 ) {

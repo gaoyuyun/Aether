@@ -125,6 +125,7 @@ use crate::provider_pool_demand::{
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, persist_local_request_candidate_status_record,
     record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
+    record_request_terminal_local_request_candidate_status,
     snapshot_local_request_candidate_status, try_enqueue_local_request_candidate_status_snapshot,
     LocalRequestCandidateStatusSnapshot,
 };
@@ -666,7 +667,7 @@ async fn record_dropped_stream_attempt_cancelled(core: StreamAttemptTerminalGuar
         true,
     )
     .await;
-    record_local_request_candidate_status(
+    record_request_terminal_local_request_candidate_status(
         &state,
         &plan,
         usage_payload.report_context.as_ref(),
@@ -2403,7 +2404,7 @@ impl DirectPassthroughFinalizerCore {
                 true,
             )
             .await;
-            record_local_request_candidate_status(
+            record_request_terminal_local_request_candidate_status(
                 &state,
                 &plan,
                 usage_payload.report_context.as_ref(),
@@ -2539,7 +2540,7 @@ impl DirectPassthroughFinalizerCore {
             false,
         )
         .await;
-        record_local_request_candidate_status(
+        record_request_terminal_local_request_candidate_status(
             &state,
             &plan,
             usage_payload.report_context.as_ref(),
@@ -3533,7 +3534,7 @@ async fn execute_stream_from_direct_passthrough(
                 true,
             )
             .await;
-            record_local_request_candidate_status(
+            record_request_terminal_local_request_candidate_status(
                 &state_for_report,
                 &plan_for_report,
                 usage_payload.report_context.as_ref(),
@@ -3704,7 +3705,7 @@ async fn execute_stream_from_direct_passthrough(
             false,
         )
         .await;
-        record_local_request_candidate_status(
+        record_request_terminal_local_request_candidate_status(
             &state_for_report,
             &plan_for_report,
             usage_payload.report_context.as_ref(),
@@ -5946,6 +5947,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             }
             if failure_disposition.preserve_upstream_error {
                 if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
+                    let fallback_body = Bytes::from(provider_error_body.clone());
                     let mut fallback_headers = headers.clone();
                     apply_endpoint_response_header_rules(
                         state,
@@ -5954,17 +5956,22 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                         provider_body_json.as_ref(),
                     )
                     .await?;
-                    *retry_fallback = Some(attach_control_metadata_headers(
+                    let response = attach_control_metadata_headers(
                         build_client_response_from_parts(
                             status_code,
                             &fallback_headers,
-                            Body::from(provider_error_body.clone()),
+                            Body::from(fallback_body.clone()),
                             trace_id,
                             Some(decision),
                         )?,
                         Some(request_id),
                         candidate_id,
-                    )?);
+                    )?;
+                    *retry_fallback =
+                        Some(crate::executor::attach_deferred_upstream_response_capture(
+                            response,
+                            fallback_body,
+                        ));
                 }
             }
             let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -6108,7 +6115,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         )
         .await;
         let terminal_unix_secs = current_request_candidate_unix_ms();
-        record_local_request_candidate_status(
+        record_request_terminal_local_request_candidate_status(
             state,
             &plan,
             payload.report_context.as_ref(),
@@ -6520,6 +6527,18 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 stream_started_at,
                                 prefetched_usage_telemetry.as_ref(),
                             );
+                            let error_type = body_json
+                                .pointer("/error/type")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or("execution_runtime_stream_prefetch_embedded_error")
+                                .to_string();
+                            let error_message = body_json
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or("upstream stream contained an embedded error")
+                                .to_string();
                             let payload = build_stream_sync_payload(
                                 trace_id,
                                 report_kind.clone(),
@@ -6535,6 +6554,25 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                 &plan,
                                 payload.report_context.as_ref(),
                                 &payload,
+                            )
+                            .await;
+                            let terminal_unix_ms = current_request_candidate_unix_ms();
+                            record_request_terminal_local_request_candidate_status(
+                                state,
+                                &plan,
+                                payload.report_context.as_ref(),
+                                SchedulerRequestCandidateStatusUpdate {
+                                    status: RequestCandidateStatus::Failed,
+                                    status_code: Some(payload.status_code),
+                                    error_type: Some(error_type),
+                                    error_message: Some(error_message),
+                                    latency_ms: payload
+                                        .telemetry
+                                        .as_ref()
+                                        .and_then(|telemetry| telemetry.elapsed_ms),
+                                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                                    finished_at_unix_ms: Some(terminal_unix_ms),
+                                },
                             )
                             .await;
                             let response = submit_local_core_error_or_sync_finalize(
@@ -7885,7 +7923,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 true,
             )
             .await;
-            record_local_request_candidate_status(
+            record_request_terminal_local_request_candidate_status(
                 &state_for_report,
                 &plan_for_report,
                 usage_payload.report_context.as_ref(),
@@ -8057,7 +8095,7 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             false,
         )
         .await;
-        record_local_request_candidate_status(
+        record_request_terminal_local_request_candidate_status(
             &state_for_report,
             &plan_for_report,
             usage_payload.report_context.as_ref(),

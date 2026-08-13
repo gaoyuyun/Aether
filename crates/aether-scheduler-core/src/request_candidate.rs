@@ -4,6 +4,16 @@ use aether_data_contracts::repository::candidates::{
 };
 use serde_json::{Map, Value};
 
+/// Extra-data key carrying the request-level lifecycle conclusion for a candidate row.
+///
+/// A terminal candidate is not by itself proof that the request is over: the candidate loop keeps
+/// switching candidates after retryable failures, transport errors, empty replies and control
+/// fallbacks. Only the commit points that own the client response stamp
+/// [`REQUEST_CANDIDATE_LIFECYCLE_REQUEST_TERMINAL`], so readers can tell a request terminal state
+/// apart from an intermediate candidate outcome instead of guessing from error metadata.
+pub const REQUEST_CANDIDATE_LIFECYCLE_KEY: &str = "request_lifecycle";
+pub const REQUEST_CANDIDATE_LIFECYCLE_REQUEST_TERMINAL: &str = "request_terminal";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchedulerRequestCandidateReportContext {
     pub request_id: Option<String>,
@@ -28,6 +38,7 @@ pub struct SchedulerRequestCandidateReportContext {
     pub upstream_response: Option<Value>,
     pub proxy: Option<Value>,
     pub error_flow: Option<Value>,
+    pub request_lifecycle: Option<String>,
     pub candidate_group_id: Option<String>,
     pub pool_key_index: Option<u32>,
     pub ranking_mode: Option<String>,
@@ -76,6 +87,7 @@ struct ReportCandidateExtraDataInput {
     upstream_response: Option<Value>,
     proxy: Option<Value>,
     error_flow: Option<Value>,
+    request_lifecycle: Option<String>,
     candidate_group_id: Option<String>,
     pool_key_index: Option<u32>,
     ranking_mode: Option<String>,
@@ -174,6 +186,7 @@ pub fn parse_request_candidate_report_context(
             .get("error_flow")
             .cloned()
             .filter(|value| !value.is_null()),
+        request_lifecycle: string_field(report_context, REQUEST_CANDIDATE_LIFECYCLE_KEY),
         candidate_group_id: string_field(report_context, "candidate_group_id"),
         pool_key_index: u32_field(report_context, "pool_key_index"),
         ranking_mode: string_field(report_context, "ranking_mode"),
@@ -219,6 +232,7 @@ pub fn resolve_report_request_candidate_slot(
         upstream_response,
         proxy,
         error_flow,
+        request_lifecycle,
         candidate_group_id,
         pool_key_index,
         ranking_mode,
@@ -244,6 +258,7 @@ pub fn resolve_report_request_candidate_slot(
         upstream_response,
         proxy,
         error_flow,
+        request_lifecycle,
         candidate_group_id,
         pool_key_index,
         ranking_mode,
@@ -368,6 +383,7 @@ pub fn build_execution_request_candidate_seed(
             upstream_response: metadata.upstream_response,
             proxy: metadata.proxy,
             error_flow: metadata.error_flow,
+            request_lifecycle: metadata.request_lifecycle,
             candidate_group_id: metadata.candidate_group_id,
             pool_key_index: metadata.pool_key_index,
             ranking_mode: metadata.ranking_mode,
@@ -534,6 +550,7 @@ fn build_local_request_candidate_extra_data(
         upstream_response: metadata.and_then(|metadata| metadata.upstream_response.clone()),
         proxy: metadata.and_then(|metadata| metadata.proxy.clone()),
         error_flow: metadata.and_then(|metadata| metadata.error_flow.clone()),
+        request_lifecycle: metadata.and_then(|metadata| metadata.request_lifecycle.clone()),
         candidate_group_id: metadata.and_then(|metadata| metadata.candidate_group_id.clone()),
         pool_key_index: metadata.and_then(|metadata| metadata.pool_key_index),
         ranking_mode: metadata.and_then(|metadata| metadata.ranking_mode.clone()),
@@ -752,6 +769,7 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
         upstream_response,
         proxy,
         error_flow,
+        request_lifecycle,
         candidate_group_id,
         pool_key_index,
         ranking_mode,
@@ -815,6 +833,12 @@ fn build_report_candidate_extra_data(input: ReportCandidateExtraDataInput) -> Op
     }
     if let Some(error_flow) = error_flow {
         extra_data.insert("error_flow".to_string(), error_flow);
+    }
+    if let Some(request_lifecycle) = request_lifecycle {
+        extra_data.insert(
+            REQUEST_CANDIDATE_LIFECYCLE_KEY.to_string(),
+            Value::String(request_lifecycle),
+        );
     }
     if let Some(candidate_group_id) = candidate_group_id {
         extra_data.insert(

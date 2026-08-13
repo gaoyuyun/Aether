@@ -849,7 +849,9 @@ where
 
     tokio::spawn(async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
+            let state_for_finalize = state.clone();
             let bytes = standard_text_sync_heartbeat_final_bytes(
+                &state_for_finalize,
                 client_api_format.as_str(),
                 redaction_slot.as_ref(),
                 execute(state, parts, trace_id, decision, plan_kind, started_at).await,
@@ -904,12 +906,15 @@ async fn record_standard_text_sync_heartbeat_exhaustion(
 }
 
 async fn standard_text_sync_heartbeat_final_bytes(
+    state: &AppState,
     client_api_format: &str,
     redaction_slot: Option<&crate::privacy::RedactionSessionSlot>,
     result: Result<LocalExecutionRequestOutcome, GatewayError>,
 ) -> Vec<u8> {
     match result {
         Ok(LocalExecutionRequestOutcome::Responded(response)) => {
+            let response =
+                crate::executor::finalize_deferred_upstream_response(state, response).await;
             standard_text_sync_heartbeat_response_body_bytes(
                 client_api_format,
                 redaction_slot,
@@ -1124,7 +1129,9 @@ fn build_openai_image_sync_heartbeat_shell_response(
 
     tokio::spawn(async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
+            let state_for_finalize = state.clone();
             let bytes = openai_image_sync_heartbeat_final_bytes(
+                &state_for_finalize,
                 execute_openai_image_sync_heartbeat_attempts(
                     state,
                     request_path,
@@ -1213,10 +1220,13 @@ async fn execute_openai_image_sync_heartbeat_attempts(
 }
 
 async fn openai_image_sync_heartbeat_final_bytes(
+    state: &AppState,
     result: Result<LocalExecutionRequestOutcome, GatewayError>,
 ) -> Vec<u8> {
     match result {
         Ok(LocalExecutionRequestOutcome::Responded(response)) => {
+            let response =
+                crate::executor::finalize_deferred_upstream_response(state, response).await;
             openai_image_sync_heartbeat_response_body_bytes(response).await
         }
         Ok(LocalExecutionRequestOutcome::Exhausted(_))
@@ -1568,6 +1578,9 @@ mod tests {
     use super::*;
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateReadRepository, RequestCandidateStatus,
+    };
     use aether_data_contracts::repository::usage::UsageReadRepository;
     use aether_usage_runtime::UsageRuntimeConfig;
     use futures_util::StreamExt;
@@ -1776,6 +1789,51 @@ mod tests {
         assert!(end_to_end_first_byte_time_ms <= end_to_end_time_ms);
     }
 
+    async fn assert_deferred_heartbeat_terminal_state(
+        usage_repository: &InMemoryUsageReadRepository,
+        request_candidate_repository: &InMemoryRequestCandidateRepository,
+        request_id: &str,
+    ) {
+        let deadline = Instant::now() + HEARTBEAT_USAGE_SETTLE_TIMEOUT;
+        let usage = loop {
+            let usage = usage_repository
+                .find_by_request_id(request_id)
+                .await
+                .expect("usage should read");
+            if usage.as_ref().is_some_and(|usage| usage.status == "failed") {
+                break usage.expect("failed usage should be recorded");
+            }
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "deferred heartbeat usage should reach failed within {HEARTBEAT_USAGE_SETTLE_TIMEOUT:?}"
+            );
+            tokio::time::sleep(HEARTBEAT_USAGE_POLL_INTERVAL.min(deadline - now)).await;
+        };
+        assert_eq!(usage.status_code, Some(429));
+        assert_eq!(usage.error_message.as_deref(), Some("slow down"));
+
+        let candidates = request_candidate_repository
+            .list_by_request_id(request_id)
+            .await
+            .expect("request candidates should read");
+        let owner = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.status == RequestCandidateStatus::Failed
+                    && candidate.status_code == Some(429)
+            })
+            .expect("deferred response owner candidate should be recorded");
+        assert_eq!(
+            owner
+                .extra_data
+                .as_ref()
+                .and_then(|value| value.get("request_lifecycle"))
+                .and_then(Value::as_str),
+            Some("request_terminal")
+        );
+    }
+
     fn test_standard_text_heartbeat_decision() -> GatewayControlDecision {
         GatewayControlDecision::synthetic(
             "/v1/responses",
@@ -1883,8 +1941,12 @@ mod tests {
 
     #[tokio::test]
     async fn openai_image_sync_heartbeat_no_path_returns_json_error_body() {
-        let bytes =
-            openai_image_sync_heartbeat_final_bytes(Ok(LocalExecutionRequestOutcome::NoPath)).await;
+        let state = AppState::new().expect("state should build");
+        let bytes = openai_image_sync_heartbeat_final_bytes(
+            &state,
+            Ok(LocalExecutionRequestOutcome::NoPath),
+        )
+        .await;
         let body: Value = serde_json::from_slice(&bytes).expect("body should decode");
 
         assert_eq!(body["error"]["type"], json!("upstream_error"));
@@ -1926,6 +1988,60 @@ mod tests {
         assert!(!body.is_empty());
         assert_usage_has_end_to_end_timings(
             usage_repository.as_ref(),
+            "trace-image-heartbeat-retry",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn openai_image_sync_heartbeat_finalizes_deferred_upstream_error() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_sync_override_for_tests(|plan| {
+                Ok(test_openai_image_execution_result(
+                    plan,
+                    StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    json!({"error": {"type": "rate_limit", "message": "slow down"}}),
+                ))
+            });
+        let mut attempt =
+            test_openai_image_heartbeat_attempt(0, "endpoint-failure", "candidate-failure");
+        // Anthropic preserves retryable 429 responses as the deferred fallback when the loop
+        // exhausts, even when the gateway is converting that response for an image client.
+        attempt.plan.provider_api_format = "claude:messages".to_string();
+        let response = build_openai_image_sync_heartbeat_shell_response(
+            state,
+            "/v1/images/generations".to_string(),
+            "trace-image-heartbeat-retry".to_string(),
+            test_openai_image_heartbeat_decision(),
+            TEST_OPENAI_IMAGE_SYNC_PLAN_KIND.to_string(),
+            vec![attempt],
+            ProviderTransferTracker::default(),
+        )
+        .expect("heartbeat shell should build");
+
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("heartbeat response body should complete");
+        let body: Value =
+            serde_json::from_slice(bytes.trim_ascii()).expect("heartbeat final body should decode");
+        assert_eq!(body["error"]["message"], json!("slow down"));
+        assert_eq!(body["error"]["upstream_status"], json!(429));
+        assert_deferred_heartbeat_terminal_state(
+            usage_repository.as_ref(),
+            request_candidate_repository.as_ref(),
             "trace-image-heartbeat-retry",
         )
         .await;
@@ -2252,6 +2368,80 @@ mod tests {
         assert!(!body.is_empty());
         assert_usage_has_end_to_end_timings(
             usage_repository.as_ref(),
+            "trace-standard-text-heartbeat-retry",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn standard_text_sync_heartbeat_finalizes_deferred_upstream_error() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_sync_override_for_tests(|plan| {
+                Ok(test_openai_image_execution_result(
+                    plan,
+                    StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    json!({"error": {"type": "rate_limit", "message": "slow down"}}),
+                ))
+            });
+        let (parts, _) = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/v1/responses")
+            .body(())
+            .expect("request should build")
+            .into_parts();
+        let response = build_standard_text_sync_heartbeat_shell_response(
+            state,
+            parts,
+            "trace-standard-text-heartbeat-retry".to_string(),
+            test_standard_text_heartbeat_decision(),
+            TEST_STANDARD_TEXT_SYNC_PLAN_KIND.to_string(),
+            move |state, parts, trace_id, decision, plan_kind, _started_at| async move {
+                let mut attempt = test_standard_text_heartbeat_attempt(
+                    0,
+                    "endpoint-failure",
+                    "candidate-failure",
+                    "openai:responses:compact",
+                );
+                attempt.plan.provider_api_format = "claude:messages".to_string();
+                if let Some(context) = attempt.report_context.as_mut() {
+                    context["provider_api_format"] = json!("claude:messages");
+                }
+                execute_sync_attempt_source::<AiSyncAttempt, _>(
+                    &state,
+                    &parts,
+                    trace_id.as_str(),
+                    &decision,
+                    plan_kind.as_str(),
+                    TestSyncAttemptSource::new(vec![attempt]),
+                )
+                .await
+            },
+        )
+        .expect("heartbeat shell should build");
+
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("heartbeat response body should complete");
+        let body: Value =
+            serde_json::from_slice(bytes.trim_ascii()).expect("heartbeat final body should decode");
+        assert_eq!(body["error"]["message"], json!("slow down"));
+        assert_eq!(body["error"]["upstream_status"], json!(429));
+        assert_deferred_heartbeat_terminal_state(
+            usage_repository.as_ref(),
+            request_candidate_repository.as_ref(),
             "trace-standard-text-heartbeat-retry",
         )
         .await;
