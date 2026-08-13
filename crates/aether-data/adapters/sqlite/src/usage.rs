@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2248,15 +2248,48 @@ WHERE "date" >= ?
         }))
     }
 
-    async fn list_dashboard_daily_breakdown_from_daily_aggregates(
+    async fn read_dashboard_daily_cutoff_unix_secs(&self) -> Result<Option<u64>, DataLayerError> {
+        let latest_date = sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+SELECT MAX(latest_date)
+FROM (
+  SELECT MAX("date") AS latest_date
+  FROM stats_daily
+  WHERE total_requests > 0 OR is_complete <> 0
+  UNION ALL
+  SELECT MAX("date") AS latest_date
+  FROM stats_user_daily
+  WHERE total_requests > 0
+) AS imported_daily_aggregates
+"#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_sql_err()?;
+        latest_date
+            .map(|value| {
+                u64::try_from(value)
+                    .map(|value| value.saturating_add(86_400))
+                    .map_err(|_| {
+                        DataLayerError::UnexpectedValue(
+                            "stats daily cutoff date must not be negative".to_string(),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    async fn list_dashboard_daily_breakdown_from_daily_totals(
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
     ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        let date_expr = sqlite_usage_local_date_expr(query.tz_offset_minutes)
+            .replace("created_at_unix_ms", "\"date\"");
         let rows = if let Some(user_id) = query.user_id.as_deref() {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
 SELECT
-  date("date", 'unixepoch') AS date,
+  {date_expr} AS date,
   'aggregate' AS model,
   'aggregate' AS provider,
   COALESCE(SUM(total_requests), 0) AS requests,
@@ -2272,7 +2305,8 @@ WHERE user_id = ?
 GROUP BY "date"
 ORDER BY "date" ASC
 "#,
-            )
+                date_expr = date_expr
+            ))
             .bind(user_id)
             .bind(query.created_from_unix_secs as i64)
             .bind(query.created_until_unix_secs as i64)
@@ -2280,10 +2314,10 @@ ORDER BY "date" ASC
             .await
             .map_sql_err()?
         } else {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
 SELECT
-  date("date", 'unixepoch') AS date,
+  {date_expr} AS date,
   'aggregate' AS model,
   'aggregate' AS provider,
   COALESCE(SUM(total_requests), 0) AS requests,
@@ -2298,7 +2332,8 @@ WHERE "date" >= ?
 GROUP BY "date"
 ORDER BY "date" ASC
 "#,
-            )
+                date_expr = date_expr
+            ))
             .bind(query.created_from_unix_secs as i64)
             .bind(query.created_until_unix_secs as i64)
             .fetch_all(&self.pool)
@@ -2306,6 +2341,159 @@ ORDER BY "date" ASC
             .map_sql_err()?
         };
 
+        rows.iter()
+            .map(|row| {
+                Ok(StoredUsageDashboardDailyBreakdownRow {
+                    date: row.try_get("date").map_sql_err()?,
+                    model: row.try_get("model").map_sql_err()?,
+                    provider: row.try_get("provider").map_sql_err()?,
+                    requests: sqlite_aggregate_u64(row, "requests")?,
+                    total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
+                    total_cost_usd: sqlite_real(row, "total_cost_usd")?,
+                    response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
+                    response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_dashboard_daily_breakdown_from_daily_aggregates(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        let date_expr = sqlite_usage_local_date_expr(query.tz_offset_minutes)
+            .replace("created_at_unix_ms", "\"date\"");
+        let rows = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(&format!(
+                r#"
+SELECT
+  {date_expr} AS date,
+  model,
+  provider_name AS provider,
+  COALESCE(SUM(total_requests), 0) AS requests,
+  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+  COALESCE(SUM(COALESCE(CAST(total_cost AS REAL), 0)), 0) AS total_cost_usd,
+  COALESCE(SUM(response_time_sum_ms), 0) AS response_time_sum_ms,
+  COALESCE(SUM(response_time_samples), 0) AS response_time_samples
+FROM stats_user_daily_model_provider
+WHERE user_id = ?
+  AND "date" >= ?
+  AND "date" < ?
+GROUP BY "date", model, provider_name
+ORDER BY "date" ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#,
+                date_expr = date_expr
+            ))
+            .bind(user_id)
+            .bind(query.created_from_unix_secs as i64)
+            .bind(query.created_until_unix_secs as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        } else {
+            sqlx::query(&format!(
+                r#"
+SELECT
+  {date_expr} AS date,
+  model,
+  provider_name AS provider,
+  COALESCE(SUM(total_requests), 0) AS requests,
+  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+  COALESCE(SUM(COALESCE(CAST(total_cost AS REAL), 0)), 0) AS total_cost_usd,
+  COALESCE(SUM(response_time_sum_ms), 0) AS response_time_sum_ms,
+  COALESCE(SUM(response_time_samples), 0) AS response_time_samples
+FROM stats_daily_model_provider
+WHERE "date" >= ?
+  AND "date" < ?
+GROUP BY "date", model, provider_name
+ORDER BY "date" ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#,
+                date_expr = date_expr
+            ))
+            .bind(query.created_from_unix_secs as i64)
+            .bind(query.created_until_unix_secs as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        };
+
+        let mut items = rows
+            .iter()
+            .map(|row| {
+                Ok(StoredUsageDashboardDailyBreakdownRow {
+                    date: row.try_get("date").map_sql_err()?,
+                    model: row.try_get("model").map_sql_err()?,
+                    provider: row.try_get("provider").map_sql_err()?,
+                    requests: sqlite_aggregate_u64(row, "requests")?,
+                    total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
+                    total_cost_usd: sqlite_real(row, "total_cost_usd")?,
+                    response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
+                    response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
+                })
+            })
+            .collect::<Result<Vec<_>, DataLayerError>>()?;
+        let detailed_dates = items
+            .iter()
+            .map(|item| item.date.clone())
+            .collect::<BTreeSet<_>>();
+        for item in self
+            .list_dashboard_daily_breakdown_from_daily_totals(query)
+            .await?
+        {
+            if !detailed_dates.contains(&item.date) {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    }
+
+    async fn list_dashboard_daily_breakdown_raw(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        let date_expr = sqlite_usage_local_date_expr(query.tz_offset_minutes);
+        let mut builder = QueryBuilder::<Sqlite>::new(format!(
+            r#"
+SELECT
+  {date_expr} AS date,
+  model,
+  provider_name AS provider,
+  COUNT(*) AS requests,
+  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
+  COALESCE(SUM(COALESCE(settlement.billing_total_cost_usd, "usage".total_cost_usd, 0)), 0)
+    AS total_cost_usd,
+  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN MAX(COALESCE(response_time_ms, 0), 0) ELSE 0 END), 0)
+    AS response_time_sum_ms,
+  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0)
+    AS response_time_samples
+FROM "usage"
+LEFT JOIN usage_settlement_snapshots AS settlement
+  ON settlement.request_id = "usage".request_id
+"#,
+            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR
+        ));
+        let mut has_where = false;
+        push_sqlite_usage_range(
+            &mut builder,
+            &mut has_where,
+            query.created_from_unix_secs,
+            query.created_until_unix_secs,
+        );
+        push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
+        push_sqlite_usage_optional_text_filter(
+            &mut builder,
+            &mut has_where,
+            "user_id",
+            query.user_id.as_deref(),
+        );
+        builder.push(
+            r#"
+GROUP BY date, model, provider
+ORDER BY date ASC, total_cost_usd DESC, model ASC, provider ASC
+"#,
+        );
+
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
         rows.iter()
             .map(|row| {
                 Ok(StoredUsageDashboardDailyBreakdownRow {
@@ -2767,69 +2955,96 @@ LEFT JOIN usage_settlement_snapshots AS settlement
             return Ok(Vec::new());
         }
 
-        let aggregate_rows = self
-            .list_dashboard_daily_breakdown_from_daily_aggregates(query)
-            .await?;
-        if !aggregate_rows.is_empty() {
-            return Ok(aggregate_rows);
+        if query.tz_offset_minutes != 0 {
+            let raw_rows = self.list_dashboard_daily_breakdown_raw(query).await?;
+            let raw_dates = raw_rows
+                .iter()
+                .map(|item| item.date.clone())
+                .collect::<BTreeSet<_>>();
+            let mut items = self
+                .list_dashboard_daily_breakdown_from_daily_aggregates(query)
+                .await?
+                .into_iter()
+                .filter(|item| !raw_dates.contains(&item.date))
+                .collect::<Vec<_>>();
+            items.extend(raw_rows);
+            items.sort_by(|left, right| {
+                left.date
+                    .cmp(&right.date)
+                    .then_with(|| {
+                        right
+                            .total_cost_usd
+                            .partial_cmp(&left.total_cost_usd)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| left.model.cmp(&right.model))
+                    .then_with(|| left.provider.cmp(&right.provider))
+            });
+            return Ok(items);
         }
 
-        let date_expr = sqlite_usage_local_date_expr(query.tz_offset_minutes);
-        let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            r#"
-SELECT
-  {date_expr} AS date,
-  model,
-  provider_name AS provider,
-  COUNT(*) AS requests,
-  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
-  COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd,
-  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN MAX(COALESCE(response_time_ms, 0), 0) ELSE 0 END), 0)
-    AS response_time_sum_ms,
-  COALESCE(SUM(CASE WHEN response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0)
-    AS response_time_samples
-FROM "usage"
-LEFT JOIN usage_settlement_snapshots AS settlement
-  ON settlement.request_id = "usage".request_id
-"#,
-            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR
-        ));
-        let mut has_where = false;
-        push_sqlite_usage_range(
-            &mut builder,
-            &mut has_where,
-            query.created_from_unix_secs,
-            query.created_until_unix_secs,
-        );
-        push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
-        push_sqlite_usage_optional_text_filter(
-            &mut builder,
-            &mut has_where,
-            "user_id",
-            query.user_id.as_deref(),
-        );
-        builder.push(
-            r#"
-GROUP BY date, model, provider
-ORDER BY date ASC, total_cost_usd DESC, model ASC, provider ASC
-"#,
-        );
+        let Some(cutoff) = self.read_dashboard_daily_cutoff_unix_secs().await? else {
+            return self.list_dashboard_daily_breakdown_raw(query).await;
+        };
+        let aggregate_start = query.created_from_unix_secs.saturating_add(86_399) / 86_400 * 86_400;
+        let aggregate_end = query.created_until_unix_secs.min(cutoff) / 86_400 * 86_400;
+        if aggregate_start >= aggregate_end {
+            return self.list_dashboard_daily_breakdown_raw(query).await;
+        }
 
-        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
-        rows.iter()
-            .map(|row| {
-                Ok(StoredUsageDashboardDailyBreakdownRow {
-                    date: row.try_get("date").map_sql_err()?,
-                    model: row.try_get("model").map_sql_err()?,
-                    provider: row.try_get("provider").map_sql_err()?,
-                    requests: sqlite_aggregate_u64(row, "requests")?,
-                    total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
-                    total_cost_usd: sqlite_real(row, "total_cost_usd")?,
-                    response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
-                    response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
+        let mut items = Vec::new();
+        if query.created_from_unix_secs < aggregate_start {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&UsageDashboardDailyBreakdownQuery {
+                    created_from_unix_secs: query.created_from_unix_secs,
+                    created_until_unix_secs: aggregate_start,
+                    tz_offset_minutes: query.tz_offset_minutes,
+                    user_id: query.user_id.clone(),
                 })
-            })
-            .collect()
+                .await?,
+            );
+        }
+        let aggregate_query = UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: aggregate_start,
+            created_until_unix_secs: aggregate_end,
+            tz_offset_minutes: query.tz_offset_minutes,
+            user_id: query.user_id.clone(),
+        };
+        let aggregate_rows = self
+            .list_dashboard_daily_breakdown_from_daily_aggregates(&aggregate_query)
+            .await?;
+        if aggregate_rows.is_empty() {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&aggregate_query)
+                    .await?,
+            );
+        } else {
+            items.extend(aggregate_rows);
+        }
+        if aggregate_end < query.created_until_unix_secs {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&UsageDashboardDailyBreakdownQuery {
+                    created_from_unix_secs: aggregate_end,
+                    created_until_unix_secs: query.created_until_unix_secs,
+                    tz_offset_minutes: query.tz_offset_minutes,
+                    user_id: query.user_id.clone(),
+                })
+                .await?,
+            );
+        }
+        items.sort_by(|left, right| {
+            left.date
+                .cmp(&right.date)
+                .then_with(|| {
+                    right
+                        .total_cost_usd
+                        .partial_cmp(&left.total_cost_usd)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.model.cmp(&right.model))
+                .then_with(|| left.provider.cmp(&right.provider))
+        });
+        Ok(items)
     }
 
     async fn summarize_dashboard_provider_counts(

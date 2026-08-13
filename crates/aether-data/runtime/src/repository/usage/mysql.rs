@@ -218,21 +218,7 @@ impl UsageReadRepository for MysqlUsageReadRepository {
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
     ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
-        if query.created_from_unix_secs >= query.created_until_unix_secs {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .storage
-            .list_dashboard_daily_breakdown_from_daily_aggregates(query)
-            .await?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-        let filter = Self::range(query.created_from_unix_secs, query.created_until_unix_secs)
-            .with_user_id(query.user_id.as_deref())
-            .finalized_only();
-        let repository = self.materialize_read_model(filter).await?;
-        repository.list_dashboard_daily_breakdown(query).await
+        self.storage.list_dashboard_daily_breakdown(query).await
     }
 
     async fn summarize_dashboard_provider_counts(

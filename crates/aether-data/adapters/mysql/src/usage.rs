@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
@@ -813,15 +813,47 @@ WHERE `date` >= ?
         }))
     }
 
-    pub async fn list_dashboard_daily_breakdown_from_daily_aggregates(
+    async fn read_dashboard_daily_cutoff_unix_secs(&self) -> Result<Option<u64>, DataLayerError> {
+        let latest_date = sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+SELECT MAX(latest_date)
+FROM (
+  SELECT MAX(`date`) AS latest_date
+  FROM stats_daily
+  WHERE total_requests > 0 OR is_complete <> 0
+  UNION ALL
+  SELECT MAX(`date`) AS latest_date
+  FROM stats_user_daily
+  WHERE total_requests > 0
+) AS imported_daily_aggregates
+"#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_sql_err()?;
+        latest_date
+            .map(|value| {
+                u64::try_from(value)
+                    .map(|value| value.saturating_add(86_400))
+                    .map_err(|_| {
+                        DataLayerError::UnexpectedValue(
+                            "stats daily cutoff date must not be negative".to_string(),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    async fn list_dashboard_daily_breakdown_from_daily_totals(
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
     ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        let offset_seconds = i64::from(query.tz_offset_minutes) * 60;
         let rows = if let Some(user_id) = query.user_id.as_deref() {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
 SELECT
-  DATE_FORMAT(FROM_UNIXTIME(`date`), '%Y-%m-%d') AS date,
+  DATE_FORMAT(FROM_UNIXTIME(`date` + ({offset_seconds})), '%Y-%m-%d') AS date,
   'aggregate' AS model,
   'aggregate' AS provider,
   CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS requests,
@@ -837,7 +869,8 @@ WHERE user_id = ?
 GROUP BY `date`
 ORDER BY `date` ASC
 "#,
-            )
+                offset_seconds = offset_seconds
+            ))
             .bind(user_id)
             .bind(to_i64(
                 query.created_from_unix_secs,
@@ -851,10 +884,10 @@ ORDER BY `date` ASC
             .await
             .map_sql_err()?
         } else {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
 SELECT
-  DATE_FORMAT(FROM_UNIXTIME(`date`), '%Y-%m-%d') AS date,
+  DATE_FORMAT(FROM_UNIXTIME(`date` + ({offset_seconds})), '%Y-%m-%d') AS date,
   'aggregate' AS model,
   'aggregate' AS provider,
   CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS requests,
@@ -869,7 +902,8 @@ WHERE `date` >= ?
 GROUP BY `date`
 ORDER BY `date` ASC
 "#,
-            )
+                offset_seconds = offset_seconds
+            ))
             .bind(to_i64(query.created_from_unix_secs, "stats_daily.date")?)
             .bind(to_i64(query.created_until_unix_secs, "stats_daily.date")?)
             .fetch_all(&self.pool)
@@ -891,6 +925,248 @@ ORDER BY `date` ASC
                 })
             })
             .collect()
+    }
+
+    async fn list_dashboard_daily_breakdown_from_daily_aggregates(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        let offset_seconds = i64::from(query.tz_offset_minutes) * 60;
+        let rows = if let Some(user_id) = query.user_id.as_deref() {
+            sqlx::query(&format!(
+                r#"
+SELECT
+  DATE_FORMAT(FROM_UNIXTIME(`date` + ({offset_seconds})), '%Y-%m-%d') AS date,
+  model,
+  provider_name AS provider,
+  CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS requests,
+  CAST(COALESCE(SUM(total_tokens), 0) AS SIGNED) AS total_tokens,
+  CAST(COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS DOUBLE) AS total_cost_usd,
+  CAST(COALESCE(SUM(response_time_sum_ms), 0) AS DOUBLE) AS response_time_sum_ms,
+  CAST(COALESCE(SUM(response_time_samples), 0) AS SIGNED) AS response_time_samples
+FROM stats_user_daily_model_provider
+WHERE user_id = ?
+  AND `date` >= ?
+  AND `date` < ?
+GROUP BY `date`, model, provider_name
+ORDER BY `date` ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#,
+                offset_seconds = offset_seconds
+            ))
+            .bind(user_id)
+            .bind(to_i64(
+                query.created_from_unix_secs,
+                "stats_user_daily_model_provider.date",
+            )?)
+            .bind(to_i64(
+                query.created_until_unix_secs,
+                "stats_user_daily_model_provider.date",
+            )?)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        } else {
+            sqlx::query(&format!(
+                r#"
+SELECT
+  DATE_FORMAT(FROM_UNIXTIME(`date` + ({offset_seconds})), '%Y-%m-%d') AS date,
+  model,
+  provider_name AS provider,
+  CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS requests,
+  CAST(COALESCE(SUM(total_tokens), 0) AS SIGNED) AS total_tokens,
+  CAST(COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS DOUBLE) AS total_cost_usd,
+  CAST(COALESCE(SUM(response_time_sum_ms), 0) AS DOUBLE) AS response_time_sum_ms,
+  CAST(COALESCE(SUM(response_time_samples), 0) AS SIGNED) AS response_time_samples
+FROM stats_daily_model_provider
+WHERE `date` >= ?
+  AND `date` < ?
+GROUP BY `date`, model, provider_name
+ORDER BY `date` ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#,
+                offset_seconds = offset_seconds
+            ))
+            .bind(to_i64(
+                query.created_from_unix_secs,
+                "stats_daily_model_provider.date",
+            )?)
+            .bind(to_i64(
+                query.created_until_unix_secs,
+                "stats_daily_model_provider.date",
+            )?)
+            .fetch_all(&self.pool)
+            .await
+            .map_sql_err()?
+        };
+
+        let mut items = rows
+            .iter()
+            .map(map_mysql_dashboard_daily_breakdown_row)
+            .collect::<Result<Vec<_>, DataLayerError>>()?;
+        let detailed_dates = items
+            .iter()
+            .map(|item| item.date.clone())
+            .collect::<BTreeSet<_>>();
+        for item in self
+            .list_dashboard_daily_breakdown_from_daily_totals(query)
+            .await?
+        {
+            if !detailed_dates.contains(&item.date) {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    }
+
+    async fn list_dashboard_daily_breakdown_raw(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        let offset_seconds = i64::from(query.tz_offset_minutes) * 60;
+        let mut sql = format!(
+            r#"
+SELECT
+  DATE_FORMAT(FROM_UNIXTIME(`usage`.created_at_unix_ms + ({offset_seconds})), '%Y-%m-%d') AS date,
+  `usage`.model AS model,
+  `usage`.provider_name AS provider,
+  CAST(COUNT(*) AS SIGNED) AS requests,
+  CAST(COALESCE(SUM({total_tokens_expr}), 0) AS SIGNED) AS total_tokens,
+  CAST(COALESCE(SUM(COALESCE(settlement.billing_total_cost_usd, `usage`.total_cost_usd, 0)), 0) AS DOUBLE)
+    AS total_cost_usd,
+  CAST(COALESCE(SUM(CASE WHEN `usage`.response_time_ms IS NOT NULL THEN GREATEST(COALESCE(`usage`.response_time_ms, 0), 0) ELSE 0 END), 0) AS DOUBLE)
+    AS response_time_sum_ms,
+  CAST(COALESCE(SUM(CASE WHEN `usage`.response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0) AS SIGNED)
+    AS response_time_samples
+FROM `usage`
+LEFT JOIN usage_settlement_snapshots AS settlement
+  ON settlement.request_id = `usage`.request_id
+WHERE `usage`.created_at_unix_ms >= ?
+  AND `usage`.created_at_unix_ms < ?
+  AND `usage`.status NOT IN ('pending', 'streaming')
+  AND `usage`.provider_name NOT IN ('unknown', 'pending')
+"#,
+            total_tokens_expr = MYSQL_USAGE_CANONICAL_TOTAL_TOKENS_EXPR,
+        );
+        if query.user_id.is_some() {
+            sql.push_str("  AND `usage`.user_id = ?\n");
+        }
+        sql.push_str(
+            "GROUP BY date, `usage`.model, `usage`.provider_name\n\
+             ORDER BY date ASC, total_cost_usd DESC, `usage`.model ASC, `usage`.provider_name ASC",
+        );
+        let mut statement = sqlx::query(&sql)
+            .bind(to_i64(
+                query.created_from_unix_secs,
+                "usage.created_at_unix_ms",
+            )?)
+            .bind(to_i64(
+                query.created_until_unix_secs,
+                "usage.created_at_unix_ms",
+            )?);
+        if let Some(user_id) = query.user_id.as_deref() {
+            statement = statement.bind(user_id);
+        }
+        let rows = statement.fetch_all(&self.pool).await.map_sql_err()?;
+        rows.iter()
+            .map(map_mysql_dashboard_daily_breakdown_row)
+            .collect()
+    }
+
+    pub async fn list_dashboard_daily_breakdown(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        if query.created_from_unix_secs >= query.created_until_unix_secs {
+            return Ok(Vec::new());
+        }
+        if query.tz_offset_minutes != 0 {
+            let raw_rows = self.list_dashboard_daily_breakdown_raw(query).await?;
+            let raw_dates = raw_rows
+                .iter()
+                .map(|item| item.date.clone())
+                .collect::<BTreeSet<_>>();
+            let mut items = self
+                .list_dashboard_daily_breakdown_from_daily_aggregates(query)
+                .await?
+                .into_iter()
+                .filter(|item| !raw_dates.contains(&item.date))
+                .collect::<Vec<_>>();
+            items.extend(raw_rows);
+            items.sort_by(|left, right| {
+                left.date
+                    .cmp(&right.date)
+                    .then_with(|| {
+                        right
+                            .total_cost_usd
+                            .partial_cmp(&left.total_cost_usd)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| left.model.cmp(&right.model))
+                    .then_with(|| left.provider.cmp(&right.provider))
+            });
+            return Ok(items);
+        }
+        let Some(cutoff) = self.read_dashboard_daily_cutoff_unix_secs().await? else {
+            return self.list_dashboard_daily_breakdown_raw(query).await;
+        };
+        let aggregate_start = query.created_from_unix_secs.saturating_add(86_399) / 86_400 * 86_400;
+        let aggregate_end = query.created_until_unix_secs.min(cutoff) / 86_400 * 86_400;
+        if aggregate_start >= aggregate_end {
+            return self.list_dashboard_daily_breakdown_raw(query).await;
+        }
+
+        let mut items = Vec::new();
+        if query.created_from_unix_secs < aggregate_start {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&UsageDashboardDailyBreakdownQuery {
+                    created_from_unix_secs: query.created_from_unix_secs,
+                    created_until_unix_secs: aggregate_start,
+                    tz_offset_minutes: query.tz_offset_minutes,
+                    user_id: query.user_id.clone(),
+                })
+                .await?,
+            );
+        }
+        let aggregate_query = UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: aggregate_start,
+            created_until_unix_secs: aggregate_end,
+            tz_offset_minutes: query.tz_offset_minutes,
+            user_id: query.user_id.clone(),
+        };
+        let aggregate_rows = self
+            .list_dashboard_daily_breakdown_from_daily_aggregates(&aggregate_query)
+            .await?;
+        if aggregate_rows.is_empty() {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&aggregate_query)
+                    .await?,
+            );
+        } else {
+            items.extend(aggregate_rows);
+        }
+        if aggregate_end < query.created_until_unix_secs {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&UsageDashboardDailyBreakdownQuery {
+                    created_from_unix_secs: aggregate_end,
+                    created_until_unix_secs: query.created_until_unix_secs,
+                    tz_offset_minutes: query.tz_offset_minutes,
+                    user_id: query.user_id.clone(),
+                })
+                .await?,
+            );
+        }
+        items.sort_by(|left, right| {
+            left.date
+                .cmp(&right.date)
+                .then_with(|| {
+                    right
+                        .total_cost_usd
+                        .partial_cmp(&left.total_cost_usd)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.model.cmp(&right.model))
+                .then_with(|| left.provider.cmp(&right.provider))
+        });
+        Ok(items)
     }
 
     pub async fn summarize_usage_totals_by_user_ids(
@@ -1859,6 +2135,21 @@ fn map_mysql_usage_daily_summary(
         total_tokens: row_u64(row, "total_tokens")?,
         total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
         actual_total_cost_usd: row.try_get("actual_total_cost_usd").map_sql_err()?,
+    })
+}
+
+fn map_mysql_dashboard_daily_breakdown_row(
+    row: &MySqlRow,
+) -> Result<StoredUsageDashboardDailyBreakdownRow, DataLayerError> {
+    Ok(StoredUsageDashboardDailyBreakdownRow {
+        date: row.try_get("date").map_sql_err()?,
+        model: row.try_get("model").map_sql_err()?,
+        provider: row.try_get("provider").map_sql_err()?,
+        requests: row_u64(row, "requests")?,
+        total_tokens: row_u64(row, "total_tokens")?,
+        total_cost_usd: row.try_get("total_cost_usd").map_sql_err()?,
+        response_time_sum_ms: row.try_get("response_time_sum_ms").map_sql_err()?,
+        response_time_samples: row_u64(row, "response_time_samples")?,
     })
 }
 

@@ -1966,6 +1966,146 @@ INSERT INTO stats_daily (
 }
 
 #[tokio::test]
+async fn sqlite_dashboard_daily_stats_combines_dimension_rollups_with_live_usage() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily (
+    id, "date", total_requests, success_requests, error_requests,
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+    total_cost, actual_total_cost, is_complete, created_at, updated_at
+) VALUES (
+    'daily-dimension-1', 86400, 2, 2, 0, 5, 7, 0, 0, 0.75, 0.75, 1, 1, 1
+);
+INSERT INTO stats_daily_model_provider (
+    id, "date", model, provider_name, total_requests, total_tokens, total_cost,
+    response_time_sum_ms, response_time_samples, created_at, updated_at
+) VALUES (
+    'daily-model-provider-1', 86400, 'model-history', 'provider-history',
+    2, 12, 0.75, 80, 2, 1, 1
+);
+INSERT INTO "usage" (
+    request_id, id, provider_name, model, total_tokens, total_cost_usd,
+    response_time_ms, status, billing_status, created_at_unix_ms, updated_at_unix_secs
+) VALUES (
+    'live-request-1', 'live-usage-1', 'provider-live', 'model-live', 9, 0.5,
+    30, 'completed', 'settled', 176400, 176400
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("dashboard dimension fixtures should seed");
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let rows = reader
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: 86_400,
+            created_until_unix_secs: 259_200,
+            tz_offset_minutes: 0,
+            user_id: None,
+        })
+        .await
+        .expect("dashboard daily breakdown should load");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].date, "1970-01-02");
+    assert_eq!(rows[0].model, "model-history");
+    assert_eq!(rows[0].provider, "provider-history");
+    assert_eq!(rows[0].requests, 2);
+    assert_eq!(rows[0].total_tokens, 12);
+    assert_eq!(rows[1].date, "1970-01-03");
+    assert_eq!(rows[1].model, "model-live");
+    assert_eq!(rows[1].provider, "provider-live");
+    assert_eq!(rows[1].requests, 1);
+    assert_eq!(rows[1].total_tokens, 9);
+    assert!(rows.iter().all(|row| row.model != "aggregate"));
+
+    let local_rows = reader
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: 57_600,
+            created_until_unix_secs: 230_400,
+            tz_offset_minutes: 480,
+            user_id: None,
+        })
+        .await
+        .expect("local dashboard daily breakdown should merge rollups and live usage");
+    assert_eq!(local_rows.len(), 2);
+    assert_eq!(local_rows[0].date, "1970-01-02");
+    assert_eq!(local_rows[0].model, "model-history");
+    assert_eq!(local_rows[0].provider, "provider-history");
+    assert_eq!(local_rows[1].date, "1970-01-03");
+    assert_eq!(local_rows[1].model, "model-live");
+    assert_eq!(local_rows[1].provider, "provider-live");
+    assert!(local_rows.iter().all(|row| row.model != "aggregate"));
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_daily_stats_uses_raw_rows_for_local_day_boundaries() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily (
+    id, "date", total_requests, success_requests, error_requests,
+    input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+    total_cost, actual_total_cost, is_complete, created_at, updated_at
+) VALUES (
+    'daily-local-1', 86400, 10, 10, 0, 10, 10, 0, 0, 1.0, 1.0, 1, 1, 1
+);
+INSERT INTO stats_daily_model_provider (
+    id, "date", model, provider_name, total_requests, total_tokens, total_cost,
+    response_time_sum_ms, response_time_samples, created_at, updated_at
+) VALUES (
+    'daily-local-model-provider-1', 86400, 'utc-model', 'utc-provider',
+    10, 20, 1.0, 100, 10, 1, 1
+);
+INSERT INTO "usage" (
+    request_id, id, provider_name, model, total_tokens, total_cost_usd,
+    response_time_ms, status, billing_status, created_at_unix_ms, updated_at_unix_secs
+) VALUES (
+    'local-request-1', 'local-usage-1', 'local-provider', 'local-model', 7, 0.25,
+    20, 'completed', 'settled', 60000, 60000
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("local dashboard fixtures should seed");
+
+    let rows = SqliteUsageReadRepository::new(pool)
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: 57_600,
+            created_until_unix_secs: 144_000,
+            tz_offset_minutes: 480,
+            user_id: None,
+        })
+        .await
+        .expect("local dashboard daily breakdown should load");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].date, "1970-01-02");
+    assert_eq!(rows[0].model, "local-model");
+    assert_eq!(rows[0].provider, "local-provider");
+    assert_eq!(rows[0].total_tokens, 7);
+}
+
+#[tokio::test]
 async fn sqlite_first_byte_fast_path_preserves_lifecycle_state_and_counters() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)

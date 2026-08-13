@@ -2,7 +2,8 @@ use super::{MysqlUsageStorage, MysqlUsageWriteRepository};
 use crate::run_migrations;
 use aether_data_contracts::repository::usage::{
     UpsertUsageRecord, UsageAuditListQuery, UsageBodyCaptureState, UsageCleanupExecutionMode,
-    UsageCleanupTargets, UsageCleanupWindow, UsageWriteRepository,
+    UsageCleanupTargets, UsageCleanupWindow, UsageDashboardDailyBreakdownQuery,
+    UsageWriteRepository,
 };
 use chrono::DateTime;
 
@@ -44,12 +45,167 @@ fn mysql_dashboard_reads_imported_daily_aggregates() {
     let source = include_str!("../usage.rs");
     assert!(source.contains("summarize_dashboard_usage_from_daily_aggregates"));
     assert!(source.contains("list_dashboard_daily_breakdown_from_daily_aggregates"));
+    assert!(source.contains("FROM stats_daily_model_provider"));
+    assert!(source.contains("FROM stats_user_daily_model_provider"));
+    assert!(source.contains("list_dashboard_daily_breakdown_raw"));
+    assert!(source.contains("tz_offset_minutes: query.tz_offset_minutes"));
+    assert!(source.contains("aggregate_end < query.created_until_unix_secs"));
     assert!(source.contains("FROM stats_daily"));
     assert!(source.contains("FROM stats_user_daily"));
     assert!(source.contains("'aggregate' AS model"));
     assert!(source.contains("AS SIGNED) AS total_requests"));
     assert!(source.contains("CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS total_requests"));
     assert!(source.contains("CAST(COALESCE(SUM(total_requests), 0) AS SIGNED) AS requests"));
+}
+
+#[tokio::test]
+async fn mysql_dashboard_combines_dimension_rollups_with_live_usage_when_url_is_set() {
+    let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!("skipping mysql dashboard rollup test because AETHER_TEST_MYSQL_URL is unset");
+        return;
+    };
+
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("mysql test pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("mysql migrations should run");
+
+    let suffix = unique_suffix();
+    let daily_id = format!("dashboard-daily-{suffix}");
+    let dimension_id = format!("dashboard-dimension-{suffix}");
+    let live_request_id = format!("dashboard-live-request-{suffix}");
+    let live_usage_id = format!("dashboard-live-usage-{suffix}");
+    let history_model = format!("history-model-{suffix}");
+    let history_provider = format!("history-provider-{suffix}");
+    let live_model = format!("live-model-{suffix}");
+    let live_provider = format!("live-provider-{suffix}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let day_index = 10_000 + (now.as_nanos() % 5_000) as i64;
+    let day = day_index * 86_400;
+    let live_created_at = day + 86_400 + 3_600;
+    let history_local_date = DateTime::<chrono::Utc>::from_timestamp(day + 28_800, 0)
+        .expect("history timestamp should be valid")
+        .date_naive()
+        .to_string();
+    let live_local_date = DateTime::<chrono::Utc>::from_timestamp(live_created_at + 28_800, 0)
+        .expect("live timestamp should be valid")
+        .date_naive()
+        .to_string();
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily (
+  id, `date`, total_requests, success_requests, error_requests,
+  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+  total_cost, actual_total_cost, is_complete, aggregated_at, created_at, updated_at
+) VALUES (?, ?, 2, 2, 0, 5, 7, 0, 0, 0.75, 0.75, TRUE, 1, 1, 1)
+"#,
+    )
+    .bind(&daily_id)
+    .bind(day)
+    .execute(&pool)
+    .await
+    .expect("mysql dashboard daily aggregate should seed");
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily_model_provider (
+  id, `date`, model, provider_name, total_requests, total_tokens, total_cost,
+  response_time_sum_ms, response_time_samples, created_at, updated_at
+) VALUES (?, ?, ?, ?, 2, 12, 0.75, 80, 2, 1, 1)
+"#,
+    )
+    .bind(&dimension_id)
+    .bind(day)
+    .bind(&history_model)
+    .bind(&history_provider)
+    .execute(&pool)
+    .await
+    .expect("mysql dashboard dimension aggregate should seed");
+    sqlx::query(
+        r#"
+INSERT INTO `usage` (
+  request_id, id, provider_name, model, total_tokens, total_cost_usd,
+  response_time_ms, status, billing_status, created_at_unix_ms, updated_at_unix_secs
+) VALUES (?, ?, ?, ?, 9, 0.5, 30, 'completed', 'settled', ?, ?)
+"#,
+    )
+    .bind(&live_request_id)
+    .bind(&live_usage_id)
+    .bind(&live_provider)
+    .bind(&live_model)
+    .bind(live_created_at)
+    .bind(live_created_at)
+    .execute(&pool)
+    .await
+    .expect("mysql live dashboard usage should seed");
+
+    let rows = MysqlUsageStorage::new(pool.clone())
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: day as u64,
+            created_until_unix_secs: (day + 172_800) as u64,
+            tz_offset_minutes: 0,
+            user_id: None,
+        })
+        .await
+        .expect("mysql dashboard daily breakdown should load");
+    let rows = rows
+        .into_iter()
+        .filter(|row| row.model == history_model || row.model == live_model)
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].model, history_model);
+    assert_eq!(rows[0].provider, history_provider);
+    assert_eq!(rows[0].total_tokens, 12);
+    assert_eq!(rows[1].model, live_model);
+    assert_eq!(rows[1].provider, live_provider);
+    assert_eq!(rows[1].total_tokens, 9);
+
+    let local_rows = MysqlUsageStorage::new(pool.clone())
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: (day - 28_800) as u64,
+            created_until_unix_secs: (day + 144_000) as u64,
+            tz_offset_minutes: 480,
+            user_id: None,
+        })
+        .await
+        .expect("mysql local dashboard daily breakdown should load");
+    let local_rows = local_rows
+        .into_iter()
+        .filter(|row| row.model == history_model || row.model == live_model)
+        .collect::<Vec<_>>();
+    assert_eq!(local_rows.len(), 2);
+    assert_eq!(local_rows[0].date, history_local_date);
+    assert_eq!(local_rows[0].model, history_model);
+    assert_eq!(local_rows[0].provider, history_provider);
+    assert_eq!(local_rows[1].date, live_local_date);
+    assert_eq!(local_rows[1].model, live_model);
+    assert_eq!(local_rows[1].provider, live_provider);
+
+    sqlx::query("DELETE FROM `usage` WHERE request_id = ?")
+        .bind(&live_request_id)
+        .execute(&pool)
+        .await
+        .expect("mysql live dashboard usage should clean up");
+    sqlx::query("DELETE FROM stats_daily_model_provider WHERE id = ?")
+        .bind(&dimension_id)
+        .execute(&pool)
+        .await
+        .expect("mysql dashboard dimension aggregate should clean up");
+    sqlx::query("DELETE FROM stats_daily WHERE id = ?")
+        .bind(&daily_id)
+        .execute(&pool)
+        .await
+        .expect("mysql dashboard daily aggregate should clean up");
 }
 
 #[test]
@@ -87,7 +243,7 @@ fn mysql_usage_stat_rebuilds_aggregate_in_sql() {
         source
             .matches("LEFT JOIN usage_settlement_snapshots AS settlement")
             .count(),
-        4
+        5
     );
 }
 
