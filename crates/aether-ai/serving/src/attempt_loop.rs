@@ -18,7 +18,11 @@ pub trait AiExecutionAttempt {
 #[derive(Debug)]
 pub enum AiAttemptLoopOutcome<Response, Exhaustion> {
     Responded(Response),
-    Deferred(Response),
+    Deferred {
+        response: Response,
+        owner_plan: Box<aether_contracts::ExecutionPlan>,
+        owner_report_context: Option<serde_json::Value>,
+    },
     Exhausted(Exhaustion),
     NoPath,
 }
@@ -130,8 +134,12 @@ where
                 fallback_response: attempt_fallback_response,
             } => {
                 port.record_attempt_failed(&attempt).await?;
-                if attempt_fallback_response.is_some() {
-                    fallback_response = attempt_fallback_response;
+                if let Some(response) = attempt_fallback_response {
+                    fallback_response = Some((
+                        response,
+                        Box::new(attempt.execution_plan().clone()),
+                        attempt.report_context(),
+                    ));
                 }
                 if scope != AiAttemptRetryScope::Candidate {
                     retry_filters.push(AiAttemptRetryFilter::new(&attempt, scope));
@@ -144,8 +152,12 @@ where
         last_attempted = Some((attempt.execution_plan().clone(), attempt.report_context()));
     }
 
-    if let Some(response) = fallback_response {
-        return Ok(AiAttemptLoopOutcome::Deferred(response));
+    if let Some((response, owner_plan, owner_report_context)) = fallback_response {
+        return Ok(AiAttemptLoopOutcome::Deferred {
+            response,
+            owner_plan,
+            owner_report_context,
+        });
     }
 
     let Some((last_plan, last_report_context)) = last_attempted else {
@@ -474,13 +486,47 @@ mod tests {
         .await
         .expect("fallback response loop should succeed");
 
-        assert!(matches!(
-            outcome,
-            super::AiAttemptLoopOutcome::Deferred("provider-error")
-        ));
+        let super::AiAttemptLoopOutcome::Deferred {
+            response,
+            owner_plan,
+            ..
+        } = outcome
+        else {
+            panic!("expected a deferred response");
+        };
+        assert_eq!(response, "provider-error");
+        assert_eq!(owner_plan.endpoint_id, "endpoint-a");
         assert_eq!(
             *port.unused.lock().expect("unused attempts should lock"),
             vec!["same-provider"]
         );
+    }
+
+    #[tokio::test]
+    async fn preserved_response_keeps_its_owner_when_a_later_failure_has_no_response() {
+        let port = ScopedRetryPort {
+            executed: Mutex::new(Vec::new()),
+            unused: Mutex::new(Vec::new()),
+        };
+        let outcome = run_ai_attempt_loop(
+            &port,
+            vec![
+                routed_attempt("provider-failure", "provider-a", "endpoint-a", "key-a"),
+                routed_attempt("endpoint-failure", "provider-b", "endpoint-b", "key-b"),
+            ],
+        )
+        .await
+        .expect("exhausted loop should preserve the earlier response");
+
+        let super::AiAttemptLoopOutcome::Deferred {
+            response,
+            owner_plan,
+            ..
+        } = outcome
+        else {
+            panic!("expected a deferred response");
+        };
+        assert_eq!(response, "provider-error");
+        assert_eq!(owner_plan.endpoint_id, "endpoint-a");
     }
 }

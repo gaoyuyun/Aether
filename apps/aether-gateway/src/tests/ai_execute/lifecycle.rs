@@ -14,6 +14,9 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data_contracts::repository::candidate_selection::{
     StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
 };
+use aether_data_contracts::repository::candidates::{
+    RequestCandidateReadRepository, RequestCandidateStatus,
+};
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -501,7 +504,7 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_
                     auth_repository,
                     candidate_selection_repository,
                     provider_catalog_repository,
-                    request_candidate_repository,
+                    Arc::clone(&request_candidate_repository),
                     DEVELOPMENT_ENCRYPTION_KEY,
                 ),
             ),
@@ -536,6 +539,24 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_
     assert!(body_text.contains("\"rate_limit_error\""));
     assert!(body_text.contains("\"slow down\""));
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
+
+    let candidates = request_candidate_repository
+        .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
+        .await
+        .expect("request candidates should read");
+    let terminal_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.status == RequestCandidateStatus::Failed)
+        .expect("embedded prefetch error should record a failed candidate");
+    assert_eq!(
+        terminal_candidate
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("request_lifecycle"))
+            .and_then(serde_json::Value::as_str),
+        Some("request_terminal"),
+        "the candidate whose embedded error was sent to the client owns request termination"
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

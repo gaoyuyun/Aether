@@ -7,7 +7,7 @@ use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 use aether_usage_runtime::{
     build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
 };
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::Response;
 use base64::Engine as _;
 use serde::Serialize;
@@ -30,7 +30,9 @@ use crate::orchestration::{
     LocalExecutionEffectContext, LocalFailoverAnalysis, LocalFailoverDecision,
     LocalHealthFailureEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
 };
-use crate::request_candidate_runtime::record_report_request_candidate_status;
+use crate::request_candidate_runtime::{
+    record_report_request_candidate_status, record_request_terminal_report_request_candidate_status,
+};
 use crate::request_diagnostics::attach_current_request_diagnostics_and_candidate_timing_to_report_context;
 use crate::usage::submit_sync_report;
 use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
@@ -443,7 +445,9 @@ async fn record_stream_sync_failure(
         failure_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
     );
-    if !matches!(handling, StreamFailureHandling::HonorLocalFailover) || !retrying_next_candidate {
+    let concludes_request =
+        !matches!(handling, StreamFailureHandling::HonorLocalFailover) || !retrying_next_candidate;
+    if concludes_request {
         crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
         let report_context_with_diagnostics =
             attach_current_request_diagnostics_and_candidate_timing_to_report_context(
@@ -472,23 +476,28 @@ async fn record_stream_sync_failure(
             .await;
     }
     let terminal_unix_secs = current_request_candidate_unix_ms();
-    record_report_request_candidate_status(
-        state,
-        report_context,
-        SchedulerRequestCandidateStatusUpdate {
-            status: RequestCandidateStatus::Failed,
-            status_code: candidate_status_code,
-            error_type: Some(error_type.to_string()),
-            error_message: Some(error_message.to_string()),
-            latency_ms: payload
-                .telemetry
-                .as_ref()
-                .and_then(|telemetry| telemetry.elapsed_ms),
-            started_at_unix_ms: started_at_unix_ms.or(Some(terminal_unix_secs)),
-            finished_at_unix_ms: Some(terminal_unix_secs),
-        },
-    )
-    .await;
+    let status_update = SchedulerRequestCandidateStatusUpdate {
+        status: RequestCandidateStatus::Failed,
+        status_code: candidate_status_code,
+        error_type: Some(error_type.to_string()),
+        error_message: Some(error_message.to_string()),
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms),
+        started_at_unix_ms: started_at_unix_ms.or(Some(terminal_unix_secs)),
+        finished_at_unix_ms: Some(terminal_unix_secs),
+    };
+    if concludes_request {
+        record_request_terminal_report_request_candidate_status(
+            state,
+            report_context,
+            status_update,
+        )
+        .await;
+    } else {
+        record_report_request_candidate_status(state, report_context, status_update).await;
+    }
     failure_analysis
 }
 
@@ -552,17 +561,22 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
         }
         if failure_disposition.preserve_upstream_error {
             if let Some(retry_fallback) = retry_fallback_out {
-                *retry_fallback = Some(attach_control_metadata_headers(
+                let fallback_body = Bytes::copy_from_slice(buffered_body);
+                let response = attach_control_metadata_headers(
                     crate::api::response::build_client_response_from_parts(
                         upstream_status_code,
                         &upstream_headers,
-                        Body::from(buffered_body.to_vec()),
+                        Body::from(fallback_body.clone()),
                         trace_id,
                         Some(decision),
                     )?,
                     Some(request_id),
                     candidate_id,
-                )?);
+                )?;
+                *retry_fallback = Some(crate::executor::attach_deferred_upstream_response_capture(
+                    response,
+                    fallback_body,
+                ));
             }
         }
         warn!(
@@ -757,24 +771,34 @@ async fn handle_prefetch_transport_stream_failure(
     }
 
     let terminal_unix_ms = current_request_candidate_unix_ms();
-    record_report_request_candidate_status(
-        state,
-        payload.report_context.as_ref(),
-        SchedulerRequestCandidateStatusUpdate {
-            status: RequestCandidateStatus::Failed,
-            status_code: None,
-            error_type: Some(error_type.to_string()),
-            error_message: Some(error_message.to_string()),
-            latency_ms: payload
-                .telemetry
-                .as_ref()
-                .and_then(|telemetry| telemetry.elapsed_ms)
-                .or(Some(candidate_elapsed_ms)),
-            started_at_unix_ms: Some(candidate_started_unix_ms),
-            finished_at_unix_ms: Some(terminal_unix_ms),
-        },
-    )
-    .await;
+    let status_update = SchedulerRequestCandidateStatusUpdate {
+        status: RequestCandidateStatus::Failed,
+        status_code: None,
+        error_type: Some(error_type.to_string()),
+        error_message: Some(error_message.to_string()),
+        latency_ms: payload
+            .telemetry
+            .as_ref()
+            .and_then(|telemetry| telemetry.elapsed_ms)
+            .or(Some(candidate_elapsed_ms)),
+        started_at_unix_ms: Some(candidate_started_unix_ms),
+        finished_at_unix_ms: Some(terminal_unix_ms),
+    };
+    if retrying_next_candidate {
+        record_report_request_candidate_status(
+            state,
+            payload.report_context.as_ref(),
+            status_update,
+        )
+        .await;
+    } else {
+        record_request_terminal_report_request_candidate_status(
+            state,
+            payload.report_context.as_ref(),
+            status_update,
+        )
+        .await;
+    }
 
     if retrying_next_candidate {
         if let Some(retry_scope) = retry_scope_out {
@@ -857,15 +881,128 @@ pub(super) async fn submit_midstream_stream_failure(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use aether_contracts::{ExecutionError, ExecutionErrorKind, ExecutionPhase};
+    use aether_contracts::{
+        ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan, RequestBody,
+    };
+    use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
     use base64::Engine as _;
     use serde_json::json;
 
     use super::{
         build_stream_failure_from_execution_error, build_stream_failure_from_provider_error_body,
         build_stream_failure_sync_payload, build_stream_transport_failure_report,
+        record_stream_sync_failure, StreamFailureHandling,
     };
+    use crate::data::GatewayDataState;
+    use crate::request_candidate_runtime::request_candidate_marks_request_terminal;
+    use crate::usage::GatewaySyncReportRequest;
+    use crate::AppState;
+
+    fn failure_test_plan(request_id: &str) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: request_id.to_string(),
+            candidate_id: Some(format!("candidate-{request_id}")),
+            provider_name: Some("custom".to_string()),
+            provider_id: format!("provider-{request_id}"),
+            endpoint_id: format!("endpoint-{request_id}"),
+            key_id: format!("key-{request_id}"),
+            method: "POST".to_string(),
+            url: "https://provider.example/v1/chat/completions".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-5"})),
+            stream: true,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
+
+    fn failure_test_payload(plan: &ExecutionPlan) -> GatewaySyncReportRequest {
+        GatewaySyncReportRequest {
+            trace_id: format!("trace-{}", plan.request_id),
+            report_kind: "openai_chat_sync_error".to_string(),
+            report_context: Some(json!({
+                "request_id": plan.request_id,
+                "candidate_id": plan.candidate_id,
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_id": plan.provider_id,
+                "endpoint_id": plan.endpoint_id,
+                "key_id": plan.key_id,
+            })),
+            status_code: 500,
+            headers: BTreeMap::new(),
+            body_json: Some(json!({
+                "error": {"type": "server_error", "message": "upstream failed"}
+            })),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_failure_marks_only_the_branch_that_concludes_the_request() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
+                    &repository,
+                )),
+            );
+
+        let terminal_plan = failure_test_plan("request-stream-failure-terminal");
+        let terminal_payload = failure_test_payload(&terminal_plan);
+        record_stream_sync_failure(
+            &state,
+            &terminal_plan,
+            terminal_payload.report_context.as_ref(),
+            &terminal_payload,
+            Some(500),
+            Some(100),
+            StreamFailureHandling::Terminal,
+        )
+        .await;
+
+        let retry_plan = failure_test_plan("request-stream-failure-retry");
+        let retry_payload = failure_test_payload(&retry_plan);
+        let retry_analysis = record_stream_sync_failure(
+            &state,
+            &retry_plan,
+            retry_payload.report_context.as_ref(),
+            &retry_payload,
+            Some(500),
+            Some(200),
+            StreamFailureHandling::HonorLocalFailover,
+        )
+        .await;
+        assert_eq!(
+            retry_analysis.decision,
+            crate::orchestration::LocalFailoverDecision::RetryNextCandidate
+        );
+
+        let terminal = repository
+            .list_by_request_id(terminal_plan.request_id.as_str())
+            .await
+            .expect("terminal candidate should read");
+        let retry = repository
+            .list_by_request_id(retry_plan.request_id.as_str())
+            .await
+            .expect("retry candidate should read");
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(retry.len(), 1);
+        assert!(request_candidate_marks_request_terminal(&terminal[0]));
+        assert!(!request_candidate_marks_request_terminal(&retry[0]));
+    }
 
     #[test]
     fn committed_transport_failure_has_no_upstream_status() {

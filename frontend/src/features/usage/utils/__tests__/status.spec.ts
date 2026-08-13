@@ -5,6 +5,7 @@ import {
   hasUsageFallback,
   hasUsageRetry,
   isUsageRecordFailed,
+  isUsageRecordPollable,
   isUsageRecordSuccessful,
   isUsageWebSocket,
   mapRequestStatusToTimelineStatus,
@@ -244,6 +245,37 @@ describe('usage status helpers', () => {
       client_requested_stream: false,
       client_is_stream: true,
     }))).toBe('标准->流式')
+  })
+
+  it('keeps polling a request whose candidate loop is still switching candidates', () => {
+    // The gateway may still be retrying the next candidate while a previous candidate's error is
+    // attached to the row. Polling must follow the backend lifecycle, not the display inference.
+    const record = buildUsageRecord({
+      status: 'pending',
+      status_code: 503,
+      error_message: 'first candidate failed'
+    })
+
+    expect(resolveDisplayRequestStatus(record)).toBe('failed')
+    expect(isUsageRecordPollable(record)).toBe(true)
+  })
+
+  it('keeps polling a streaming request that reports a candidate error', () => {
+    expect(isUsageRecordPollable(buildUsageRecord({
+      status: 'streaming',
+      status_code: 429,
+      error_message: 'rate limited'
+    }))).toBe(true)
+  })
+
+  it('stops polling once the request reaches a terminal lifecycle status', () => {
+    for (const status of ['completed', 'failed', 'cancelled'] as const) {
+      expect(isUsageRecordPollable(buildUsageRecord({ status }))).toBe(false)
+    }
+  })
+
+  it('does not poll records without a known lifecycle status', () => {
+    expect(isUsageRecordPollable(buildUsageRecord({ status: undefined }))).toBe(false)
   })
 
   it('uses status code only as a last fallback for timeline status', () => {

@@ -64,4 +64,5 @@ pub use request_candidate::{
     LocalRequestCandidateStatusRecordInput, ReportRequestCandidateStatusRecordInput,
     SchedulerExecutionRequestCandidateSeed, SchedulerRequestCandidateReportContext,
     SchedulerRequestCandidateStatusUpdate, SchedulerResolvedReportRequestCandidateSlot,
+    REQUEST_CANDIDATE_LIFECYCLE_KEY, REQUEST_CANDIDATE_LIFECYCLE_REQUEST_TERMINAL,
 };

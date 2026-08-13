@@ -7,11 +7,17 @@ describe('reconcileActiveRequestDiscovery', () => {
     const result = reconcileActiveRequestDiscovery({
       activeRequestIds: ['req-new', 'req-retained', 'req-new'],
       knownRecordIds: ['req-known'],
-      discoveredActiveRequestIds: ['req-retained', 'req-stale']
+      discoveredActiveRequestMissCounts: [
+        ['req-retained', 1],
+        ['req-briefly-omitted', 0]
+      ]
     })
 
     expect(result).toEqual({
-      retainedDiscoveredActiveRequestIds: ['req-retained'],
+      retainedDiscoveredActiveRequestMissCounts: [
+        ['req-retained', 0],
+        ['req-briefly-omitted', 1]
+      ],
       unseenActiveRequestIds: ['req-new']
     })
   })
@@ -20,12 +26,57 @@ describe('reconcileActiveRequestDiscovery', () => {
     const result = reconcileActiveRequestDiscovery({
       activeRequestIds: ['req-known', 'req-fresh'],
       knownRecordIds: ['req-known'],
-      discoveredActiveRequestIds: ['req-known']
+      discoveredActiveRequestMissCounts: [['req-known', 0]]
     })
 
     expect(result).toEqual({
-      retainedDiscoveredActiveRequestIds: [],
+      retainedDiscoveredActiveRequestMissCounts: [],
       unseenActiveRequestIds: ['req-fresh']
+    })
+  })
+
+  it('does not conclude anything about a record the active snapshot briefly omits', () => {
+    // A request missing from one active snapshot (paging, a lagging replica, a filtered window)
+    // must stay discovered so polling remains hot until the table can load its durable row.
+    const result = reconcileActiveRequestDiscovery({
+      activeRequestIds: [],
+      knownRecordIds: [],
+      discoveredActiveRequestMissCounts: [['req-briefly-omitted', 0]]
+    })
+
+    expect(result).toEqual({
+      retainedDiscoveredActiveRequestMissCounts: [['req-briefly-omitted', 1]],
+      unseenActiveRequestIds: []
+    })
+  })
+
+  it('drops a discovery after three consecutive active snapshot misses', () => {
+    let discoveredActiveRequestMissCounts: Array<[string, number]> = [['req-completed', 0]]
+
+    for (let miss = 1; miss <= 3; miss += 1) {
+      const result = reconcileActiveRequestDiscovery({
+        activeRequestIds: [],
+        knownRecordIds: [],
+        discoveredActiveRequestMissCounts
+      })
+      discoveredActiveRequestMissCounts = result.retainedDiscoveredActiveRequestMissCounts
+
+      expect(discoveredActiveRequestMissCounts).toEqual(
+        miss < 3 ? [['req-completed', miss]] : []
+      )
+    }
+  })
+
+  it('resets the miss count when a discovered request reappears', () => {
+    const result = reconcileActiveRequestDiscovery({
+      activeRequestIds: ['req-lagged'],
+      knownRecordIds: [],
+      discoveredActiveRequestMissCounts: [['req-lagged', 2]]
+    })
+
+    expect(result).toEqual({
+      retainedDiscoveredActiveRequestMissCounts: [['req-lagged', 0]],
+      unseenActiveRequestIds: []
     })
   })
 
@@ -33,11 +84,11 @@ describe('reconcileActiveRequestDiscovery', () => {
     const result = reconcileActiveRequestDiscovery({
       activeRequestIds: ['req-known', 'req-retained'],
       knownRecordIds: ['req-known'],
-      discoveredActiveRequestIds: ['req-retained']
+      discoveredActiveRequestMissCounts: [['req-retained', 0]]
     })
 
     expect(result).toEqual({
-      retainedDiscoveredActiveRequestIds: ['req-retained'],
+      retainedDiscoveredActiveRequestMissCounts: [['req-retained', 0]],
       unseenActiveRequestIds: []
     })
   })

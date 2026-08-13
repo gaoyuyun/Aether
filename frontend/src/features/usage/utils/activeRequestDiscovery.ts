@@ -1,13 +1,15 @@
 export interface ActiveRequestDiscoverySnapshot {
   activeRequestIds: Iterable<string>
   knownRecordIds: Iterable<string>
-  discoveredActiveRequestIds: Iterable<string>
+  discoveredActiveRequestMissCounts: Iterable<readonly [string, number]>
 }
 
 export interface ActiveRequestDiscoveryResult {
-  retainedDiscoveredActiveRequestIds: string[]
+  retainedDiscoveredActiveRequestMissCounts: Array<[string, number]>
   unseenActiveRequestIds: string[]
 }
+
+export const ACTIVE_REQUEST_DISCOVERY_MISS_LIMIT = 3
 
 export function reconcileActiveRequestDiscovery(
   snapshot: ActiveRequestDiscoverySnapshot
@@ -22,14 +24,23 @@ export function reconcileActiveRequestDiscovery(
     activeRequestIds.push(id)
   }
 
-  const retainedDiscoveredActiveRequestIds: string[] = []
+  const retainedDiscoveredActiveRequestMissCounts: Array<[string, number]> = []
   const retainedDiscoveredSet = new Set<string>()
 
-  for (const id of snapshot.discoveredActiveRequestIds) {
+  for (const [id, previousMissCount] of snapshot.discoveredActiveRequestMissCounts) {
     if (!id || retainedDiscoveredSet.has(id)) continue
-    if (knownRecordIds.has(id) || !activeRequestIdSet.has(id)) continue
+    if (knownRecordIds.has(id)) continue
+
+    // A discovery snapshot can briefly omit an in-flight request because of paging or replica
+    // lag. Keep it through a small grace window, but eventually release completed requests that
+    // cannot enter the currently filtered/paged table so discovery polling can cool down again.
+    const missCount = activeRequestIdSet.has(id)
+      ? 0
+      : Math.max(0, previousMissCount) + 1
+    if (missCount >= ACTIVE_REQUEST_DISCOVERY_MISS_LIMIT) continue
+
     retainedDiscoveredSet.add(id)
-    retainedDiscoveredActiveRequestIds.push(id)
+    retainedDiscoveredActiveRequestMissCounts.push([id, missCount])
   }
 
   const unseenActiveRequestIds = activeRequestIds.filter(
@@ -37,7 +48,7 @@ export function reconcileActiveRequestDiscovery(
   )
 
   return {
-    retainedDiscoveredActiveRequestIds,
+    retainedDiscoveredActiveRequestMissCounts,
     unseenActiveRequestIds
   }
 }

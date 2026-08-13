@@ -5,6 +5,8 @@ use std::sync::{
     Arc,
 };
 
+use aether_data_contracts::repository::candidates::RequestCandidateStatus;
+use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 use aether_usage_runtime::{build_usage_event_data_seed, UsageEvent, UsageEventType};
 use axum::body::Body;
 use axum::http::Response;
@@ -14,6 +16,7 @@ use tokio::sync::Notify;
 use crate::ai_serving::{build_core_error_body_for_client_format, LocalCoreSyncErrorKind};
 use crate::api::response::{attach_control_metadata_headers, build_client_response_from_parts};
 use crate::control::GatewayControlDecision;
+use crate::request_candidate_runtime::record_request_terminal_local_request_candidate_status;
 use crate::request_diagnostics::attach_current_request_diagnostics_and_candidate_timing_to_report_context;
 use crate::{AppState, GatewayError};
 
@@ -138,6 +141,24 @@ pub(crate) async fn build_transport_error_stop_response(
         ("content-type".to_string(), "application/json".to_string()),
         ("content-length".to_string(), body_bytes.len().to_string()),
     ]);
+    let terminal_unix_ms = crate::clock::current_unix_ms();
+    record_request_terminal_local_request_candidate_status(
+        state,
+        plan,
+        report_context,
+        SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Failed,
+            status_code: Some(client_status_code),
+            error_type: Some(error_type.to_string()),
+            error_message: Some(error_message.to_string()),
+            latency_ms: Some(elapsed_ms),
+            // Preserve the exact start timestamp written when the candidate began. The elapsed
+            // duration is sufficient when this terminal update has to create the row itself.
+            started_at_unix_ms: None,
+            finished_at_unix_ms: Some(terminal_unix_ms),
+        },
+    )
+    .await;
 
     if state.usage_runtime.is_enabled() {
         let report_context_with_diagnostics =
@@ -189,4 +210,89 @@ pub(crate) async fn build_transport_error_stop_response(
         Some(plan.request_id.as_str()),
         plan.candidate_id.as_deref(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use aether_contracts::{ExecutionPlan, RequestBody};
+    use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateReadRepository, RequestCandidateStatus,
+    };
+    use serde_json::json;
+
+    use super::build_transport_error_stop_response;
+    use crate::control::GatewayControlDecision;
+    use crate::data::GatewayDataState;
+    use crate::request_candidate_runtime::request_candidate_marks_request_terminal;
+    use crate::AppState;
+
+    #[tokio::test]
+    async fn transport_stop_response_marks_owning_candidate_request_terminal() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
+                    &repository,
+                )),
+            );
+        let plan = ExecutionPlan {
+            request_id: "request-transport-stop".to_string(),
+            candidate_id: Some("candidate-transport-stop".to_string()),
+            provider_name: Some("custom".to_string()),
+            provider_id: "provider-transport-stop".to_string(),
+            endpoint_id: "endpoint-transport-stop".to_string(),
+            key_id: "key-transport-stop".to_string(),
+            method: "POST".to_string(),
+            url: "https://provider.example/v1/chat/completions".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-5"})),
+            stream: false,
+            client_api_format: "openai:chat".to_string(),
+            provider_api_format: "openai:chat".to_string(),
+            model_name: Some("gpt-5".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let report_context = json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        let response = build_transport_error_stop_response(
+            &state,
+            &plan,
+            Some(&report_context),
+            "trace-transport-stop",
+            &GatewayControlDecision::synthetic(
+                "/v1/chat/completions",
+                Some("ai_public".to_string()),
+                Some("openai".to_string()),
+                Some("chat".to_string()),
+                Some("openai:chat".to_string()),
+            ),
+            504,
+            "local_stream_candidate_watchdog_timeout",
+            "Stream first byte timeout",
+            250,
+        )
+        .await
+        .expect("transport stop response should build");
+
+        assert_eq!(response.status().as_u16(), 504);
+        let candidates = repository
+            .list_by_request_id(plan.request_id.as_str())
+            .await
+            .expect("request candidates should read");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status, RequestCandidateStatus::Failed);
+        assert_eq!(candidates[0].status_code, Some(504));
+        assert!(request_candidate_marks_request_terminal(&candidates[0]));
+    }
 }

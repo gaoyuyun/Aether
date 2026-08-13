@@ -140,9 +140,14 @@ pub(crate) async fn maybe_execute_via_stream_decision_path(
         transfer_tracker,
     };
 
-    Ok(from_ai_serving_outcome(
-        run_ai_stream_execution_path(&port).await?,
-    ))
+    let outcome = run_ai_stream_execution_path(&port).await?;
+    let outcome = match outcome {
+        AiServingExecutionOutcome::Deferred(response) => AiServingExecutionOutcome::Deferred(
+            super::finalize_deferred_upstream_response(state, response).await,
+        ),
+        other => other,
+    };
+    Ok(from_ai_serving_outcome(outcome))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,15 +177,19 @@ async fn execute_openai_chat_stream_fast_path(
         "stream_openai_chat_local_decision",
         started_at.elapsed().as_millis() as u64,
     );
-    match local_outcome {
+    let deferred_response = match local_outcome {
         LocalExecutionRequestOutcome::Responded(response) => {
-            return Ok(LocalExecutionRequestOutcome::Responded(response));
+            if super::is_deferred_upstream_response(&response) {
+                Some(response)
+            } else {
+                return Ok(LocalExecutionRequestOutcome::Responded(response));
+            }
         }
         LocalExecutionRequestOutcome::Exhausted(outcome) => {
             return Ok(LocalExecutionRequestOutcome::Exhausted(outcome));
         }
-        LocalExecutionRequestOutcome::NoPath => {}
-    }
+        LocalExecutionRequestOutcome::NoPath => None,
+    };
 
     if let Some(response) = maybe_execute_stream_via_remote_decision(
         state, parts, trace_id, decision, body_json, plan_kind,
@@ -188,6 +197,12 @@ async fn execute_openai_chat_stream_fast_path(
     .await?
     {
         return Ok(LocalExecutionRequestOutcome::Responded(response));
+    }
+
+    if let Some(response) = deferred_response {
+        return Ok(LocalExecutionRequestOutcome::Responded(
+            super::finalize_deferred_upstream_response(state, response).await,
+        ));
     }
 
     let fallback_started_at = std::time::Instant::now();
@@ -208,7 +223,16 @@ async fn execute_openai_chat_stream_fast_path(
         "frontdoor_stream_fast_path",
         fallback_started_at.elapsed().as_millis() as u64,
     );
-    Ok(fallback_outcome)
+    match fallback_outcome {
+        LocalExecutionRequestOutcome::Responded(response)
+            if super::is_deferred_upstream_response(&response) =>
+        {
+            Ok(LocalExecutionRequestOutcome::Responded(
+                super::finalize_deferred_upstream_response(state, response).await,
+            ))
+        }
+        other => Ok(other),
+    }
 }
 
 struct GatewayStreamExecutionPathPort<'a> {

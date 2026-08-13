@@ -38,6 +38,30 @@ const ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL: &str = "Admin usage data unavailable"
 const DAY_1_UNIX_SECS: i64 = 1_711_000_000;
 const DAY_2_UNIX_SECS: i64 = 1_711_086_400;
 
+/// Runs an async gateway test on a dedicated large stack.
+///
+/// The end-to-end router futures are large in debug builds and overflow the default test stack.
+fn run_async_test_on_large_stack<F>(name: &'static str, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime should build")
+                .block_on(future);
+        })
+        .expect("large-stack admin usage test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 fn admin_request(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     builder
         .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
@@ -1024,16 +1048,27 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["requests"].as_array().expect("array").len(), 1);
-    assert_eq!(payload["requests"][0]["id"], "usage-pending");
-    assert_eq!(payload["requests"][0]["effective_input_tokens"], 0);
-    assert_eq!(payload["requests"][0]["provider"], "OpenAI");
-    assert_eq!(payload["requests"][0]["api_key_name"], "fresh-primary");
-    assert_eq!(payload["requests"][0]["has_fallback"], true);
-    assert_eq!(
-        payload["requests"][0]["provider_key_name"],
-        "upstream-primary"
-    );
+    let requests = payload["requests"].as_array().expect("array");
+    // Both rows are still `pending`. A request-level 4xx/5xx on an active row belongs to a
+    // candidate the loop may still retry past, so it must neither drop the row from the active
+    // list nor be reported as the request outcome.
+    assert_eq!(requests.len(), 2);
+    let pending = requests
+        .iter()
+        .find(|request| request["id"] == "usage-pending")
+        .expect("the plain pending request should stay active");
+    assert_eq!(pending["effective_input_tokens"], 0);
+    assert_eq!(pending["provider"], "OpenAI");
+    assert_eq!(pending["api_key_name"], "fresh-primary");
+    assert_eq!(pending["has_fallback"], true);
+    assert_eq!(pending["provider_key_name"], "upstream-primary");
+    let failed_pending = requests
+        .iter()
+        .find(|request| request["id"] == "usage-failed-pending")
+        .expect("a pending request carrying a candidate failure should stay active");
+    assert_eq!(failed_pending["status"], "pending");
+    assert!(failed_pending["status_code"].is_null());
+    assert!(failed_pending["error_message"].is_null());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -1168,6 +1203,170 @@ async fn gateway_handles_admin_usage_active_ids_for_terminal_updates() {
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+/// Builds an active usage row that still carries an intermediate candidate's failure signal.
+///
+/// Older gateways promoted the candidate's HTTP status to the request row while the candidate loop
+/// was still switching candidates, so the reader has to keep tolerating those rows.
+fn active_usage_row_with_candidate_failure_signal(
+    id: &str,
+    request_id: &str,
+    status: &str,
+) -> StoredRequestUsageAudit {
+    let mut usage = sample_usage_row(
+        id,
+        request_id,
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "OpenAI",
+        "gpt-5",
+        status,
+        10,
+        0,
+        0.0,
+        0.0,
+        recent_unix_secs(2),
+    );
+    usage.status_code = Some(503);
+    usage.error_message = Some("upstream failed".to_string());
+    usage
+}
+
+fn retryable_failed_request_candidate(
+    id: &str,
+    request_id: &str,
+    candidate_index: i32,
+) -> StoredRequestCandidate {
+    let mut candidate = sample_request_candidate(
+        id,
+        request_id,
+        candidate_index,
+        0,
+        RequestCandidateStatus::Failed,
+    );
+    candidate.extra_data = Some(json!({
+        "error_flow": {
+            "decision": "retry_next_candidate",
+            "retryable": true,
+        }
+    }));
+    candidate
+}
+
+#[test]
+fn gateway_keeps_admin_usage_active_while_candidates_are_still_switching() {
+    run_async_test_on_large_stack(
+        "gateway_keeps_admin_usage_active_while_candidates_are_still_switching",
+        gateway_keeps_admin_usage_active_while_candidates_are_still_switching_impl(),
+    );
+}
+
+async fn gateway_keeps_admin_usage_active_while_candidates_are_still_switching_impl() {
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+        active_usage_row_with_candidate_failure_signal(
+            "usage-switching",
+            "req-switching",
+            "pending",
+        ),
+    ]));
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        retryable_failed_request_candidate("cand-switching-0", "req-switching", 0),
+    ]));
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    request_candidate_repository,
+                    usage_repository,
+                ),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response =
+        admin_request(reqwest::Client::new().get(format!("{gateway_url}/api/admin/usage/active")))
+            .send()
+            .await
+            .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let requests = payload["requests"].as_array().expect("array");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a request that is still switching candidates must stay in the active list"
+    );
+    assert_eq!(requests[0]["id"], "usage-switching");
+    assert_eq!(requests[0]["status"], "pending");
+    assert!(
+        requests[0]["status_code"].is_null(),
+        "the intermediate candidate status must not surface as a request status code"
+    );
+    assert!(
+        requests[0]["error_message"].is_null(),
+        "the intermediate candidate error must not surface as a request error"
+    );
+
+    gateway_handle.abort();
+}
+
+#[test]
+fn gateway_commits_admin_usage_failure_when_candidate_owns_the_response() {
+    run_async_test_on_large_stack(
+        "gateway_commits_admin_usage_failure_when_candidate_owns_the_response",
+        gateway_commits_admin_usage_failure_when_candidate_owns_the_response_impl(),
+    );
+}
+
+async fn gateway_commits_admin_usage_failure_when_candidate_owns_the_response_impl() {
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![
+        active_usage_row_with_candidate_failure_signal("usage-final", "req-final", "pending"),
+    ]));
+    let mut terminal_candidate = sample_request_candidate(
+        "cand-final-0",
+        "req-final",
+        0,
+        0,
+        RequestCandidateStatus::Failed,
+    );
+    terminal_candidate.extra_data = Some(json!({ "request_lifecycle": "request_terminal" }));
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        terminal_candidate,
+    ]));
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    request_candidate_repository,
+                    usage_repository,
+                ),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/active?ids=usage-final"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    let requests = payload["requests"].as_array().expect("array");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["status"], "failed");
+    assert_eq!(requests[0]["status_code"], 503);
+    assert_eq!(requests[0]["error_message"], "upstream failed");
+
+    gateway_handle.abort();
 }
 
 #[tokio::test]

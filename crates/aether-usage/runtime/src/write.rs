@@ -438,6 +438,7 @@ pub fn build_streaming_usage_record_from_seed(
 
 pub(crate) fn build_active_usage_event_from_owned_seed(
     seed: LifecycleUsageSeed,
+    telemetry: Option<ExecutionTelemetry>,
     updated_at_unix_secs: u64,
 ) -> Result<UsageEvent, DataLayerError> {
     let record = build_lifecycle_usage_record_owned(OwnedLifecycleUsageRecordInput {
@@ -445,8 +446,8 @@ pub(crate) fn build_active_usage_event_from_owned_seed(
         options: LifecycleUsageRecordOptions {
             lifecycle_state: UsageLifecycleState::Streaming,
             status_code: None,
-            response_time_ms: None,
-            first_byte_time_ms: None,
+            response_time_ms: telemetry.as_ref().and_then(|value| value.elapsed_ms),
+            first_byte_time_ms: telemetry.as_ref().and_then(|value| value.ttfb_ms),
             response_headers: None,
             client_response_headers: None,
             updated_at_unix_secs,

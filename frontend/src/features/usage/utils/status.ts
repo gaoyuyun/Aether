@@ -252,6 +252,21 @@ export function resolveDisplayRequestStatus(record: UsageDisplayStatusRecord): R
   return status ?? (hasAnyFailureSignal(record) ? 'failed' : undefined)
 }
 
+/**
+ * Whether a record's request lifecycle is still running and must keep being polled.
+ *
+ * This deliberately reads the backend lifecycle status only. A request that is retrying across
+ * candidates can still carry an error code from a candidate the gateway already abandoned, and
+ * deriving pollability from the display status would drop such a request from the polling set
+ * before its next candidate answers — leaving the row stuck on an intermediate failure forever.
+ */
+export function isUsageRecordPollable(
+  record: Pick<UsageRecord, 'status'>
+): boolean {
+  const status = normalizeRequestStatus(record.status)
+  return status === 'pending' || status === 'streaming'
+}
+
 export function mapRequestStatusToTimelineStatus(
   status: RequestStatusLike
 ): TimelineFinalStatus | undefined {

@@ -21,6 +21,16 @@ describe('admin usage initial loading', () => {
     expect(mountedBlock).not.toContain('await loadAdminUsers()')
   })
 
+  it('derives the polling set from the backend lifecycle status, not the display status', () => {
+    const activeIdsBlock = source
+      .split('const activeRequestIds = computed(() => {')[1]
+      ?.split('})')[0]
+
+    expect(activeIdsBlock).toBeTruthy()
+    expect(activeIdsBlock).toContain('isUsageRecordPollable(record)')
+    expect(activeIdsBlock).not.toContain('resolveDisplayRequestStatus')
+  })
+
   it('uses authoritative active snapshots for errors and final-provider facts', () => {
     const pollBlock = source
       .split('async function pollActiveRequests()')[1]
@@ -31,6 +41,10 @@ describe('admin usage initial loading', () => {
     expect(pollBlock).toContain('!updateSnapshotIsOlder && currentRank < 2 && updateHasFailureSignal')
     expect(pollBlock).toContain('record.error_message = mergeUsageRecordErrorMessage(')
     expect(pollBlock).toContain('{ authoritative: shouldApply }')
+    // A terminal snapshot must be able to clear a status code left by an abandoned candidate.
+    expect(pollBlock).toContain('record.status_code = update.status_code ?? undefined')
+    // Records the active snapshot omits are left untouched instead of being concluded.
+    expect(pollBlock).toContain('if (!record) continue')
     expect(pollBlock).toContain('record.target_model = typeof update.target_model')
     expect(pollBlock).toContain('record.reasoning_effort = typeof update.reasoning_effort')
     expect(pollBlock).toContain('record.service_tier = typeof update.service_tier')

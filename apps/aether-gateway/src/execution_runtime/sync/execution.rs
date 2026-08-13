@@ -82,7 +82,7 @@ use crate::provider_pool_demand::acquire_provider_pool_in_flight_guard;
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_extra_data,
     record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
-    snapshot_local_request_candidate_status,
+    snapshot_local_request_candidate_status, with_request_terminal_lifecycle_report_context,
 };
 use crate::request_diagnostics::{
     attach_current_request_diagnostics_and_candidate_start_timing_to_report_context,
@@ -274,12 +274,16 @@ async fn record_sync_attempt_forced_terminal_state(
     let error_message = error_message.into();
     let report_context =
         attach_request_diagnostics_to_report_context(report_context, request_diagnostics.as_ref());
+    // The guard only fires once the attempt future is gone, so no other candidate can take over
+    // this request: the candidate outcome is the request outcome.
+    let request_terminal_report_context =
+        with_request_terminal_lifecycle_report_context(report_context.as_ref());
     let terminal_unix_ms = current_request_candidate_unix_ms();
     let latency_ms = elapsed_ms_since(candidate_started_at);
     record_local_request_candidate_status(
         &state,
         &plan,
-        report_context.as_ref(),
+        Some(&request_terminal_report_context),
         SchedulerRequestCandidateStatusUpdate {
             status: candidate_status,
             status_code: Some(status_code),
@@ -406,6 +410,7 @@ fn build_sync_execution_failure_fallback_response(
     let body_json = build_sync_execution_failure_fallback_body(&plan.client_api_format, kind);
     let body_bytes = serde_json::to_vec(&body_json)
         .map_err(|error| GatewayError::Internal(error.to_string()))?;
+    let body_bytes = Bytes::from(body_bytes);
     let headers = BTreeMap::from([
         ("content-type".to_string(), "application/json".to_string()),
         ("content-length".to_string(), body_bytes.len().to_string()),
@@ -413,16 +418,18 @@ fn build_sync_execution_failure_fallback_response(
     let response = build_client_response_from_parts(
         StatusCode::BAD_GATEWAY.as_u16(),
         &headers,
-        Body::from(body_bytes),
+        Body::from(body_bytes.clone()),
         trace_id,
         Some(decision),
     )?;
-    attach_control_metadata_headers(
+    let response = attach_control_metadata_headers(
         response,
         Some(plan.request_id.as_str()),
         plan.candidate_id.as_deref(),
-    )
-    .map(Some)
+    )?;
+    Ok(Some(
+        crate::executor::attach_deferred_upstream_response_capture(response, body_bytes),
+    ))
 }
 
 fn maybe_store_sync_execution_failure_fallback(
@@ -496,6 +503,12 @@ fn spawn_sync_candidate_status_update(
     });
 }
 
+/// Records that a non-stream candidate's upstream response headers arrived.
+///
+/// The candidate's HTTP status must not reach the request-level usage record here: the candidate
+/// loop may still discard this candidate and retry the next one, and a request-level 4xx/5xx would
+/// make an active request look like a failed one to the usage APIs and the UI. Only liveness and
+/// first-byte timing are promoted; the status code stays on the request candidate row.
 fn record_sync_response_started(
     state: &AppState,
     lifecycle_seed: aether_usage_runtime::LifecycleUsageSeed,
@@ -506,16 +519,17 @@ fn record_sync_response_started(
     status_code: u16,
     ttfb_ms: u64,
 ) {
-    state.usage_runtime.record_stream_started_immediate_async(
-        state.usage_lifecycle_data_state().as_ref(),
-        lifecycle_seed,
-        status_code,
-        Some(ExecutionTelemetry {
-            ttfb_ms: Some(ttfb_ms),
-            elapsed_ms: Some(ttfb_ms),
-            upstream_bytes: None,
-        }),
-    );
+    state
+        .usage_runtime
+        .record_sync_response_started_immediate_async(
+            state.usage_lifecycle_data_state().as_ref(),
+            lifecycle_seed,
+            Some(ExecutionTelemetry {
+                ttfb_ms: Some(ttfb_ms),
+                elapsed_ms: Some(ttfb_ms),
+                upstream_bytes: None,
+            }),
+        );
 
     if let Some(snapshot) = request_candidate_status_snapshot {
         spawn_sync_candidate_status_update(
@@ -2781,6 +2795,7 @@ async fn execute_execution_runtime_sync_impl(
         }
         if failure_disposition.preserve_upstream_error {
             if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
+                let fallback_body = Bytes::from(body_bytes.clone());
                 let mut fallback_headers = headers.clone();
                 apply_endpoint_response_header_rules(
                     state,
@@ -2789,17 +2804,23 @@ async fn execute_execution_runtime_sync_impl(
                     body_json.as_ref(),
                 )
                 .await?;
-                *retry_fallback = Some(attach_control_metadata_headers(
+                let response = attach_control_metadata_headers(
                     build_client_response_from_parts(
                         result.status_code,
                         &fallback_headers,
-                        Body::from(body_bytes.clone()),
+                        Body::from(fallback_body.clone()),
                         trace_id,
                         Some(decision),
                     )?,
                     Some(plan.request_id.as_str()),
                     plan.candidate_id.as_deref(),
-                )?);
+                )?;
+                *retry_fallback = Some(
+                    crate::executor::attach_deferred_upstream_response_capture(
+                        response,
+                        fallback_body,
+                    ),
+                );
             }
         }
         let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -2929,12 +2950,17 @@ async fn execute_execution_runtime_sync_impl(
             )
         })
         .flatten();
-    record_local_request_candidate_status(
-        state,
-        &plan,
+    // Past the retry decision this candidate owns the client response, so its outcome is also the
+    // request outcome. Candidates that fail earlier stay unmarked because the loop may continue.
+    let request_terminal_report_context = with_request_terminal_lifecycle_report_context(
         error_flow_report_context
             .as_ref()
             .or(report_context.as_ref()),
+    );
+    record_local_request_candidate_status(
+        state,
+        &plan,
+        Some(&request_terminal_report_context),
         SchedulerRequestCandidateStatusUpdate {
             status: if result.status_code >= 400 {
                 RequestCandidateStatus::Failed
@@ -3970,7 +3996,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let active_usage = active_usage.expect("usage should become active before body finishes");
-        assert_eq!(active_usage.status_code, Some(200));
+        // The candidate's HTTP status stays on the candidate row: the loop may still discard this
+        // candidate, and a request-level status code would make an in-flight request look decided.
+        assert_eq!(active_usage.status_code, None);
         assert!(active_usage.first_byte_time_ms.is_some());
         assert!(active_usage.response_time_ms.is_some());
 
