@@ -207,33 +207,6 @@ VALUES (
 )
 "#;
 
-const FIND_DUPLICATE_PROXY_NODE_SQL: &str = r#"
-SELECT
-  id,
-  name,
-  ip,
-  port
-FROM proxy_nodes
-WHERE ip = $1
-  AND port = $2
-LIMIT 1
-FOR UPDATE
-"#;
-
-const FIND_DUPLICATE_PROXY_NODE_EXCLUDING_ID_SQL: &str = r#"
-SELECT
-  id,
-  name,
-  ip,
-  port
-FROM proxy_nodes
-WHERE ip = $1
-  AND port = $2
-  AND id <> $3
-LIMIT 1
-FOR UPDATE
-"#;
-
 const INSERT_MANUAL_PROXY_NODE_SQL: &str = r#"
 INSERT INTO proxy_nodes (
   id,
@@ -799,43 +772,6 @@ impl SqlxProxyNodeRepository {
 
         (!config.is_empty()).then_some(serde_json::Value::Object(config))
     }
-
-    fn duplicate_proxy_node_detail(name: &str, ip: &str, port: i32) -> String {
-        format!("已存在相同地址的代理节点: {name} ({ip}:{port})")
-    }
-
-    async fn find_duplicate_proxy_node_locked(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        ip: &str,
-        port: i32,
-        exclude_node_id: Option<&str>,
-    ) -> Result<Option<(String, String, i32)>, DataLayerError> {
-        let row = if let Some(exclude_node_id) = exclude_node_id {
-            sqlx::query(FIND_DUPLICATE_PROXY_NODE_EXCLUDING_ID_SQL)
-                .bind(ip)
-                .bind(port)
-                .bind(exclude_node_id)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_postgres_err()?
-        } else {
-            sqlx::query(FIND_DUPLICATE_PROXY_NODE_SQL)
-                .bind(ip)
-                .bind(port)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_postgres_err()?
-        };
-
-        row.map(|row| {
-            Ok((
-                row.try_get("name").map_postgres_err()?,
-                row.try_get("ip").map_postgres_err()?,
-                row.try_get("port").map_postgres_err()?,
-            ))
-        })
-        .transpose()
-    }
 }
 
 #[async_trait]
@@ -1011,23 +947,7 @@ impl ProxyNodeWriteRepository for SqlxProxyNodeRepository {
         &self,
         mutation: &ProxyNodeManualCreateMutation,
     ) -> Result<StoredProxyNode, DataLayerError> {
-        let lock_key = Self::registration_lock_key(&mutation.ip, mutation.port);
         let mut tx = self.pool.begin().await.map_postgres_err()?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await
-            .map_postgres_err()?;
-
-        if let Some((name, ip, port)) =
-            Self::find_duplicate_proxy_node_locked(&mut tx, &mutation.ip, mutation.port, None)
-                .await?
-        {
-            return Err(DataLayerError::InvalidInput(
-                Self::duplicate_proxy_node_detail(&name, &ip, port),
-            ));
-        }
-
         let node_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(INSERT_MANUAL_PROXY_NODE_SQL)
             .bind(&node_id)
@@ -1063,29 +983,7 @@ impl ProxyNodeWriteRepository for SqlxProxyNodeRepository {
             ));
         }
 
-        let next_ip = mutation.ip.as_deref().unwrap_or(existing.ip.as_str());
-        let next_port = mutation.port.unwrap_or(existing.port);
-        let lock_key = Self::registration_lock_key(next_ip, next_port);
         let mut tx = self.pool.begin().await.map_postgres_err()?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await
-            .map_postgres_err()?;
-
-        if let Some((name, ip, port)) = Self::find_duplicate_proxy_node_locked(
-            &mut tx,
-            next_ip,
-            next_port,
-            Some(&mutation.node_id),
-        )
-        .await?
-        {
-            return Err(DataLayerError::InvalidInput(
-                Self::duplicate_proxy_node_detail(&name, &ip, port),
-            ));
-        }
-
         sqlx::query(UPDATE_MANUAL_PROXY_NODE_SQL)
             .bind(&mutation.node_id)
             .bind(mutation.name.as_deref())

@@ -162,13 +162,6 @@ impl InMemoryProxyNodeRepository {
 
         (!config.is_empty()).then_some(Value::Object(config))
     }
-
-    fn duplicate_proxy_node_error(node: &StoredProxyNode) -> DataLayerError {
-        DataLayerError::InvalidInput(format!(
-            "已存在相同地址的代理节点: {} ({}:{})",
-            node.name, node.ip, node.port
-        ))
-    }
 }
 
 #[async_trait]
@@ -362,13 +355,6 @@ impl ProxyNodeWriteRepository for InMemoryProxyNodeRepository {
         mutation: &ProxyNodeManualCreateMutation,
     ) -> Result<StoredProxyNode, DataLayerError> {
         let mut nodes = self.nodes.write().expect("proxy node repository lock");
-        if let Some(existing) = nodes
-            .values()
-            .find(|node| node.ip == mutation.ip && node.port == mutation.port)
-        {
-            return Err(Self::duplicate_proxy_node_error(existing));
-        }
-
         let now = Self::now_unix_secs();
         let node = StoredProxyNode::new(
             Uuid::new_v4().to_string(),
@@ -422,14 +408,6 @@ impl ProxyNodeWriteRepository for InMemoryProxyNodeRepository {
             return Err(DataLayerError::InvalidInput(
                 "只能编辑手动添加的代理节点".to_string(),
             ));
-        }
-
-        let next_ip = mutation.ip.as_deref().unwrap_or(existing.ip.as_str());
-        let next_port = mutation.port.unwrap_or(existing.port);
-        if let Some(duplicate) = nodes.values().find(|node| {
-            node.id != mutation.node_id && node.ip == next_ip && node.port == next_port
-        }) {
-            return Err(Self::duplicate_proxy_node_error(duplicate));
         }
 
         let node = nodes
@@ -890,9 +868,10 @@ impl ProxyNodeWriteRepository for InMemoryProxyNodeRepository {
 mod tests {
     use super::InMemoryProxyNodeRepository;
     use crate::repository::proxy_nodes::{
-        ProxyNodeHeartbeatMutation, ProxyNodeReadRepository, ProxyNodeRegistrationMutation,
-        ProxyNodeRemoteConfigMutation, ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository,
-        StoredProxyNode, StoredProxyNodeEvent,
+        ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation, ProxyNodeReadRepository,
+        ProxyNodeRegistrationMutation, ProxyNodeRemoteConfigMutation,
+        ProxyNodeTunnelStatusMutation, ProxyNodeWriteRepository, StoredProxyNode,
+        StoredProxyNodeEvent,
     };
     use serde_json::json;
 
@@ -1099,6 +1078,40 @@ mod tests {
         assert_eq!(manual.status, "online");
         assert!(manual.tunnel_connected);
         assert_eq!(manual.active_connections, 4);
+    }
+
+    #[tokio::test]
+    async fn manual_nodes_allow_the_same_endpoint_with_distinct_credentials() {
+        let repository = InMemoryProxyNodeRepository::default();
+        let first = repository
+            .create_manual_node(&ProxyNodeManualCreateMutation {
+                name: "route-a".to_string(),
+                ip: "proxy.example".to_string(),
+                port: 8080,
+                region: None,
+                proxy_url: "http://proxy.example:8080".to_string(),
+                proxy_username: Some("alice".to_string()),
+                proxy_password: Some("secret-a".to_string()),
+                registered_by: None,
+            })
+            .await
+            .expect("first manual route should create");
+        let second = repository
+            .create_manual_node(&ProxyNodeManualCreateMutation {
+                name: "route-b".to_string(),
+                ip: "proxy.example".to_string(),
+                port: 8080,
+                region: None,
+                proxy_url: "http://proxy.example:8080".to_string(),
+                proxy_username: Some("bob".to_string()),
+                proxy_password: Some("secret-b".to_string()),
+                registered_by: None,
+            })
+            .await
+            .expect("second manual route should create");
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(repository.list_proxy_nodes().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

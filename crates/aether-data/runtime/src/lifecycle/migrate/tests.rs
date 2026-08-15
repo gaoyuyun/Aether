@@ -412,6 +412,7 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260720000000,
             20260727000000,
             20260731000000,
+            20260815000000,
         ]
     );
 }
@@ -1023,6 +1024,21 @@ fn worker_boot_cleanup_migration_is_enabled_for_every_driver() {
             "{driver} must delete child events before worker boot runs"
         );
     }
+}
+
+#[test]
+fn postgres_allows_duplicate_manual_proxy_endpoints() {
+    const VERSION: i64 = 20260815000000;
+    let migration = POSTGRES_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == VERSION)
+        .expect("manual proxy endpoint migration should be embedded");
+    let sql = migration.sql.as_ref();
+
+    assert!(sql.contains("DROP CONSTRAINT IF EXISTS uq_proxy_node_ip_port"));
+    assert!(!sql.contains("DROP TABLE"));
+    assert!(!sql.contains("DELETE FROM proxy_nodes"));
+    assert!(!EMPTY_DATABASE_SNAPSHOT_SQL.contains("uq_proxy_node_ip_port"));
 }
 
 #[test]
@@ -2211,6 +2227,7 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260720000000,
             20260727000000,
             20260731000000,
+            20260815000000,
         ]
     );
 }

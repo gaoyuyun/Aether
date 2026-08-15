@@ -142,35 +142,6 @@ ON DUPLICATE KEY UPDATE
         Ok(())
     }
 
-    async fn find_duplicate_proxy_node(
-        &self,
-        ip: &str,
-        port: i32,
-        excluding_node_id: Option<&str>,
-    ) -> Result<Option<StoredProxyNode>, DataLayerError> {
-        let row = if let Some(excluding_node_id) = excluding_node_id {
-            sqlx::query(&format!(
-                "{PROXY_NODE_COLUMNS} WHERE ip = ? AND port = ? AND id <> ? LIMIT 1"
-            ))
-            .bind(ip)
-            .bind(port)
-            .bind(excluding_node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_sql_err()?
-        } else {
-            sqlx::query(&format!(
-                "{PROXY_NODE_COLUMNS} WHERE ip = ? AND port = ? LIMIT 1"
-            ))
-            .bind(ip)
-            .bind(port)
-            .fetch_optional(&self.pool)
-            .await
-            .map_sql_err()?
-        };
-        row.as_ref().map(map_proxy_node_row).transpose()
-    }
-
     async fn insert_event(
         &self,
         node_id: &str,
@@ -586,13 +557,6 @@ WHERE is_manual = 0
         &self,
         mutation: &ProxyNodeManualCreateMutation,
     ) -> Result<StoredProxyNode, DataLayerError> {
-        if let Some(existing) = self
-            .find_duplicate_proxy_node(&mutation.ip, mutation.port, None)
-            .await?
-        {
-            return Err(duplicate_proxy_node_error(&existing));
-        }
-
         let now = Some(current_unix_secs());
         let node = StoredProxyNode::new(
             uuid::Uuid::new_v4().to_string(),
@@ -645,15 +609,6 @@ WHERE is_manual = 0
             return Err(DataLayerError::InvalidInput(
                 "只能编辑手动添加的代理节点".to_string(),
             ));
-        }
-
-        let next_ip = mutation.ip.as_deref().unwrap_or(node.ip.as_str());
-        let next_port = mutation.port.unwrap_or(node.port);
-        if let Some(existing) = self
-            .find_duplicate_proxy_node(next_ip, next_port, Some(&mutation.node_id))
-            .await?
-        {
-            return Err(duplicate_proxy_node_error(&existing));
         }
 
         if let Some(name) = mutation.name.as_ref() {
@@ -1141,13 +1096,6 @@ fn optional_json_to_string(
             })
         })
         .transpose()
-}
-
-fn duplicate_proxy_node_error(node: &StoredProxyNode) -> DataLayerError {
-    DataLayerError::InvalidInput(format!(
-        "已存在相同地址的代理节点: {} ({}:{})",
-        node.name, node.ip, node.port
-    ))
 }
 
 fn optional_json_from_string(
