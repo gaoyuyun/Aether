@@ -1073,6 +1073,37 @@ async fn gateway_creates_updates_and_tests_manual_proxy_nodes_locally() {
     assert_eq!(create_payload["node"]["proxy_username"], "alice");
     assert_eq!(create_payload["node"]["proxy_password"], "su****et");
 
+    let second_create_response = client
+        .post(format!("{gateway_url}/api/admin/proxy-nodes/manual"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "name": "manual-node-second-route",
+            "proxy_url": proxy_url.clone(),
+            "username": "bob",
+            "password": "anothersecret",
+            "region": "US-West"
+        }))
+        .send()
+        .await
+        .expect("second create request should succeed");
+    let second_create_status = second_create_response.status();
+    let second_create_payload: serde_json::Value = second_create_response
+        .json()
+        .await
+        .expect("second create body should parse");
+    assert_eq!(
+        second_create_status,
+        StatusCode::OK,
+        "second create body: {second_create_payload}"
+    );
+    assert_ne!(second_create_payload["node_id"], create_payload["node_id"]);
+    assert_eq!(second_create_payload["node"]["proxy_url"], proxy_url);
+    assert_eq!(second_create_payload["node"]["proxy_username"], "bob");
+    assert_eq!(second_create_payload["node"]["proxy_password"], "an****et");
+
     let test_url_response = client
         .post(format!("{gateway_url}/api/admin/proxy-nodes/test-url"))
         .header(GATEWAY_HEADER, "rust-phase3b")

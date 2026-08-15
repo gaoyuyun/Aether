@@ -718,21 +718,6 @@ END $mig$;
 
 
 --
--- Name: proxy_nodes uq_proxy_node_ip_port; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-DO $mig$ BEGIN
-  ALTER TABLE ONLY public.proxy_nodes
-    ADD CONSTRAINT uq_proxy_node_ip_port UNIQUE (ip, port);
-EXCEPTION
-  WHEN duplicate_object THEN NULL;
-  WHEN duplicate_table THEN NULL;
-  WHEN invalid_table_definition THEN NULL;
-END $mig$;
-
-
-
---
 -- Name: refund_requests uq_refund_requests_idempotency_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 

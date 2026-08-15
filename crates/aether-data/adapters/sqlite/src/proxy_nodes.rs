@@ -143,35 +143,6 @@ ON CONFLICT(id) DO UPDATE SET
         Ok(())
     }
 
-    async fn find_duplicate_proxy_node(
-        &self,
-        ip: &str,
-        port: i32,
-        excluding_node_id: Option<&str>,
-    ) -> Result<Option<StoredProxyNode>, DataLayerError> {
-        let row = if let Some(excluding_node_id) = excluding_node_id {
-            sqlx::query(&format!(
-                "{PROXY_NODE_COLUMNS} WHERE ip = ? AND port = ? AND id <> ? LIMIT 1"
-            ))
-            .bind(ip)
-            .bind(port)
-            .bind(excluding_node_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_sql_err()?
-        } else {
-            sqlx::query(&format!(
-                "{PROXY_NODE_COLUMNS} WHERE ip = ? AND port = ? LIMIT 1"
-            ))
-            .bind(ip)
-            .bind(port)
-            .fetch_optional(&self.pool)
-            .await
-            .map_sql_err()?
-        };
-        row.as_ref().map(map_proxy_node_row).transpose()
-    }
-
     async fn insert_event(
         &self,
         node_id: &str,
@@ -577,13 +548,6 @@ WHERE is_manual = 0
         &self,
         mutation: &ProxyNodeManualCreateMutation,
     ) -> Result<StoredProxyNode, DataLayerError> {
-        if let Some(existing) = self
-            .find_duplicate_proxy_node(&mutation.ip, mutation.port, None)
-            .await?
-        {
-            return Err(duplicate_proxy_node_error(&existing));
-        }
-
         let now = Some(current_unix_secs());
         let node = StoredProxyNode::new(
             uuid::Uuid::new_v4().to_string(),
@@ -636,15 +600,6 @@ WHERE is_manual = 0
             return Err(DataLayerError::InvalidInput(
                 "只能编辑手动添加的代理节点".to_string(),
             ));
-        }
-
-        let next_ip = mutation.ip.as_deref().unwrap_or(node.ip.as_str());
-        let next_port = mutation.port.unwrap_or(node.port);
-        if let Some(existing) = self
-            .find_duplicate_proxy_node(next_ip, next_port, Some(&mutation.node_id))
-            .await?
-        {
-            return Err(duplicate_proxy_node_error(&existing));
         }
 
         if let Some(name) = mutation.name.as_ref() {
@@ -1145,13 +1100,6 @@ fn optional_json_to_string(
         .transpose()
 }
 
-fn duplicate_proxy_node_error(node: &StoredProxyNode) -> DataLayerError {
-    DataLayerError::InvalidInput(format!(
-        "已存在相同地址的代理节点: {} ({}:{})",
-        node.name, node.ip, node.port
-    ))
-}
-
 fn optional_json_from_string(
     value: Option<String>,
     field_name: &str,
@@ -1382,6 +1330,21 @@ VALUES ('node-1', 'registered', 'ok', 3)
         assert!(manual.is_manual);
         assert_eq!(manual.status, "online");
 
+        let same_endpoint_manual = repository
+            .create_manual_node(&ProxyNodeManualCreateMutation {
+                name: "manual-2".to_string(),
+                ip: "127.0.0.2".to_string(),
+                port: 8081,
+                region: Some("local".to_string()),
+                proxy_url: "http://127.0.0.2:8081".to_string(),
+                proxy_username: Some("other-user".to_string()),
+                proxy_password: Some("other-pass".to_string()),
+                registered_by: Some("admin".to_string()),
+            })
+            .await
+            .expect("same endpoint with different credentials should create");
+        assert_ne!(manual.id, same_endpoint_manual.id);
+
         let manual = repository
             .update_manual_node(&ProxyNodeManualUpdateMutation {
                 node_id: manual.id.clone(),
@@ -1554,6 +1517,11 @@ VALUES ('node-1', 'registered', 'ok', 3)
             .delete_node(&manual.id)
             .await
             .expect("manual node should delete")
+            .is_some());
+        assert!(repository
+            .delete_node(&same_endpoint_manual.id)
+            .await
+            .expect("same-endpoint manual node should delete")
             .is_some());
     }
 
