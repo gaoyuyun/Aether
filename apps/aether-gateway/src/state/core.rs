@@ -258,6 +258,7 @@ impl AppState {
         self.candidate_row_page_cache.clear();
         self.candidate_page_cache.clear();
         self.candidate_resolved_page_cache.clear();
+        self.public_model_metadata_cache = Arc::new(TokioRwLock::new(None));
         self.tunnel = crate::tunnel::EmbeddedTunnelState::with_data_and_runtime_state(
             Arc::clone(&data),
             self.runtime_state.clone(),
@@ -369,6 +370,7 @@ impl AppState {
             scheduler_affinity_epoch: Arc::new(AtomicU64::new(0)),
             dashboard_response_cache: Arc::new(DashboardResponseCache::default()),
             system_config_cache: Arc::new(SystemConfigCache::default()),
+            public_model_metadata_cache: Arc::new(TokioRwLock::new(None)),
             endpoint_response_header_rules_cache: Arc::new(JsonValueCache::default()),
             candidate_row_page_cache: Arc::new(crate::cache::CandidateRowPageCache::default()),
             candidate_page_cache: Arc::new(crate::cache::CandidatePageCache::default()),

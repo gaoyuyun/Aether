@@ -13,6 +13,21 @@ afterEach(() => {
 })
 
 describe('Checkbox', () => {
+  it('renders a true model value as checked', async () => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({
+      render: () => h(Checkbox, { modelValue: true }),
+    })
+
+    app.mount(root)
+    mountedApps.push({ app, root })
+
+    const input = root.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    expect(input?.checked).toBe(true)
+    expect(input?.getAttribute('aria-checked')).toBe('true')
+  })
+
   it('applies and clears the native indeterminate state', async () => {
     const indeterminate = ref(true)
     const root = document.createElement('div')

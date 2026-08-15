@@ -158,6 +158,75 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn backfills_global_model_reasoning_levels_without_overwriting_explicit_values() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        run_migrations(&pool).await.expect("run sqlite migrations");
+
+        for (id, config) in [
+            ("reasoning", r#"{"extended_thinking":true}"#),
+            ("plain", r#"{"streaming":true}"#),
+            ("explicit", r#"{"reasoning_levels":["minimal","high"]}"#),
+        ] {
+            sqlx::query(
+                r#"
+INSERT INTO global_models (
+    id, name, display_name, enabled, is_active, usage_count, config, created_at, updated_at
+) VALUES (?, ?, ?, 1, 1, 0, ?, 1, 1)
+"#,
+            )
+            .bind(id)
+            .bind(id)
+            .bind(id)
+            .bind(config)
+            .execute(&pool)
+            .await
+            .expect("legacy global model should insert");
+        }
+
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 20260815010000)
+            .expect("reasoning-level migration should be embedded");
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("reasoning-level migration should execute");
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, config FROM global_models ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("migrated global models should load")
+        .into_iter()
+        .map(|(id, config)| {
+            (
+                id,
+                serde_json::from_str::<serde_json::Value>(&config)
+                    .expect("config should remain valid JSON"),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(rows["reasoning"]["extended_thinking"], true);
+        assert_eq!(
+            rows["reasoning"]["reasoning_levels"],
+            serde_json::json!(["low", "medium", "high"])
+        );
+        assert_eq!(rows["plain"]["extended_thinking"], false);
+        assert!(rows["plain"]["reasoning_levels"].is_null());
+        assert_eq!(rows["explicit"]["extended_thinking"], false);
+        assert_eq!(
+            rows["explicit"]["reasoning_levels"],
+            serde_json::json!(["minimal", "high"])
+        );
+    }
+
     #[test]
     fn rejects_applied_migration_versions_unknown_to_this_binary() {
         let version = MIGRATOR

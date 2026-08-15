@@ -30,6 +30,10 @@ export interface ModelsDevModel {
   name: string
   family?: string
   reasoning?: boolean
+  reasoning_options?: Array<{
+    type?: string
+    values?: Array<string | null>
+  }>
   tool_call?: boolean
   structured_output?: boolean
   temperature?: boolean
@@ -97,6 +101,7 @@ export interface ModelsDevModelItem {
   supportsVision?: boolean
   supportsToolCall?: boolean
   supportsReasoning?: boolean
+  reasoningLevels?: string[]
   supportsStructuredOutput?: boolean
   supportsTemperature?: boolean
   supportsAttachment?: boolean
@@ -218,6 +223,14 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
       for (const [modelId, model] of Object.entries(provider.models)) {
         const inputModalities = model.modalities?.input ?? model.input
         const outputModalities = model.modalities?.output ?? model.output
+        const reasoningLevels = [...new Set(
+          (model.reasoning_options ?? [])
+            .filter(option => option.type === 'effort' || option.type === undefined)
+            .flatMap(option => option.values ?? [])
+            .filter((value): value is string => typeof value === 'string')
+            .map(value => value.trim().toLowerCase())
+            .filter(Boolean),
+        )]
         const tieredPricing = resolveModelsDevTieredPricing(
           providerId,
           modelId,
@@ -247,6 +260,7 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
           supportsVision: inputModalities?.includes('image'),
           supportsToolCall: model.tool_call,
           supportsReasoning: model.reasoning,
+          reasoningLevels: reasoningLevels.length > 0 ? reasoningLevels : undefined,
           supportsStructuredOutput: model.structured_output,
           supportsTemperature: model.temperature,
           supportsAttachment: model.attachment,

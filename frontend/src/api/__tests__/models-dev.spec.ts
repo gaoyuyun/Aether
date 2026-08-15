@@ -93,6 +93,11 @@ describe('getModelsDevList', () => {
                   },
                 },
               },
+              reasoning: true,
+              reasoning_options: [
+                { type: 'effort', values: ['low', 'medium', 'high'] },
+                { type: 'toggle' },
+              ],
             },
             legacy: {
               id: 'legacy',
@@ -123,6 +128,8 @@ describe('getModelsDevList', () => {
       tieredPricing: {
         processing_tiers: { priority: { price_multiplier: 2 } },
       },
+      supportsReasoning: true,
+      reasoningLevels: ['low', 'medium', 'high'],
     })
     expect(legacy).toMatchObject({
       supportsVision: true,

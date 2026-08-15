@@ -1,8 +1,11 @@
 use super::{AppState, GatewayError, LocalMutationOutcome, LocalProviderDeleteTaskState};
 use crate::handlers::shared::sync_provider_key_oauth_status_snapshot;
 use aether_data_contracts::repository::{candidates, global_models, pool_scores, provider_catalog};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
+
+const PUBLIC_MODEL_METADATA_CACHE_PAGE_SIZE: usize = 1_000;
 
 impl AppState {
     pub fn has_provider_catalog_data_reader(&self) -> bool {
@@ -90,6 +93,89 @@ impl AppState {
             .list_public_global_models(query)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
+    async fn load_public_model_metadata_cache(
+        &self,
+    ) -> Result<BTreeMap<String, global_models::StoredPublicGlobalModel>, GatewayError> {
+        let mut offset = 0;
+        let mut models = BTreeMap::new();
+        loop {
+            let page = self
+                .data
+                .list_public_global_models(&global_models::PublicGlobalModelQuery {
+                    offset,
+                    limit: PUBLIC_MODEL_METADATA_CACHE_PAGE_SIZE,
+                    is_active: Some(true),
+                    search: None,
+                })
+                .await
+                .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            let loaded = page.items.len();
+            models.extend(
+                page.items
+                    .into_iter()
+                    .map(|model| (model.name.clone(), model)),
+            );
+            if loaded == 0 || offset.saturating_add(loaded) >= page.total {
+                break;
+            }
+            offset = offset.saturating_add(loaded);
+        }
+        Ok(models)
+    }
+
+    pub(crate) async fn public_model_metadata_by_names(
+        &self,
+        requested_names: &BTreeSet<&str>,
+    ) -> Result<BTreeMap<String, global_models::StoredPublicGlobalModel>, GatewayError> {
+        if !self.has_global_model_data_reader() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut cache = self.public_model_metadata_cache.write().await;
+        if cache.is_none() {
+            *cache = Some(self.load_public_model_metadata_cache().await?);
+        }
+        Ok(cache
+            .as_ref()
+            .into_iter()
+            .flat_map(|models| models.values())
+            .filter(|model| requested_names.contains(model.name.as_str()))
+            .map(|model| (model.name.clone(), model.clone()))
+            .collect())
+    }
+
+    async fn update_public_model_metadata_cache(
+        &self,
+        model: &global_models::StoredAdminGlobalModel,
+    ) {
+        let mut cache = self.public_model_metadata_cache.write().await;
+        let Some(models) = cache.as_mut() else {
+            return;
+        };
+        if !model.is_active {
+            models.remove(&model.name);
+            return;
+        }
+        models.insert(
+            model.name.clone(),
+            global_models::StoredPublicGlobalModel {
+                id: model.id.clone(),
+                name: model.name.clone(),
+                display_name: Some(model.display_name.clone()),
+                is_active: model.is_active,
+                default_price_per_request: model.default_price_per_request,
+                default_tiered_pricing: model.default_tiered_pricing.clone(),
+                supported_capabilities: model.supported_capabilities.clone(),
+                config: model.config.clone(),
+                usage_count: model.usage_count,
+            },
+        );
+    }
+
+    async fn invalidate_public_model_metadata_cache(&self) {
+        *self.public_model_metadata_cache.write().await = None;
     }
 
     pub(crate) async fn list_active_global_model_identities(
@@ -374,8 +460,9 @@ impl AppState {
             .create_admin_global_model(record)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        if created.is_some() {
+        if let Some(created) = created.as_ref() {
             self.invalidate_provider_routing_caches();
+            self.update_public_model_metadata_cache(created).await;
         }
         Ok(created)
     }
@@ -389,8 +476,9 @@ impl AppState {
             .update_admin_global_model(record)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        if updated.is_some() {
+        if let Some(updated) = updated.as_ref() {
             self.invalidate_provider_routing_caches();
+            self.update_public_model_metadata_cache(updated).await;
         }
         Ok(updated)
     }
@@ -406,6 +494,7 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
             self.invalidate_provider_routing_caches();
+            self.invalidate_public_model_metadata_cache().await;
         }
         Ok(deleted)
     }
@@ -1168,6 +1257,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1185,8 +1275,8 @@ mod tests {
         StoredRequestedModelCandidateRowsQuery,
     };
     use aether_data_contracts::repository::global_models::{
-        CreateAdminGlobalModelRecord, StoredAdminGlobalModel, UpdateAdminGlobalModelRecord,
-        UpsertAdminProviderModelRecord,
+        CreateAdminGlobalModelRecord, StoredAdminGlobalModel, StoredPublicGlobalModel,
+        UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
     };
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -1383,8 +1473,19 @@ mod tests {
         let candidate_repository =
             Arc::new(ClearCountingCandidateSelectionReadRepository::default());
         let global_model_repository = Arc::new(
-            InMemoryGlobalModelReadRepository::seed(Vec::new())
-                .with_admin_global_models(vec![sample_admin_global_model()]),
+            InMemoryGlobalModelReadRepository::seed([StoredPublicGlobalModel::new(
+                "global-1".to_string(),
+                "gpt-5".to_string(),
+                Some("GPT 5".to_string()),
+                true,
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .expect("public global model should build")])
+            .with_admin_global_models(vec![sample_admin_global_model()]),
         );
         let state = AppState::new()
             .expect("app state should build")
@@ -1396,6 +1497,10 @@ mod tests {
             );
 
         assert_eq!(candidate_repository.clear_count(), 0);
+        state
+            .public_model_metadata_by_names(&BTreeSet::from(["gpt-5"]))
+            .await
+            .expect("metadata cache should initialize");
 
         let provider_model = sample_provider_model_record("model-1", "global-1", true);
         state
@@ -1436,6 +1541,12 @@ mod tests {
             .expect("global model create should succeed")
             .expect("global model should create");
         assert_eq!(candidate_repository.clear_count(), 4);
+        assert!(state
+            .public_model_metadata_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|models| models.contains_key("gpt-4.1")));
 
         let disabled_global_model = UpdateAdminGlobalModelRecord::new(
             "global-1".to_string(),
@@ -1453,12 +1564,65 @@ mod tests {
             .expect("global model update should succeed")
             .expect("global model should update");
         assert_eq!(candidate_repository.clear_count(), 5);
+        assert!(state
+            .public_model_metadata_cache
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|models| !models.contains_key("gpt-5")));
 
         assert!(state
             .delete_admin_global_model("global-2")
             .await
             .expect("global model delete should succeed"));
         assert_eq!(candidate_repository.clear_count(), 6);
+        assert!(state.public_model_metadata_cache.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn public_model_metadata_cache_loads_all_pages_once() {
+        let public_models = (0..10_001)
+            .map(|index| {
+                StoredPublicGlobalModel::new(
+                    format!("global-{index}"),
+                    format!("model-{index:05}"),
+                    Some(format!("Model {index}")),
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                )
+                .expect("public model should build")
+            })
+            .collect::<Vec<_>>();
+        let repository = Arc::new(InMemoryGlobalModelReadRepository::seed(public_models));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_global_model_repository_for_tests(repository.clone()),
+            );
+        let requested_names = BTreeSet::from(["model-10000"]);
+
+        let first = state
+            .public_model_metadata_by_names(&requested_names)
+            .await
+            .expect("metadata cache should load");
+        let first_read_count = repository.public_model_read_count();
+        let second = state
+            .public_model_metadata_by_names(&requested_names)
+            .await
+            .expect("metadata cache should be reused");
+
+        assert_eq!(
+            first["model-10000"].display_name.as_deref(),
+            Some("Model 10000")
+        );
+        assert_eq!(second, first);
+        assert_eq!(repository.public_model_read_count(), first_read_count);
+        assert_eq!(first_read_count, 11);
     }
 
     #[tokio::test]

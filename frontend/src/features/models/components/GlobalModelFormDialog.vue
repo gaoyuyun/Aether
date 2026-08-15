@@ -361,6 +361,47 @@
                 />
               </div>
             </div>
+            <div
+              class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-2"
+              :class="reasoningSupportLocked ? 'opacity-60' : ''"
+              data-testid="reasoning-levels-control"
+            >
+              <div class="flex items-start gap-2">
+                <Checkbox
+                  :model-value="isReasoningEnabled"
+                  :disabled="reasoningSupportLocked"
+                  class="mt-0.5"
+                  data-testid="reasoning-enabled"
+                  @update:model-value="setReasoningEnabled"
+                />
+                <div class="space-y-1">
+                  <div class="text-sm font-medium">
+                    推理强度
+                  </div>
+                  <p class="text-xs text-muted-foreground">
+                    {{ reasoningSupportLocked ? '该模型不支持推理' : '选择模型支持的推理档位' }}
+                  </p>
+                  <div
+                    v-if="isReasoningEnabled"
+                    class="flex flex-wrap gap-x-3 gap-y-2 pt-1"
+                  >
+                    <label
+                      v-for="level in reasoningLevelOptions"
+                      :key="level"
+                      class="inline-flex items-center gap-1.5 text-xs"
+                    >
+                      <Checkbox
+                        :model-value="isReasoningLevelSelected(level)"
+                        :disabled="reasoningSupportLocked"
+                        :data-testid="`reasoning-level-${level}`"
+                        @update:model-value="(value) => setReasoningLevel(level, value)"
+                      />
+                      {{ level }}
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
             <div class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-2">
               <div class="flex items-start gap-2">
                 <Checkbox
@@ -790,6 +831,7 @@ import {
 import type { TieredPricingConfig } from '@/api/endpoints/types'
 import {
   EMBEDDING_API_FORMATS,
+  REASONING_LEVEL_OPTIONS,
   buildGlobalModelCreatePayload,
   buildGlobalModelUpdatePayload,
   cloneTieredPricingConfig,
@@ -1063,11 +1105,29 @@ const defaultForm = (): FormData => ({
 
 const form = ref<FormData>(defaultForm())
 const imageGenerationExplicitOverride = ref<boolean | null>(null)
+const reasoningCapabilityAvailable = ref(false)
 
 const isEmbeddingEnabled = computed(() => {
   return form.value.supported_capabilities?.includes('embedding') === true
     || form.value.config?.embedding === true
     || form.value.config?.model_type === 'embedding'
+})
+
+const reasoningLevelOptions = [...REASONING_LEVEL_OPTIONS]
+
+const isReasoningEnabled = computed(() => form.value.config?.extended_thinking === true)
+
+function getSelectedReasoningLevels(): string[] {
+  const value = form.value.config?.reasoning_levels
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((level): level is string => typeof level === 'string')
+    .map(level => level.trim().toLowerCase())
+    .filter(level => reasoningLevelOptions.includes(level as typeof reasoningLevelOptions[number]))
+}
+
+const reasoningSupportLocked = computed(() => {
+  return !reasoningCapabilityAvailable.value
 })
 
 const isImageGenerationEnabled = computed(() => {
@@ -1122,6 +1182,39 @@ function setEmbeddingEnabled(enabled: boolean) {
     }
   }
   form.value.supported_capabilities = [...caps]
+}
+
+function setReasoningEnabled(value: boolean | 'indeterminate') {
+  const enabled = value === true
+  if (reasoningSupportLocked.value && enabled !== isReasoningEnabled.value) return
+  if (!form.value.config) form.value.config = {}
+  if (enabled) {
+    form.value.config.extended_thinking = true
+    if (selectedModel.value?.reasoningLevels?.length) {
+      form.value.config.reasoning_levels = [...selectedModel.value.reasoningLevels]
+    }
+  } else {
+    delete form.value.config.extended_thinking
+    delete form.value.config.reasoning_levels
+  }
+}
+
+function isReasoningLevelSelected(level: string): boolean {
+  const levels = getSelectedReasoningLevels()
+  return levels.includes(level)
+}
+
+function setReasoningLevel(level: string, value: boolean | 'indeterminate') {
+  if (reasoningSupportLocked.value || !isReasoningEnabled.value) return
+  const levels = new Set(getSelectedReasoningLevels())
+  if (value === true) levels.add(level)
+  else levels.delete(level)
+  if (!form.value.config) form.value.config = {}
+  if (levels.size > 0) {
+    form.value.config.reasoning_levels = reasoningLevelOptions.filter(option => levels.has(option))
+  } else {
+    delete form.value.config.reasoning_levels
+  }
 }
 
 function setImageGenerationEnabled(value: boolean | 'indeterminate') {
@@ -1316,6 +1409,7 @@ function selectModel(model: ModelsDevModelItem) {
   if (getExistingModel(model)) return
 
   imageGenerationExplicitOverride.value = null
+  reasoningCapabilityAvailable.value = model.supportsReasoning === true
   selectedModel.value = model
   expandedProvider.value = model.providerId
 
@@ -1325,7 +1419,10 @@ function selectModel(model: ModelsDevModelItem) {
   }
   if (model.supportsVision) config.vision = true
   if (model.supportsToolCall) config.function_calling = true
-  if (model.supportsReasoning) config.extended_thinking = true
+  if (model.supportsReasoning) {
+    config.extended_thinking = true
+    if (model.reasoningLevels?.length) config.reasoning_levels = [...model.reasoningLevels]
+  }
   if (model.supportsStructuredOutput) config.structured_output = true
   if (model.supportsTemperature !== false) config.temperature = model.supportsTemperature
   if (model.supportsAttachment) config.attachment = true
@@ -1603,6 +1700,7 @@ async function syncOnlinePricing() {
 // 清除选择（手动填写）
 function clearSelection() {
   imageGenerationExplicitOverride.value = null
+  reasoningCapabilityAvailable.value = false
   selectedModel.value = null
   form.value = defaultForm()
   tieredPricing.value = null
@@ -1620,6 +1718,7 @@ function handleLogoError(event: Event) {
 function resetForm() {
   resetOnlinePricingSourceSelection()
   imageGenerationExplicitOverride.value = null
+  reasoningCapabilityAvailable.value = false
   editingOnlinePricingSource.value = null
   form.value = defaultForm()
   tieredPricing.value = null
@@ -1633,6 +1732,7 @@ function resetForm() {
 
 function populateFormFromGlobalModel(model: GlobalModelResponse) {
   imageGenerationExplicitOverride.value = null
+  reasoningCapabilityAvailable.value = model.config?.extended_thinking === true
   const modelTieredPricing = model.default_tiered_pricing
     ? cloneTieredPricingConfig(model.default_tiered_pricing)
     : null

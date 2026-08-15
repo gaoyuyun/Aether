@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+use aether_data_contracts::repository::global_models::StoredPublicGlobalModel;
 use axum::{
     body::Body,
     http,
@@ -115,19 +118,111 @@ pub(super) fn build_codex_models_list_response(
 
 pub(super) fn build_openai_models_list_response(
     rows: &[StoredMinimalCandidateSelectionRow],
+    metadata_by_name: &BTreeMap<String, StoredPublicGlobalModel>,
 ) -> Response<Body> {
     Json(json!({
         "object": "list",
         "data": rows.iter().map(|row| {
+            let metadata = metadata_by_name.get(&row.global_model_name);
             json!({
                 "id": row.global_model_name,
                 "object": "model",
                 "created": 0,
                 "owned_by": PUBLIC_MODELS_OWNER,
+                "display_name": metadata
+                    .and_then(|model| model.display_name.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&row.global_model_name),
+                "context_limit": model_config_value(
+                    metadata,
+                    &["context_limit", "context_window", "context_length"],
+                ),
+                "output_limit": model_config_value(
+                    metadata,
+                    &["output_limit", "max_output_tokens", "max_completion_tokens"],
+                ),
+                "input_modalities": model_config_value(
+                    metadata,
+                    &["input_modalities", "input"],
+                ),
+                "pricing": model_pricing_value(metadata),
+                "reasoning_levels": model_reasoning_levels_value(metadata),
             })
         }).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+fn model_reasoning_levels_value(metadata: Option<&StoredPublicGlobalModel>) -> serde_json::Value {
+    let config = metadata.and_then(|model| model.config.as_ref());
+    if !config
+        .and_then(|value| value.get("extended_thinking"))
+        .is_some_and(|value| value.as_bool() == Some(true))
+    {
+        return serde_json::Value::Null;
+    }
+
+    let value = model_config_value(
+        metadata,
+        &[
+            "reasoning_levels",
+            "supported_reasoning_levels",
+            "reasoning_efforts",
+            "supported_reasoning_efforts",
+        ],
+    );
+    let Some(levels) = value.as_array() else {
+        return serde_json::Value::Null;
+    };
+    let levels = levels
+        .iter()
+        .filter_map(|level| {
+            level
+                .as_str()
+                .or_else(|| level.get("effort").and_then(serde_json::Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+        .map(|level| serde_json::Value::String(level.to_string()))
+        .collect::<Vec<_>>();
+    if levels.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Array(levels)
+    }
+}
+
+fn model_config_value(
+    metadata: Option<&StoredPublicGlobalModel>,
+    keys: &[&str],
+) -> serde_json::Value {
+    let config = metadata.and_then(|model| model.config.as_ref());
+    keys.iter()
+        .find_map(|key| config.and_then(|value| value.get(*key)))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn model_pricing_value(metadata: Option<&StoredPublicGlobalModel>) -> serde_json::Value {
+    let Some(metadata) = metadata else {
+        return serde_json::Value::Null;
+    };
+
+    let mut pricing = match metadata.default_tiered_pricing.as_ref() {
+        Some(serde_json::Value::Object(object)) => object.clone(),
+        Some(value) => serde_json::Map::from_iter([("tiered_pricing".to_string(), value.clone())]),
+        None => serde_json::Map::new(),
+    };
+    if let Some(price_per_request) = metadata.default_price_per_request {
+        pricing.insert("price_per_request".to_string(), json!(price_per_request));
+    }
+
+    if pricing.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(pricing)
+    }
 }
 
 pub(super) fn build_openai_model_detail_response(

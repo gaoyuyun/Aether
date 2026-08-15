@@ -4,6 +4,7 @@ use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+use aether_data_contracts::repository::global_models::StoredPublicGlobalModel;
 use axum::{body::Body, response::Response};
 use serde_json::Value;
 use tokio::time::timeout;
@@ -305,6 +306,26 @@ async fn list_model_rows_for_client_format_and_global_model(
     Some(sort_and_dedup_model_rows(collected))
 }
 
+async fn load_public_model_metadata(
+    state: &AppState,
+    rows: &[StoredMinimalCandidateSelectionRow],
+) -> BTreeMap<String, StoredPublicGlobalModel> {
+    if !state.has_global_model_data_reader() {
+        return BTreeMap::new();
+    }
+
+    let requested_names = rows
+        .iter()
+        .map(|row| row.global_model_name.as_str())
+        .collect::<BTreeSet<_>>();
+    await_models_route_read(
+        "public_global_model_metadata",
+        state.public_model_metadata_by_names(&requested_names),
+    )
+    .await
+    .unwrap_or_default()
+}
+
 pub(super) async fn maybe_build_local_models_route_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
@@ -435,7 +456,10 @@ pub(super) async fn maybe_build_local_models_route_response(
                     );
                     build_gemini_models_list_response(&rows, page_size, page_token.as_deref())
                 }
-                _ => build_openai_models_list_response(&rows),
+                _ => {
+                    let metadata_by_name = load_public_model_metadata(state, &rows).await;
+                    build_openai_models_list_response(&rows, &metadata_by_name)
+                }
             };
             Some(response)
         }

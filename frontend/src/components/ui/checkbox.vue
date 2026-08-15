@@ -35,10 +35,10 @@ const checkboxClass = computed(() =>
 )
 
 const isChecked = computed<boolean>(() => {
-  if (typeof props.checked === 'boolean') {
-    return props.checked
+  if (typeof props.modelValue === 'boolean') {
+    return props.modelValue
   }
-  return props.modelValue ?? false
+  return props.checked
 })
 
 const inputRef = ref<HTMLInputElement | null>(null)
