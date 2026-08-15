@@ -18,7 +18,7 @@ use aether_data_contracts::repository::candidate_selection::{
     StoredRequestedModelCandidateRowsQuery,
 };
 use aether_data_contracts::repository::global_models::{
-    StoredAdminGlobalModel, UpdateAdminGlobalModelRecord,
+    StoredAdminGlobalModel, StoredPublicGlobalModel, UpdateAdminGlobalModelRecord,
 };
 use async_trait::async_trait;
 use axum::response::IntoResponse;
@@ -416,6 +416,54 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
             sample_models_candidate_row("provider-openai", "openai", "openai:chat", "gpt-5", 10),
             sample_models_candidate_row("provider-openai", "openai", "openai:chat", "gpt-4.1", 10),
         ]));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(vec![
+        StoredPublicGlobalModel::new(
+            "global-gpt-4.1".to_string(),
+            "gpt-4.1".to_string(),
+            Some("GPT-4.1".to_string()),
+            true,
+            Some(0.02),
+            Some(json!({
+                "tiers": [
+                    {
+                        "up_to": 128000,
+                        "input_price_per_1m": 2.0,
+                        "output_price_per_1m": 8.0
+                    },
+                    {
+                        "up_to": null,
+                        "input_price_per_1m": 4.0,
+                        "output_price_per_1m": 12.0
+                    }
+                ]
+            })),
+            Some(json!(["vision", "extended_thinking"])),
+            Some(json!({
+                "context_limit": 1_000_000,
+                "output_limit": 32_768,
+                "input_modalities": ["text", "image"],
+                "extended_thinking": true,
+                "reasoning_levels": ["low", "medium", "high"]
+            })),
+            0,
+        )
+        .expect("public global model should build"),
+        StoredPublicGlobalModel::new(
+            "global-gpt-5".to_string(),
+            "gpt-5".to_string(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            Some(json!({
+                "extended_thinking": false,
+                "reasoning_levels": ["low", "medium", "high"]
+            })),
+            0,
+        )
+        .expect("non-reasoning public global model should build"),
+    ]));
 
     let (_unused_fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
     let gateway = build_router_with_state(
@@ -425,12 +473,14 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
                 crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
                     candidate_repository,
                     auth_repository,
-                ),
+                )
+                .with_global_model_repository_for_tests(global_model_repository.clone()),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let response = client
         .get(format!("{gateway_url}/v1/models"))
         .header("authorization", "Bearer sk-openai-models")
         .send()
@@ -443,6 +493,34 @@ async fn gateway_handles_public_openai_models_without_hitting_fallback_probe() {
     assert_eq!(payload["data"][0]["id"], "gpt-4.1");
     assert_eq!(payload["data"][1]["id"], "gpt-5");
     assert_eq!(payload["data"][0]["owned_by"], "aether");
+    assert_eq!(payload["data"][0]["display_name"], "GPT-4.1");
+    assert_eq!(payload["data"][0]["context_limit"], 1_000_000);
+    assert_eq!(payload["data"][0]["output_limit"], 32_768);
+    assert_eq!(
+        payload["data"][0]["input_modalities"],
+        json!(["text", "image"])
+    );
+    assert_eq!(
+        payload["data"][0]["reasoning_levels"],
+        json!(["low", "medium", "high"])
+    );
+    assert_eq!(payload["data"][0]["pricing"]["price_per_request"], 0.02);
+    assert_eq!(
+        payload["data"][0]["pricing"]["tiers"][1]["input_price_per_1m"],
+        4.0
+    );
+    assert_eq!(payload["data"][1]["display_name"], "gpt-5");
+    assert!(payload["data"][1]["pricing"].is_null());
+    assert!(payload["data"][1]["reasoning_levels"].is_null());
+
+    let cached_response = client
+        .get(format!("{gateway_url}/v1/models"))
+        .header("authorization", "Bearer sk-openai-models")
+        .send()
+        .await
+        .expect("cached request should succeed");
+    assert_eq!(cached_response.status(), StatusCode::OK);
+    assert_eq!(global_model_repository.public_model_read_count(), 1);
     assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

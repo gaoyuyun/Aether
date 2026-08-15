@@ -44,6 +44,7 @@ const stalePreset: ModelsDevModelItem = {
   modelName: 'Stale Model',
   official: true,
   supportsReasoning: true,
+  reasoningLevels: ['low', 'medium', 'high'],
   inputPrice: 1,
   outputPrice: 2,
   tieredPricing: {
@@ -247,6 +248,34 @@ afterEach(() => {
 })
 
 describe('GlobalModelFormDialog preset replacement', () => {
+  it('persists provider reasoning levels from the selected preset', async () => {
+    mountDialog()
+    await settle()
+
+    findButton('Stale Model').click()
+    await settle()
+    expect(document.body.querySelector<HTMLButtonElement>('[data-testid="reasoning-enabled"]')?.disabled).toBe(false)
+    expect(document.body.querySelector<HTMLInputElement>('[data-testid="reasoning-level-low"]')?.checked).toBe(true)
+    findExactButton('添加').click()
+    await settle()
+
+    expect(globalModelMocks.createGlobalModel.mock.calls[0][0].config).toMatchObject({
+      extended_thinking: true,
+      reasoning_levels: ['low', 'medium', 'high'],
+    })
+  })
+
+  it('locks reasoning controls for a non-reasoning preset', async () => {
+    mountDialog()
+    await settle()
+
+    findButton('Fresh Model').click()
+    await settle()
+
+    expect(document.body.querySelector<HTMLButtonElement>('[data-testid="reasoning-enabled"]')?.disabled).toBe(true)
+    expect(document.body.querySelector('[data-testid="reasoning-levels-control"]')?.classList.contains('opacity-60')).toBe(true)
+  })
+
   it('drops the previous draft and submits only the newly selected model preset', async () => {
     mountDialog()
     await settle()

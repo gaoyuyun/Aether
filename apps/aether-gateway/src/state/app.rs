@@ -409,6 +409,16 @@ pub struct AppState {
     pub(crate) scheduler_affinity_epoch: Arc<AtomicU64>,
     pub(crate) dashboard_response_cache: Arc<DashboardResponseCache>,
     pub(crate) system_config_cache: Arc<SystemConfigCache>,
+    pub(crate) public_model_metadata_cache: Arc<
+        TokioRwLock<
+            Option<
+                std::collections::BTreeMap<
+                    String,
+                    aether_data_contracts::repository::global_models::StoredPublicGlobalModel,
+                >,
+            >,
+        >,
+    >,
     pub(crate) endpoint_response_header_rules_cache: Arc<JsonValueCache<String>>,
     pub(crate) candidate_row_page_cache: Arc<super::super::cache::CandidateRowPageCache>,
     pub(crate) candidate_page_cache: Arc<super::super::cache::CandidatePageCache>,

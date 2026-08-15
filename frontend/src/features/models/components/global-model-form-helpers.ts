@@ -15,6 +15,18 @@ export const RERANK_API_FORMATS = [
   'jina:rerank',
 ] as const
 
+// Ordered union of effort names currently used by models.dev. A model only
+// stores the subset explicitly supported by its provider.
+export const REASONING_LEVEL_OPTIONS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
+
 export interface GlobalModelFormPayloadState {
   name: string
   display_name: string
