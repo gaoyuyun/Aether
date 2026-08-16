@@ -997,6 +997,7 @@ import {
   revealEndpointKey,
   exportKey,
   refreshProviderOAuth,
+  providerOAuthExpiryToUnixSeconds,
   refreshProviderQuota,
   consumeCodexResetCredit,
   clearOAuthInvalid,
@@ -1603,7 +1604,7 @@ async function handleRefreshOAuth(key: EndpointAPIKey) {
   refreshingOAuthKeyId.value = key.id
   try {
     const result = await refreshProviderOAuth(key.id)
-    const refreshedExpiresAt = typeof result.expires_at === 'number' ? result.expires_at : null
+    const refreshedExpiresAt = providerOAuthExpiryToUnixSeconds(result.expires_at)
     let refreshedKey: EndpointAPIKey | null = null
     // 更新本地数据
     const keyInList = providerKeys.value.find(k => k.id === key.id)

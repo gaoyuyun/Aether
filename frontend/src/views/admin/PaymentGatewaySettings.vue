@@ -519,7 +519,7 @@ const saving = ref(false)
 const testing = ref(false)
 const hasSecret = ref(false)
 const hasSecretKeys = ref<string[]>([])
-const updatedAt = ref<number | null>(null)
+const updatedAt = ref<string | null>(null)
 const fieldValues = reactive<Record<string, string>>({})
 const paymentHelpOpen = ref<PaymentGatewayProvider | null>(null)
 const paymentHelpRef = ref<HTMLElement | null>(null)
@@ -544,7 +544,8 @@ const visibleFields = computed(() => activeProviderMeta.value.fields)
 
 const updatedAtText = computed(() => {
   if (!updatedAt.value) return ''
-  return new Date(updatedAt.value * 1000).toLocaleString('zh-CN')
+  const timestamp = new Date(updatedAt.value)
+  return Number.isNaN(timestamp.getTime()) ? '' : timestamp.toLocaleString('zh-CN')
 })
 
 const defaultCallbackBaseUrl = computed(() => {

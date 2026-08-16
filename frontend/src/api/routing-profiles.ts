@@ -15,9 +15,9 @@ export interface RoutingGroupRecord {
   is_system_default: boolean
   config_json: RoutingGroupConfig
   version: number
-  created_at: number
-  updated_at: number
-  published_at?: number | null
+  created_at: string
+  updated_at: string
+  published_at?: string | null
 }
 
 export interface RoutingGroupListResponse {
@@ -30,7 +30,7 @@ export interface RoutingGroupVersionRecord {
   group_id: string
   version: number
   config_json: RoutingGroupConfig
-  created_at: number
+  created_at: string
   created_by?: string | null
 }
 
@@ -46,8 +46,8 @@ export interface RoutingGroupBindingRecord {
   subject_id: string
   is_default: boolean
   allow_explicit_select: boolean
-  created_at: number
-  updated_at: number
+  created_at: string
+  updated_at: string
 }
 
 export interface RoutingGroupBindingListResponse {

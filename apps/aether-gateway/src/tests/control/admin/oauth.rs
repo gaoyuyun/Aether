@@ -680,6 +680,8 @@ async fn gateway_batch_authorizes_claude_cookies_as_redacted_task_impl() {
     assert_eq!(submitted["status"], "submitted");
     assert_eq!(submitted["total"], 4);
     assert_eq!(submitted["import_kind"], "cookie_authorize");
+    assert!(submitted["created_at"].is_string());
+    assert!(submitted["updated_at"].is_string());
     let task_id = submitted["task_id"]
         .as_str()
         .expect("task id should exist")
@@ -2674,6 +2676,10 @@ async fn gateway_handles_admin_provider_oauth_batch_import_task_status_locally_w
     assert_eq!(payload["replaced_count"], 1);
     assert_eq!(payload["progress_percent"], 100);
     assert_eq!(payload["error_samples"].as_array().map(Vec::len), Some(1));
+    assert_eq!(payload["created_at"], "2023-11-14T22:13:21Z");
+    assert_eq!(payload["started_at"], "2023-11-14T22:13:22Z");
+    assert_eq!(payload["finished_at"], "2023-11-14T22:13:23Z");
+    assert_eq!(payload["updated_at"], "2023-11-14T22:13:24Z");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -3195,6 +3201,8 @@ async fn gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trus
         .expect("submit payload should parse");
     assert_eq!(submit_payload["status"], "submitted");
     assert_eq!(submit_payload["total"], 1);
+    assert!(submit_payload["created_at"].is_string());
+    assert!(submit_payload["updated_at"].is_string());
     let task_id = submit_payload["task_id"]
         .as_str()
         .expect("task id should exist")
@@ -3558,7 +3566,7 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["provider_type"], "codex");
     assert_eq!(payload["has_refresh_token"], true);
-    assert_eq!(payload["expires_at"], 4_102_444_800u64);
+    assert_eq!(payload["expires_at"], "2100-01-01T00:00:00Z");
     assert_eq!(payload["email"], "alice@example.com");
     assert_eq!(payload["account_state_recheck_attempted"], false);
     assert_eq!(
@@ -3776,7 +3784,7 @@ async fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_ad
     assert_eq!(payload["key_id"], "key-codex-inactive-duplicate");
     assert_eq!(payload["provider_type"], "codex");
     assert_eq!(payload["has_refresh_token"], true);
-    assert_eq!(payload["expires_at"], 4_102_444_800u64);
+    assert_eq!(payload["expires_at"], "2100-01-01T00:00:00Z");
     assert_eq!(payload["email"], "alice@example.com");
     assert_eq!(payload["replaced"], true);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
@@ -4411,7 +4419,7 @@ async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_h
     let status = response.status();
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(status, StatusCode::OK, "payload={payload}");
-    assert_eq!(payload["expires_at"], 2_100_000_000u64);
+    assert_eq!(payload["expires_at"], "2036-07-18T13:20:00Z");
 
     let reloaded = provider_catalog_repository
         .list_keys_by_provider_ids(&["provider-codex".to_string()])

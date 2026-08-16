@@ -17,7 +17,7 @@ export interface ProviderOAuthCompleteRequest {
 
 export interface ProviderOAuthCompleteResponse {
   provider_type: string
-  expires_at?: number | null
+  expires_at?: string | null
   has_refresh_token: boolean
   temporary?: boolean
   email?: string | null
@@ -28,7 +28,7 @@ export interface ProviderOAuthCompleteResponse {
 export interface ProviderOAuthCompleteResponseWithKey {
   key_id: string
   provider_type: string
-  expires_at?: number | null
+  expires_at?: string | null
   has_refresh_token: boolean
   temporary?: boolean
   email?: string | null
@@ -74,6 +74,10 @@ export interface OAuthBatchImportTaskStartResponse {
   replaced_count?: number
   progress_percent: number
   message?: string | null
+  created_at?: string
+  started_at?: string | null
+  finished_at?: string | null
+  updated_at?: string
 }
 
 export interface OAuthBatchImportTaskStatusResponse {
@@ -92,10 +96,16 @@ export interface OAuthBatchImportTaskStatusResponse {
   message?: string | null
   error?: string | null
   error_samples: OAuthBatchImportResultItem[]
-  created_at: number
-  started_at?: number | null
-  finished_at?: number | null
-  updated_at: number
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  updated_at: string
+}
+
+export function providerOAuthExpiryToUnixSeconds(value?: string | null): number | null {
+  if (!value) return null
+  const timestampMs = Date.parse(value)
+  return Number.isFinite(timestampMs) ? Math.floor(timestampMs / 1000) : null
 }
 
 export type BatchImportCredentialsNormalization =

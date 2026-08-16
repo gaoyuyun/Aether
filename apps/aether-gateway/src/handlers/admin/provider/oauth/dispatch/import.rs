@@ -29,6 +29,7 @@ use crate::handlers::admin::provider::shared::paths::admin_provider_oauth_import
 use crate::handlers::admin::request::{
     AdminAppState, AdminProviderOAuthTemplate, AdminRequestContext,
 };
+use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use crate::GatewayError;
 use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
@@ -1259,7 +1260,7 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
     Ok(Json(json!({
         "key_id": persisted_key.id,
         "provider_type": provider_type,
-        "expires_at": expires_at,
+        "expires_at": expires_at.and_then(unix_secs_to_rfc3339),
         "has_refresh_token": has_refresh_token,
         "temporary": auth_config
             .get("access_token_import_temporary")
