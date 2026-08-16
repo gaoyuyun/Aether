@@ -1,5 +1,7 @@
 use super::*;
-use crate::handlers::admin::provider::oauth::errors::build_internal_control_error_response;
+use crate::handlers::admin::provider::oauth::{
+    errors::build_internal_control_error_response, format_provider_oauth_task_timestamps,
+};
 use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionTimeouts, ProxySnapshot, RequestBody,
     EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
@@ -201,10 +203,9 @@ impl<'a> AdminAppState<'a> {
         {
             return Ok(None);
         }
-        Ok(Some(build_provider_oauth_batch_task_status_payload(
-            provider_id,
-            state,
-        )))
+        let mut payload = build_provider_oauth_batch_task_status_payload(provider_id, state);
+        format_provider_oauth_task_timestamps(&mut payload);
+        Ok(Some(payload))
     }
 
     pub(crate) async fn save_provider_oauth_device_session(

@@ -941,9 +941,9 @@ interface MockRoutingGroup {
   is_system_default: boolean
   config_json: Record<string, unknown>
   version: number
-  created_at: number
-  updated_at: number
-  published_at: number | null
+  created_at: string
+  updated_at: string
+  published_at: string | null
 }
 
 interface MockRoutingGroupVersion {
@@ -951,7 +951,7 @@ interface MockRoutingGroupVersion {
   group_id: string
   version: number
   config_json: Record<string, unknown>
-  created_at: number
+  created_at: string
   created_by: string | null
 }
 
@@ -962,11 +962,11 @@ interface MockRoutingGroupBinding {
   subject_id: string
   is_default: boolean
   allow_explicit_select: boolean
-  created_at: number
-  updated_at: number
+  created_at: string
+  updated_at: string
 }
 
-const mockRoutingNow = Math.floor(Date.now() / 1000)
+const mockRoutingNow = Date.now()
 const MOCK_ROUTING_GROUPS: MockRoutingGroup[] = [
   {
     id: 'routing-default',
@@ -994,9 +994,9 @@ const MOCK_ROUTING_GROUPS: MockRoutingGroup[] = [
       rules: [],
     },
     version: 1,
-    created_at: mockRoutingNow - 86400,
-    updated_at: mockRoutingNow - 3600,
-    published_at: mockRoutingNow - 3600,
+    created_at: new Date(mockRoutingNow - 86400 * 1000).toISOString(),
+    updated_at: new Date(mockRoutingNow - 3600 * 1000).toISOString(),
+    published_at: new Date(mockRoutingNow - 3600 * 1000).toISOString(),
   },
 ]
 
@@ -1006,7 +1006,7 @@ const MOCK_ROUTING_GROUP_VERSIONS: MockRoutingGroupVersion[] = [
     group_id: 'routing-default',
     version: 1,
     config_json: MOCK_ROUTING_GROUPS[0].config_json,
-    created_at: MOCK_ROUTING_GROUPS[0].published_at ?? mockRoutingNow,
+    created_at: MOCK_ROUTING_GROUPS[0].published_at ?? new Date(mockRoutingNow).toISOString(),
     created_by: null,
   },
 ]
@@ -1864,7 +1864,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     await delay()
     requireAdmin()
     const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroup>
-    const now = Math.floor(Date.now() / 1000)
+    const now = new Date().toISOString()
     const group: MockRoutingGroup = {
       id: body.id || `routing-demo-${Date.now()}`,
       name: body.name || '未命名调度策略',
@@ -1897,7 +1897,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
     await delay()
     requireAdmin()
     const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroupBinding>
-    const now = Math.floor(Date.now() / 1000)
+    const now = new Date().toISOString()
     const binding: MockRoutingGroupBinding = {
       id: body.id || `routing-binding-demo-${Date.now()}`,
       group_id: body.group_id || 'routing-default',
@@ -3114,7 +3114,7 @@ registerDynamicRoute('POST', '/api/admin/provider-oauth/keys/:keyId/refresh', as
   requireAdmin()
   return createMockResponse({
     provider_type: 'codex',
-    expires_at: Math.floor(Date.now() / 1000) + 6 * 3600,
+    expires_at: new Date(Date.now() + 6 * 3600 * 1000).toISOString(),
     has_refresh_token: true,
     email: 'oauth-demo@aether.dev',
     key_id: params.keyId
@@ -3139,7 +3139,7 @@ registerDynamicRoute('POST', '/api/admin/provider-oauth/providers/:providerId/co
   return createMockResponse({
     key_id: `key-oauth-${Date.now()}`,
     provider_type: 'codex',
-    expires_at: Math.floor(Date.now() / 1000) + 24 * 3600,
+    expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
     has_refresh_token: true,
     email: body.name ? `${body.name}@demo.dev` : 'oauth-demo@aether.dev'
   })
@@ -3162,7 +3162,7 @@ registerDynamicRoute('POST', '/api/admin/provider-oauth/providers/:providerId/co
   ))
   const failed = errorSamples.length
   const success = cookies.length - failed
-  const now = Math.floor(Date.now() / 1000)
+  const now = new Date().toISOString()
   const taskId = `claude-cookie-${Date.now()}-${++mockClaudeCookieAuthorizeTaskSequence}`
   mockClaudeCookieAuthorizeTasks.set(taskId, {
     task_id: taskId,
@@ -3218,7 +3218,7 @@ registerDynamicRoute('POST', '/api/admin/provider-oauth/providers/:providerId/co
   return createMockResponse({
     key_id: `key-claude-cookie-${Date.now()}`,
     provider_type: 'claude_code',
-    expires_at: Math.floor(Date.now() / 1000) + 24 * 3600,
+    expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
     has_refresh_token: true,
     email: body.name ? `${body.name}@demo.dev` : 'claude-oauth-demo@aether.dev'
   })
@@ -3231,7 +3231,7 @@ registerDynamicRoute('POST', '/api/admin/provider-oauth/providers/:providerId/im
   return createMockResponse({
     key_id: `key-oauth-${Date.now()}`,
     provider_type: 'codex',
-    expires_at: Math.floor(Date.now() / 1000) + 24 * 3600,
+    expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
     has_refresh_token: true,
     email: body.name ? `${body.name}@demo.dev` : 'oauth-demo@aether.dev'
   })
@@ -3525,7 +3525,7 @@ registerDynamicRoute('PATCH', '/api/admin/routing/groups/:groupId', async (confi
   }
   const body = JSON.parse(config.data || '{}') as Partial<MockRoutingGroup>
   const current = MOCK_ROUTING_GROUPS[index]
-  const now = Math.floor(Date.now() / 1000)
+  const now = new Date().toISOString()
   const updated: MockRoutingGroup = {
     ...current,
     ...body,
@@ -3559,11 +3559,12 @@ registerDynamicRoute('POST', '/api/admin/routing/groups/:groupId/publish', async
   if (!group) {
     throw { response: createMockResponse({ detail: '调度策略不存在' }, 404) }
   }
-  const now = Math.floor(Date.now() / 1000)
+  const nowMs = Date.now()
+  const now = new Date(nowMs).toISOString()
   group.published_at = now
   group.updated_at = now
   MOCK_ROUTING_GROUP_VERSIONS.unshift({
-    id: `${group.id}-v${group.version}-${now}`,
+    id: `${group.id}-v${group.version}-${nowMs}`,
     group_id: group.id,
     version: group.version,
     config_json: group.config_json,
@@ -3665,7 +3666,7 @@ registerDynamicRoute('PATCH', '/api/admin/routing/bindings/:bindingId', async (c
     ...MOCK_ROUTING_GROUP_BINDINGS[index],
     ...body,
     id: MOCK_ROUTING_GROUP_BINDINGS[index].id,
-    updated_at: Math.floor(Date.now() / 1000),
+    updated_at: new Date().toISOString(),
   }
   return createMockResponse({ ...MOCK_ROUTING_GROUP_BINDINGS[index] })
 })

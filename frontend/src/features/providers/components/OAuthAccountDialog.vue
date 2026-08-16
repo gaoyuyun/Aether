@@ -2252,10 +2252,10 @@ async function handleImport() {
         message: task.message || null,
         error: null,
         error_samples: [],
-        created_at: Math.floor(Date.now() / 1000),
+        created_at: new Date().toISOString(),
         started_at: null,
         finished_at: null,
-        updated_at: Math.floor(Date.now() / 1000),
+        updated_at: new Date().toISOString(),
       }
       keepImporting = true
       scheduleImportPoll(task.task_id, 400)

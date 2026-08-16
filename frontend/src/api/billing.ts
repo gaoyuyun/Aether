@@ -26,8 +26,8 @@ export interface EpayGatewayConfig {
   refund_enabled?: boolean
   allow_user_refund?: boolean
   config?: Record<string, unknown>
-  created_at?: number | null
-  updated_at?: number | null
+  created_at?: string | null
+  updated_at?: string | null
 }
 
 export type PaymentGatewayProvider = 'epay' | 'alipay' | 'wxpay' | 'stripe'
@@ -90,8 +90,8 @@ export interface BillingPlan {
   max_active_per_user: number
   purchase_limit_scope: BillingPurchaseLimitScope
   entitlements: BillingEntitlement[]
-  created_at?: number | null
-  updated_at?: number | null
+  created_at?: string | null
+  updated_at?: string | null
 }
 
 export interface BillingPlanWriteRequest {

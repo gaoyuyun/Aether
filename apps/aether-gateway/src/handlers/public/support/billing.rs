@@ -112,8 +112,8 @@ fn billing_plan_payload(
         "max_active_per_user": record.max_active_per_user,
         "purchase_limit_scope": record.purchase_limit_scope,
         "entitlements": record.entitlements_json,
-        "created_at": record.created_at_unix_secs,
-        "updated_at": record.updated_at_unix_secs,
+        "created_at": unix_secs_to_rfc3339(record.created_at_unix_secs),
+        "updated_at": unix_secs_to_rfc3339(record.updated_at_unix_secs),
     })
 }
 

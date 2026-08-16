@@ -14,6 +14,7 @@ use crate::ai_serving::{
 use crate::handlers::admin::admin_provider_pool_config;
 use crate::handlers::admin::provider::write::keys::build_provider_catalog_key_admin_cas_update;
 use crate::handlers::admin::request::AdminAppState;
+use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use crate::provider_key_auth::provider_active_api_formats;
 use crate::GatewayError;
 use aether_contracts::ProxySnapshot;
@@ -268,7 +269,7 @@ pub(crate) async fn provision_provider_oauth_token_payload_for_provider(
     Ok(Json(json!({
         "key_id": persisted_key.id,
         "provider_type": provider_type,
-        "expires_at": expires_at,
+        "expires_at": expires_at.and_then(unix_secs_to_rfc3339),
         "has_refresh_token": refresh_token.is_some(),
         "temporary": refresh_token.is_none(),
         "email": auth_config.get("email").cloned().unwrap_or(Value::Null),

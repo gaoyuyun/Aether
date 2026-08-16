@@ -111,7 +111,7 @@
                   {{ groupSchedulingSummary(group) }}
                 </TableCell>
                 <TableCell class="text-muted-foreground">
-                  {{ formatUnixSeconds(group.updated_at) }}
+                  {{ formatTimestamp(group.updated_at) }}
                 </TableCell>
                 <TableCell class="text-right">
                   <Button
@@ -208,7 +208,7 @@
                 </Badge>
               </div>
               <p class="mt-1 text-xs text-muted-foreground">
-                更新时间 {{ formatUnixSeconds(draft.updated_at) }}
+                更新时间 {{ formatTimestamp(draft.updated_at) }}
               </p>
             </div>
             <div class="flex flex-wrap items-center gap-2">
@@ -804,7 +804,7 @@ interface RoutingGroupDraft {
   is_system_default: boolean
   config_json: RoutingGroupConfig
   version: number
-  updated_at?: number | null
+  updated_at?: string | null
 }
 
 type ModelFilter = 'configured' | 'unconfigured'
@@ -1494,9 +1494,10 @@ async function confirmDeleteDraft(): Promise<void> {
   }
 }
 
-function formatUnixSeconds(value?: number | null): string {
+function formatTimestamp(value?: string | null): string {
   if (!value) return '-'
-  return new Date(value * 1000).toLocaleString('zh-CN')
+  const timestamp = new Date(value)
+  return Number.isNaN(timestamp.getTime()) ? '-' : timestamp.toLocaleString('zh-CN')
 }
 
 onMounted(() => {
