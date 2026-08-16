@@ -7,6 +7,7 @@ use aether_data_contracts::repository::usage::{
     UsageCounterFlushSummary, UsageCounterHealthSnapshot, UsageCounterPendingHealthSnapshot,
 };
 use aether_data_contracts::DataLayerError;
+use aether_wallet::{quota_clock_minute, quota_window_start_unix_secs, quota_windows_from_config};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::error::SqlResultExt;
@@ -38,7 +39,13 @@ SELECT
   last_used_ip,
   candidate_last_used_at_unix_secs,
   removed_last_used_at_unix_secs,
-  usage_created_at_unix_secs
+  usage_created_at_unix_secs,
+  provider_billing_type_at_usage,
+  quota_epoch_start_at_usage,
+  provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd,
+  quota_accounting_status,
+  created_at
 FROM usage_counter_deltas
 WHERE processed_at IS NULL
 ORDER BY created_at ASC, id ASC
@@ -63,6 +70,20 @@ struct DeltaRow {
     candidate_last_used_at_unix_secs: Option<u64>,
     removed_last_used_at_unix_secs: Option<u64>,
     usage_created_at_unix_secs: Option<u64>,
+    provider_billing_type_at_usage: Option<String>,
+    quota_epoch_start_at_usage: Option<u64>,
+    provider_dispatch_at_unix_secs: Option<u64>,
+    provider_quota_cost_usd: Option<f64>,
+    quota_accounting_status: Option<String>,
+    created_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderMonthlyDelta {
+    provider_quota_cost_usd: f64,
+    quota_epoch_start_unix_secs: u64,
+    provider_dispatch_at_unix_secs: u64,
+    accounting_ready: bool,
 }
 
 #[derive(Default)]
@@ -70,7 +91,7 @@ struct Aggregates {
     api_keys: BTreeMap<String, ApiKeyUsageDelta>,
     provider_api_keys: BTreeMap<String, ProviderApiKeyUsageDelta>,
     models: BTreeMap<String, ModelUsageDelta>,
-    provider_monthly: BTreeMap<String, f64>,
+    provider_monthly: BTreeMap<String, Vec<ProviderMonthlyDelta>>,
     proxy_nodes: BTreeMap<String, ProxyNodeCounterDelta>,
     management_tokens: BTreeMap<String, ManagementTokenCounterDelta>,
     api_key_last_used: BTreeMap<String, ApiKeyLastUsedDelta>,
@@ -136,10 +157,32 @@ impl Aggregates {
                         .request_count += row.request_count_delta;
                 }
                 KIND_PROVIDER_MONTHLY => {
-                    *aggregates
+                    if row
+                        .provider_billing_type_at_usage
+                        .as_deref()
+                        .is_none_or(|value| !value.eq_ignore_ascii_case("monthly_quota"))
+                    {
+                        continue;
+                    }
+                    let Some(quota_epoch_start_unix_secs) = row.quota_epoch_start_at_usage else {
+                        continue;
+                    };
+                    aggregates
                         .provider_monthly
                         .entry(row.target_id.clone())
-                        .or_default() += row.total_cost_usd_delta;
+                        .or_default()
+                        .push(ProviderMonthlyDelta {
+                            provider_quota_cost_usd: row
+                                .provider_quota_cost_usd
+                                .unwrap_or(row.total_cost_usd_delta),
+                            quota_epoch_start_unix_secs,
+                            provider_dispatch_at_unix_secs: row
+                                .provider_dispatch_at_unix_secs
+                                .or(row.usage_created_at_unix_secs)
+                                .unwrap_or(row.created_at_unix_secs),
+                            accounting_ready: row.quota_accounting_status.as_deref()
+                                == Some("ready"),
+                        });
                 }
                 KIND_PROXY_NODE => {
                     let entry = aggregates
@@ -245,7 +288,7 @@ pub(super) async fn flush(
         apply_provider_api_key(&mut tx, target_id, delta).await?;
     }
     for (target_id, delta) in &aggregates.provider_monthly {
-        apply_provider_monthly(&mut tx, target_id, *delta).await?;
+        apply_provider_monthly(&mut tx, target_id, delta).await?;
     }
     for (target_id, delta) in &aggregates.proxy_nodes {
         apply_proxy_node(&mut tx, target_id, delta).await?;
@@ -280,6 +323,266 @@ pub(super) async fn flush(
         management_token_targets: aggregates.management_tokens.len(),
         api_key_last_used_targets: aggregates.api_key_last_used.len(),
     })
+}
+
+pub(super) async fn maintain_provider_quota_windows(
+    pool: &SqlitePool,
+    now_unix_secs: u64,
+) -> Result<usize, DataLayerError> {
+    let clock_minute = quota_clock_minute(now_unix_secs);
+    let providers = sqlx::query(
+        "SELECT id, quota_last_reset_at, config FROM providers WHERE quota_last_reset_at IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_sql_err()?;
+    let mut maintained = 0usize;
+
+    for provider in providers {
+        let provider_id: String = provider.try_get("id").map_sql_err()?;
+        let epoch = provider
+            .try_get::<i64, _>("quota_last_reset_at")
+            .map_sql_err()?
+            .max(0) as u64;
+        let epoch = quota_clock_minute(epoch);
+        let config = provider
+            .try_get::<Option<String>, _>("config")
+            .map_sql_err()?
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+        let windows = quota_windows_from_config(config.as_ref());
+        let mut tx = pool.begin().await.map_sql_err()?;
+        sqlx::query("UPDATE provider_quota_window_counters SET updated_at = updated_at WHERE 0")
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+
+        let existing_durations = sqlx::query_scalar::<_, i64>(
+            "SELECT duration_secs FROM provider_quota_window_counters WHERE provider_id = ?",
+        )
+        .bind(&provider_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_sql_err()?;
+        for duration in existing_durations {
+            if !windows
+                .iter()
+                .any(|window| window.duration_secs == duration.max(0) as u64)
+            {
+                sqlx::query(
+                    "DELETE FROM provider_quota_window_counters WHERE provider_id = ? AND duration_secs = ?",
+                )
+                .bind(&provider_id)
+                .bind(duration)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+            }
+        }
+
+        for window in &windows {
+            let rolling_start =
+                quota_window_start_unix_secs(clock_minute, Some(epoch), window.duration_secs);
+            sqlx::query(
+                r#"
+INSERT INTO provider_quota_window_counters (
+  provider_id, duration_secs, quota_epoch_start, rolling_start,
+  accounted_until, used_usd, status, rebuild_error, updated_at
+) VALUES (?, ?, ?, ?, ?, 0, 'rebuilding', NULL, ?)
+ON CONFLICT (provider_id, duration_secs) DO UPDATE SET
+  quota_epoch_start = excluded.quota_epoch_start,
+  rolling_start = excluded.rolling_start,
+  accounted_until = excluded.accounted_until,
+  used_usd = 0,
+  status = 'rebuilding',
+  rebuild_error = NULL,
+  updated_at = excluded.updated_at
+WHERE provider_quota_window_counters.quota_epoch_start <> excluded.quota_epoch_start
+"#,
+            )
+            .bind(&provider_id)
+            .bind(window.duration_secs as i64)
+            .bind(epoch as i64)
+            .bind(rolling_start as i64)
+            .bind(clock_minute as i64)
+            .bind(now_unix_secs as i64)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM provider_quota_window_counters WHERE provider_id = ? AND duration_secs = ? AND quota_epoch_start = ?",
+            )
+            .bind(&provider_id)
+            .bind(window.duration_secs as i64)
+            .bind(epoch as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+            if status.as_deref() == Some("rebuilding") {
+                let used_usd: f64 = sqlx::query_scalar(
+                    r#"
+SELECT CAST(COALESCE(SUM(used_usd), 0) AS REAL)
+FROM provider_quota_usage_buckets
+WHERE provider_id = ?
+  AND quota_epoch_start = ?
+  AND bucket_start >= ?
+  AND bucket_start < ?
+"#,
+                )
+                .bind(&provider_id)
+                .bind(epoch as i64)
+                .bind(rolling_start as i64)
+                .bind(clock_minute as i64)
+                .fetch_one(&mut *tx)
+                .await
+                .map_sql_err()?;
+                sqlx::query(
+                    r#"
+UPDATE provider_quota_window_counters
+SET rolling_start = ?, accounted_until = ?, used_usd = ?,
+    status = 'ready', rebuild_error = NULL, updated_at = ?
+WHERE provider_id = ? AND duration_secs = ?
+  AND quota_epoch_start = ? AND status = 'rebuilding'
+"#,
+                )
+                .bind(rolling_start as i64)
+                .bind(clock_minute as i64)
+                .bind(used_usd)
+                .bind(now_unix_secs as i64)
+                .bind(&provider_id)
+                .bind(window.duration_secs as i64)
+                .bind(epoch as i64)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+            }
+
+            finalize_and_cleanup_sqlite(
+                &mut tx,
+                &provider_id,
+                epoch,
+                window.duration_secs,
+                clock_minute,
+                now_unix_secs,
+            )
+            .await?;
+            maintained += 1;
+        }
+        tx.commit().await.map_sql_err()?;
+    }
+    Ok(maintained)
+}
+
+async fn finalize_and_cleanup_sqlite(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    provider_id: &str,
+    epoch: u64,
+    duration_secs: u64,
+    clock_minute: u64,
+    now_unix_secs: u64,
+) -> Result<(), DataLayerError> {
+    let row = sqlx::query(
+        r#"
+SELECT rolling_start, accounted_until, CAST(used_usd AS REAL) AS used_usd
+FROM provider_quota_window_counters
+WHERE provider_id = ? AND duration_secs = ?
+  AND quota_epoch_start = ? AND status = 'ready'
+"#,
+    )
+    .bind(provider_id)
+    .bind(duration_secs as i64)
+    .bind(epoch as i64)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let mut rolling_start = row.try_get::<i64, _>("rolling_start").map_sql_err()?.max(0) as u64;
+    let mut accounted_until = row
+        .try_get::<i64, _>("accounted_until")
+        .map_sql_err()?
+        .max(0) as u64;
+    let mut used_usd = sqlite_real(&row, "used_usd")?;
+
+    if accounted_until < clock_minute {
+        let added: f64 = sqlx::query_scalar(
+            r#"
+SELECT CAST(COALESCE(SUM(used_usd), 0) AS REAL)
+FROM provider_quota_usage_buckets
+WHERE provider_id = ? AND quota_epoch_start = ?
+  AND bucket_start >= ? AND bucket_start < ?
+"#,
+        )
+        .bind(provider_id)
+        .bind(epoch as i64)
+        .bind(accounted_until as i64)
+        .bind(clock_minute as i64)
+        .fetch_one(&mut **tx)
+        .await
+        .map_sql_err()?;
+        used_usd += added;
+        sqlx::query(
+            r#"
+UPDATE provider_quota_window_counters
+SET used_usd = ?, accounted_until = ?, updated_at = ?
+WHERE provider_id = ? AND duration_secs = ? AND quota_epoch_start = ?
+  AND status = 'ready' AND accounted_until = ?
+"#,
+        )
+        .bind(used_usd)
+        .bind(clock_minute as i64)
+        .bind(now_unix_secs as i64)
+        .bind(provider_id)
+        .bind(duration_secs as i64)
+        .bind(epoch as i64)
+        .bind(accounted_until as i64)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+        accounted_until = clock_minute;
+    }
+
+    let new_rolling_start = quota_window_start_unix_secs(clock_minute, Some(epoch), duration_secs);
+    if new_rolling_start > rolling_start && accounted_until >= new_rolling_start {
+        let removed: f64 = sqlx::query_scalar(
+            r#"
+SELECT CAST(COALESCE(SUM(used_usd), 0) AS REAL)
+FROM provider_quota_usage_buckets
+WHERE provider_id = ? AND quota_epoch_start = ?
+  AND bucket_start >= ? AND bucket_start < ?
+"#,
+        )
+        .bind(provider_id)
+        .bind(epoch as i64)
+        .bind(rolling_start as i64)
+        .bind(new_rolling_start as i64)
+        .fetch_one(&mut **tx)
+        .await
+        .map_sql_err()?;
+        used_usd = (used_usd - removed).max(0.0);
+        sqlx::query(
+            r#"
+UPDATE provider_quota_window_counters
+SET used_usd = ?, rolling_start = ?, updated_at = ?
+WHERE provider_id = ? AND duration_secs = ? AND quota_epoch_start = ?
+  AND status = 'ready' AND rolling_start = ?
+"#,
+        )
+        .bind(used_usd)
+        .bind(new_rolling_start as i64)
+        .bind(now_unix_secs as i64)
+        .bind(provider_id)
+        .bind(duration_secs as i64)
+        .bind(epoch as i64)
+        .bind(rolling_start as i64)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+        rolling_start = new_rolling_start;
+    }
+    let _ = rolling_start;
+    Ok(())
 }
 
 pub(super) async fn enqueue_proxy_node(
@@ -845,6 +1148,23 @@ fn map_row(row: &sqlx::sqlite::SqliteRow) -> Result<DeltaRow, DataLayerError> {
             "usage_counter_deltas.usage_created_at_unix_secs",
             row.try_get("usage_created_at_unix_secs").map_sql_err()?,
         )?,
+        provider_billing_type_at_usage: row
+            .try_get("provider_billing_type_at_usage")
+            .map_sql_err()?,
+        quota_epoch_start_at_usage: optional_u64(
+            "usage_counter_deltas.quota_epoch_start_at_usage",
+            row.try_get("quota_epoch_start_at_usage").map_sql_err()?,
+        )?,
+        provider_dispatch_at_unix_secs: optional_u64(
+            "usage_counter_deltas.provider_dispatch_at_unix_secs",
+            row.try_get("provider_dispatch_at_unix_secs")
+                .map_sql_err()?,
+        )?,
+        provider_quota_cost_usd: row
+            .try_get::<Option<f64>, _>("provider_quota_cost_usd")
+            .map_sql_err()?,
+        quota_accounting_status: row.try_get("quota_accounting_status").map_sql_err()?,
+        created_at_unix_secs: row.try_get::<i64, _>("created_at").map_sql_err()?.max(0) as u64,
     })
 }
 
@@ -975,25 +1295,156 @@ WHERE id = ?
 async fn apply_provider_monthly(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     target_id: &str,
-    delta: f64,
+    deltas: &[ProviderMonthlyDelta],
 ) -> Result<(), DataLayerError> {
-    if target_id.trim().is_empty() || delta == 0.0 {
+    if target_id.trim().is_empty() || deltas.is_empty() {
         return Ok(());
     }
-    if !delta.is_finite() {
+    let provider =
+        sqlx::query("SELECT quota_last_reset_at, config FROM providers WHERE id = ? LIMIT 1")
+            .bind(target_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_sql_err()?;
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let current_epoch = provider
+        .try_get::<Option<i64>, _>("quota_last_reset_at")
+        .map_sql_err()?
+        .map(|value| quota_clock_minute(value.max(0) as u64));
+    let now_db = current_unix_secs();
+    let now = now_db.max(0) as u64;
+    let accepted = deltas
+        .iter()
+        .copied()
+        .filter(|delta| {
+            delta.provider_dispatch_at_unix_secs <= now
+                && delta.provider_dispatch_at_unix_secs >= delta.quota_epoch_start_unix_secs
+        })
+        .collect::<Vec<_>>();
+    let current_epoch_delta = accepted
+        .iter()
+        .filter(|delta| Some(delta.quota_epoch_start_unix_secs) == current_epoch)
+        .filter(|delta| delta.accounting_ready)
+        .map(|delta| delta.provider_quota_cost_usd)
+        .sum::<f64>();
+    if !current_epoch_delta.is_finite() {
         return Err(DataLayerError::UnexpectedValue(format!(
             "providers.monthly_used_usd delta is not finite for {target_id}"
         )));
     }
-    sqlx::query(
-        "UPDATE providers SET monthly_used_usd = COALESCE(monthly_used_usd, 0) + ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(delta)
-    .bind(current_unix_secs())
-    .bind(target_id)
-    .execute(&mut **tx)
-    .await
-    .map_sql_err()?;
+    if current_epoch_delta != 0.0 {
+        sqlx::query(
+            "UPDATE providers SET monthly_used_usd = COALESCE(monthly_used_usd, 0) + ?, updated_at = ? WHERE id = ? AND quota_last_reset_at = ?",
+        )
+        .bind(current_epoch_delta)
+        .bind(now_db)
+        .bind(target_id)
+        .bind(current_epoch.map(|value| value as i64))
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
+
+    let config = provider
+        .try_get::<Option<String>, _>("config")
+        .map_sql_err()?
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    let windows = quota_windows_from_config(config.as_ref());
+    for delta in &accepted {
+        let bucket_start = quota_clock_minute(delta.provider_dispatch_at_unix_secs);
+        if delta.accounting_ready {
+            sqlx::query(
+                r#"
+INSERT INTO provider_quota_usage_buckets (
+  provider_id, quota_epoch_start, bucket_start, used_usd, updated_at
+) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (provider_id, quota_epoch_start, bucket_start) DO UPDATE SET
+  used_usd = provider_quota_usage_buckets.used_usd + excluded.used_usd,
+  updated_at = excluded.updated_at
+"#,
+            )
+            .bind(target_id)
+            .bind(delta.quota_epoch_start_unix_secs as i64)
+            .bind(bucket_start as i64)
+            .bind(delta.provider_quota_cost_usd)
+            .bind(now_db)
+            .execute(&mut **tx)
+            .await
+            .map_sql_err()?;
+        }
+
+        if Some(delta.quota_epoch_start_unix_secs) != current_epoch {
+            continue;
+        }
+        for window in &windows {
+            let rolling_start =
+                quota_window_start_unix_secs(now, current_epoch, window.duration_secs);
+            sqlx::query(
+                r#"
+INSERT INTO provider_quota_window_counters (
+  provider_id, duration_secs, quota_epoch_start, rolling_start,
+  accounted_until, used_usd, status, rebuild_error, updated_at
+) VALUES (?, ?, ?, ?, ?, 0, 'rebuilding', NULL, ?)
+ON CONFLICT (provider_id, duration_secs) DO NOTHING
+"#,
+            )
+            .bind(target_id)
+            .bind(window.duration_secs as i64)
+            .bind(delta.quota_epoch_start_unix_secs as i64)
+            .bind(rolling_start as i64)
+            .bind(quota_clock_minute(now) as i64)
+            .bind(now_db)
+            .execute(&mut **tx)
+            .await
+            .map_sql_err()?;
+
+            if delta.accounting_ready {
+                sqlx::query(
+                    r#"
+UPDATE provider_quota_window_counters
+SET used_usd = used_usd + ?, updated_at = ?
+WHERE provider_id = ?
+  AND duration_secs = ?
+  AND quota_epoch_start = ?
+  AND status = 'ready'
+  AND ? >= rolling_start
+  AND ? < accounted_until
+"#,
+                )
+                .bind(delta.provider_quota_cost_usd)
+                .bind(now_db)
+                .bind(target_id)
+                .bind(window.duration_secs as i64)
+                .bind(delta.quota_epoch_start_unix_secs as i64)
+                .bind(bucket_start as i64)
+                .bind(bucket_start as i64)
+                .execute(&mut **tx)
+                .await
+                .map_sql_err()?;
+            } else {
+                sqlx::query(
+                    r#"
+UPDATE provider_quota_window_counters
+SET status = 'failed',
+    rebuild_error = 'quota cost is unavailable for a dispatched monthly request',
+    updated_at = ?
+WHERE provider_id = ?
+  AND duration_secs = ?
+  AND quota_epoch_start = ?
+"#,
+                )
+                .bind(now_db)
+                .bind(target_id)
+                .bind(window.duration_secs as i64)
+                .bind(delta.quota_epoch_start_unix_secs as i64)
+                .execute(&mut **tx)
+                .await
+                .map_sql_err()?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1158,9 +1609,109 @@ fn optional_nonnegative_u64(value: Option<i64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_processed, enqueue_api_key_last_used, enqueue_management_token, enqueue_proxy_node,
-        flush, read_health, read_pending_health,
+        apply_provider_monthly, cleanup_processed, current_unix_secs, enqueue_api_key_last_used,
+        enqueue_management_token, enqueue_proxy_node, flush, maintain_provider_quota_windows,
+        read_health, read_pending_health, ProviderMonthlyDelta,
     };
+
+    #[tokio::test]
+    async fn provider_quota_counters_use_dispatch_epoch_across_mode_switches() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let now = current_unix_secs().max(240);
+        let clock_minute = (now as u64 / 60) * 60;
+        let anchor = clock_minute.saturating_sub(120);
+        sqlx::query(
+            r#"
+INSERT INTO providers (
+  id, name, provider_type, billing_type, monthly_used_usd,
+  quota_last_reset_at, config, created_at, updated_at
+) VALUES (?, 'quota provider', 'custom', 'monthly_quota', 0, ?, ?, ?, ?)
+"#,
+        )
+        .bind("quota-provider")
+        .bind(anchor as i64)
+        .bind(r#"{"quota_windows":[{"duration_secs":86400,"limit_usd":10}]}"#)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("provider should seed");
+
+        let mut tx = pool.begin().await.expect("transaction should begin");
+        apply_provider_monthly(
+            &mut tx,
+            "quota-provider",
+            &[
+                ProviderMonthlyDelta {
+                    provider_quota_cost_usd: 100.0,
+                    quota_epoch_start_unix_secs: anchor.saturating_sub(60),
+                    provider_dispatch_at_unix_secs: anchor.saturating_sub(1),
+                    accounting_ready: true,
+                },
+                ProviderMonthlyDelta {
+                    provider_quota_cost_usd: 2.5,
+                    quota_epoch_start_unix_secs: anchor,
+                    provider_dispatch_at_unix_secs: clock_minute.saturating_sub(60),
+                    accounting_ready: true,
+                },
+            ],
+        )
+        .await
+        .expect("monthly counters should apply");
+        tx.commit().await.expect("transaction should commit");
+        maintain_provider_quota_windows(&pool, now as u64)
+            .await
+            .expect("rolling windows should be maintained");
+
+        let monthly_used: f64 = sqlx::query_scalar(
+            "SELECT monthly_used_usd FROM providers WHERE id = 'quota-provider'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("monthly counter should load");
+        let window_used: f64 = sqlx::query_scalar(
+            "SELECT used_usd FROM provider_quota_window_counters WHERE provider_id = 'quota-provider' AND duration_secs = 86400",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("window counter should load");
+        assert_eq!(monthly_used, 2.5);
+        assert_eq!(window_used, 2.5);
+
+        sqlx::query("UPDATE providers SET billing_type = 'pay_as_you_go' WHERE id = ?")
+            .bind("quota-provider")
+            .execute(&pool)
+            .await
+            .expect("billing mode should update");
+        let mut tx = pool.begin().await.expect("transaction should begin");
+        apply_provider_monthly(
+            &mut tx,
+            "quota-provider",
+            &[ProviderMonthlyDelta {
+                provider_quota_cost_usd: 7.5,
+                quota_epoch_start_unix_secs: anchor,
+                provider_dispatch_at_unix_secs: now as u64,
+                accounting_ready: true,
+            }],
+        )
+        .await
+        .expect("dispatched monthly event should retain its epoch");
+        tx.commit().await.expect("transaction should commit");
+        let unchanged: f64 = sqlx::query_scalar(
+            "SELECT monthly_used_usd FROM providers WHERE id = 'quota-provider'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("monthly counter should load");
+        assert_eq!(unchanged, 10.0);
+    }
     use aether_data_contracts::repository::usage::{
         ApiKeyLastUsedDelta, ManagementTokenCounterDelta, ProxyNodeCounterDelta,
     };

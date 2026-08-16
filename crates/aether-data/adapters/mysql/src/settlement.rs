@@ -42,10 +42,24 @@ SELECT
   ) AS wallet_gift_balance_after,
   usage_settlement_snapshots.provider_monthly_used_usd AS provider_monthly_used_usd,
   usage_record.provider_id,
+  usage_record.created_at_unix_ms AS usage_created_at_unix_secs,
+  COALESCE(
+    JSON_UNQUOTE(JSON_EXTRACT(usage_settlement_snapshots.settlement_snapshot, '$.pricing_snapshot.provider_billing_type')),
+    CAST(provider.billing_type AS CHAR)
+  ) AS provider_billing_type_at_usage,
+  COALESCE(
+    CAST(JSON_UNQUOTE(JSON_EXTRACT(usage_settlement_snapshots.settlement_snapshot, '$.pricing_snapshot.provider_quota_epoch_start_unix_secs')) AS SIGNED),
+    provider.quota_last_reset_at
+  ) AS quota_epoch_start_at_usage,
+  CAST(JSON_UNQUOTE(JSON_EXTRACT(usage_settlement_snapshots.settlement_snapshot, '$.provider_quota_cost_usd')) AS DOUBLE) AS provider_quota_cost_usd,
+  usage_settlement_snapshots.billing_rule_version AS pricing_rule_version_at_usage,
+  JSON_EXTRACT(usage_settlement_snapshots.settlement_snapshot, '$.pricing_snapshot') AS provider_pricing_snapshot_at_usage,
   COALESCE(usage_settlement_snapshots.finalized_at, usage_record.finalized_at) AS finalized_at_unix_secs
 FROM `usage` AS usage_record
 LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = usage_record.request_id
+LEFT JOIN providers AS provider
+  ON provider.id = usage_record.provider_id
 WHERE usage_record.request_id = ?
 FOR UPDATE
 "#;
@@ -96,9 +110,13 @@ ON DUPLICATE KEY UPDATE
 
 const ENQUEUE_PROVIDER_MONTHLY_USAGE_DELTA_SQL: &str = r#"
 INSERT INTO usage_counter_deltas (
-  id, request_id, kind, target_id, total_cost_usd_delta, created_at
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage, quota_accounting_status, created_at
 )
-VALUES (?, ?, 'provider_monthly', ?, ?, ?)
+VALUES (?, ?, 'provider_monthly', ?, ?, ?, 'monthly_quota', ?, ?, ?, ?, ?, ?, ?)
 "#;
 
 #[derive(Debug, Clone)]
@@ -150,11 +168,15 @@ async fn enqueue_provider_monthly_usage_delta_mysql(
     request_id: &str,
     provider_id: &str,
     total_cost_usd_delta: f64,
+    usage_created_at_unix_secs: i64,
+    quota_epoch_start_at_usage: i64,
+    pricing_rule_version_at_usage: Option<&str>,
+    provider_pricing_snapshot_at_usage: Option<&str>,
     created_at: i64,
 ) -> Result<(), DataLayerError> {
     let request_id = request_id.trim();
     let provider_id = provider_id.trim();
-    if request_id.is_empty() || provider_id.is_empty() || total_cost_usd_delta == 0.0 {
+    if request_id.is_empty() || provider_id.is_empty() {
         return Ok(());
     }
     if !total_cost_usd_delta.is_finite() {
@@ -168,6 +190,17 @@ async fn enqueue_provider_monthly_usage_delta_mysql(
         .bind(request_id)
         .bind(provider_id)
         .bind(total_cost_usd_delta)
+        .bind(usage_created_at_unix_secs)
+        .bind(quota_epoch_start_at_usage)
+        .bind(usage_created_at_unix_secs)
+        .bind(total_cost_usd_delta)
+        .bind(pricing_rule_version_at_usage)
+        .bind(provider_pricing_snapshot_at_usage)
+        .bind(if total_cost_usd_delta > 0.0 {
+            "ready"
+        } else {
+            "pending"
+        })
         .bind(created_at)
         .execute(&mut **tx)
         .await
@@ -403,6 +436,48 @@ impl SettlementWriteRepository for MysqlSettlementRepository {
             let settlement = settlement_from_row(&usage_row)?;
             tx.commit().await.map_sql_err()?;
             return Ok(Some(settlement));
+        }
+
+        let provider_billing_type_at_usage = usage_row
+            .try_get::<Option<String>, _>("provider_billing_type_at_usage")
+            .map_sql_err()?
+            .unwrap_or_default();
+        let quota_epoch_start_at_usage = usage_row
+            .try_get::<Option<i64>, _>("quota_epoch_start_at_usage")
+            .map_sql_err()?;
+        if provider_billing_type_at_usage.eq_ignore_ascii_case("monthly_quota") {
+            if let (Some(provider_id), Some(quota_epoch_start_at_usage)) = (
+                input
+                    .provider_id
+                    .as_deref()
+                    .filter(|value| !value.is_empty()),
+                quota_epoch_start_at_usage,
+            ) {
+                let provider_quota_cost_usd = usage_row
+                    .try_get::<Option<f64>, _>("provider_quota_cost_usd")
+                    .map_sql_err()?
+                    .unwrap_or(input.actual_total_cost_usd);
+                let pricing_rule_version = usage_row
+                    .try_get::<Option<String>, _>("pricing_rule_version_at_usage")
+                    .map_sql_err()?;
+                let provider_pricing_snapshot = usage_row
+                    .try_get::<Option<String>, _>("provider_pricing_snapshot_at_usage")
+                    .map_sql_err()?;
+                enqueue_provider_monthly_usage_delta_mysql(
+                    &mut tx,
+                    &input.request_id,
+                    provider_id,
+                    provider_quota_cost_usd,
+                    usage_row
+                        .try_get("usage_created_at_unix_secs")
+                        .map_sql_err()?,
+                    quota_epoch_start_at_usage / 60 * 60,
+                    pricing_rule_version.as_deref(),
+                    provider_pricing_snapshot.as_deref(),
+                    updated_at,
+                )
+                .await?;
+            }
         }
 
         let mut final_billing_status =
@@ -656,21 +731,6 @@ WHERE id = ?
                     .map_sql_err()?;
                 tx.commit().await.map_sql_err()?;
                 return Ok(Some(settlement));
-            }
-
-            if let Some(provider_id) = input
-                .provider_id
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
-                enqueue_provider_monthly_usage_delta_mysql(
-                    &mut tx,
-                    &input.request_id,
-                    provider_id,
-                    input.actual_total_cost_usd,
-                    updated_at,
-                )
-                .await?;
             }
         }
 

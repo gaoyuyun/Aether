@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS public.providers (
     monthly_used_usd double precision,
     quota_reset_day integer,
     quota_last_reset_at bigint,
+    pending_quota_reset_at bigint,
     quota_expires_at bigint,
     enabled boolean DEFAULT true NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
@@ -351,6 +352,33 @@ CREATE INDEX IF NOT EXISTS provider_usage_tracking_provider_id_idx ON public.pro
 CREATE INDEX IF NOT EXISTS provider_usage_tracking_window_start_idx ON public.provider_usage_tracking USING btree (window_start);
 CREATE INDEX IF NOT EXISTS idx_provider_window ON public.provider_usage_tracking USING btree (provider_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_window_time ON public.provider_usage_tracking USING btree (window_start, window_end);
+
+CREATE TABLE IF NOT EXISTS public.provider_quota_window_counters (
+    provider_id character varying(64) NOT NULL,
+    duration_secs bigint NOT NULL,
+    window_start bigint,
+    quota_epoch_start bigint NOT NULL,
+    rolling_start bigint NOT NULL,
+    accounted_until bigint NOT NULL,
+    used_usd double precision DEFAULT 0 NOT NULL,
+    status character varying(32) DEFAULT 'rebuilding' NOT NULL,
+    rebuild_error text,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.provider_quota_window_counters ADD CONSTRAINT provider_quota_window_counters_pkey PRIMARY KEY (provider_id, duration_secs);
+ALTER TABLE ONLY public.provider_quota_window_counters ADD CONSTRAINT provider_quota_window_counters_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
+
+CREATE TABLE IF NOT EXISTS public.provider_quota_usage_buckets (
+    provider_id character varying(64) NOT NULL,
+    quota_epoch_start bigint NOT NULL,
+    bucket_start bigint NOT NULL,
+    used_usd double precision DEFAULT 0 NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.provider_quota_usage_buckets ADD CONSTRAINT provider_quota_usage_buckets_pkey PRIMARY KEY (provider_id, quota_epoch_start, bucket_start);
+ALTER TABLE ONLY public.provider_quota_usage_buckets ADD CONSTRAINT provider_quota_usage_buckets_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
 
 CREATE TABLE IF NOT EXISTS public.models (
     id character varying(64) NOT NULL,

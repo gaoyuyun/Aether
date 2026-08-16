@@ -27,7 +27,7 @@ pub async fn settle_usage_if_needed(
     if !writer.has_usage_settlement_writer() || usage.billing_status != "pending" {
         return Ok(());
     }
-    if !matches!(usage.status.as_str(), "completed" | "failed") {
+    if !matches!(usage.status.as_str(), "completed" | "failed" | "cancelled") {
         return Ok(());
     }
 
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_pending_cancelled_usage() {
+    async fn settles_pending_cancelled_usage() {
         let writer = TestSettlementWriter {
             has_writer: true,
             ..Default::default()
@@ -262,10 +262,11 @@ mod tests {
 
         settle_usage_if_needed(&writer, &usage)
             .await
-            .expect("skipped settlement should succeed");
+            .expect("cancelled settlement should succeed");
 
         let inputs = writer.inputs.lock().expect("settlement inputs lock");
-        assert!(inputs.is_empty());
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].status, "cancelled");
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
 use crate::{AppState, GatewayError};
-use aether_data_contracts::repository::{candidate_selection, candidates, quota};
+use aether_data_contracts::repository::{candidate_selection, candidates, quota, usage};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 const PROVIDER_QUOTA_RUNTIME_CACHE_TTL: Duration = Duration::from_secs(5);
+const PROVIDER_QUOTA_WINDOW_USAGE_CACHE_TTL: Duration = Duration::from_secs(1);
 
 impl AppState {
     pub(crate) async fn list_minimal_candidate_selection_rows_for_api_format(
@@ -93,10 +95,201 @@ impl AppState {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<quota::StoredProviderQuotaSnapshot>, GatewayError> {
+        let mut snapshots = Vec::with_capacity(provider_ids.len());
+        let mut missing = BTreeSet::new();
+        for provider_id in provider_ids {
+            let provider_id = provider_id.trim();
+            if provider_id.is_empty() {
+                continue;
+            }
+            let cache_key = provider_id.to_string();
+            match self
+                .provider_quota_snapshot_cache
+                .get(&cache_key, PROVIDER_QUOTA_RUNTIME_CACHE_TTL)
+            {
+                Some(Some(snapshot)) => snapshots.push(snapshot),
+                Some(None) => {}
+                None => {
+                    missing.insert(cache_key);
+                }
+            }
+        }
+        if missing.is_empty() {
+            return self
+                .ensure_due_provider_quota_resets(provider_ids, snapshots)
+                .await;
+        }
+
+        let _refresh_guard = self.provider_quota_cache_refresh_lock.lock().await;
+        let mut still_missing = Vec::with_capacity(missing.len());
+        for provider_id in missing {
+            match self
+                .provider_quota_snapshot_cache
+                .get(&provider_id, PROVIDER_QUOTA_RUNTIME_CACHE_TTL)
+            {
+                Some(Some(snapshot)) => snapshots.push(snapshot),
+                Some(None) => {}
+                None => still_missing.push(provider_id),
+            }
+        }
+        if still_missing.is_empty() {
+            return self
+                .ensure_due_provider_quota_resets(provider_ids, snapshots)
+                .await;
+        }
+
+        let mut loaded = self
+            .data
+            .find_provider_quotas_by_provider_ids(&still_missing)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .map(|snapshot| (snapshot.provider_id.clone(), snapshot))
+            .collect::<BTreeMap<_, _>>();
+        for provider_id in still_missing {
+            let snapshot = loaded.remove(&provider_id);
+            self.provider_quota_snapshot_cache.insert(
+                provider_id,
+                snapshot.clone(),
+                PROVIDER_QUOTA_RUNTIME_CACHE_TTL,
+            );
+            if let Some(snapshot) = snapshot {
+                snapshots.push(snapshot);
+            }
+        }
+        self.ensure_due_provider_quota_resets(provider_ids, snapshots)
+            .await
+    }
+
+    async fn ensure_due_provider_quota_resets(
+        &self,
+        provider_ids: &[String],
+        snapshots: Vec<quota::StoredProviderQuotaSnapshot>,
+    ) -> Result<Vec<quota::StoredProviderQuotaSnapshot>, GatewayError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 60
+            * 60;
+        let reset_is_due = snapshots.iter().any(|snapshot| {
+            snapshot
+                .pending_quota_reset_at_unix_secs
+                .is_some_and(|effective_at| effective_at <= now)
+                || (snapshot.billing_type == "monthly_quota"
+                    && snapshot
+                        .quota_reset_day
+                        .is_some_and(|days| (1..=30).contains(&days))
+                    && snapshot
+                        .quota_last_reset_at_unix_secs
+                        .map_or(true, |epoch| {
+                            now.saturating_sub(epoch)
+                                >= snapshot.quota_reset_day.unwrap_or(30) * 86_400
+                        }))
+        });
+        if !reset_is_due {
+            return Ok(snapshots);
+        }
+        let reset = self
+            .data
+            .reset_due_provider_quotas(now)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if reset == 0 {
+            return Ok(snapshots);
+        }
         self.data
+            .maintain_provider_quota_windows(now)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.provider_quota_snapshot_cache.clear();
+        self.provider_quota_window_usage_cache.clear();
+        let reloaded = self
+            .data
             .find_provider_quotas_by_provider_ids(provider_ids)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        for snapshot in &reloaded {
+            self.provider_quota_snapshot_cache.insert(
+                snapshot.provider_id.clone(),
+                Some(snapshot.clone()),
+                PROVIDER_QUOTA_RUNTIME_CACHE_TTL,
+            );
+        }
+        Ok(reloaded)
+    }
+
+    pub(crate) async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[usage::ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<usage::StoredProviderQuotaWindowUsage>, GatewayError> {
+        let mut usage_rows = Vec::with_capacity(requests.len());
+        let mut missing = BTreeMap::new();
+        for request in requests {
+            match self
+                .provider_quota_window_usage_cache
+                .get(request, PROVIDER_QUOTA_WINDOW_USAGE_CACHE_TTL)
+            {
+                Some(Some(usage)) => usage_rows.push(usage),
+                Some(None) => {}
+                None => {
+                    missing.insert(request.clone(), ());
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(usage_rows);
+        }
+
+        let _refresh_guard = self.provider_quota_cache_refresh_lock.lock().await;
+        let mut still_missing = BTreeMap::new();
+        for (request, _) in missing {
+            match self
+                .provider_quota_window_usage_cache
+                .get(&request, PROVIDER_QUOTA_WINDOW_USAGE_CACHE_TTL)
+            {
+                Some(Some(usage)) => usage_rows.push(usage),
+                Some(None) => {}
+                None => {
+                    still_missing.insert(request, ());
+                }
+            }
+        }
+        if still_missing.is_empty() {
+            return Ok(usage_rows);
+        }
+
+        let missing_requests = still_missing.keys().cloned().collect::<Vec<_>>();
+        let loaded = self
+            .data
+            .read_provider_quota_window_usage(&missing_requests)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let mut loaded = loaded
+            .into_iter()
+            .map(|usage| {
+                (
+                    usage::ProviderQuotaWindowUsageRequest {
+                        provider_id: usage.provider_id.clone(),
+                        duration_secs: usage.duration_secs,
+                        quota_epoch_start_unix_secs: usage.quota_epoch_start_unix_secs,
+                    },
+                    usage,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (request, _) in still_missing {
+            let usage = loaded.remove(&request);
+            self.provider_quota_window_usage_cache.insert(
+                request,
+                usage.clone(),
+                PROVIDER_QUOTA_WINDOW_USAGE_CACHE_TTL,
+            );
+            if let Some(usage) = usage {
+                usage_rows.push(usage);
+            }
+        }
+        Ok(usage_rows)
     }
 
     pub(crate) async fn read_recent_request_candidates(

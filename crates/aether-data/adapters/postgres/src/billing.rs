@@ -16,6 +16,7 @@ const FIND_MODEL_CONTEXT_SQL: &str = r#"
 SELECT
   p.id AS provider_id,
   CAST(p.billing_type AS TEXT) AS provider_billing_type,
+  CAST(EXTRACT(EPOCH FROM p.quota_last_reset_at) AS BIGINT) AS provider_quota_epoch_start_unix_secs,
   pak.id AS provider_api_key_id,
   pak.rate_multipliers AS provider_api_key_rate_multipliers,
   pak.cache_ttl_minutes AS provider_api_key_cache_ttl_minutes,
@@ -1108,7 +1109,7 @@ RETURNING
 "#;
 
 fn map_row(row: &sqlx::postgres::PgRow) -> Result<StoredBillingModelContext, DataLayerError> {
-    StoredBillingModelContext::new(
+    let mut context = StoredBillingModelContext::new(
         row.try_get("provider_id").map_postgres_err()?,
         row.try_get("provider_billing_type").map_postgres_err()?,
         row.try_get("provider_api_key_id").map_postgres_err()?,
@@ -1129,7 +1130,12 @@ fn map_row(row: &sqlx::postgres::PgRow) -> Result<StoredBillingModelContext, Dat
         row.try_get("model_config").map_postgres_err()?,
         row.try_get("model_price_per_request").map_postgres_err()?,
         row.try_get("model_tiered_pricing").map_postgres_err()?,
-    )
+    )?;
+    context.provider_quota_epoch_start_unix_secs = row
+        .try_get::<Option<i64>, _>("provider_quota_epoch_start_unix_secs")
+        .map_postgres_err()?
+        .map(|value| value.max(0) as u64);
+    Ok(context)
 }
 
 fn read_count(row: sqlx::postgres::PgRow) -> Result<u64, DataLayerError> {

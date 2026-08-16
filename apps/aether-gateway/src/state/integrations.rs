@@ -13,6 +13,9 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
+use aether_data_contracts::repository::usage::{
+    ProviderQuotaWindowUsageRequest, StoredProviderQuotaWindowUsage,
+};
 use aether_model_fetch::{
     aggregate_models_for_cache, build_antigravity_load_code_assist_plan,
     fetch_models_from_transports, merge_upstream_metadata, model_fetch_interval_minutes,
@@ -614,6 +617,20 @@ impl SchedulerRuntimeState for AppState {
         provider_id: &str,
     ) -> Result<Option<StoredProviderQuotaSnapshot>, GatewayError> {
         AppState::read_provider_quota_snapshot(self, provider_id).await
+    }
+
+    async fn read_provider_quota_snapshots(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderQuotaSnapshot>, GatewayError> {
+        AppState::read_provider_quota_snapshots(self, provider_ids).await
+    }
+
+    async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, GatewayError> {
+        AppState::read_provider_quota_window_usage(self, requests).await
     }
 
     async fn read_provider_catalog_providers_by_ids(

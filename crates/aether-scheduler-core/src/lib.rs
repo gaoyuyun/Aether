@@ -50,7 +50,11 @@ pub use model::{
     row_supports_requested_model_with_model_directives_and_request_operation,
     row_supports_required_capability, select_provider_model_name,
 };
-pub use provider::{build_provider_concurrent_limit_map, should_skip_provider_quota};
+pub use provider::{
+    build_provider_concurrent_limit_map, provider_quota_windows,
+    provider_quota_windows_config_is_valid, should_skip_provider_quota,
+    should_skip_provider_quota_with_windows,
+};
 pub use ranking::{
     apply_scheduler_candidate_ranking, SchedulerRankableCandidate, SchedulerRankingContext,
     SchedulerRankingMode, SchedulerRankingOutcome, SchedulerTunnelAffinityBucket,

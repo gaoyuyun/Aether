@@ -157,6 +157,14 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
         else {
             return Ok(Some(build_admin_providers_data_unavailable_response()));
         };
+        if existing_provider.quota_last_reset_at_unix_secs
+            != updated_record.quota_last_reset_at_unix_secs
+        {
+            state
+                .app()
+                .clear_provider_quota_window_counters(&provider_id)
+                .await?;
+        }
         if state
             .fixed_provider_template(&updated_record.provider_type)
             .is_some()

@@ -41,6 +41,7 @@ fn quota_snapshot_select() -> SelectQuery<'static> {
             .with_mysql("quota_last_reset_at"),
         )
         .alias("quota_last_reset_at_unix_secs"),
+        SelectColumn::expr("pending_quota_reset_at").alias("pending_quota_reset_at_unix_secs"),
         SelectColumn::expr(
             DialectSql::dialect(
                 "CAST(EXTRACT(EPOCH FROM quota_expires_at) AS BIGINT)",
@@ -109,33 +110,91 @@ impl ProviderQuotaWriteRepository for MysqlProviderQuotaRepository {
         let now = i64::try_from(now_unix_secs).map_err(|_| {
             DataLayerError::InvalidInput("provider quota reset timestamp overflow".to_string())
         })?;
-        let rows_affected = sqlx::query(
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let due = sqlx::query(
             r#"
-UPDATE providers
-SET monthly_used_usd = 0,
-    quota_last_reset_at = ?,
-    updated_at = ?
-WHERE billing_type = 'monthly_quota'
-  AND is_active = 1
+SELECT id, pending_quota_reset_at
+FROM providers
+WHERE is_active = 1
   AND (
-    quota_last_reset_at IS NULL
-    OR (? - quota_last_reset_at) >= (quota_reset_day * 86400)
+    (pending_quota_reset_at IS NOT NULL AND pending_quota_reset_at <= ?)
+    OR (
+      billing_type = 'monthly_quota'
+      AND quota_reset_day BETWEEN 1 AND 30
+      AND (
+        quota_last_reset_at IS NULL
+        OR (? - quota_last_reset_at) >= (quota_reset_day * 86400)
+      )
+    )
   )
+FOR UPDATE
 "#,
         )
         .bind(now)
         .bind(now)
-        .bind(now)
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await
-        .map_sql_err()?
-        .rows_affected();
-        Ok(usize::try_from(rows_affected).unwrap_or_default())
+        .map_sql_err()?;
+        for row in &due {
+            let provider_id: String = row.try_get("id").map_sql_err()?;
+            let effective_at = row
+                .try_get::<Option<i64>, _>("pending_quota_reset_at")
+                .map_sql_err()?
+                .filter(|value| *value <= now)
+                .unwrap_or(now);
+            sqlx::query("UPDATE providers SET monthly_used_usd = 0, quota_last_reset_at = ?, pending_quota_reset_at = NULL, updated_at = ? WHERE id = ?")
+                .bind(effective_at / 60 * 60)
+                .bind(now)
+                .bind(&provider_id)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+            sqlx::query("DELETE FROM provider_quota_window_counters WHERE provider_id = ?")
+                .bind(&provider_id)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(due.len())
+    }
+
+    async fn request_reset(
+        &self,
+        provider_id: &str,
+        effective_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        let effective_at = i64::try_from(effective_at_unix_secs / 60 * 60).map_err(|_| {
+            DataLayerError::InvalidInput("provider quota reset timestamp overflow".to_string())
+        })?;
+        let now = chrono::Utc::now().timestamp();
+        let result = sqlx::query("UPDATE providers SET pending_quota_reset_at = ?, updated_at = ? WHERE id = ? AND billing_type = 'monthly_quota'")
+            .bind(effective_at)
+            .bind(now)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn clear_window_counters(&self, provider_id: &str) -> Result<(), DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider quota provider_id is empty".to_string(),
+            ));
+        }
+        sqlx::query("DELETE FROM provider_quota_window_counters WHERE provider_id = ?")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        Ok(())
     }
 }
 
 fn map_row(row: &MySqlRow) -> Result<StoredProviderQuotaSnapshot, DataLayerError> {
-    StoredProviderQuotaSnapshot::new(
+    let mut snapshot = StoredProviderQuotaSnapshot::new(
         row.try_get("provider_id").map_sql_err()?,
         row.try_get("billing_type").map_sql_err()?,
         row.try_get("monthly_quota_usd").map_sql_err()?,
@@ -144,7 +203,12 @@ fn map_row(row: &MySqlRow) -> Result<StoredProviderQuotaSnapshot, DataLayerError
         row.try_get("quota_last_reset_at_unix_secs").map_sql_err()?,
         row.try_get("quota_expires_at_unix_secs").map_sql_err()?,
         row.try_get("is_active").map_sql_err()?,
-    )
+    )?;
+    snapshot.pending_quota_reset_at_unix_secs = row
+        .try_get::<Option<i64>, _>("pending_quota_reset_at_unix_secs")
+        .map_sql_err()?
+        .map(|value| value.max(0) as u64);
+    Ok(snapshot)
 }
 
 #[cfg(test)]

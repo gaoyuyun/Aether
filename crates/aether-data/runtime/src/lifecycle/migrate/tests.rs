@@ -695,6 +695,7 @@ fn empty_database_snapshot_sql_includes_usage_body_blobs_and_audit_admin_role() 
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL
         .contains("CREATE TABLE IF NOT EXISTS public.usage_counter_deltas"));
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("ix_usage_counter_deltas_unprocessed"));
+    assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("provider_quota_window_counters"));
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("idx_entitlement_usage_entitlement_date"));
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("idx_provider_api_keys_provider_default_sort"));
     assert!(EMPTY_DATABASE_SNAPSHOT_SQL.contains("idx_provider_api_keys_provider_name_id"));

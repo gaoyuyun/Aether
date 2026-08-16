@@ -51,6 +51,17 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn summarize_provider_actual_usage_since(
+        &self,
+        provider_id: &str,
+        since_unix_secs: u64,
+    ) -> Result<f64, GatewayError> {
+        self.data
+            .summarize_provider_actual_usage_since(provider_id, since_unix_secs)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn find_request_usage_by_id(
         &self,
         usage_id: &str,

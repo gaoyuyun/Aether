@@ -71,13 +71,43 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
                 quota_expires_at_unix_secs: quota.quota_expires_at_unix_secs,
                 is_active: quota.is_active,
             };
-            if snapshot.should_reset(now_unix_secs) {
+            let pending_due = quota
+                .pending_quota_reset_at_unix_secs
+                .is_some_and(|effective_at| effective_at <= now_unix_secs);
+            if pending_due
+                || (quota.quota_reset_day.is_some_and(|days| days <= 30)
+                    && snapshot.should_reset(now_unix_secs))
+            {
                 quota.monthly_used_usd = 0.0;
-                quota.quota_last_reset_at_unix_secs = Some(now_unix_secs);
+                quota.quota_last_reset_at_unix_secs = Some(
+                    quota
+                        .pending_quota_reset_at_unix_secs
+                        .filter(|effective_at| *effective_at <= now_unix_secs)
+                        .unwrap_or(now_unix_secs)
+                        / 60
+                        * 60,
+                );
+                quota.pending_quota_reset_at_unix_secs = None;
                 count += 1;
             }
         }
         Ok(count)
+    }
+
+    async fn request_reset(
+        &self,
+        provider_id: &str,
+        effective_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        let mut quotas = self.by_provider_id.write().expect("quota repository lock");
+        let Some(quota) = quotas.get_mut(provider_id) else {
+            return Ok(false);
+        };
+        if ProviderBillingType::parse(&quota.billing_type) != ProviderBillingType::MonthlyQuota {
+            return Ok(false);
+        }
+        quota.pending_quota_reset_at_unix_secs = Some(effective_at_unix_secs / 60 * 60);
+        Ok(true)
     }
 }
 

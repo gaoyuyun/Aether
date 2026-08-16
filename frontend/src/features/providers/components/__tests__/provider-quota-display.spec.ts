@@ -33,7 +33,7 @@ describe('provider quota display components', () => {
     expect(root.querySelector('[data-testid="provider-monthly-quota-card"]')).toBeTruthy()
     expect(root.querySelector('[data-testid="provider-monthly-quota-percent"]')?.textContent).toContain('25.0%')
     expect(root.querySelector('[data-testid="provider-monthly-quota-amount"]')?.textContent).toContain('$25.00 / $100.00')
-    expect(root.querySelector('[data-testid="provider-monthly-quota-reset"]')?.textContent).toContain('15')
+    expect(root.querySelector('[data-testid="provider-monthly-quota-reset"]')?.textContent).toContain('每 15 天重置')
 
     unmount()
   })
@@ -50,6 +50,30 @@ describe('provider quota display components', () => {
     expect(root.querySelector('[data-testid="provider-quota-progress-meter"]')?.textContent?.trim()).toBe('100.0%')
     expect((root.querySelector('[data-testid="provider-quota-progress-bar"]') as HTMLElement).style.width).toBe('100%')
     expect(root.querySelector('[data-testid="provider-quota-progress-reset"]')?.textContent).toBe('2h reset')
+
+    unmount()
+  })
+
+  it('renders configured quota windows', () => {
+    const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
+      used: 10,
+      quota: 100,
+      windows: [
+        {
+          duration_secs: 86_400,
+          limit_usd: 5,
+          used_usd: 2.5,
+          status: 'ready',
+          rolling_start: '2026-08-17T00:00:00Z',
+        },
+        { duration_secs: 604_800, limit_usd: 20, status: 'rebuilding' },
+      ],
+    })
+
+    const text = root.querySelector('[data-testid="provider-quota-windows"]')?.textContent
+    expect(text).toContain('$2.50 / $5.00')
+    expect(text).toContain('$20.00')
+    expect(text).toContain('统计重建中')
 
     unmount()
   })

@@ -17,6 +17,7 @@ const MODEL_CONTEXT_COLUMNS: &str = r#"
 SELECT
   p.id AS provider_id,
   p.billing_type AS provider_billing_type,
+  p.quota_last_reset_at AS provider_quota_epoch_start_unix_secs,
   pak.id AS provider_api_key_id,
   pak.rate_multipliers AS provider_api_key_rate_multipliers,
   pak.cache_ttl_minutes AS provider_api_key_cache_ttl_minutes,
@@ -1108,7 +1109,7 @@ fn json_mapping_matches(value: &serde_json::Value, requested_model: &str) -> boo
 }
 
 fn map_row(row: &MySqlRow) -> Result<StoredBillingModelContext, DataLayerError> {
-    StoredBillingModelContext::new(
+    let mut context = StoredBillingModelContext::new(
         row.try_get("provider_id").map_sql_err()?,
         row.try_get("provider_billing_type").map_sql_err()?,
         row.try_get("provider_api_key_id").map_sql_err()?,
@@ -1129,7 +1130,12 @@ fn map_row(row: &MySqlRow) -> Result<StoredBillingModelContext, DataLayerError> 
         parse_json(row.try_get("model_config").ok().flatten())?,
         row.try_get("model_price_per_request").map_sql_err()?,
         parse_json(row.try_get("model_tiered_pricing").ok().flatten())?,
-    )
+    )?;
+    context.provider_quota_epoch_start_unix_secs = row
+        .try_get::<Option<i64>, _>("provider_quota_epoch_start_unix_secs")
+        .map_sql_err()?
+        .map(|value| value.max(0) as u64);
+    Ok(context)
 }
 
 fn parse_json(value: Option<String>) -> Result<Option<serde_json::Value>, DataLayerError> {

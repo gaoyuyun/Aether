@@ -514,7 +514,8 @@ nullable = true
 
 [[table.usage.columns]]
 name = "created_at_unix_ms"
-type = "unix_millis"
+# Legacy column name. Runtime and all SQL adapters store Unix seconds here.
+type = "unix_seconds"
 default = 0
 
 [[table.usage.columns]]
@@ -899,6 +900,49 @@ nullable = true
 [[table.usage_counter_deltas.columns]]
 name = "usage_created_at_unix_secs"
 type = "unix_seconds"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "provider_billing_type_at_usage"
+type = "text"
+length = 64
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "quota_epoch_start_at_usage"
+type = "unix_seconds"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "provider_dispatch_at_unix_secs"
+type = "unix_seconds"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "provider_quota_cost_usd"
+type = "float64"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "pricing_rule_version_at_usage"
+type = "text"
+length = 128
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "provider_pricing_snapshot_at_usage"
+type = "json"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "quota_delta_sequence"
+type = "int64"
+nullable = true
+
+[[table.usage_counter_deltas.columns]]
+name = "quota_accounting_status"
+type = "text"
+length = 32
 nullable = true
 
 [[table.usage_counter_deltas.columns]]
