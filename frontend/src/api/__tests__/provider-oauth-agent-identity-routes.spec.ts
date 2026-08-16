@@ -17,6 +17,7 @@ import {
   getProviderCookieAuthorizeTaskStatus,
   getBatchImportOAuthTaskStatus,
   importProviderRefreshToken,
+  providerOAuthExpiryToUnixSeconds,
   startProviderCookieAuthorizeTask,
   startBatchImportOAuthTask,
 } from '@/api/endpoints/provider_oauth'
@@ -29,6 +30,12 @@ describe('Provider OAuth management routes', () => {
     postMock.mockReset()
     getMock.mockResolvedValue({ data: {} })
     postMock.mockResolvedValue({ data: {} })
+  })
+
+  it('converts RFC3339 response expiries only at the internal runtime boundary', () => {
+    expect(providerOAuthExpiryToUnixSeconds('2100-01-01T00:00:00Z')).toBe(4_102_444_800)
+    expect(providerOAuthExpiryToUnixSeconds('invalid')).toBeNull()
+    expect(providerOAuthExpiryToUnixSeconds(null)).toBeNull()
   })
 
   it('routes one Agent Identity JSON through the provider-oauth permission surface', async () => {

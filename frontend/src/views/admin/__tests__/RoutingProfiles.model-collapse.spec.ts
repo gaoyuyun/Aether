@@ -146,7 +146,7 @@ beforeEach(() => {
       is_system_default: false,
       config_json: modelConfig('gpt-5'),
       version: 1,
-      updated_at: 1,
+      updated_at: '2026-01-01T00:00:00Z',
     }],
   })
   apiMocks.getGlobalModels.mockResolvedValue({

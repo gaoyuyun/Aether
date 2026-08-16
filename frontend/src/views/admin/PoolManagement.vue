@@ -1076,7 +1076,10 @@ import {
   refreshProviderQuota,
   resetProviderKeyCycleStats,
 } from '@/api/endpoints/keys'
-import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
+import {
+  providerOAuthExpiryToUnixSeconds,
+  refreshProviderOAuth,
+} from '@/api/endpoints/provider_oauth'
 import type {
   PoolOverviewItem,
   PoolKeyDetail,
@@ -2757,7 +2760,7 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
   refreshingOAuthKeyId.value = key.key_id
   try {
     const result = await refreshProviderOAuth(key.key_id)
-    const refreshedExpiresAt = typeof result.expires_at === 'number' ? result.expires_at : null
+    const refreshedExpiresAt = providerOAuthExpiryToUnixSeconds(result.expires_at)
     const target = keyPage.value.keys.find(k => k.key_id === key.key_id)
     if (target) {
       target.oauth_expires_at = refreshedExpiresAt

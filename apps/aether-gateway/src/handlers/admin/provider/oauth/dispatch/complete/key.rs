@@ -19,6 +19,7 @@ use super::shared::{
 };
 use crate::handlers::admin::provider::shared::paths::admin_provider_oauth_complete_key_id;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use crate::handlers::shared::sync_provider_key_oauth_status_snapshot;
 use crate::provider_key_auth::provider_key_is_oauth_managed;
 use crate::GatewayError;
@@ -502,7 +503,7 @@ pub(super) async fn handle_admin_provider_oauth_complete_key(
 
     Ok(Json(json!({
         "provider_type": provider_type,
-        "expires_at": expires_at,
+        "expires_at": expires_at.and_then(unix_secs_to_rfc3339),
         "has_refresh_token": refresh_token.is_some(),
         "email": auth_config.get("email").cloned().unwrap_or(serde_json::Value::Null),
         "account_state_recheck_attempted": false,

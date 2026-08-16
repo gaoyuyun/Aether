@@ -3,6 +3,7 @@ use super::{
     build_admin_billing_data_unavailable_response, build_admin_billing_not_found_response,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use crate::{GatewayError, LocalMutationOutcome};
 use aether_data_contracts::repository::billing::{BillingPlanRecord, BillingPlanWriteInput};
 use axum::{
@@ -242,8 +243,8 @@ pub(crate) fn billing_plan_payload(record: &BillingPlanRecord) -> serde_json::Va
         "max_active_per_user": record.max_active_per_user,
         "purchase_limit_scope": record.purchase_limit_scope,
         "entitlements": record.entitlements_json,
-        "created_at": record.created_at_unix_secs,
-        "updated_at": record.updated_at_unix_secs,
+        "created_at": unix_secs_to_rfc3339(record.created_at_unix_secs),
+        "updated_at": unix_secs_to_rfc3339(record.updated_at_unix_secs),
     })
 }
 
@@ -259,6 +260,38 @@ fn plan_id_from_path(path: &str, suffix: Option<&str>) -> Option<String> {
         None
     } else {
         Some(id.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::billing_plan_payload;
+    use aether_data_contracts::repository::billing::BillingPlanRecord;
+    use serde_json::json;
+
+    #[test]
+    fn billing_plan_payload_formats_timestamps_as_rfc3339() {
+        let record = BillingPlanRecord {
+            id: "plan-1".to_string(),
+            title: "Plan".to_string(),
+            description: None,
+            price_amount: 10.0,
+            price_currency: "CNY".to_string(),
+            duration_unit: "month".to_string(),
+            duration_value: 1,
+            enabled: true,
+            sort_order: 0,
+            max_active_per_user: 1,
+            purchase_limit_scope: "active_period".to_string(),
+            entitlements_json: json!([]),
+            created_at_unix_secs: 1_700_000_000,
+            updated_at_unix_secs: 4_102_444_800,
+        };
+
+        let payload = billing_plan_payload(&record);
+
+        assert_eq!(payload["created_at"], "2023-11-14T22:13:20Z");
+        assert_eq!(payload["updated_at"], "2100-01-01T00:00:00Z");
     }
 }
 

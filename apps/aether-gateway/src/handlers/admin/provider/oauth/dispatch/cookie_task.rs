@@ -9,6 +9,7 @@ use super::super::state::{
 };
 use super::batch::build_admin_provider_oauth_batch_task_state;
 use super::cookie::normalize_claude_session_key;
+use crate::handlers::admin::provider::oauth::format_provider_oauth_task_timestamps;
 use crate::handlers::admin::provider::shared::paths::admin_provider_oauth_cookie_task_provider_id;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::task_runtime::{
@@ -365,7 +366,9 @@ pub(super) async fn handle_admin_provider_oauth_start_cookie_task(
         .await;
     });
 
-    Ok(Json(submitted_state).into_response())
+    let mut submitted_response = submitted_state;
+    format_provider_oauth_task_timestamps(&mut submitted_response);
+    Ok(Json(submitted_response).into_response())
 }
 
 #[allow(clippy::too_many_arguments)]
