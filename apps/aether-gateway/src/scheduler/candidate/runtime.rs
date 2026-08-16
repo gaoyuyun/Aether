@@ -9,10 +9,10 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use aether_data_contracts::repository::usage::ProviderQuotaWindowUsageRequest;
 use aether_scheduler_core::{
-    auth_api_key_concurrency_limit_reached, candidate_is_selectable_with_runtime_state,
-    candidate_runtime_skip_reason_with_state, effective_provider_key_rpm_limit,
-    provider_quota_windows, should_skip_provider_quota_with_windows,
-    CandidateRuntimeSelectabilityInput,
+    auth_api_key_concurrency_limit_reached, build_provider_concurrent_limit_map,
+    candidate_is_selectable_with_runtime_state, candidate_runtime_skip_reason_with_state,
+    effective_provider_key_rpm_limit, provider_quota_windows,
+    should_skip_provider_quota_with_windows, CandidateRuntimeSelectabilityInput,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,16 +41,8 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     now_unix_secs: u64,
 ) -> Result<CandidateRuntimeSelectionSnapshot, GatewayError> {
     let providers = read_provider_runtime_states(state, candidates).await?;
-    let provider_concurrent_limits = providers
-        .iter()
-        .filter_map(|(provider_id, provider)| {
-            provider
-                .concurrent_limit
-                .and_then(|limit| usize::try_from(limit).ok())
-                .filter(|limit| *limit > 0)
-                .map(|limit| (provider_id.clone(), limit))
-        })
-        .collect();
+    let provider_concurrent_limits =
+        build_provider_concurrent_limit_map(providers.values().cloned().collect());
     let provider_pool_state = read_provider_pool_state_map(&providers);
     let provider_skip_exhausted_accounts = provider_pool_state
         .iter()

@@ -1086,6 +1086,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260725030000,
             20260727000000,
             20260731000000,
+            20260815010000,
+            20260816000000,
         ]
     );
     assert_eq!(
@@ -1121,6 +1123,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260725040000,
             20260727000000,
             20260731000000,
+            20260815010000,
+            20260816000000,
         ]
     );
 }
@@ -2229,12 +2233,14 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260727000000,
             20260731000000,
             20260815000000,
+            20260815010000,
+            20260816000000,
         ]
     );
 }
 
 #[test]
-fn pending_migrations_from_applied_is_empty_after_empty_database_snapshot_stamp() {
+fn pending_migrations_from_applied_keeps_post_snapshot_incrementals_pending() {
     let applied = empty_database_snapshot_migrations(&POSTGRES_MIGRATOR)
         .expect("empty database snapshot migrations should resolve")
         .into_iter()
@@ -2246,10 +2252,15 @@ fn pending_migrations_from_applied_is_empty_after_empty_database_snapshot_stamp(
 
     let pending = pending_migrations_from_applied(&applied);
 
-    assert!(
-            pending.is_empty(),
-            "empty database snapshot-stamped databases should not require a manual migration before first startup"
-        );
+    let pending_versions = pending
+        .into_iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pending_versions,
+        vec![20260815010000, 20260816000000],
+        "data and schema migrations added after the empty database snapshot must remain pending"
+    );
 }
 
 #[tokio::test]
