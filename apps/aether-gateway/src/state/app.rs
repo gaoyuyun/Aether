@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use aether_data::repository::users::StoredUserGroup;
 use aether_data_contracts::repository::billing::UserDailyQuotaAvailabilityRecord;
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
-use aether_data_contracts::repository::usage::UsageCounterHealthSnapshot;
+use aether_data_contracts::repository::usage::{
+    ProviderQuotaWindowUsageRequest, StoredProviderQuotaWindowUsage, UsageCounterHealthSnapshot,
+};
 use aether_runtime::ConcurrencyGate;
 use aether_runtime_state::{RuntimeSemaphore, RuntimeState};
 use dashmap::DashMap;
@@ -401,6 +403,9 @@ pub struct AppState {
         Arc<ValueCache<String, aether_data::repository::wallet::StoredWalletSnapshot>>,
     pub(crate) auth_request_cost_upper_bound_cache: Arc<ValueCache<String, f64>>,
     pub(crate) provider_quota_snapshot_cache: Arc<ValueCache<String, StoredProviderQuotaSnapshot>>,
+    pub(crate) provider_quota_window_usage_cache:
+        Arc<ValueCache<ProviderQuotaWindowUsageRequest, StoredProviderQuotaWindowUsage>>,
+    pub(crate) provider_quota_cache_refresh_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) user_groups_for_user_cache: Arc<ValueCache<String, Vec<StoredUserGroup>>>,
     pub(crate) routing_group_selection_cache:
         Arc<ValueCache<String, crate::routing::GatewayRoutingGroupSelection>>,

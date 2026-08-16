@@ -83,6 +83,8 @@ impl BillingPricingResolution {
 pub struct BillingModelPricingSnapshot {
     pub provider_id: String,
     pub provider_billing_type: Option<String>,
+    #[serde(default)]
+    pub provider_quota_epoch_start_unix_secs: Option<u64>,
     pub provider_api_key_id: Option<String>,
     pub provider_api_key_rate_multipliers: Option<Value>,
     pub provider_api_key_cache_ttl_minutes: Option<i64>,
@@ -463,6 +465,7 @@ impl From<&StoredBillingModelContext> for BillingModelPricingSnapshot {
         Self {
             provider_id: context.provider_id.clone(),
             provider_billing_type: context.provider_billing_type.clone(),
+            provider_quota_epoch_start_unix_secs: context.provider_quota_epoch_start_unix_secs,
             provider_api_key_id: context.provider_api_key_id.clone(),
             provider_api_key_rate_multipliers: context.provider_api_key_rate_multipliers.clone(),
             provider_api_key_cache_ttl_minutes: context.provider_api_key_cache_ttl_minutes,
@@ -485,6 +488,7 @@ impl From<StoredBillingModelContext> for BillingModelPricingSnapshot {
         Self {
             provider_id: context.provider_id,
             provider_billing_type: context.provider_billing_type,
+            provider_quota_epoch_start_unix_secs: context.provider_quota_epoch_start_unix_secs,
             provider_api_key_id: context.provider_api_key_id,
             provider_api_key_rate_multipliers: context.provider_api_key_rate_multipliers,
             provider_api_key_cache_ttl_minutes: context.provider_api_key_cache_ttl_minutes,
@@ -775,6 +779,7 @@ mod tests {
         BillingModelPricingSnapshot {
             provider_id: "provider-1".to_string(),
             provider_billing_type: None,
+            provider_quota_epoch_start_unix_secs: None,
             provider_api_key_id: None,
             provider_api_key_rate_multipliers: None,
             provider_api_key_cache_ttl_minutes: None,
@@ -1549,7 +1554,11 @@ impl BillingUsageInput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BillingComputation {
     pub cost_result: crate::CostResult,
+    /// Compatibility alias for `user_billable_cost_usd`.
     pub actual_total_cost: f64,
+    pub provider_cost_usd: f64,
+    pub provider_quota_cost_usd: f64,
+    pub user_billable_cost_usd: f64,
     pub rate_multiplier: f64,
     pub is_free_tier: bool,
     pub pricing_resolution: BillingPricingResolution,

@@ -197,6 +197,11 @@ type = "unix_seconds"
 nullable = true
 
 [[table.providers.columns]]
+name = "pending_quota_reset_at"
+type = "unix_seconds"
+nullable = true
+
+[[table.providers.columns]]
 name = "quota_expires_at"
 type = "unix_seconds"
 nullable = true
@@ -1514,6 +1519,98 @@ columns = ["provider_id", "window_start"]
 [[table.provider_usage_tracking.indexes]]
 name = "idx_window_time"
 columns = ["window_start", "window_end"]
+
+[table.provider_quota_window_counters]
+domain = "provider_catalog"
+order = 87
+primary_key = ["provider_id", "duration_secs"]
+
+[[table.provider_quota_window_counters.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.provider_quota_window_counters.columns]]
+name = "duration_secs"
+type = "int64"
+
+[[table.provider_quota_window_counters.columns]]
+name = "window_start"
+type = "unix_seconds"
+nullable = true
+
+[[table.provider_quota_window_counters.columns]]
+name = "quota_epoch_start"
+type = "unix_seconds"
+
+[[table.provider_quota_window_counters.columns]]
+name = "rolling_start"
+type = "unix_seconds"
+
+[[table.provider_quota_window_counters.columns]]
+name = "accounted_until"
+type = "unix_seconds"
+
+[[table.provider_quota_window_counters.columns]]
+name = "used_usd"
+type = "float64"
+default = 0
+
+[[table.provider_quota_window_counters.columns]]
+name = "status"
+type = "text"
+length = 32
+default = "rebuilding"
+
+[[table.provider_quota_window_counters.columns]]
+name = "rebuild_error"
+type = "long_text"
+nullable = true
+
+[[table.provider_quota_window_counters.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.provider_quota_window_counters.foreign_keys]]
+name = "provider_quota_window_counters_provider_id_fkey"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[table.provider_quota_usage_buckets]
+domain = "provider_catalog"
+order = 88
+primary_key = ["provider_id", "quota_epoch_start", "bucket_start"]
+
+[[table.provider_quota_usage_buckets.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.provider_quota_usage_buckets.columns]]
+name = "quota_epoch_start"
+type = "unix_seconds"
+
+[[table.provider_quota_usage_buckets.columns]]
+name = "bucket_start"
+type = "unix_seconds"
+
+[[table.provider_quota_usage_buckets.columns]]
+name = "used_usd"
+type = "float64"
+default = 0
+
+[[table.provider_quota_usage_buckets.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.provider_quota_usage_buckets.foreign_keys]]
+name = "provider_quota_usage_buckets_provider_id_fkey"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "cascade"
 
 [table.models]
 domain = "provider_catalog"

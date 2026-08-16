@@ -358,6 +358,7 @@ fn build_settlement_snapshot(
         "pricing_snapshot": {
             "provider_id": pricing.provider_id.clone(),
             "provider_billing_type": pricing.provider_billing_type.clone(),
+            "provider_quota_epoch_start_unix_secs": pricing.provider_quota_epoch_start_unix_secs,
             "provider_api_key_id": pricing.provider_api_key_id.clone(),
             "global_model_id": pricing.global_model_id.clone(),
             "global_model_name": pricing.global_model_name.clone(),
@@ -387,6 +388,10 @@ fn build_settlement_snapshot(
         "cost_breakdown": snapshot.cost_breakdown.clone(),
         "total_cost": snapshot.total_cost,
         "actual_total_cost": computation.actual_total_cost,
+        "list_cost_usd": snapshot.total_cost,
+        "provider_cost_usd": computation.provider_cost_usd,
+        "provider_quota_cost_usd": computation.provider_quota_cost_usd,
+        "user_billable_cost_usd": computation.user_billable_cost_usd,
         "status": snapshot.status,
         "calculated_at": snapshot.calculated_at.clone(),
     })

@@ -684,6 +684,35 @@ impl AppState {
         Ok(updated)
     }
 
+    pub(crate) async fn clear_provider_quota_window_counters(
+        &self,
+        provider_id: &str,
+    ) -> Result<(), GatewayError> {
+        self.data
+            .clear_provider_quota_window_counters(provider_id)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.provider_quota_window_usage_cache.clear();
+        Ok(())
+    }
+
+    pub(crate) async fn request_provider_quota_reset(
+        &self,
+        provider_id: &str,
+        effective_at_unix_secs: u64,
+    ) -> Result<bool, GatewayError> {
+        let requested = self
+            .data
+            .request_provider_quota_reset(provider_id, effective_at_unix_secs)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if requested {
+            self.provider_quota_snapshot_cache.clear();
+            self.provider_quota_window_usage_cache.clear();
+        }
+        Ok(requested)
+    }
+
     pub(crate) async fn delete_provider_catalog_provider(
         &self,
         provider_id: &str,

@@ -1667,6 +1667,13 @@ WHERE request_id = ?
         counters::flush(&self.pool, batch_size).await
     }
 
+    async fn maintain_provider_quota_windows(
+        &self,
+        now_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        counters::maintain_provider_quota_windows(&self.pool, now_unix_secs).await
+    }
+
     async fn enqueue_proxy_node_counter_delta(
         &self,
         delta: aether_data_contracts::repository::usage::ProxyNodeCounterDelta,

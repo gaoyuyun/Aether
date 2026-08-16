@@ -351,10 +351,10 @@ pub(super) fn classify_admin_basic_family_route(
             "admin:provider_strategy",
             false,
         ))
-    } else if method == http::Method::DELETE
+    } else if ((method == http::Method::DELETE && normalized_path.ends_with("/quota"))
+        || (method == http::Method::POST && normalized_path.ends_with("/quota/reset")))
         && normalized_path.starts_with("/api/admin/provider-strategy/providers/")
-        && normalized_path.ends_with("/quota")
-        && normalized_path.matches('/').count() == 6
+        && normalized_path.matches('/').count() == if method == http::Method::POST { 7 } else { 6 }
     {
         Some(classified(
             "admin_proxy",

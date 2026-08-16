@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use aether_data_contracts::repository::usage::{
-    ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
-    StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredRequestUsageAudit,
+    ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
+    StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
+    StoredProviderQuotaWindowUsage, StoredProviderUsageSummary, StoredRequestUsageAudit,
     StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBreakdownSummaryRow,
     StoredUsageCacheAffinityHitSummary, StoredUsageCacheAffinityIntervalRow,
     StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary, StoredUsageDailySummary,
@@ -403,6 +404,31 @@ impl UsageReadRepository for MysqlUsageReadRepository {
         );
         repository
             .summarize_provider_usage_since(provider_id, since_unix_secs)
+            .await
+    }
+
+    async fn summarize_provider_actual_usage_since(
+        &self,
+        provider_id: &str,
+        since_unix_secs: u64,
+    ) -> Result<f64, DataLayerError> {
+        let records = self
+            .storage
+            .load_usage_records_for_provider_since(provider_id, since_unix_secs)
+            .await?;
+        Ok(records
+            .into_iter()
+            .map(|record| record.actual_total_cost_usd)
+            .filter(|value| value.is_finite())
+            .sum())
+    }
+
+    async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, DataLayerError> {
+        self.storage
+            .read_provider_quota_window_usage(requests)
             .await
     }
 

@@ -144,6 +144,10 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
         primary_key: &["id"],
     },
     AuxiliaryTable {
+        name: "provider_quota_window_counters",
+        primary_key: &["provider_id", "duration_secs"],
+    },
+    AuxiliaryTable {
         name: "gemini_file_mappings",
         primary_key: &["id"],
     },

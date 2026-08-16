@@ -135,7 +135,7 @@
         </div>
         <div class="grid grid-cols-2 gap-4">
           <div class="space-y-1.5">
-            <Label>{{ legacyT('计费类型') }}</Label>
+            <Label>{{ legacyT('上游成本模式') }}</Label>
             <Select
               v-model="form.billing_type"
             >
@@ -257,27 +257,83 @@
             />
           </div>
           <div class="space-y-1.5">
-            <Label class="text-xs">{{ legacyT('重置周期 (天)') }}</Label>
+            <Label class="text-xs">{{ legacyT('总额周期 (天，1=日卡)') }}</Label>
             <Input
               :model-value="form.quota_reset_day ?? ''"
               type="number"
               min="1"
-              max="365"
+              max="30"
               @update:model-value="(v) => form.quota_reset_day = parseNumberInput(v) ?? 30"
             />
           </div>
+          <div class="col-span-2 space-y-2">
+            <div class="flex items-center justify-between">
+              <Label class="text-xs">{{ legacyT('滚动窗口（分钟）') }}</Label>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                class="h-8"
+                @click="addQuotaWindow"
+              >
+                + {{ legacyT('添加窗口') }}
+              </Button>
+            </div>
+            <p class="text-xs text-muted-foreground">
+              {{ legacyT('窗口时长必须是整分钟，范围为 1 分钟到 30 天；修改时保留当前已用额度。') }}
+            </p>
+            <div
+              v-for="(window, index) in form.quota_windows"
+              :key="index"
+              class="grid grid-cols-[1fr_1fr_auto] items-end gap-2"
+            >
+              <div class="space-y-1">
+                <Label class="text-xs">{{ legacyT('时长（分钟）') }}</Label>
+                <Input
+                  :model-value="Math.round(window.duration_secs / 60)"
+                  type="number"
+                  min="1"
+                  max="43200"
+                  step="1"
+                  @update:model-value="(value) => updateQuotaWindowDuration(index, value)"
+                />
+              </div>
+              <div class="space-y-1">
+                <Label class="text-xs">{{ legacyT('窗口额度 (USD)') }}</Label>
+                <Input
+                  :model-value="window.limit_usd"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  @update:model-value="(value) => updateQuotaWindowLimit(index, value)"
+                />
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                class="h-9 px-2"
+                :aria-label="legacyT('删除窗口')"
+                @click="removeQuotaWindow(index)"
+              >
+                ×
+              </Button>
+            </div>
+          </div>
           <div class="space-y-1.5">
             <Label class="text-xs">
-              {{ legacyT('周期开始时间') }} <span class="text-red-500">*</span>
+              {{ legacyT('周期开始时间（精确到分）') }} <span class="text-red-500">*</span>
             </Label>
             <Input
               v-model="form.quota_last_reset_at"
               type="datetime-local"
+              step="60"
             />
           </div>
           <div class="space-y-1.5">
             <Label class="text-xs">{{ legacyT('过期时间') }}</Label>
             <Input
+              id="quota-expires-at"
               v-model="form.quota_expires_at"
               type="datetime-local"
             />
@@ -432,6 +488,7 @@ import {
   createProvider,
   normalizePoolAdvancedConfig,
   updateProvider,
+  type ProviderQuotaWindow,
   type ProviderType,
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
@@ -485,6 +542,7 @@ const form = ref({
   quota_reset_day: 30,
   quota_last_reset_at: '',  // 周期开始时间
   quota_expires_at: '',
+  quota_windows: [] as ProviderQuotaWindow[],
   provider_priority: 100,
   keep_priority_on_conversion: false,  // 格式转换时是否保持优先级
   // 状态配置
@@ -520,6 +578,7 @@ function resetForm() {
     quota_reset_day: 30,
     quota_last_reset_at: '',
     quota_expires_at: '',
+    quota_windows: [],
     provider_priority: defaultPriority.value,
     keep_priority_on_conversion: false,
     is_active: true,
@@ -558,6 +617,7 @@ function loadProviderData() {
     quota_reset_day: props.provider.quota_reset_day || 30,
     quota_last_reset_at: formatDateTimeLocalInput(props.provider.quota_last_reset_at),
     quota_expires_at: formatDateTimeLocalInput(props.provider.quota_expires_at),
+    quota_windows: (props.provider.quota_windows ?? []).map(window => ({ ...window })),
     provider_priority: props.provider.provider_priority || 999,
     keep_priority_on_conversion: props.provider.keep_priority_on_conversion ?? false,
     is_active: props.provider.is_active,
@@ -579,6 +639,24 @@ function loadProviderData() {
     // Responses WebSocket 配置
     responses_websocket_enabled: props.provider.responses_websocket_enabled ?? false,
   }
+}
+
+function addQuotaWindow() {
+  if (form.value.quota_windows.length >= 8) return
+  form.value.quota_windows.push({ duration_secs: 86_400, limit_usd: 0 })
+}
+
+function removeQuotaWindow(index: number) {
+  form.value.quota_windows.splice(index, 1)
+}
+
+function updateQuotaWindowDuration(index: number, value: string | number | null | undefined) {
+  const minutes = parseNumberInput(value, { min: 1, max: 43_200 }) ?? 1
+  form.value.quota_windows[index].duration_secs = Math.round(minutes) * 60
+}
+
+function updateQuotaWindowLimit(index: number, value: string | number | null | undefined) {
+  form.value.quota_windows[index].limit_usd = parseNumberInput(value, { allowFloat: true, min: 0 }) ?? 0
 }
 
 // 使用 useFormDialog 统一处理对话框逻辑
@@ -635,7 +713,13 @@ const handleSubmit = async () => {
       monthly_quota_usd: form.value.monthly_quota_usd,
       quota_reset_day: form.value.quota_reset_day,
       quota_last_reset_at: quotaLastResetAt,
-      quota_expires_at: quotaExpiresAt,
+      // 编辑时清空过期时间需显式发送 null，后端只有收到 null 才会清除已保存的值
+      quota_expires_at: quotaExpiresAt ?? (isEditMode.value ? null : undefined),
+      // Leave the saved window policy intact while a provider is temporarily pay-as-you-go;
+      // switching back to a subscription can then resume the same policy.
+      quota_windows: form.value.billing_type === 'monthly_quota'
+        ? form.value.quota_windows.map(window => ({ ...window }))
+        : undefined,
       keep_priority_on_conversion: form.value.keep_priority_on_conversion,
       responses_websocket_enabled: form.value.responses_websocket_enabled,
       is_active: form.value.is_active,

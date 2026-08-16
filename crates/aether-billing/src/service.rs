@@ -59,9 +59,6 @@ impl BillingService {
         if normalize_task_type(&estimate.task_type) == "image" {
             return Ok(None);
         }
-        if pricing.is_free_tier() {
-            return Ok(Some(0.0));
-        }
         if estimate.max_output_tokens.is_none()
             && pricing_resolutions.iter().any(|resolution| {
                 resolution
@@ -262,10 +259,20 @@ impl BillingService {
         };
         let rate_multiplier = pricing.rate_multiplier_for_api_format(input.api_format.as_deref());
         let is_free_tier = pricing.is_free_tier();
-        let actual_total_cost = if is_free_tier {
+        let user_billable_cost_usd = quantize_cost(total_cost * rate_multiplier);
+        let provider_cost_usd = if is_free_tier {
             0.0
         } else {
-            quantize_cost(total_cost * rate_multiplier)
+            user_billable_cost_usd
+        };
+        let provider_quota_cost_usd = if pricing
+            .provider_billing_type
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("monthly_quota"))
+        {
+            user_billable_cost_usd
+        } else {
+            0.0
         };
 
         Ok(BillingComputation {
@@ -290,7 +297,10 @@ impl BillingService {
                     engine_version: "2.0".to_string(),
                 },
             },
-            actual_total_cost,
+            actual_total_cost: user_billable_cost_usd,
+            provider_cost_usd,
+            provider_quota_cost_usd,
+            user_billable_cost_usd,
             rate_multiplier,
             is_free_tier,
             pricing_resolution,
@@ -409,6 +419,9 @@ fn no_rule_computation(
             },
         },
         actual_total_cost: 0.0,
+        provider_cost_usd: 0.0,
+        provider_quota_cost_usd: 0.0,
+        user_billable_cost_usd: 0.0,
         rate_multiplier: pricing.rate_multiplier_for_api_format(input.api_format.as_deref()),
         is_free_tier: pricing.is_free_tier(),
         pricing_resolution,
@@ -917,6 +930,7 @@ mod tests {
         BillingModelPricingSnapshot {
             provider_id: "provider-1".to_string(),
             provider_billing_type: Some("pay_as_you_go".to_string()),
+            provider_quota_epoch_start_unix_secs: None,
             provider_api_key_id: Some("key-1".to_string()),
             provider_api_key_rate_multipliers: Some(json!({"openai:chat": 0.5})),
             provider_api_key_cache_ttl_minutes: Some(60),
@@ -1715,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn authorization_estimate_supports_standard_fixed_price_and_free_tier() {
+    fn authorization_estimate_does_not_treat_free_tier_as_user_free() {
         let service = BillingService::new();
         let estimate = BillingAuthorizationEstimateInput::new("chat", 1_000);
         let fixed_pricing = BillingModelPricingSnapshot {
@@ -1739,8 +1753,20 @@ mod tests {
             service
                 .estimate_authorization_cost_upper_bound(&free_pricing, &estimate)
                 .expect("free estimate should calculate"),
-            Some(0.0)
+            None
         );
+
+        let free_fixed_pricing = BillingModelPricingSnapshot {
+            provider_billing_type: Some("free_tier".to_string()),
+            ..fixed_pricing
+        };
+        let result = service
+            .calculate(&free_fixed_pricing, &BillingUsageInput::new("chat"))
+            .expect("free-tier upstream should retain downstream pricing");
+        assert_eq!(result.provider_cost_usd, 0.0);
+        assert_eq!(result.provider_quota_cost_usd, 0.0);
+        assert_eq!(result.user_billable_cost_usd, 0.02);
+        assert_eq!(result.actual_total_cost, 0.02);
     }
 
     #[test]
@@ -2214,6 +2240,7 @@ mod tests {
         let pricing = BillingModelPricingSnapshot {
             provider_id: "provider-1".to_string(),
             provider_billing_type: Some("pay_as_you_go".to_string()),
+            provider_quota_epoch_start_unix_secs: None,
             provider_api_key_id: Some("key-1".to_string()),
             provider_api_key_rate_multipliers: None,
             provider_api_key_cache_ttl_minutes: Some(5),
@@ -2289,6 +2316,7 @@ mod tests {
         let pricing = BillingModelPricingSnapshot {
             provider_id: "provider-1".to_string(),
             provider_billing_type: Some("pay_as_you_go".to_string()),
+            provider_quota_epoch_start_unix_secs: None,
             provider_api_key_id: Some("key-1".to_string()),
             provider_api_key_rate_multipliers: None,
             provider_api_key_cache_ttl_minutes: Some(60),

@@ -183,6 +183,14 @@ CREATE TABLE IF NOT EXISTS usage_counter_deltas (
     candidate_last_used_at_unix_secs INTEGER,
     removed_last_used_at_unix_secs INTEGER,
     usage_created_at_unix_secs INTEGER,
+    provider_billing_type_at_usage TEXT,
+    quota_epoch_start_at_usage INTEGER,
+    provider_dispatch_at_unix_secs INTEGER,
+    provider_quota_cost_usd REAL,
+    pricing_rule_version_at_usage TEXT,
+    provider_pricing_snapshot_at_usage TEXT,
+    quota_delta_sequence INTEGER,
+    quota_accounting_status TEXT,
     created_at INTEGER NOT NULL,
     processed_at INTEGER
 );

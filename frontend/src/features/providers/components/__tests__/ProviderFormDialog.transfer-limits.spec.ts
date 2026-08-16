@@ -226,6 +226,40 @@ describe('ProviderFormDialog transfer limits', () => {
   })
 })
 
+describe('ProviderFormDialog quota expiry updates', () => {
+  it('sends null when the administrator clears an existing expiry', async () => {
+    mountDialog(makeProvider({
+      billing_type: 'monthly_quota',
+      monthly_quota_usd: 10,
+      quota_reset_day: 30,
+      quota_last_reset_at: '2026-08-18T00:00:00Z',
+      quota_expires_at: '2026-12-31T00:00:00Z',
+    }))
+    await settle()
+
+    await setInput('#quota-expires-at', '')
+    clickButton('保存')
+    await settle()
+
+    expect(endpointMocks.updateProvider).toHaveBeenCalledWith(
+      'provider-1',
+      expect.objectContaining({ quota_expires_at: null }),
+    )
+  })
+
+  it('omits the expiry when creating a provider without one', async () => {
+    mountDialog(null)
+    await settle()
+
+    await setInput('#name', 'New Provider')
+    clickButton('创建')
+    await settle()
+
+    const payload = endpointMocks.createProvider.mock.calls[0]?.[0]
+    expect(payload?.quota_expires_at).toBeUndefined()
+  })
+})
+
 describe('ProviderFormDialog provider types', () => {
   it('creates an experimental Claude Code provider from the add dialog', async () => {
     mountDialog(null)

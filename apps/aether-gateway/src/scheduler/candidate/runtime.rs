@@ -4,11 +4,15 @@ use aether_admin::provider::{
     pool as admin_provider_pool_pure, status as admin_provider_status_pure,
 };
 use aether_data_contracts::repository::candidates::StoredRequestCandidate;
-use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
+use aether_data_contracts::repository::provider_catalog::{
+    StoredProviderCatalogKey, StoredProviderCatalogProvider,
+};
+use aether_data_contracts::repository::usage::ProviderQuotaWindowUsageRequest;
 use aether_scheduler_core::{
-    auth_api_key_concurrency_limit_reached, build_provider_concurrent_limit_map,
-    candidate_is_selectable_with_runtime_state, candidate_runtime_skip_reason_with_state,
-    effective_provider_key_rpm_limit, CandidateRuntimeSelectabilityInput,
+    auth_api_key_concurrency_limit_reached, candidate_is_selectable_with_runtime_state,
+    candidate_runtime_skip_reason_with_state, effective_provider_key_rpm_limit,
+    provider_quota_windows, should_skip_provider_quota_with_windows,
+    CandidateRuntimeSelectabilityInput,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,8 +40,18 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     now_unix_secs: u64,
 ) -> Result<CandidateRuntimeSelectionSnapshot, GatewayError> {
-    let provider_concurrent_limits = read_provider_concurrent_limits(state, candidates).await?;
-    let provider_pool_state = read_provider_pool_state_map(state, candidates).await?;
+    let providers = read_provider_runtime_states(state, candidates).await?;
+    let provider_concurrent_limits = providers
+        .iter()
+        .filter_map(|(provider_id, provider)| {
+            provider
+                .concurrent_limit
+                .and_then(|limit| usize::try_from(limit).ok())
+                .filter(|limit| *limit > 0)
+                .map(|limit| (provider_id.clone(), limit))
+        })
+        .collect();
+    let provider_pool_state = read_provider_pool_state_map(&providers);
     let provider_skip_exhausted_accounts = provider_pool_state
         .iter()
         .map(|(provider_id, state)| (provider_id.clone(), state.skip_exhausted_accounts))
@@ -65,7 +79,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     let key_oauth_invalid =
         read_key_oauth_invalid_map(candidates, &provider_key_rpm_states, now_unix_secs);
     let provider_quota_blocks_requests =
-        read_provider_quota_block_map(state, candidates, now_unix_secs).await?;
+        read_provider_quota_block_map(state, &providers, now_unix_secs).await?;
     let provider_key_rpm_reset_ats =
         read_provider_key_rpm_reset_at_map(state, candidates, now_unix_secs);
 
@@ -221,10 +235,10 @@ pub(super) fn current_candidate_runtime_skip_reason(
     })
 }
 
-pub(super) async fn read_provider_concurrent_limits(
+async fn read_provider_runtime_states(
     state: &(impl SchedulerRuntimeState + ?Sized),
     candidates: &[SchedulerMinimalCandidateSelectionCandidate],
-) -> Result<BTreeMap<String, usize>, GatewayError> {
+) -> Result<BTreeMap<String, StoredProviderCatalogProvider>, GatewayError> {
     let provider_ids = candidates
         .iter()
         .map(|candidate| candidate.provider_id.clone())
@@ -235,10 +249,12 @@ pub(super) async fn read_provider_concurrent_limits(
         return Ok(BTreeMap::new());
     }
 
-    let providers = state
+    Ok(state
         .read_provider_catalog_providers_by_ids(&provider_ids)
-        .await?;
-    Ok(build_provider_concurrent_limit_map(providers))
+        .await?
+        .into_iter()
+        .map(|provider| (provider.id.clone(), provider))
+        .collect())
 }
 
 pub(super) async fn read_provider_key_rpm_states(
@@ -264,23 +280,128 @@ pub(super) async fn read_provider_key_rpm_states(
 
 async fn read_provider_quota_block_map(
     state: &(impl SchedulerRuntimeState + ?Sized),
-    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
+    providers: &BTreeMap<String, StoredProviderCatalogProvider>,
     now_unix_secs: u64,
 ) -> Result<BTreeMap<String, bool>, GatewayError> {
-    let provider_ids = candidates
-        .iter()
-        .map(|candidate| candidate.provider_id.clone())
-        .collect::<BTreeSet<_>>()
+    let provider_ids = providers.keys().cloned().collect::<Vec<_>>();
+    let quotas = state
+        .read_provider_quota_snapshots(&provider_ids)
+        .await?
         .into_iter()
-        .collect::<Vec<_>>();
+        .map(|quota| (quota.provider_id.clone(), quota))
+        .collect::<BTreeMap<_, _>>();
+    let mut provider_windows = BTreeMap::new();
+    let mut invalid_window_configs = std::collections::BTreeSet::new();
+    let mut window_requests = Vec::new();
+    for provider_id in &provider_ids {
+        let Some(quota) = quotas.get(provider_id) else {
+            continue;
+        };
+        if aether_scheduler_core::should_skip_provider_quota(quota, now_unix_secs) {
+            continue;
+        }
+        let Some(provider) = providers.get(provider_id) else {
+            continue;
+        };
+        if !aether_scheduler_core::provider_quota_windows_config_is_valid(provider.config.as_ref())
+        {
+            invalid_window_configs.insert(provider_id.clone());
+            continue;
+        }
+        let windows = provider_quota_windows(provider.config.as_ref());
+        let Some(quota_epoch_start_unix_secs) = quota
+            .quota_last_reset_at_unix_secs
+            .map(aether_wallet::quota_clock_minute)
+        else {
+            if !windows.is_empty() {
+                provider_windows.insert(provider_id.clone(), windows);
+            }
+            continue;
+        };
+        for window in &windows {
+            window_requests.push(ProviderQuotaWindowUsageRequest {
+                provider_id: provider_id.clone(),
+                duration_secs: window.duration_secs,
+                quota_epoch_start_unix_secs,
+            });
+        }
+        if !windows.is_empty() {
+            provider_windows.insert(provider_id.clone(), windows);
+        }
+    }
+    let mut window_usage = BTreeMap::<
+        String,
+        BTreeMap<
+            (u64, u64),
+            aether_data_contracts::repository::usage::StoredProviderQuotaWindowUsage,
+        >,
+    >::new();
+    for usage in state
+        .read_provider_quota_window_usage(&window_requests)
+        .await?
+    {
+        window_usage
+            .entry(usage.provider_id.clone())
+            .or_default()
+            .insert(
+                (usage.duration_secs, usage.quota_epoch_start_unix_secs),
+                usage,
+            );
+    }
     let mut quota_blocks = BTreeMap::new();
 
     for provider_id in provider_ids {
-        let blocks_requests = state
-            .read_provider_quota_snapshot(&provider_id)
-            .await?
-            .as_ref()
-            .is_some_and(|quota| should_skip_provider_quota(quota, now_unix_secs));
+        let quota = quotas.get(&provider_id);
+        let mut blocks_requests = quota.as_ref().is_some_and(|quota| {
+            aether_scheduler_core::should_skip_provider_quota(quota, now_unix_secs)
+        }) || invalid_window_configs.contains(&provider_id);
+
+        if !blocks_requests {
+            if let (Some(quota), Some(windows)) = (quota, provider_windows.get(&provider_id)) {
+                let epoch = quota
+                    .quota_last_reset_at_unix_secs
+                    .map(aether_wallet::quota_clock_minute);
+                let clock_minute = aether_wallet::quota_clock_minute(now_unix_secs);
+                let rows = epoch.map(|epoch| {
+                    windows
+                        .iter()
+                        .map(|window| {
+                            window_usage
+                                .get(&provider_id)
+                                .and_then(|usage| usage.get(&(window.duration_secs, epoch)))
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let all_ready = rows.as_ref().is_some_and(|rows| {
+                    rows.iter().zip(windows).all(|(row, window)| {
+                        row.is_some_and(|row| {
+                            row.status == "ready"
+                                && row.accounted_until_unix_secs >= clock_minute
+                                && row.rolling_start_unix_secs
+                                    == aether_wallet::quota_window_start_unix_secs(
+                                        now_unix_secs,
+                                        epoch,
+                                        window.duration_secs,
+                                    )
+                        })
+                    })
+                });
+                if !all_ready {
+                    blocks_requests = true;
+                } else if let Some(rows) = rows {
+                    let usage = rows
+                        .into_iter()
+                        .map(|row| row.map(|row| row.used_usd).unwrap_or_default())
+                        .collect::<Vec<_>>();
+                    blocks_requests = should_skip_provider_quota_with_windows(
+                        quota,
+                        now_unix_secs,
+                        windows,
+                        &usage,
+                    );
+                }
+            }
+        }
         quota_blocks.insert(provider_id, blocks_requests);
     }
 
@@ -293,25 +414,11 @@ struct ProviderPoolState {
     skip_exhausted_accounts: bool,
 }
 
-async fn read_provider_pool_state_map(
-    state: &(impl SchedulerRuntimeState + ?Sized),
-    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
-) -> Result<BTreeMap<String, ProviderPoolState>, GatewayError> {
-    let provider_ids = candidates
-        .iter()
-        .map(|candidate| candidate.provider_id.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if provider_ids.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    let providers = state
-        .read_provider_catalog_providers_by_ids(&provider_ids)
-        .await?;
-    Ok(providers
-        .into_iter()
+fn read_provider_pool_state_map(
+    providers: &BTreeMap<String, StoredProviderCatalogProvider>,
+) -> BTreeMap<String, ProviderPoolState> {
+    providers
+        .values()
         .map(|provider| {
             let pool_advanced = provider
                 .config
@@ -323,14 +430,14 @@ async fn read_provider_pool_state_map(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             (
-                provider.id,
+                provider.id.clone(),
                 ProviderPoolState {
                     pool_enabled: pool_advanced.is_some(),
                     skip_exhausted_accounts,
                 },
             )
         })
-        .collect())
+        .collect()
 }
 
 fn read_key_account_quota_exhaustion_map(

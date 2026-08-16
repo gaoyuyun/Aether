@@ -16,7 +16,8 @@ pub(crate) fn admin_provider_id_for_provider_strategy_stats(request_path: &str) 
 }
 
 pub(crate) fn admin_provider_id_for_provider_strategy_quota(request_path: &str) -> Option<String> {
-    strategy_provider_id_for_suffix(request_path, "/quota")
+    strategy_provider_id_for_suffix(request_path, "/quota/reset")
+        .or_else(|| strategy_provider_id_for_suffix(request_path, "/quota"))
 }
 
 fn strategy_provider_id_for_suffix(request_path: &str, suffix: &str) -> Option<String> {

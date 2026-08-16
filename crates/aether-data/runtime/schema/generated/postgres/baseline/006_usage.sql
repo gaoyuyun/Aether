@@ -191,6 +191,14 @@ CREATE TABLE IF NOT EXISTS public.usage_counter_deltas (
     candidate_last_used_at_unix_secs bigint,
     removed_last_used_at_unix_secs bigint,
     usage_created_at_unix_secs bigint,
+    provider_billing_type_at_usage character varying(64),
+    quota_epoch_start_at_usage bigint,
+    provider_dispatch_at_unix_secs bigint,
+    provider_quota_cost_usd double precision,
+    pricing_rule_version_at_usage character varying(128),
+    provider_pricing_snapshot_at_usage jsonb,
+    quota_delta_sequence bigint,
+    quota_accounting_status character varying(32),
     created_at timestamp with time zone NOT NULL,
     processed_at timestamp with time zone
 );

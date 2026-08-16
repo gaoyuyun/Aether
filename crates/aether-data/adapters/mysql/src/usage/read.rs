@@ -1,9 +1,11 @@
 use aether_data_contracts::repository::usage::{
-    ProviderApiKeyWindowUsageRequest, StoredRequestUsageAudit, UsageAuditKeywordSearchQuery,
+    ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
+    StoredProviderQuotaWindowUsage, StoredRequestUsageAudit, UsageAuditKeywordSearchQuery,
     UsageAuditListQuery, UsageMonitoringErrorCountQuery, UsageMonitoringErrorListQuery,
 };
 use aether_data_contracts::DataLayerError;
-use sqlx::{MySql, QueryBuilder};
+use sqlx::{MySql, QueryBuilder, Row};
+use std::collections::BTreeSet;
 
 use crate::error::SqlResultExt;
 
@@ -135,6 +137,90 @@ impl MysqlUsageReadFilter {
 }
 
 impl MysqlUsageStorage {
+    pub async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, DataLayerError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested = BTreeSet::new();
+        let mut provider_ids = BTreeSet::new();
+        let mut duration_secs_values = BTreeSet::new();
+        for request in requests {
+            if request.provider_id.trim().is_empty() || request.duration_secs == 0 {
+                return Err(DataLayerError::InvalidInput(
+                    "provider quota window request must have a provider and duration".to_string(),
+                ));
+            }
+            let duration_secs = to_i64(
+                request.duration_secs,
+                "provider_quota_window_counters.duration_secs",
+            )?;
+            to_i64(
+                request.quota_epoch_start_unix_secs,
+                "provider_quota_window_counters.quota_epoch_start",
+            )?;
+            requested.insert((
+                request.provider_id.clone(),
+                request.duration_secs,
+                request.quota_epoch_start_unix_secs,
+            ));
+            provider_ids.insert(request.provider_id.clone());
+            duration_secs_values.insert(duration_secs);
+        }
+
+        let mut builder = QueryBuilder::<MySql>::new(
+            "SELECT provider_id, duration_secs, quota_epoch_start, rolling_start, accounted_until, used_usd, status FROM provider_quota_window_counters WHERE provider_id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for provider_id in provider_ids {
+                separated.push_bind(provider_id);
+            }
+        }
+        builder.push(") AND duration_secs IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for duration_secs in duration_secs_values {
+                separated.push_bind(duration_secs);
+            }
+        }
+        builder.push(")");
+
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
+        let mut usage_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let usage = StoredProviderQuotaWindowUsage {
+                provider_id: row.try_get("provider_id").map_sql_err()?,
+                duration_secs: row.try_get::<i64, _>("duration_secs").map_sql_err()?.max(0) as u64,
+                quota_epoch_start_unix_secs: row
+                    .try_get::<i64, _>("quota_epoch_start")
+                    .map_sql_err()?
+                    .max(0) as u64,
+                rolling_start_unix_secs: row
+                    .try_get::<i64, _>("rolling_start")
+                    .map_sql_err()?
+                    .max(0) as u64,
+                accounted_until_unix_secs: row
+                    .try_get::<i64, _>("accounted_until")
+                    .map_sql_err()?
+                    .max(0) as u64,
+                used_usd: row.try_get("used_usd").map_sql_err()?,
+                status: row.try_get("status").map_sql_err()?,
+            };
+            if requested.contains(&(
+                usage.provider_id.clone(),
+                usage.duration_secs,
+                usage.quota_epoch_start_unix_secs,
+            )) {
+                usage_rows.push(usage);
+            }
+        }
+        Ok(usage_rows)
+    }
+
     pub async fn find_by_id(
         &self,
         id: &str,
