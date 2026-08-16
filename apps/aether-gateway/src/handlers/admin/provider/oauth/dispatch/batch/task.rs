@@ -13,6 +13,7 @@ use super::progress::{
 };
 use crate::handlers::admin::provider::oauth::duplicates::codex_agent_identity_account_lock_keys;
 use crate::handlers::admin::provider::oauth::errors::build_internal_control_error_response;
+use crate::handlers::admin::provider::oauth::format_provider_oauth_task_timestamps;
 use crate::handlers::admin::provider::oauth::state::{
     admin_provider_oauth_template, build_admin_provider_oauth_backend_unavailable_response,
     is_fixed_provider_type_for_provider_oauth,
@@ -711,7 +712,7 @@ async fn handle_admin_provider_oauth_start_import_task(
         }
     });
 
-    let submitted_response = build_admin_provider_oauth_batch_task_state(
+    let mut submitted_response = build_admin_provider_oauth_batch_task_state(
         &task_id,
         &provider_id,
         &provider_type,
@@ -730,6 +731,7 @@ async fn handle_admin_provider_oauth_start_import_task(
         None,
         None,
     );
+    format_provider_oauth_task_timestamps(&mut submitted_response);
     Ok(Json(submitted_response).into_response())
 }
 

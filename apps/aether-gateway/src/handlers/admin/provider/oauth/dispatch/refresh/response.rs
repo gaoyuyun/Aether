@@ -1,5 +1,6 @@
 use super::super::super::errors::build_internal_control_error_response;
 use super::helpers::RefreshSuccessContext;
+use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use axum::{
     body::Body,
     http,
@@ -47,9 +48,13 @@ pub(super) fn admin_provider_oauth_refresh_success_response(
 ) -> Response<Body> {
     let expires_at = success
         .refreshed_expires_at_unix_secs
-        .map(serde_json::Value::from)
-        .or_else(|| success.refreshed_auth_config.get("expires_at").cloned())
-        .unwrap_or(Value::Null);
+        .or_else(|| {
+            success
+                .refreshed_auth_config
+                .get("expires_at")
+                .and_then(Value::as_u64)
+        })
+        .and_then(unix_secs_to_rfc3339);
     Json(json!({
         "provider_type": success.provider_type,
         "expires_at": expires_at,

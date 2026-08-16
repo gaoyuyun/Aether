@@ -2,6 +2,7 @@ use super::{
     build_admin_payments_backend_unavailable_response, build_admin_payments_bad_request_response,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use crate::handlers::shared::{
     payment_gateway_allow_user_refund, payment_gateway_channels_config_json,
     payment_gateway_channels_json, payment_gateway_config_json, payment_gateway_refund_enabled,
@@ -171,8 +172,8 @@ fn gateway_config_payload(
         "refund_enabled": refund_enabled,
         "allow_user_refund": allow_user_refund,
         "config": config,
-        "created_at": record.created_at_unix_secs,
-        "updated_at": record.updated_at_unix_secs,
+        "created_at": unix_secs_to_rfc3339(record.created_at_unix_secs),
+        "updated_at": unix_secs_to_rfc3339(record.updated_at_unix_secs),
     })
 }
 
@@ -491,5 +492,35 @@ pub(super) async fn maybe_build_local_admin_payment_gateways_response(
             ))
         }
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gateway_config_payload;
+    use aether_data_contracts::repository::billing::PaymentGatewayConfigRecord;
+    use serde_json::json;
+
+    #[test]
+    fn gateway_config_payload_formats_timestamps_as_rfc3339() {
+        let record = PaymentGatewayConfigRecord {
+            provider: "stripe".to_string(),
+            enabled: true,
+            endpoint_url: "https://api.stripe.com".to_string(),
+            callback_base_url: None,
+            merchant_id: "merchant".to_string(),
+            merchant_key_encrypted: Some("encrypted".to_string()),
+            pay_currency: "USD".to_string(),
+            usd_exchange_rate: 1.0,
+            min_recharge_usd: 1.0,
+            channels_json: json!([]),
+            created_at_unix_secs: 1_700_000_000,
+            updated_at_unix_secs: 4_102_444_800,
+        };
+
+        let payload = gateway_config_payload(record);
+
+        assert_eq!(payload["created_at"], "2023-11-14T22:13:20Z");
+        assert_eq!(payload["updated_at"], "2100-01-01T00:00:00Z");
     }
 }

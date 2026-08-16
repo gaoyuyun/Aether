@@ -22,7 +22,9 @@ use uuid::Uuid;
 
 use crate::clock::current_unix_secs;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
-use crate::handlers::admin::shared::{attach_admin_audit_response, query_param_value};
+use crate::handlers::admin::shared::{
+    attach_admin_audit_response, query_param_value, unix_secs_to_rfc3339,
+};
 use crate::routing::{
     apply_routing_mutation_plan, build_routing_trace_seed, resolve_gateway_routing_policy,
     GatewayRoutingPolicyInput,
@@ -606,9 +608,9 @@ fn routing_group_payload(group: &StoredRoutingGroup) -> Value {
         "is_system_default": group.is_system_default,
         "config_json": group.config_json,
         "version": group.version,
-        "created_at": group.created_at,
-        "updated_at": group.updated_at,
-        "published_at": group.published_at,
+        "created_at": routing_timestamp(group.created_at),
+        "updated_at": routing_timestamp(group.updated_at),
+        "published_at": group.published_at.and_then(routing_timestamp),
     })
 }
 
@@ -620,8 +622,8 @@ fn routing_group_binding_payload(binding: &StoredRoutingGroupBinding) -> Value {
         "subject_id": binding.subject_id,
         "is_default": binding.is_default,
         "allow_explicit_select": binding.allow_explicit_select,
-        "created_at": binding.created_at,
-        "updated_at": binding.updated_at,
+        "created_at": routing_timestamp(binding.created_at),
+        "updated_at": routing_timestamp(binding.updated_at),
     })
 }
 
@@ -631,9 +633,13 @@ fn routing_group_version_payload(version: &StoredRoutingGroupVersion) -> Value {
         "group_id": version.group_id,
         "version": version.version,
         "config_json": version.config_json,
-        "created_at": version.created_at,
+        "created_at": routing_timestamp(version.created_at),
         "created_by": version.created_by,
     })
+}
+
+fn routing_timestamp(unix_secs: i64) -> Option<String> {
+    u64::try_from(unix_secs).ok().and_then(unix_secs_to_rfc3339)
 }
 
 fn normalized_admin_path(path: &str) -> String {
@@ -757,4 +763,61 @@ fn data_unavailable_response() -> Response<Body> {
         Json(json!({ "detail": "routing profile data backend is unavailable" })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        routing_group_binding_payload, routing_group_payload, routing_group_version_payload,
+    };
+    use aether_data_contracts::repository::routing_profiles::{
+        StoredRoutingGroup, StoredRoutingGroupBinding, StoredRoutingGroupVersion,
+    };
+    use aether_routing_core::RoutingGroupBindingSubject;
+    use serde_json::json;
+
+    #[test]
+    fn routing_payloads_format_timestamps_as_rfc3339() {
+        let group = StoredRoutingGroup {
+            id: "group-1".to_string(),
+            name: "Default".to_string(),
+            description: None,
+            enabled: true,
+            is_system_default: true,
+            config_json: json!({}),
+            version: 1,
+            created_at: 1_700_000_001,
+            updated_at: 1_700_000_002,
+            published_at: Some(1_700_000_003),
+        };
+        let binding = StoredRoutingGroupBinding {
+            id: "binding-1".to_string(),
+            group_id: group.id.clone(),
+            subject_type: RoutingGroupBindingSubject::User,
+            subject_id: "user-1".to_string(),
+            is_default: false,
+            allow_explicit_select: true,
+            created_at: 1_700_000_001,
+            updated_at: 1_700_000_002,
+        };
+        let version = StoredRoutingGroupVersion {
+            id: "version-1".to_string(),
+            group_id: group.id.clone(),
+            version: 1,
+            config_json: json!({}),
+            created_at: 1_700_000_003,
+            created_by: None,
+        };
+
+        let group_payload = routing_group_payload(&group);
+        let binding_payload = routing_group_binding_payload(&binding);
+        let version_payload = routing_group_version_payload(&version);
+
+        assert_eq!(group_payload["created_at"], "2023-11-14T22:13:21Z");
+        assert_eq!(group_payload["updated_at"], "2023-11-14T22:13:22Z");
+        assert_eq!(group_payload["published_at"], "2023-11-14T22:13:23Z");
+        assert_eq!(binding_payload["created_at"], "2023-11-14T22:13:21Z");
+        assert_eq!(binding_payload["updated_at"], "2023-11-14T22:13:22Z");
+        assert_eq!(version_payload["created_at"], "2023-11-14T22:13:23Z");
+    }
 }

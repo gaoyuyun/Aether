@@ -480,9 +480,9 @@ describe('OAuthAccountDialog authorization and import', () => {
       message: null,
       error: null,
       error_samples: [{ index: 1, status: 'error', error: 'expired cookie' }],
-      created_at: 1,
-      finished_at: 2,
-      updated_at: 2,
+      created_at: '1970-01-01T00:00:01Z',
+      finished_at: '1970-01-01T00:00:02Z',
+      updated_at: '1970-01-01T00:00:02Z',
     })
     const root = mountDialog('claude_code')
     await settle()
@@ -552,9 +552,9 @@ describe('OAuthAccountDialog authorization and import', () => {
         { index: 2, status: 'error', error: 'expired cookie' },
         { index: 3, status: 'error', error: 'third safe reason' },
       ],
-      created_at: 1,
-      finished_at: 2,
-      updated_at: 2,
+      created_at: '1970-01-01T00:00:01Z',
+      finished_at: '1970-01-01T00:00:02Z',
+      updated_at: '1970-01-01T00:00:02Z',
     })
     const root = mountDialog('claude_code')
     await settle()
