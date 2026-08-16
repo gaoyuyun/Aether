@@ -5,7 +5,7 @@ use tracing::warn;
 use crate::data::GatewayDataState;
 use crate::AppState;
 
-const QUOTA_RESET_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const QUOTA_RESET_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) async fn reset_due_provider_quotas_once(
     data: &GatewayDataState,
@@ -14,7 +14,8 @@ pub(crate) async fn reset_due_provider_quotas_once(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    data.reset_due_provider_quotas(now_unix_secs).await
+    data.reset_due_provider_quotas(now_unix_secs / 60 * 60)
+        .await
 }
 
 pub(crate) fn spawn_provider_quota_reset_worker(
@@ -28,17 +29,45 @@ pub(crate) fn spawn_provider_quota_reset_worker(
         app,
         crate::task_runtime::TASK_KEY_PROVIDER_QUOTA_RESET,
         |app| async move {
-            let data = app.data;
-            if let Err(err) = reset_due_provider_quotas_once(&data).await {
-                warn!(error = %err, "gateway provider quota reset startup failed");
+            let data = app.data.clone();
+            match reset_due_provider_quotas_once(&data).await {
+                Ok(reset) if reset > 0 => app.invalidate_provider_routing_caches(),
+                Ok(_) => {}
+                Err(err) => warn!(error = %err, "gateway provider quota reset startup failed"),
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            match data.maintain_provider_quota_windows(now / 60 * 60).await {
+                Ok(maintained) if maintained > 0 => app.provider_quota_window_usage_cache.clear(),
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(error = %err, "gateway provider rolling quota maintenance startup failed")
+                }
             }
             let mut interval = tokio::time::interval(QUOTA_RESET_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if let Err(err) = reset_due_provider_quotas_once(&data).await {
-                    warn!(error = %err, "gateway provider quota reset tick failed");
+                match reset_due_provider_quotas_once(&data).await {
+                    Ok(reset) if reset > 0 => app.invalidate_provider_routing_caches(),
+                    Ok(_) => {}
+                    Err(err) => warn!(error = %err, "gateway provider quota reset tick failed"),
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                match data.maintain_provider_quota_windows(now / 60 * 60).await {
+                    Ok(maintained) if maintained > 0 => {
+                        app.provider_quota_window_usage_cache.clear()
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(error = %err, "gateway provider rolling quota maintenance tick failed")
+                    }
                 }
             }
         },

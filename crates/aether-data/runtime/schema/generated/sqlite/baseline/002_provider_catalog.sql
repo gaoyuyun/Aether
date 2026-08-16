@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS providers (
     monthly_used_usd REAL,
     quota_reset_day INTEGER,
     quota_last_reset_at INTEGER,
+    pending_quota_reset_at INTEGER,
     quota_expires_at INTEGER,
     enabled INTEGER NOT NULL DEFAULT 1,
     is_active INTEGER NOT NULL DEFAULT 1,
@@ -329,6 +330,31 @@ CREATE INDEX IF NOT EXISTS provider_usage_tracking_provider_id_idx ON provider_u
 CREATE INDEX IF NOT EXISTS provider_usage_tracking_window_start_idx ON provider_usage_tracking (window_start);
 CREATE INDEX IF NOT EXISTS idx_provider_window ON provider_usage_tracking (provider_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_window_time ON provider_usage_tracking (window_start, window_end);
+
+CREATE TABLE IF NOT EXISTS provider_quota_window_counters (
+    provider_id TEXT NOT NULL,
+    duration_secs INTEGER NOT NULL,
+    window_start INTEGER,
+    quota_epoch_start INTEGER NOT NULL,
+    rolling_start INTEGER NOT NULL,
+    accounted_until INTEGER NOT NULL,
+    used_usd REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'rebuilding',
+    rebuild_error TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, duration_secs),
+    CONSTRAINT provider_quota_window_counters_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS provider_quota_usage_buckets (
+    provider_id TEXT NOT NULL,
+    quota_epoch_start INTEGER NOT NULL,
+    bucket_start INTEGER NOT NULL,
+    used_usd REAL NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, quota_epoch_start, bucket_start),
+    CONSTRAINT provider_quota_usage_buckets_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS models (
     id TEXT PRIMARY KEY NOT NULL,

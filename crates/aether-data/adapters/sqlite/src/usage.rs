@@ -13,8 +13,9 @@ use crate::{sqlite_optional_real, sqlite_real, SqlitePool};
 use aether_data_contracts::repository::usage::{
     strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
     usage_request_metadata_client_family, PendingUsageCleanupSummary,
-    ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
-    StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredRequestUsageAudit,
+    ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
+    StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
+    StoredProviderQuotaWindowUsage, StoredProviderUsageSummary, StoredRequestUsageAudit,
     StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBreakdownSummaryRow,
     StoredUsageCacheAffinityHitSummary, StoredUsageCacheAffinityIntervalRow,
     StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary, StoredUsageDailySummary,
@@ -4313,6 +4314,117 @@ WHERE provider_id = ?
         })
     }
 
+    async fn summarize_provider_actual_usage_since(
+        &self,
+        provider_id: &str,
+        since_unix_secs: u64,
+    ) -> Result<f64, DataLayerError> {
+        let row = sqlx::query(
+            r#"
+SELECT COALESCE(SUM(CAST(COALESCE(
+    json_extract(usage_settlement_snapshots.settlement_snapshot, '$.provider_cost_usd'),
+    usage_settlement_snapshots.billing_actual_total_cost_usd,
+    "usage".actual_total_cost_usd,
+    0
+) AS REAL)), 0)
+       AS actual_total_cost_usd
+FROM "usage"
+LEFT JOIN usage_settlement_snapshots
+  ON usage_settlement_snapshots.request_id = "usage".request_id
+WHERE "usage".provider_id = ?
+  AND "usage".created_at_unix_ms >= ?
+"#,
+        )
+        .bind(provider_id)
+        .bind(since_unix_secs as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_sql_err()?;
+        sqlite_real(&row, "actual_total_cost_usd")
+    }
+
+    async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, DataLayerError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested = BTreeSet::new();
+        let mut provider_ids = BTreeSet::new();
+        let mut duration_secs_values = BTreeSet::new();
+        for request in requests {
+            if request.provider_id.trim().is_empty() || request.duration_secs == 0 {
+                return Err(DataLayerError::InvalidInput(
+                    "provider quota window request must have a provider and duration".to_string(),
+                ));
+            }
+            let duration_secs = i64::try_from(request.duration_secs).map_err(|_| {
+                DataLayerError::InvalidInput("provider quota window duration overflow".to_string())
+            })?;
+            i64::try_from(request.quota_epoch_start_unix_secs).map_err(|_| {
+                DataLayerError::InvalidInput("provider quota epoch start overflow".to_string())
+            })?;
+            requested.insert((
+                request.provider_id.clone(),
+                request.duration_secs,
+                request.quota_epoch_start_unix_secs,
+            ));
+            provider_ids.insert(request.provider_id.clone());
+            duration_secs_values.insert(duration_secs);
+        }
+
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT provider_id, duration_secs, quota_epoch_start, rolling_start, accounted_until, used_usd, status FROM provider_quota_window_counters WHERE provider_id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for provider_id in provider_ids {
+                separated.push_bind(provider_id);
+            }
+        }
+        builder.push(") AND duration_secs IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for duration_secs in duration_secs_values {
+                separated.push_bind(duration_secs);
+            }
+        }
+        builder.push(")");
+
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
+        let mut usage_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let usage = StoredProviderQuotaWindowUsage {
+                provider_id: row.try_get("provider_id").map_sql_err()?,
+                duration_secs: row.try_get::<i64, _>("duration_secs").map_sql_err()?.max(0) as u64,
+                quota_epoch_start_unix_secs: row
+                    .try_get::<i64, _>("quota_epoch_start")
+                    .map_sql_err()?
+                    .max(0) as u64,
+                rolling_start_unix_secs: row
+                    .try_get::<i64, _>("rolling_start")
+                    .map_sql_err()?
+                    .max(0) as u64,
+                accounted_until_unix_secs: row
+                    .try_get::<i64, _>("accounted_until")
+                    .map_sql_err()?
+                    .max(0) as u64,
+                used_usd: sqlite_real(&row, "used_usd")?,
+                status: row.try_get("status").map_sql_err()?,
+            };
+            if requested.contains(&(
+                usage.provider_id.clone(),
+                usage.duration_secs,
+                usage.quota_epoch_start_unix_secs,
+            )) {
+                usage_rows.push(usage);
+            }
+        }
+        Ok(usage_rows)
+    }
+
     async fn summarize_usage_daily_heatmap(
         &self,
         query: &UsageDailyHeatmapQuery,
@@ -5013,6 +5125,13 @@ WHERE request_id = ?
     ) -> Result<aether_data_contracts::repository::usage::UsageCounterFlushSummary, DataLayerError>
     {
         counters::flush(&self.pool, batch_size).await
+    }
+
+    async fn maintain_provider_quota_windows(
+        &self,
+        now_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        counters::maintain_provider_quota_windows(&self.pool, now_unix_secs).await
     }
 
     async fn enqueue_proxy_node_counter_delta(

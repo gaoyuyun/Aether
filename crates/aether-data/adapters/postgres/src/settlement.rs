@@ -42,6 +42,18 @@ SELECT
   ) AS wallet_gift_balance_after,
   CAST(usage_settlement_snapshots.provider_monthly_used_usd AS DOUBLE PRECISION) AS provider_monthly_used_usd,
   usage_record.provider_id,
+  FLOOR(EXTRACT(EPOCH FROM usage_record.created_at))::BIGINT AS usage_created_at_unix_secs,
+  COALESCE(
+    usage_settlement_snapshots.settlement_snapshot #>> '{pricing_snapshot,provider_billing_type}',
+    CAST(provider.billing_type AS TEXT)
+  ) AS provider_billing_type_at_usage,
+  COALESCE(
+    NULLIF(usage_settlement_snapshots.settlement_snapshot #>> '{pricing_snapshot,provider_quota_epoch_start_unix_secs}', '')::BIGINT,
+    FLOOR(EXTRACT(EPOCH FROM provider.quota_last_reset_at))::BIGINT
+  ) AS quota_epoch_start_at_usage,
+  NULLIF(usage_settlement_snapshots.settlement_snapshot #>> '{provider_quota_cost_usd}', '')::DOUBLE PRECISION AS provider_quota_cost_usd,
+  usage_settlement_snapshots.billing_rule_version AS pricing_rule_version_at_usage,
+  usage_settlement_snapshots.settlement_snapshot -> 'pricing_snapshot' AS provider_pricing_snapshot_at_usage,
   CAST(
     EXTRACT(
       EPOCH FROM COALESCE(usage_settlement_snapshots.finalized_at, usage_record.finalized_at)
@@ -50,6 +62,8 @@ SELECT
 FROM "usage" AS usage_record
 LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = usage_record.request_id
+LEFT JOIN providers AS provider
+  ON provider.id = usage_record.provider_id
 WHERE usage_record.request_id = $1
 FOR UPDATE OF usage_record
 "#;
@@ -133,13 +147,29 @@ INSERT INTO usage_counter_deltas (
   request_id,
   kind,
   target_id,
-  total_cost_usd_delta
+  total_cost_usd_delta,
+  usage_created_at_unix_secs,
+  provider_billing_type_at_usage,
+  quota_epoch_start_at_usage,
+  provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd,
+  pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage,
+  quota_accounting_status
 ) VALUES (
   $1,
   $2,
   'provider_monthly',
   $3,
-  $4
+  $4,
+  $5,
+  'monthly_quota',
+  $6,
+  $5,
+  $4,
+  $7,
+  $8,
+  $9
 )
 "#;
 
@@ -216,13 +246,17 @@ async fn enqueue_provider_monthly_usage_delta<'e, E>(
     request_id: &str,
     provider_id: &str,
     total_cost_usd_delta: f64,
+    usage_created_at_unix_secs: i64,
+    quota_epoch_start_at_usage: i64,
+    pricing_rule_version_at_usage: Option<&str>,
+    provider_pricing_snapshot_at_usage: Option<&serde_json::Value>,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     let request_id = request_id.trim();
     let provider_id = provider_id.trim();
-    if request_id.is_empty() || provider_id.is_empty() || total_cost_usd_delta == 0.0 {
+    if request_id.is_empty() || provider_id.is_empty() {
         return Ok(());
     }
     if !total_cost_usd_delta.is_finite() {
@@ -236,6 +270,15 @@ where
         .bind(request_id)
         .bind(provider_id)
         .bind(total_cost_usd_delta)
+        .bind(usage_created_at_unix_secs)
+        .bind(quota_epoch_start_at_usage)
+        .bind(pricing_rule_version_at_usage)
+        .bind(provider_pricing_snapshot_at_usage)
+        .bind(if total_cost_usd_delta > 0.0 {
+            "ready"
+        } else {
+            "pending"
+        })
         .execute(executor)
         .await
         .map_postgres_err()?;
@@ -457,6 +500,49 @@ impl SettlementWriteRepository for SqlxSettlementRepository {
                         "settled" | "void" | "insufficient_quota"
                     ) {
                         return settlement_from_row(&usage_row).map(Some);
+                    }
+
+                    let provider_billing_type_at_usage = usage_row
+                        .try_get::<Option<String>, _>("provider_billing_type_at_usage")
+                        .map_postgres_err()?
+                        .unwrap_or_default();
+                    let quota_epoch_start_at_usage = usage_row
+                        .try_get::<Option<i64>, _>("quota_epoch_start_at_usage")
+                        .map_postgres_err()?;
+                    if provider_billing_type_at_usage.eq_ignore_ascii_case("monthly_quota") {
+                        if let (Some(provider_id), Some(quota_epoch_start_at_usage)) = (
+                            input
+                                .provider_id
+                                .as_deref()
+                                .filter(|value| !value.is_empty()),
+                            quota_epoch_start_at_usage,
+                        ) {
+                            let provider_quota_cost_usd = usage_row
+                                .try_get::<Option<f64>, _>("provider_quota_cost_usd")
+                                .map_postgres_err()?
+                                .unwrap_or(input.actual_total_cost_usd);
+                            let pricing_rule_version = usage_row
+                                .try_get::<Option<String>, _>("pricing_rule_version_at_usage")
+                                .map_postgres_err()?;
+                            let provider_pricing_snapshot = usage_row
+                                .try_get::<Option<serde_json::Value>, _>(
+                                    "provider_pricing_snapshot_at_usage",
+                                )
+                                .map_postgres_err()?;
+                            enqueue_provider_monthly_usage_delta(
+                                &mut **tx,
+                                &input.request_id,
+                                provider_id,
+                                provider_quota_cost_usd,
+                                usage_row
+                                    .try_get("usage_created_at_unix_secs")
+                                    .map_postgres_err()?,
+                                quota_epoch_start_at_usage / 60 * 60,
+                                pricing_rule_version.as_deref(),
+                                provider_pricing_snapshot.as_ref(),
+                            )
+                            .await?;
+                        }
                     }
 
                     let mut final_billing_status =
@@ -703,20 +789,6 @@ WHERE id = $1
                                 .await
                                 .map_postgres_err()?;
                             return Ok(Some(settlement));
-                        }
-
-                        if let Some(provider_id) = input
-                            .provider_id
-                            .as_deref()
-                            .filter(|value| !value.is_empty())
-                        {
-                            enqueue_provider_monthly_usage_delta(
-                                &mut **tx,
-                                &input.request_id,
-                                provider_id,
-                                input.actual_total_cost_usd,
-                            )
-                            .await?;
                         }
                     }
 

@@ -36,11 +36,11 @@ use super::{
     WalletMutationOutcome,
 };
 use aether_data_contracts::repository::usage::{
-    PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest,
-    StoredProviderApiKeyWindowUsageSummary, StoredUsageDailySummary, UsageAuditListQuery,
-    UsageCleanupExecutionMode, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
-    UsageCounterFlushSummary, UsageCounterHealthSnapshot, UsageCounterPendingHealthSnapshot,
-    UsageDailyHeatmapQuery,
+    PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
+    StoredProviderApiKeyWindowUsageSummary, StoredProviderQuotaWindowUsage,
+    StoredUsageDailySummary, UsageAuditListQuery, UsageCleanupExecutionMode, UsageCleanupSummary,
+    UsageCleanupTargets, UsageCleanupWindow, UsageCounterFlushSummary, UsageCounterHealthSnapshot,
+    UsageCounterPendingHealthSnapshot, UsageDailyHeatmapQuery,
 };
 use aether_runtime_state::RuntimeQueueStore;
 use aether_video_tasks_core::read_data_backed_video_task_response;
@@ -1204,6 +1204,31 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn request_provider_quota_reset(
+        &self,
+        provider_id: &str,
+        effective_at_unix_secs: u64,
+    ) -> Result<bool, DataLayerError> {
+        match &self.provider_quota_writer {
+            Some(repository) => {
+                repository
+                    .request_reset(provider_id, effective_at_unix_secs)
+                    .await
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn clear_provider_quota_window_counters(
+        &self,
+        provider_id: &str,
+    ) -> Result<(), DataLayerError> {
+        match &self.provider_quota_writer {
+            Some(repository) => repository.clear_window_counters(provider_id).await,
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn find_provider_quota_by_provider_id(
         &self,
         provider_id: &str,
@@ -1332,6 +1357,20 @@ impl GatewayDataState {
         match &self.usage_writer {
             Some(repository) => repository.flush_usage_counter_deltas(batch_size).await,
             None => Ok(UsageCounterFlushSummary::default()),
+        }
+    }
+
+    pub(crate) async fn maintain_provider_quota_windows(
+        &self,
+        now_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        match &self.usage_writer {
+            Some(repository) => {
+                repository
+                    .maintain_provider_quota_windows(now_unix_secs)
+                    .await
+            }
+            None => Ok(0),
         }
     }
 
@@ -1976,6 +2015,31 @@ impl GatewayDataState {
                     .await
             }
             None => Ok(StoredProviderUsageSummary::default()),
+        }
+    }
+
+    pub(crate) async fn summarize_provider_actual_usage_since(
+        &self,
+        provider_id: &str,
+        since_unix_secs: u64,
+    ) -> Result<f64, DataLayerError> {
+        match &self.usage_reader {
+            Some(repository) => {
+                repository
+                    .summarize_provider_actual_usage_since(provider_id, since_unix_secs)
+                    .await
+            }
+            None => Ok(0.0),
+        }
+    }
+
+    pub(crate) async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, DataLayerError> {
+        match &self.usage_reader {
+            Some(repository) => repository.read_provider_quota_window_usage(requests).await,
+            None => Ok(Vec::new()),
         }
     }
 

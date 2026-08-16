@@ -206,6 +206,7 @@ dependencies = [
  "aether-ai-formats",
  "aether-data-contracts",
  "aether-data-query",
+ "aether-wallet",
  "async-trait",
  "chrono",
  "chrono-tz",
@@ -225,6 +226,7 @@ dependencies = [
  "aether-ai-formats",
  "aether-data-contracts",
  "aether-data-query",
+ "aether-wallet",
  "async-trait",
  "chrono",
  "chrono-tz",
@@ -262,6 +264,7 @@ dependencies = [
  "aether-ai-formats",
  "aether-data-contracts",
  "aether-data-query",
+ "aether-wallet",
  "async-trait",
  "chrono",
  "chrono-tz",
@@ -765,6 +768,7 @@ name = "aether-wallet"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

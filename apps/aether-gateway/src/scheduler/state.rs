@@ -5,6 +5,9 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
+use aether_data_contracts::repository::usage::{
+    ProviderQuotaWindowUsageRequest, StoredProviderQuotaWindowUsage,
+};
 use aether_scheduler_core::SchedulerAffinityTarget;
 use async_trait::async_trait;
 
@@ -18,6 +21,16 @@ pub(crate) trait SchedulerRuntimeState {
         &self,
         provider_id: &str,
     ) -> Result<Option<StoredProviderQuotaSnapshot>, GatewayError>;
+
+    async fn read_provider_quota_snapshots(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<Vec<StoredProviderQuotaSnapshot>, GatewayError>;
+
+    async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, GatewayError>;
 
     async fn read_provider_catalog_providers_by_ids(
         &self,

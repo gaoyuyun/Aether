@@ -8,6 +8,8 @@ pub struct StoredProviderQuotaSnapshot {
     pub monthly_used_usd: f64,
     pub quota_reset_day: Option<u64>,
     pub quota_last_reset_at_unix_secs: Option<u64>,
+    #[serde(default)]
+    pub pending_quota_reset_at_unix_secs: Option<u64>,
     pub quota_expires_at_unix_secs: Option<u64>,
     pub is_active: bool,
 }
@@ -41,6 +43,7 @@ impl StoredProviderQuotaSnapshot {
             monthly_used_usd,
             quota_reset_day: quota_reset_day.map(|value| value as u64),
             quota_last_reset_at_unix_secs: quota_last_reset_at_unix_secs.map(|value| value as u64),
+            pending_quota_reset_at_unix_secs: None,
             quota_expires_at_unix_secs: quota_expires_at_unix_secs.map(|value| value as u64),
             is_active,
         })
@@ -63,6 +66,19 @@ pub trait ProviderQuotaReadRepository: Send + Sync {
 #[async_trait]
 pub trait ProviderQuotaWriteRepository: Send + Sync {
     async fn reset_due(&self, now_unix_secs: u64) -> Result<usize, crate::DataLayerError>;
+
+    async fn request_reset(
+        &self,
+        provider_id: &str,
+        effective_at_unix_secs: u64,
+    ) -> Result<bool, crate::DataLayerError> {
+        let _ = (provider_id, effective_at_unix_secs);
+        Ok(false)
+    }
+
+    async fn clear_window_counters(&self, _provider_id: &str) -> Result<(), crate::DataLayerError> {
+        Ok(())
+    }
 }
 
 pub trait ProviderQuotaRepository:

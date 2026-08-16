@@ -119,7 +119,8 @@ impl<'a> AdminAppState<'a> {
         }
 
         if decision.route_kind.as_deref() == Some("reset_provider_quota")
-            && request_context.method() == http::Method::DELETE
+            && (request_context.method() == http::Method::DELETE
+                || request_context.method() == http::Method::POST)
         {
             if !self.has_provider_catalog_data_reader() || !self.has_provider_catalog_data_writer()
             {

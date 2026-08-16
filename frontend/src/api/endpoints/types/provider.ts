@@ -874,6 +874,7 @@ export interface ProviderWithEndpointsSummary {
   quota_reset_day?: number
   quota_last_reset_at?: string  // 当前周期开始时间
   quota_expires_at?: string
+  quota_windows?: ProviderQuotaWindow[]
   // 请求配置（从 Endpoint 迁移）
   max_retries?: number  // 最大重试次数
   max_transfer_count?: number  // 提供商内最大转移次数，0 表示不限制
@@ -904,6 +905,16 @@ export interface ProviderWithEndpointsSummary {
   ops_quota_alert_enabled?: boolean
   created_at: string
   updated_at: string
+}
+
+export interface ProviderQuotaWindow {
+  duration_secs: number
+  limit_usd: number
+  used_usd?: number | null
+  rolling_start?: string | null
+  accounted_until?: string | null
+  quota_epoch_start?: string | null
+  status?: 'ready' | 'rebuilding' | 'failed' | string
 }
 
 export interface HealthStatus {

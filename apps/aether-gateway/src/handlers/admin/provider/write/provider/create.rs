@@ -1,8 +1,9 @@
 use crate::handlers::admin::provider::shared::payloads::AdminProviderCreateRequest;
 use crate::handlers::admin::provider::shared::support::{
-    normalize_provider_billing_type, normalize_provider_transfer_limit,
-    normalize_provider_transfer_limit_json, parse_optional_rfc3339_unix_secs,
-    PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY, PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
+    normalize_provider_billing_type, normalize_provider_quota_windows,
+    normalize_provider_transfer_limit, normalize_provider_transfer_limit_json,
+    parse_optional_rfc3339_unix_secs, PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
+    PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY, PROVIDER_QUOTA_WINDOWS_CONFIG_KEY,
 };
 use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redaction_config;
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
@@ -58,11 +59,11 @@ pub(crate) async fn build_admin_create_provider_record(
         None => None,
     };
     let quota_reset_day = match payload.quota_reset_day {
-        Some(value) if (1..=365).contains(&value) => Some(value),
-        Some(_) => return Err("quota_reset_day 必须是 1 到 365 之间的整数".to_string()),
+        Some(value) if (1..=30).contains(&value) => Some(value),
+        Some(_) => return Err("quota_reset_day 必须是 1 到 30 之间的整数".to_string()),
         None => Some(30),
     };
-    let quota_last_reset_at_unix_secs = payload
+    let mut quota_last_reset_at_unix_secs = payload
         .quota_last_reset_at
         .as_deref()
         .map(|value| parse_optional_rfc3339_unix_secs(value, "quota_last_reset_at"))
@@ -140,6 +141,22 @@ pub(crate) async fn build_admin_create_provider_record(
     if let Some(value) = normalize_pool_advanced_config(payload.pool_advanced)? {
         config_map.insert("pool_advanced".to_string(), value);
     }
+    if let Some(quota_windows) = payload.quota_windows.as_ref() {
+        let value = serde_json::to_value(quota_windows)
+            .map_err(|err| format!("quota_windows 无法解析: {err}"))?;
+        let value = normalize_provider_quota_windows(Some(&value))?;
+        if !value.as_array().is_some_and(|entries| entries.is_empty()) {
+            config_map.insert(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY.to_string(), value);
+        }
+    }
+    if let Some(raw_windows) = config_map.get(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY).cloned() {
+        let value = normalize_provider_quota_windows(Some(&raw_windows))?;
+        if value.as_array().is_some_and(|entries| entries.is_empty()) {
+            config_map.remove(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY);
+        } else {
+            config_map.insert(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY.to_string(), value);
+        }
+    }
     if let Some(value) = normalize_json_object(payload.failover_rules, "failover_rules")? {
         config_map.insert("failover_rules".to_string(), value);
     }
@@ -166,6 +183,9 @@ pub(crate) async fn build_admin_create_provider_record(
         .ok()
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    if billing_type == "monthly_quota" && quota_last_reset_at_unix_secs.is_none() {
+        quota_last_reset_at_unix_secs = Some(now_unix_secs / 60 * 60);
+    }
 
     let record = StoredProviderCatalogProvider::new(
         Uuid::new_v4().to_string(),

@@ -2058,7 +2058,7 @@ mod tests {
     }
 
     #[test]
-    fn daily_quota_estimate_treats_free_tier_as_zero_cost() {
+    fn daily_quota_estimate_keeps_user_price_for_free_upstream_tier() {
         let context = billing_context_with_pricing(
             Some(json!({
                 "tiers": [{
@@ -2076,7 +2076,7 @@ mod tests {
             estimate_from_billing_context(&context, "openai:chat", 1_000_000, Some(1_000_000))
                 .expect("estimate should be bounded");
 
-        assert_eq!(estimate, 0.0);
+        assert_eq!(estimate, 187.5);
     }
 
     #[test]

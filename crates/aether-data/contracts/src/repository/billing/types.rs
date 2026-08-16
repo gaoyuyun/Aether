@@ -5,6 +5,8 @@ use serde_json::Value;
 pub struct StoredBillingModelContext {
     pub provider_id: String,
     pub provider_billing_type: Option<String>,
+    #[serde(default)]
+    pub provider_quota_epoch_start_unix_secs: Option<u64>,
     pub provider_api_key_id: Option<String>,
     pub provider_api_key_rate_multipliers: Option<Value>,
     pub provider_api_key_cache_ttl_minutes: Option<i64>,
@@ -57,6 +59,7 @@ impl StoredBillingModelContext {
         Ok(Self {
             provider_id,
             provider_billing_type,
+            provider_quota_epoch_start_unix_secs: None,
             provider_api_key_id,
             provider_api_key_rate_multipliers,
             provider_api_key_cache_ttl_minutes,

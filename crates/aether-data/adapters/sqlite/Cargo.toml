@@ -10,6 +10,7 @@ description = "SQLite repositories, pools, and migrations for Aether"
 aether-ai-formats.workspace = true
 aether-data-contracts.workspace = true
 aether-data-query.workspace = true
+aether-wallet.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true

@@ -54,6 +54,8 @@
                 :used="provider.monthly_used_usd"
                 :quota="provider.monthly_quota_usd"
                 :reset-day="provider.quota_reset_day"
+                :provider-id="provider.id"
+                :windows="provider.quota_windows"
               />
 
               <!-- 密钥管理 -->
