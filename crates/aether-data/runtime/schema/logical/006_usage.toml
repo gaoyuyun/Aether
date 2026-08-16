@@ -514,7 +514,8 @@ nullable = true
 
 [[table.usage.columns]]
 name = "created_at_unix_ms"
-type = "unix_millis"
+# Legacy column name. Runtime and all SQL adapters store Unix seconds here.
+type = "unix_seconds"
 default = 0
 
 [[table.usage.columns]]

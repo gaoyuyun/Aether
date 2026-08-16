@@ -674,6 +674,18 @@ impl AppState {
         Ok(updated)
     }
 
+    pub(crate) async fn clear_provider_quota_window_counters(
+        &self,
+        provider_id: &str,
+    ) -> Result<(), GatewayError> {
+        self.data
+            .clear_provider_quota_window_counters(provider_id)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        self.provider_quota_window_usage_cache.clear();
+        Ok(())
+    }
+
     pub(crate) async fn delete_provider_catalog_provider(
         &self,
         provider_id: &str,

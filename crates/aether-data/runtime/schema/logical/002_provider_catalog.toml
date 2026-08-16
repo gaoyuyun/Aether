@@ -1515,6 +1515,40 @@ columns = ["provider_id", "window_start"]
 name = "idx_window_time"
 columns = ["window_start", "window_end"]
 
+[table.provider_quota_window_counters]
+domain = "provider_catalog"
+order = 87
+primary_key = ["provider_id", "duration_secs"]
+
+[[table.provider_quota_window_counters.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.provider_quota_window_counters.columns]]
+name = "duration_secs"
+type = "int64"
+
+[[table.provider_quota_window_counters.columns]]
+name = "window_start"
+type = "unix_seconds"
+
+[[table.provider_quota_window_counters.columns]]
+name = "used_usd"
+type = "float64"
+default = 0
+
+[[table.provider_quota_window_counters.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.provider_quota_window_counters.foreign_keys]]
+name = "provider_quota_window_counters_provider_id_fkey"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "cascade"
+
 [table.models]
 domain = "provider_catalog"
 order = 90

@@ -120,6 +120,7 @@ export async function updateProvider(
     quota_reset_day: number
     quota_last_reset_at: string  // 周期开始时间
     quota_expires_at: string
+    quota_windows: Array<{ duration_secs: number; limit_usd: number }>
     rpm_limit: number | null
     // 请求配置（从 Endpoint 迁移）
     max_retries: number
@@ -156,6 +157,7 @@ export async function createProvider(
     quota_reset_day?: number
     quota_last_reset_at?: string
     quota_expires_at?: string
+    quota_windows?: Array<{ duration_secs: number; limit_usd: number }>
     provider_priority?: number
     keep_priority_on_conversion?: boolean
     is_active?: boolean

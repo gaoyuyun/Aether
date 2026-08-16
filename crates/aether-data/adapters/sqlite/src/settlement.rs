@@ -42,6 +42,7 @@ SELECT
   ) AS wallet_gift_balance_after,
   CAST(usage_settlement_snapshots.provider_monthly_used_usd AS REAL) AS provider_monthly_used_usd,
   usage_record.provider_id,
+  usage_record.created_at_unix_ms AS usage_created_at_unix_secs,
   COALESCE(usage_settlement_snapshots.finalized_at, usage_record.finalized_at) AS finalized_at_unix_secs
 FROM "usage" AS usage_record
 LEFT JOIN usage_settlement_snapshots
@@ -111,9 +112,10 @@ DO UPDATE SET
 
 const ENQUEUE_PROVIDER_MONTHLY_USAGE_DELTA_SQL: &str = r#"
 INSERT INTO usage_counter_deltas (
-  id, request_id, kind, target_id, total_cost_usd_delta, created_at
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, created_at
 )
-VALUES (?, ?, 'provider_monthly', ?, ?, ?)
+VALUES (?, ?, 'provider_monthly', ?, ?, ?, ?)
 "#;
 
 #[derive(Debug, Clone)]
@@ -164,6 +166,7 @@ async fn enqueue_provider_monthly_usage_delta_sqlite(
     request_id: &str,
     provider_id: &str,
     total_cost_usd_delta: f64,
+    usage_created_at_unix_secs: i64,
     created_at: i64,
 ) -> Result<(), DataLayerError> {
     let request_id = request_id.trim();
@@ -182,6 +185,7 @@ async fn enqueue_provider_monthly_usage_delta_sqlite(
         .bind(request_id)
         .bind(provider_id)
         .bind(total_cost_usd_delta)
+        .bind(usage_created_at_unix_secs)
         .bind(created_at)
         .execute(&mut **tx)
         .await
@@ -685,6 +689,9 @@ WHERE id = ?
                     &input.request_id,
                     provider_id,
                     input.actual_total_cost_usd,
+                    usage_row
+                        .try_get("usage_created_at_unix_secs")
+                        .map_sql_err()?,
                     updated_at,
                 )
                 .await?;
@@ -821,6 +828,19 @@ WHERE request_id = 'request-1'
         .await
         .expect("provider delta should load");
         assert_eq!(provider_delta, (1, 6.0));
+        let usage_created_at_unix_ms: i64 = sqlx::query_scalar(
+            "SELECT created_at_unix_ms FROM usage WHERE request_id = 'request-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("usage creation time should load");
+        let delta_usage_created_at_unix_secs: i64 = sqlx::query_scalar(
+            "SELECT usage_created_at_unix_secs FROM usage_counter_deltas WHERE request_id = 'request-1' AND kind = 'provider_monthly'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("provider delta creation time should load");
+        assert_eq!(delta_usage_created_at_unix_secs, usage_created_at_unix_ms);
 
         let snapshot: (String, Option<String>, Option<f64>, Option<i64>) = sqlx::query_as(
             r#"
@@ -1174,9 +1194,10 @@ WHERE request_id = 'request-1'
         sqlx::query(
             r#"
 INSERT INTO providers (
-  id, name, provider_type, monthly_used_usd, created_at, updated_at
+  id, name, provider_type, billing_type, monthly_used_usd, quota_last_reset_at,
+  created_at, updated_at
 )
-VALUES ('provider-1', 'Provider One', 'openai', 5.0, 1, 1);
+VALUES ('provider-1', 'Provider One', 'openai', 'monthly_quota', 5.0, 1, 1, 1);
 
 INSERT INTO wallets (
   id, user_id, balance, gift_balance, limit_mode, created_at, updated_at
@@ -1184,12 +1205,13 @@ INSERT INTO wallets (
 VALUES ('wallet-1', 'user-1', 10.0, 2.0, 'finite', 1, 1);
 
 INSERT INTO "usage" (
-  request_id, user_id, provider_id, status, billing_status, total_cost_usd, actual_total_cost_usd
+  request_id, user_id, provider_id, status, billing_status, total_cost_usd,
+  actual_total_cost_usd, created_at_unix_ms
 )
 VALUES
-  ('request-1', 'user-1', 'provider-1', 'completed', 'pending', 3.0, 6.0),
-  ('request-2', 'user-1', 'provider-1', 'failed', 'pending', 3.0, 2.0),
-  ('request-overdraw', 'user-1', 'provider-1', 'completed', 'pending', 15.0, 15.0);
+  ('request-1', 'user-1', 'provider-1', 'completed', 'pending', 3.0, 6.0, 1700000000),
+  ('request-2', 'user-1', 'provider-1', 'failed', 'pending', 3.0, 2.0, 1700000000),
+  ('request-overdraw', 'user-1', 'provider-1', 'completed', 'pending', 15.0, 15.0, 1700000000);
 "#,
         )
         .execute(pool)

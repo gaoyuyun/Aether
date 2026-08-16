@@ -134,8 +134,12 @@ CREATE TEMPORARY TABLE global_models (
 );
 CREATE TEMPORARY TABLE providers (
     id VARCHAR(64) PRIMARY KEY,
+    billing_type VARCHAR(64),
+    monthly_used_usd DOUBLE NOT NULL DEFAULT 0,
+    quota_last_reset_at BIGINT,
     enabled BOOLEAN NOT NULL,
-    is_active BOOLEAN NOT NULL
+    is_active BOOLEAN NOT NULL,
+    updated_at BIGINT NOT NULL DEFAULT 0
 );
 CREATE TEMPORARY TABLE provider_endpoints (
     id VARCHAR(64) PRIMARY KEY,
@@ -150,6 +154,7 @@ CREATE TEMPORARY TABLE models (
 CREATE TEMPORARY TABLE `usage` (
     request_id VARCHAR(128) PRIMARY KEY,
     api_key_id VARCHAR(64),
+    provider_id VARCHAR(64),
     provider_api_key_id VARCHAR(64),
     model VARCHAR(255),
     status VARCHAR(64) NOT NULL,
@@ -165,12 +170,16 @@ CREATE TEMPORARY TABLE `usage` (
     endpoint_api_format VARCHAR(64),
     api_format VARCHAR(64),
     total_cost_usd DOUBLE NOT NULL DEFAULT 0,
+    actual_total_cost_usd DOUBLE NOT NULL DEFAULT 0,
+    billing_status VARCHAR(64) NOT NULL DEFAULT 'pending',
     created_at BIGINT,
     created_at_unix_ms BIGINT NOT NULL DEFAULT 0,
     updated_at_unix_secs BIGINT NOT NULL DEFAULT 0
 );
 CREATE TEMPORARY TABLE usage_settlement_snapshots (
     request_id VARCHAR(128) PRIMARY KEY,
+    billing_status VARCHAR(64) NOT NULL DEFAULT 'pending',
+    billing_actual_total_cost_usd DOUBLE,
     billing_effective_input_tokens BIGINT,
     billing_output_tokens BIGINT,
     billing_cache_creation_tokens BIGINT,
@@ -185,8 +194,10 @@ INSERT INTO provider_api_keys (id, total_tokens)
 VALUES ('mysql-backfill-provider-key', 7777);
 INSERT INTO global_models (id, name, usage_count, updated_at)
 VALUES ('mysql-backfill-model', 'gpt-portable', 77, 1);
-INSERT INTO providers (id, enabled, is_active)
-VALUES ('mysql-backfill-provider', TRUE, FALSE);
+INSERT INTO providers (
+    id, billing_type, monthly_used_usd, quota_last_reset_at, enabled, is_active
+)
+VALUES ('mysql-backfill-provider', 'monthly_quota', 99.0, 1714979000, TRUE, FALSE);
 INSERT INTO provider_endpoints (id, enabled, is_active)
 VALUES ('mysql-backfill-endpoint', TRUE, FALSE);
 INSERT INTO models (id, enabled, is_active)
@@ -194,6 +205,7 @@ VALUES ('mysql-backfill-provider-model', TRUE, FALSE);
 INSERT INTO `usage` (
     request_id,
     api_key_id,
+    provider_id,
     provider_api_key_id,
     model,
     status,
@@ -203,6 +215,8 @@ INSERT INTO `usage` (
     cache_read_input_tokens,
     api_format,
     total_cost_usd,
+    actual_total_cost_usd,
+    billing_status,
     created_at,
     created_at_unix_ms,
     updated_at_unix_secs
@@ -210,6 +224,7 @@ INSERT INTO `usage` (
     (
         'mysql-backfill-completed',
         'mysql-backfill-api-key',
+        'mysql-backfill-provider',
         'mysql-backfill-provider-key',
         'gpt-portable',
         'completed',
@@ -219,6 +234,8 @@ INSERT INTO `usage` (
         20,
         'openai',
         1.25,
+        3.5,
+        'pending',
         1714979289,
         1714979289,
         1714979289
@@ -226,6 +243,7 @@ INSERT INTO `usage` (
     (
         'mysql-backfill-pending',
         'mysql-backfill-api-key',
+        'mysql-backfill-provider',
         'mysql-backfill-provider-key',
         'gpt-portable',
         'pending',
@@ -235,17 +253,21 @@ INSERT INTO `usage` (
         0,
         'openai',
         0.25,
+        0,
+        'pending',
         1714979349,
         1714979349,
         1714979349
     );
 INSERT INTO usage_settlement_snapshots (
     request_id,
+    billing_status,
+    billing_actual_total_cost_usd,
     billing_effective_input_tokens,
     billing_output_tokens,
     billing_cache_creation_tokens,
     billing_cache_read_tokens
-) VALUES ('mysql-backfill-completed', 100, 30, 10, 20);
+) VALUES ('mysql-backfill-completed', 'settled', 2.5, 100, 30, 10, 20);
 "#,
     )
     .execute(&mut *conn)
@@ -265,7 +287,8 @@ INSERT INTO usage_settlement_snapshots (
             20260422120000,
             20260505120000,
             20260517012000,
-            20260716010000
+            20260716010000,
+            20260816010000
         ]
     );
 
@@ -359,9 +382,11 @@ INSERT INTO global_models (
     query(
         r#"
 INSERT INTO providers (
-    id, name, provider_type, enabled, is_active, created_at, updated_at
+    id, name, provider_type, billing_type, monthly_used_usd, quota_last_reset_at,
+    enabled, is_active, created_at, updated_at
 ) VALUES (
-    'sqlite-backfill-provider', 'SQLite Backfill Provider', 'openai', 1, 0, 1, 1
+    'sqlite-backfill-provider', 'SQLite Backfill Provider', 'openai', 'monthly_quota',
+    99.0, 1714979000, 1, 0, 1, 1
 )
 "#,
     )
@@ -399,6 +424,7 @@ INSERT INTO models (
 INSERT INTO "usage" (
     request_id,
     api_key_id,
+    provider_id,
     provider_api_key_id,
     model,
     status,
@@ -408,6 +434,8 @@ INSERT INTO "usage" (
     cache_read_input_tokens,
     api_format,
     total_cost_usd,
+    actual_total_cost_usd,
+    billing_status,
     created_at,
     created_at_unix_ms,
     updated_at_unix_secs
@@ -415,6 +443,7 @@ INSERT INTO "usage" (
     (
         'sqlite-backfill-completed',
         'sqlite-backfill-api-key',
+        'sqlite-backfill-provider',
         'sqlite-backfill-provider-key',
         'gpt-portable',
         'completed',
@@ -424,6 +453,8 @@ INSERT INTO "usage" (
         20,
         'openai',
         1.25,
+        3.5,
+        'pending',
         1714979289,
         1714979289,
         1714979289
@@ -431,6 +462,7 @@ INSERT INTO "usage" (
     (
         'sqlite-backfill-pending',
         'sqlite-backfill-api-key',
+        'sqlite-backfill-provider',
         'sqlite-backfill-provider-key',
         'gpt-portable',
         'pending',
@@ -440,6 +472,8 @@ INSERT INTO "usage" (
         0,
         'openai',
         0.25,
+        0,
+        'pending',
         1714979349,
         1714979349,
         1714979349
@@ -454,6 +488,7 @@ INSERT INTO "usage" (
 INSERT INTO usage_settlement_snapshots (
     request_id,
     billing_status,
+    billing_actual_total_cost_usd,
     billing_effective_input_tokens,
     billing_output_tokens,
     billing_cache_creation_tokens,
@@ -461,7 +496,7 @@ INSERT INTO usage_settlement_snapshots (
     created_at,
     updated_at
 ) VALUES (
-    'sqlite-backfill-completed', 'settled', 100, 30, 10, 20, 1, 1
+    'sqlite-backfill-completed', 'settled', 2.5, 100, 30, 10, 20, 1, 1
 )
 "#,
     )
@@ -481,7 +516,8 @@ INSERT INTO usage_settlement_snapshots (
             20260422120000,
             20260505120000,
             20260517012000,
-            20260716010000
+            20260716010000,
+            20260816010000
         ]
     );
 
@@ -504,9 +540,17 @@ INSERT INTO usage_settlement_snapshots (
             20260422120000,
             20260505120000,
             20260517012000,
-            20260716010000
+            20260716010000,
+            20260816010000
         ]
     );
+    let provider_monthly_used: f64 = query_scalar(
+        "SELECT monthly_used_usd FROM providers WHERE id = 'sqlite-backfill-provider'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("sqlite provider monthly usage should load");
+    assert_eq!(provider_monthly_used, 2.5);
     let api_key_stats: (i64, i64, f64, Option<i64>) = query_as(
         "SELECT total_requests, total_tokens, total_cost_usd, last_used_at FROM api_keys WHERE id = 'sqlite-backfill-api-key'",
     )
@@ -543,7 +587,7 @@ INSERT INTO usage_settlement_snapshots (
         .fetch_one(&pool)
         .await
         .expect("sqlite applied backfill count should load");
-    assert_eq!(applied_count, 4);
+    assert_eq!(applied_count, 5);
 
     query("UPDATE schema_backfills SET checksum = X'00' WHERE version = 20260422120000")
         .execute(&pool)
@@ -638,7 +682,7 @@ END
         .fetch_one(&pool)
         .await
         .expect("sqlite resumed applied backfill count should load");
-    assert_eq!(applied_count, 4);
+    assert_eq!(applied_count, 5);
 }
 
 #[derive(Debug)]

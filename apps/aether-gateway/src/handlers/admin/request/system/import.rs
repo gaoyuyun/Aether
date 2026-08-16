@@ -1548,6 +1548,14 @@ impl<'a> AdminAppState<'a> {
                                 "更新 Provider '{provider_name}' 失败"
                             ))));
                         };
+                        if existing.billing_type != updated.billing_type
+                            || existing.quota_last_reset_at_unix_secs
+                                != updated.quota_last_reset_at_unix_secs
+                        {
+                            self.app()
+                                .clear_provider_quota_window_counters(&persisted.id)
+                                .await?;
+                        }
                         providers_by_name.insert(provider_name.clone(), persisted.clone());
                         stats.providers.updated += 1;
                         persisted

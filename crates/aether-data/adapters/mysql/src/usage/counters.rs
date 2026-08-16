@@ -7,6 +7,7 @@ use aether_data_contracts::repository::usage::{
     UsageCounterFlushSummary, UsageCounterHealthSnapshot, UsageCounterPendingHealthSnapshot,
 };
 use aether_data_contracts::DataLayerError;
+use aether_wallet::{quota_window_start_unix_secs, quota_windows_from_config, ProviderBillingType};
 use sqlx::{MySql, MySqlPool, QueryBuilder, Row};
 
 use crate::error::SqlResultExt;
@@ -37,7 +38,8 @@ SELECT
   last_used_ip,
   candidate_last_used_at_unix_secs,
   removed_last_used_at_unix_secs,
-  usage_created_at_unix_secs
+  usage_created_at_unix_secs,
+  created_at
 FROM usage_counter_deltas
 WHERE processed_at IS NULL
 ORDER BY created_at ASC, id ASC
@@ -63,6 +65,13 @@ struct DeltaRow {
     candidate_last_used_at_unix_secs: Option<u64>,
     removed_last_used_at_unix_secs: Option<u64>,
     usage_created_at_unix_secs: Option<u64>,
+    created_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderMonthlyDelta {
+    total_cost_usd: f64,
+    usage_created_at_unix_secs: u64,
 }
 
 #[derive(Default)]
@@ -70,7 +79,7 @@ struct Aggregates {
     api_keys: BTreeMap<String, ApiKeyUsageDelta>,
     provider_api_keys: BTreeMap<String, ProviderApiKeyUsageDelta>,
     models: BTreeMap<String, ModelUsageDelta>,
-    provider_monthly: BTreeMap<String, f64>,
+    provider_monthly: BTreeMap<String, Vec<ProviderMonthlyDelta>>,
     proxy_nodes: BTreeMap<String, ProxyNodeCounterDelta>,
     management_tokens: BTreeMap<String, ManagementTokenCounterDelta>,
     api_key_last_used: BTreeMap<String, ApiKeyLastUsedDelta>,
@@ -136,10 +145,16 @@ impl Aggregates {
                         .request_count += row.request_count_delta;
                 }
                 KIND_PROVIDER_MONTHLY => {
-                    *aggregates
+                    aggregates
                         .provider_monthly
                         .entry(row.target_id.clone())
-                        .or_default() += row.total_cost_usd_delta;
+                        .or_default()
+                        .push(ProviderMonthlyDelta {
+                            total_cost_usd: row.total_cost_usd_delta,
+                            usage_created_at_unix_secs: row
+                                .usage_created_at_unix_secs
+                                .unwrap_or(row.created_at_unix_secs),
+                        });
                 }
                 KIND_PROXY_NODE => {
                     let entry = aggregates
@@ -239,7 +254,7 @@ pub(super) async fn flush(
         apply_provider_api_key(&mut tx, target_id, delta).await?;
     }
     for (target_id, delta) in &aggregates.provider_monthly {
-        apply_provider_monthly(&mut tx, target_id, *delta).await?;
+        apply_provider_monthly(&mut tx, target_id, delta).await?;
     }
     for (target_id, delta) in &aggregates.proxy_nodes {
         apply_proxy_node(&mut tx, target_id, delta).await?;
@@ -842,6 +857,7 @@ fn map_row(row: &sqlx::mysql::MySqlRow) -> Result<DeltaRow, DataLayerError> {
             "usage_counter_deltas.usage_created_at_unix_secs",
             row.try_get("usage_created_at_unix_secs").map_sql_err()?,
         )?,
+        created_at_unix_secs: row.try_get::<i64, _>("created_at").map_sql_err()?.max(0) as u64,
     })
 }
 
@@ -972,25 +988,104 @@ WHERE id = ?
 async fn apply_provider_monthly(
     tx: &mut sqlx::Transaction<'_, MySql>,
     target_id: &str,
-    delta: f64,
+    deltas: &[ProviderMonthlyDelta],
 ) -> Result<(), DataLayerError> {
-    if target_id.trim().is_empty() || delta == 0.0 {
+    if target_id.trim().is_empty() || deltas.is_empty() {
         return Ok(());
     }
-    if !delta.is_finite() {
+    let provider = sqlx::query(
+        "SELECT billing_type, quota_last_reset_at, config FROM providers WHERE id = ? LIMIT 1",
+    )
+    .bind(target_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?;
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let billing_type = provider
+        .try_get::<Option<String>, _>("billing_type")
+        .map_sql_err()?
+        .unwrap_or_default();
+    if !matches!(
+        ProviderBillingType::parse(&billing_type),
+        ProviderBillingType::MonthlyQuota | ProviderBillingType::FreeTier
+    ) {
+        return Ok(());
+    }
+    let anchor = provider
+        .try_get::<Option<i64>, _>("quota_last_reset_at")
+        .map_sql_err()?
+        .map(|value| value.max(0) as u64);
+    let now_db = current_unix_secs();
+    let now = now_db.max(0) as u64;
+    let accepted = deltas
+        .iter()
+        .copied()
+        .filter(|delta| {
+            delta.usage_created_at_unix_secs <= now
+                && anchor.map_or(true, |anchor| delta.usage_created_at_unix_secs >= anchor)
+        })
+        .collect::<Vec<_>>();
+    let total_delta = accepted
+        .iter()
+        .map(|delta| delta.total_cost_usd)
+        .sum::<f64>();
+    if !total_delta.is_finite() {
         return Err(DataLayerError::UnexpectedValue(format!(
             "providers.monthly_used_usd delta is not finite for {target_id}"
         )));
     }
+    if total_delta == 0.0 {
+        return Ok(());
+    }
     sqlx::query(
-        "UPDATE providers SET monthly_used_usd = COALESCE(monthly_used_usd, 0) + ?, updated_at = ? WHERE id = ?",
+        "UPDATE providers SET monthly_used_usd = COALESCE(monthly_used_usd, 0) + ?, updated_at = ? WHERE id = ? AND (billing_type IS NULL OR billing_type IN ('monthly_quota', 'free_tier'))",
     )
-    .bind(delta)
-    .bind(current_unix_secs())
+    .bind(total_delta)
+    .bind(now_db)
     .bind(target_id)
     .execute(&mut **tx)
     .await
     .map_sql_err()?;
+
+    let config = provider
+        .try_get::<Option<String>, _>("config")
+        .map_sql_err()?
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    for window in quota_windows_from_config(config.as_ref()) {
+        let window_start = quota_window_start_unix_secs(now, anchor, window.duration_secs);
+        let window_delta = accepted
+            .iter()
+            .filter(|delta| delta.usage_created_at_unix_secs >= window_start)
+            .map(|delta| delta.total_cost_usd)
+            .sum::<f64>();
+        if window_delta == 0.0 {
+            continue;
+        }
+        sqlx::query(
+            r#"
+INSERT INTO provider_quota_window_counters (
+  provider_id, duration_secs, window_start, used_usd, updated_at
+) VALUES (?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  used_usd = IF(window_start = VALUES(window_start), used_usd + VALUES(used_usd), VALUES(used_usd)),
+  window_start = VALUES(window_start),
+  updated_at = VALUES(updated_at)
+"#,
+        )
+        .bind(target_id)
+        .bind(to_i64(
+            window.duration_secs,
+            "provider quota window duration",
+        )?)
+        .bind(to_i64(window_start, "provider quota window start")?)
+        .bind(window_delta)
+        .bind(now_db)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
     Ok(())
 }
 

@@ -63,6 +63,10 @@ pub trait ProviderQuotaReadRepository: Send + Sync {
 #[async_trait]
 pub trait ProviderQuotaWriteRepository: Send + Sync {
     async fn reset_due(&self, now_unix_secs: u64) -> Result<usize, crate::DataLayerError>;
+
+    async fn clear_window_counters(&self, _provider_id: &str) -> Result<(), crate::DataLayerError> {
+        Ok(())
+    }
 }
 
 pub trait ProviderQuotaRepository:

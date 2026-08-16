@@ -330,6 +330,16 @@ CREATE INDEX IF NOT EXISTS provider_usage_tracking_window_start_idx ON provider_
 CREATE INDEX IF NOT EXISTS idx_provider_window ON provider_usage_tracking (provider_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_window_time ON provider_usage_tracking (window_start, window_end);
 
+CREATE TABLE IF NOT EXISTS provider_quota_window_counters (
+    provider_id TEXT NOT NULL,
+    duration_secs INTEGER NOT NULL,
+    window_start INTEGER NOT NULL,
+    used_usd REAL NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, duration_secs),
+    CONSTRAINT provider_quota_window_counters_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS models (
     id TEXT PRIMARY KEY NOT NULL,
     provider_id TEXT NOT NULL,

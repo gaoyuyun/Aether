@@ -45,8 +45,9 @@ use aether_data_contracts::repository::usage::{
     model_usage_contribution, provider_api_key_usage_contribution,
     strip_deprecated_usage_display_fields, ApiKeyUsageDelta, ModelUsageDelta,
     PendingUsageCleanupSummary, ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta,
-    ProviderApiKeyWindowUsageRequest, StoredProviderApiKeyUsageSummary,
-    StoredProviderApiKeyWindowUsageSummary, StoredProviderUsageSummary, StoredRequestUsageAudit,
+    ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
+    StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
+    StoredProviderQuotaWindowUsage, StoredProviderUsageSummary, StoredRequestUsageAudit,
     StoredUsageDailySummary, UpsertUsageRecord, UsageAuditListQuery, UsageCounterFlushSummary,
     UsageCounterHealthSnapshot, UsageCounterPendingHealthSnapshot, UsageDailyHeatmapQuery,
     UsageReadRepository, UsageWriteRepository, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
@@ -54,6 +55,7 @@ use aether_data_contracts::repository::usage::{
     REQUESTED_REASONING_EFFORT_METADATA_KEY,
 };
 use aether_data_contracts::DataLayerError;
+use aether_wallet::{quota_window_start_unix_secs, quota_windows_from_config, ProviderBillingType};
 
 pub mod cleanup;
 
@@ -1487,7 +1489,8 @@ SELECT
   delta.last_used_ip,
   delta.candidate_last_used_at_unix_secs,
   delta.removed_last_used_at_unix_secs,
-  delta.usage_created_at_unix_secs
+  delta.usage_created_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM delta.created_at) AS BIGINT) AS created_at_unix_secs
 FROM usage_counter_deltas AS delta
 JOIN claimed ON claimed.id = delta.id
 ORDER BY delta.created_at ASC, delta.id ASC
@@ -1568,14 +1571,6 @@ const USAGE_COUNTER_KIND_PROVIDER_MONTHLY: &str = "provider_monthly";
 const USAGE_COUNTER_KIND_PROXY_NODE: &str = "proxy_node";
 const USAGE_COUNTER_KIND_MANAGEMENT_TOKEN: &str = "management_token";
 const USAGE_COUNTER_KIND_API_KEY_LAST_USED: &str = "api_key_last_used";
-
-const APPLY_PROVIDER_MONTHLY_USAGE_DELTA_SQL: &str = r#"
-UPDATE providers
-SET
-  monthly_used_usd = COALESCE(monthly_used_usd, 0) + $2,
-  updated_at = NOW()
-WHERE id = $1
-"#;
 
 const APPLY_PROXY_NODE_COUNTER_DELTA_SQL: &str = r#"
 UPDATE proxy_nodes
@@ -9714,7 +9709,7 @@ RETURNING
                             .await?;
                     }
                     for (provider_id, delta) in &aggregates.provider_monthly {
-                        apply_provider_monthly_usage_delta_in_tx(tx, provider_id.as_str(), *delta)
+                        apply_provider_monthly_usage_delta_in_tx(tx, provider_id.as_str(), delta)
                             .await?;
                     }
                     for (node_id, delta) in &aggregates.proxy_nodes {
@@ -10401,6 +10396,108 @@ impl UsageReadRepository for SqlxUsageReadRepository {
         Self::summarize_provider_usage_since(self, provider_id, since_unix_secs).await
     }
 
+    async fn summarize_provider_actual_usage_since(
+        &self,
+        provider_id: &str,
+        since_unix_secs: u64,
+    ) -> Result<f64, DataLayerError> {
+        let row = sqlx::query(
+            r#"
+SELECT COALESCE(SUM(COALESCE(actual_total_cost_usd, 0)), 0)::DOUBLE PRECISION
+       AS actual_total_cost_usd
+FROM usage_billing_facts
+WHERE provider_id = $1
+  AND created_at >= TO_TIMESTAMP($2::double precision)
+"#,
+        )
+        .bind(provider_id)
+        .bind(since_unix_secs as f64)
+        .fetch_one(&self.pool)
+        .await
+        .map_postgres_err()?;
+        row.try_get("actual_total_cost_usd").map_postgres_err()
+    }
+
+    async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, DataLayerError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested = BTreeSet::new();
+        let mut provider_ids = BTreeSet::new();
+        let mut duration_secs_values = BTreeSet::new();
+        for request in requests {
+            if request.provider_id.trim().is_empty() || request.duration_secs == 0 {
+                return Err(DataLayerError::InvalidInput(
+                    "provider quota window request must have a provider and duration".to_string(),
+                ));
+            }
+            let duration_secs = i64::try_from(request.duration_secs).map_err(|_| {
+                DataLayerError::InvalidInput("provider quota window duration overflow".to_string())
+            })?;
+            i64::try_from(request.window_start_unix_secs).map_err(|_| {
+                DataLayerError::InvalidInput("provider quota window start overflow".to_string())
+            })?;
+            requested.insert((
+                request.provider_id.clone(),
+                request.duration_secs,
+                request.window_start_unix_secs,
+            ));
+            provider_ids.insert(request.provider_id.clone());
+            duration_secs_values.insert(duration_secs);
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "SELECT provider_id, duration_secs, CAST(EXTRACT(EPOCH FROM window_start) AS BIGINT) AS window_start_unix_secs, used_usd FROM provider_quota_window_counters WHERE provider_id IN (",
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for provider_id in provider_ids {
+                separated.push_bind(provider_id);
+            }
+        }
+        builder.push(") AND duration_secs IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for duration_secs in duration_secs_values {
+                separated.push_bind(duration_secs);
+            }
+        }
+        builder.push(")");
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_postgres_err()?;
+        let mut usage_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let usage = StoredProviderQuotaWindowUsage {
+                provider_id: row.try_get("provider_id").map_postgres_err()?,
+                duration_secs: row
+                    .try_get::<i64, _>("duration_secs")
+                    .map_postgres_err()?
+                    .max(0) as u64,
+                window_start_unix_secs: row
+                    .try_get::<i64, _>("window_start_unix_secs")
+                    .map_postgres_err()?
+                    .max(0) as u64,
+                used_usd: row.try_get("used_usd").map_postgres_err()?,
+            };
+            if requested.contains(&(
+                usage.provider_id.clone(),
+                usage.duration_secs,
+                usage.window_start_unix_secs,
+            )) {
+                usage_rows.push(usage);
+            }
+        }
+        Ok(usage_rows)
+    }
+
     async fn summarize_usage_daily_heatmap(
         &self,
         query: &UsageDailyHeatmapQuery,
@@ -10825,6 +10922,13 @@ struct UsageCounterDeltaRow {
     candidate_last_used_at_unix_secs: Option<u64>,
     removed_last_used_at_unix_secs: Option<u64>,
     usage_created_at_unix_secs: Option<u64>,
+    created_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderMonthlyDelta {
+    total_cost_usd: f64,
+    usage_created_at_unix_secs: u64,
 }
 
 #[derive(Default)]
@@ -10832,7 +10936,7 @@ struct UsageCounterDeltaAggregates {
     api_keys: BTreeMap<String, ApiKeyUsageDelta>,
     provider_api_keys: BTreeMap<String, ProviderApiKeyUsageDelta>,
     models: BTreeMap<String, ModelUsageDelta>,
-    provider_monthly: BTreeMap<String, f64>,
+    provider_monthly: BTreeMap<String, Vec<ProviderMonthlyDelta>>,
     proxy_nodes: BTreeMap<String, ProxyNodeCounterDelta>,
     management_tokens: BTreeMap<String, ManagementTokenCounterDelta>,
     api_key_last_used: BTreeMap<String, ApiKeyLastUsedDelta>,
@@ -10895,11 +10999,16 @@ impl UsageCounterDeltaAggregates {
                     entry.request_count += row.request_count_delta;
                 }
                 USAGE_COUNTER_KIND_PROVIDER_MONTHLY => {
-                    let entry = aggregates
+                    aggregates
                         .provider_monthly
                         .entry(row.target_id.clone())
-                        .or_default();
-                    *entry += row.total_cost_usd_delta;
+                        .or_default()
+                        .push(ProviderMonthlyDelta {
+                            total_cost_usd: row.total_cost_usd_delta,
+                            usage_created_at_unix_secs: row
+                                .usage_created_at_unix_secs
+                                .unwrap_or(row.created_at_unix_secs),
+                        });
                 }
                 USAGE_COUNTER_KIND_PROXY_NODE => {
                     let entry = aggregates
@@ -11371,6 +11480,10 @@ fn map_usage_counter_delta_row(row: &PgRow) -> Result<UsageCounterDeltaRow, Data
             row.try_get::<Option<i64>, _>("usage_created_at_unix_secs")
                 .map_postgres_err()?,
         )?,
+        created_at_unix_secs: row
+            .try_get::<i64, _>("created_at_unix_secs")
+            .map_postgres_err()?
+            .max(0) as u64,
     })
 }
 
@@ -11523,23 +11636,120 @@ async fn apply_provider_api_key_main_usage_delta_in_tx(
 async fn apply_provider_monthly_usage_delta_in_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     provider_id: &str,
-    total_cost_usd_delta: f64,
+    deltas: &[ProviderMonthlyDelta],
 ) -> Result<(), DataLayerError> {
-    if provider_id.trim().is_empty() || total_cost_usd_delta == 0.0 {
+    if provider_id.trim().is_empty() || deltas.is_empty() {
         return Ok(());
     }
+    let provider = sqlx::query(
+        r#"
+SELECT
+  billing_type,
+  CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) AS quota_last_reset_at_unix_secs,
+  config
+FROM providers
+WHERE id = $1
+LIMIT 1
+"#,
+    )
+    .bind(provider_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_postgres_err()?;
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let billing_type = provider
+        .try_get::<Option<String>, _>("billing_type")
+        .map_postgres_err()?
+        .unwrap_or_default();
+    if !matches!(
+        ProviderBillingType::parse(&billing_type),
+        ProviderBillingType::MonthlyQuota | ProviderBillingType::FreeTier
+    ) {
+        return Ok(());
+    }
+    let anchor = optional_i64_to_unix_secs(
+        "providers.quota_last_reset_at",
+        provider
+            .try_get("quota_last_reset_at_unix_secs")
+            .map_postgres_err()?,
+    )?;
+    let now = Utc::now().timestamp().max(0) as u64;
+    let accepted = deltas
+        .iter()
+        .copied()
+        .filter(|delta| {
+            delta.usage_created_at_unix_secs <= now
+                && anchor.map_or(true, |anchor| delta.usage_created_at_unix_secs >= anchor)
+        })
+        .collect::<Vec<_>>();
+    let total_cost_usd_delta = accepted
+        .iter()
+        .map(|delta| delta.total_cost_usd)
+        .sum::<f64>();
     if !total_cost_usd_delta.is_finite() {
         return Err(DataLayerError::UnexpectedValue(format!(
             "providers.monthly_used_usd delta is not finite for {provider_id}"
         )));
     }
+    if total_cost_usd_delta == 0.0 {
+        return Ok(());
+    }
 
-    sqlx::query(APPLY_PROVIDER_MONTHLY_USAGE_DELTA_SQL)
+    sqlx::query(
+        r#"
+UPDATE providers
+SET monthly_used_usd = COALESCE(monthly_used_usd, 0) + $2,
+    updated_at = NOW()
+WHERE id = $1
+  AND billing_type IN ('monthly_quota', 'free_tier')
+"#,
+    )
+    .bind(provider_id)
+    .bind(total_cost_usd_delta)
+    .execute(&mut **tx)
+    .await
+    .map_postgres_err()?;
+
+    let config = provider
+        .try_get::<Option<serde_json::Value>, _>("config")
+        .map_postgres_err()?;
+    for window in quota_windows_from_config(config.as_ref()) {
+        let window_start = quota_window_start_unix_secs(now, anchor, window.duration_secs);
+        let window_delta = accepted
+            .iter()
+            .filter(|delta| delta.usage_created_at_unix_secs >= window_start)
+            .map(|delta| delta.total_cost_usd)
+            .sum::<f64>();
+        if window_delta == 0.0 {
+            continue;
+        }
+        sqlx::query(
+            r#"
+INSERT INTO provider_quota_window_counters (
+  provider_id, duration_secs, window_start, used_usd, updated_at
+) VALUES ($1, $2, TO_TIMESTAMP($3::double precision), $4, NOW())
+ON CONFLICT (provider_id, duration_secs) DO UPDATE SET
+  used_usd = CASE
+    WHEN provider_quota_window_counters.window_start = EXCLUDED.window_start
+    THEN provider_quota_window_counters.used_usd + EXCLUDED.used_usd
+    ELSE EXCLUDED.used_usd
+  END,
+  window_start = EXCLUDED.window_start,
+  updated_at = NOW()
+"#,
+        )
         .bind(provider_id)
-        .bind(total_cost_usd_delta)
+        .bind(i64::try_from(window.duration_secs).map_err(|_| {
+            DataLayerError::InvalidInput("provider quota window duration overflow".to_string())
+        })?)
+        .bind(window_start as f64)
+        .bind(window_delta)
         .execute(&mut **tx)
         .await
         .map_postgres_err()?;
+    }
     Ok(())
 }
 

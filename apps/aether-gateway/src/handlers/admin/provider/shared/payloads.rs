@@ -1,7 +1,30 @@
 use crate::handlers::admin::shared::{
     deserialize_optional_f64_from_number_or_string, AdminTypedObjectPatch,
 };
-use serde::Deserialize;
+use serde::{de, Deserialize};
+use serde_json::Value;
+
+fn deserialize_f64_from_number_or_string<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Number(number) => number
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| de::Error::custom("expected a finite number")),
+        Value::String(raw) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| de::Error::custom("expected a finite number or numeric string")),
+        _ => Err(de::Error::custom(
+            "expected a finite number or numeric string",
+        )),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AdminProviderKeyCreateRequest {
@@ -147,6 +170,8 @@ pub(crate) struct AdminProviderCreateRequest {
     #[serde(default)]
     pub(crate) quota_expires_at: Option<String>,
     #[serde(default)]
+    pub(crate) quota_windows: Option<Vec<AdminProviderQuotaWindowRequest>>,
+    #[serde(default)]
     pub(crate) provider_priority: Option<i32>,
     #[serde(default)]
     pub(crate) keep_priority_on_conversion: Option<bool>,
@@ -206,6 +231,8 @@ pub(crate) struct AdminProviderUpdateRequest {
     #[serde(default)]
     pub(crate) quota_expires_at: Option<String>,
     #[serde(default)]
+    pub(crate) quota_windows: Option<Vec<AdminProviderQuotaWindowRequest>>,
+    #[serde(default)]
     pub(crate) provider_priority: Option<i32>,
     #[serde(default)]
     pub(crate) keep_priority_on_conversion: Option<bool>,
@@ -244,6 +271,13 @@ pub(crate) struct AdminProviderUpdateRequest {
 }
 
 pub(crate) type AdminProviderUpdatePatch = AdminTypedObjectPatch<AdminProviderUpdateRequest>;
+
+#[derive(Debug, serde::Serialize, Deserialize, Clone)]
+pub(crate) struct AdminProviderQuotaWindowRequest {
+    pub(crate) duration_secs: u64,
+    #[serde(deserialize_with = "deserialize_f64_from_number_or_string")]
+    pub(crate) limit_usd: f64,
+}
 
 pub(crate) const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub(crate) const KIRO_USAGE_LIMITS_PATH: &str = "/getUsageLimits";

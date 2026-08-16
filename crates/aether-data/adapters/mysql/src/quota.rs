@@ -132,6 +132,20 @@ WHERE billing_type = 'monthly_quota'
         .rows_affected();
         Ok(usize::try_from(rows_affected).unwrap_or_default())
     }
+
+    async fn clear_window_counters(&self, provider_id: &str) -> Result<(), DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider quota provider_id is empty".to_string(),
+            ));
+        }
+        sqlx::query("DELETE FROM provider_quota_window_counters WHERE provider_id = ?")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        Ok(())
+    }
 }
 
 fn map_row(row: &MySqlRow) -> Result<StoredProviderQuotaSnapshot, DataLayerError> {

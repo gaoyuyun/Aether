@@ -794,6 +794,14 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
                         "failover_rules": {"strategy": "ordered"}
                     })),
                 )
+                .with_billing_fields(
+                    Some("monthly_quota".to_string()),
+                    Some(100.0),
+                    Some(12.5),
+                    Some(30),
+                    Some(1_711_000_027),
+                    None,
+                )
                 .with_timestamps(Some(1_711_000_000), Some(1_711_000_100)),
             sample_provider("provider-other", "other", 20),
         ],
@@ -878,6 +886,52 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     assert_eq!(payload["chat_pii_redaction"], json!({"enabled": true}));
     assert_eq!(payload["ops_configured"], true);
     assert_eq!(payload["ops_architecture_id"], "cubence");
+
+    let same_minute_response = reqwest::Client::new()
+        .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "quota_last_reset_at": "2024-03-21T05:47:00Z"
+        }))
+        .send()
+        .await
+        .expect("same-minute quota start update should succeed");
+    assert_eq!(same_minute_response.status(), StatusCode::OK);
+    let same_minute_provider = provider_catalog_repository
+        .list_providers_by_ids(&["provider-openai".to_string()])
+        .await
+        .expect("provider should reload after same-minute update");
+    assert_eq!(same_minute_provider[0].monthly_used_usd, Some(12.5));
+    assert_eq!(
+        same_minute_provider[0].quota_last_reset_at_unix_secs,
+        Some(1_711_000_027)
+    );
+
+    let next_minute_response = reqwest::Client::new()
+        .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "quota_last_reset_at": "2024-03-21T05:48:00Z"
+        }))
+        .send()
+        .await
+        .expect("next-minute quota start update should succeed");
+    assert_eq!(next_minute_response.status(), StatusCode::OK);
+    let next_minute_provider = provider_catalog_repository
+        .list_providers_by_ids(&["provider-openai".to_string()])
+        .await
+        .expect("provider should reload after next-minute update");
+    assert_eq!(next_minute_provider[0].monthly_used_usd, Some(0.0));
+    assert_eq!(
+        next_minute_provider[0].quota_last_reset_at_unix_secs,
+        Some(1_711_000_080)
+    );
 
     let invalid_timeout_response = reqwest::Client::new()
         .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))

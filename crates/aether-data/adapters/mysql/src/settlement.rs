@@ -42,6 +42,7 @@ SELECT
   ) AS wallet_gift_balance_after,
   usage_settlement_snapshots.provider_monthly_used_usd AS provider_monthly_used_usd,
   usage_record.provider_id,
+  usage_record.created_at_unix_ms AS usage_created_at_unix_secs,
   COALESCE(usage_settlement_snapshots.finalized_at, usage_record.finalized_at) AS finalized_at_unix_secs
 FROM `usage` AS usage_record
 LEFT JOIN usage_settlement_snapshots
@@ -96,9 +97,10 @@ ON DUPLICATE KEY UPDATE
 
 const ENQUEUE_PROVIDER_MONTHLY_USAGE_DELTA_SQL: &str = r#"
 INSERT INTO usage_counter_deltas (
-  id, request_id, kind, target_id, total_cost_usd_delta, created_at
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, created_at
 )
-VALUES (?, ?, 'provider_monthly', ?, ?, ?)
+VALUES (?, ?, 'provider_monthly', ?, ?, ?, ?)
 "#;
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,7 @@ async fn enqueue_provider_monthly_usage_delta_mysql(
     request_id: &str,
     provider_id: &str,
     total_cost_usd_delta: f64,
+    usage_created_at_unix_secs: i64,
     created_at: i64,
 ) -> Result<(), DataLayerError> {
     let request_id = request_id.trim();
@@ -168,6 +171,7 @@ async fn enqueue_provider_monthly_usage_delta_mysql(
         .bind(request_id)
         .bind(provider_id)
         .bind(total_cost_usd_delta)
+        .bind(usage_created_at_unix_secs)
         .bind(created_at)
         .execute(&mut **tx)
         .await
@@ -668,6 +672,9 @@ WHERE id = ?
                     &input.request_id,
                     provider_id,
                     input.actual_total_cost_usd,
+                    usage_row
+                        .try_get("usage_created_at_unix_secs")
+                        .map_sql_err()?,
                     updated_at,
                 )
                 .await?;

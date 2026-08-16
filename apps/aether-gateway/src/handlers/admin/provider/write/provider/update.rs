@@ -1,8 +1,9 @@
 use crate::handlers::admin::provider::shared::payloads::AdminProviderUpdatePatch;
 use crate::handlers::admin::provider::shared::support::{
-    normalize_provider_billing_type, normalize_provider_transfer_limit,
-    normalize_provider_transfer_limit_json, parse_optional_rfc3339_unix_secs,
-    PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY, PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
+    normalize_provider_billing_type, normalize_provider_quota_windows,
+    normalize_provider_transfer_limit, normalize_provider_transfer_limit_json,
+    parse_optional_rfc3339_unix_secs, PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
+    PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY, PROVIDER_QUOTA_WINDOWS_CONFIG_KEY,
 };
 use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redaction_config;
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
@@ -142,6 +143,16 @@ pub(crate) async fn build_admin_update_provider_record(
             )?);
         }
     }
+    if fields.contains("quota_last_reset_at")
+        && existing
+            .quota_last_reset_at_unix_secs
+            .zip(updated.quota_last_reset_at_unix_secs)
+            .is_some_and(|(existing, updated)| existing / 60 == updated / 60)
+    {
+        // The UI intentionally edits only to minute precision. Preserve legacy seconds when the
+        // displayed minute did not change so an unrelated provider edit cannot reset the quota.
+        updated.quota_last_reset_at_unix_secs = existing.quota_last_reset_at_unix_secs;
+    }
 
     if fields.contains("quota_expires_at") {
         if fields.is_null("quota_expires_at") {
@@ -244,6 +255,31 @@ pub(crate) async fn build_admin_update_provider_record(
         }
     }
 
+    if fields.contains("quota_windows") {
+        if fields.is_null("quota_windows") {
+            // Keep no empty policy object around; this also makes switching back to an ordinary
+            // pay-as-you-go provider remove the window enforcement cleanly.
+            config_map.remove(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY);
+        } else {
+            let value = serde_json::to_value(payload.quota_windows.as_ref())
+                .map_err(|err| format!("quota_windows 无法解析: {err}"))?;
+            let value = normalize_provider_quota_windows(Some(&value))?;
+            if value.as_array().is_some_and(|entries| entries.is_empty()) {
+                config_map.remove(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY);
+            } else {
+                config_map.insert(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY.to_string(), value);
+            }
+        }
+    }
+    if let Some(raw_windows) = config_map.get(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY).cloned() {
+        let value = normalize_provider_quota_windows(Some(&raw_windows))?;
+        if value.as_array().is_some_and(|entries| entries.is_empty()) {
+            config_map.remove(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY);
+        } else {
+            config_map.insert(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY.to_string(), value);
+        }
+    }
+
     for (field_name, payload_value) in [
         (
             PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
@@ -316,6 +352,40 @@ pub(crate) async fn build_admin_update_provider_record(
         updated.config.as_ref(),
     )
     .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
+
+    // A billing-mode conversion or an explicit cycle-start change starts a fresh live quota
+    // epoch. Historical usage/audit records remain unchanged.
+    let billing_type_changed =
+        fields.contains("billing_type") && existing.billing_type != updated.billing_type;
+    let quota_start_changed = fields.contains("quota_last_reset_at")
+        && existing.quota_last_reset_at_unix_secs != updated.quota_last_reset_at_unix_secs;
+    if billing_type_changed || quota_start_changed {
+        updated.monthly_used_usd = Some(0.0);
+    }
+    if billing_type_changed
+        && (!fields.contains("quota_last_reset_at")
+            || updated.quota_last_reset_at_unix_secs.is_none())
+    {
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        updated.quota_last_reset_at_unix_secs = Some(now_unix_secs / 60 * 60);
+    }
+    if matches!(
+        updated.billing_type.as_deref(),
+        Some("monthly_quota" | "free_tier")
+    ) && updated.quota_last_reset_at_unix_secs.is_none()
+    {
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        updated.monthly_used_usd = Some(0.0);
+        updated.quota_last_reset_at_unix_secs = Some(now_unix_secs / 60 * 60);
+    }
     updated.updated_at_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()

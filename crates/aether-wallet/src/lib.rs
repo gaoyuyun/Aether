@@ -5,4 +5,7 @@ pub use access::{
     quantize_money, WalletAccessDecision, WalletAccessFailure, WalletLimitMode, WalletSnapshot,
     WalletStatus,
 };
-pub use quota::{ProviderBillingType, ProviderQuotaSnapshot};
+pub use quota::{
+    quota_window_start_unix_secs, quota_windows_from_config, ProviderBillingType,
+    ProviderQuotaSnapshot, ProviderQuotaWindow,
+};

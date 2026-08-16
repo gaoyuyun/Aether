@@ -352,6 +352,17 @@ CREATE INDEX IF NOT EXISTS provider_usage_tracking_window_start_idx ON public.pr
 CREATE INDEX IF NOT EXISTS idx_provider_window ON public.provider_usage_tracking USING btree (provider_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_window_time ON public.provider_usage_tracking USING btree (window_start, window_end);
 
+CREATE TABLE IF NOT EXISTS public.provider_quota_window_counters (
+    provider_id character varying(64) NOT NULL,
+    duration_secs bigint NOT NULL,
+    window_start bigint NOT NULL,
+    used_usd double precision DEFAULT 0 NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.provider_quota_window_counters ADD CONSTRAINT provider_quota_window_counters_pkey PRIMARY KEY (provider_id, duration_secs);
+ALTER TABLE ONLY public.provider_quota_window_counters ADD CONSTRAINT provider_quota_window_counters_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
+
 CREATE TABLE IF NOT EXISTS public.models (
     id character varying(64) NOT NULL,
     provider_id character varying(64) NOT NULL,

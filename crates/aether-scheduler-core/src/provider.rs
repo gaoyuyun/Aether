@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
 use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
-use aether_wallet::{ProviderBillingType, ProviderQuotaSnapshot};
+use aether_wallet::{
+    quota_windows_from_config, ProviderBillingType, ProviderQuotaSnapshot, ProviderQuotaWindow,
+};
+use serde_json::Value;
 
 pub fn should_skip_provider_quota(
     quota: &StoredProviderQuotaSnapshot,
@@ -27,6 +30,38 @@ pub fn should_skip_provider_quota(
     }
 }
 
+/// Evaluates the legacy cycle quota and optional provider-configured fixed-period windows.
+pub fn should_skip_provider_quota_with_windows(
+    quota: &StoredProviderQuotaSnapshot,
+    _now_unix_secs: u64,
+    windows: &[ProviderQuotaWindow],
+    window_usage_usd: &[f64],
+) -> bool {
+    let billing_type = ProviderBillingType::parse(&quota.billing_type);
+    if !matches!(
+        billing_type,
+        ProviderBillingType::MonthlyQuota | ProviderBillingType::FreeTier
+    ) {
+        return false;
+    }
+    let snapshot = ProviderQuotaSnapshot {
+        provider_id: quota.provider_id.clone(),
+        billing_type,
+        monthly_quota_usd: quota.monthly_quota_usd,
+        monthly_used_usd: quota.monthly_used_usd,
+        quota_reset_day: quota.quota_reset_day,
+        quota_last_reset_at_unix_secs: quota.quota_last_reset_at_unix_secs,
+        quota_expires_at_unix_secs: quota.quota_expires_at_unix_secs,
+        is_active: quota.is_active,
+    };
+    snapshot.is_blocked_by_quota_windows(_now_unix_secs, windows, window_usage_usd)
+}
+
+/// Convenience parser for callers that own a provider catalog row.
+pub fn provider_quota_windows(config: Option<&Value>) -> Vec<ProviderQuotaWindow> {
+    quota_windows_from_config(config)
+}
+
 pub fn build_provider_concurrent_limit_map(
     providers: Vec<StoredProviderCatalogProvider>,
 ) -> BTreeMap<String, usize> {
@@ -44,9 +79,13 @@ pub fn build_provider_concurrent_limit_map(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_provider_concurrent_limit_map, should_skip_provider_quota};
+    use super::{
+        build_provider_concurrent_limit_map, should_skip_provider_quota,
+        should_skip_provider_quota_with_windows,
+    };
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
     use aether_data_contracts::repository::quota::StoredProviderQuotaSnapshot;
+    use aether_wallet::ProviderQuotaWindow;
 
     fn sample_provider(id: &str, concurrent_limit: Option<i32>) -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
@@ -135,5 +174,52 @@ mod tests {
         assert_eq!(limits.get("provider-a"), Some(&10));
         assert!(!limits.contains_key("provider-b"));
         assert!(!limits.contains_key("provider-c"));
+    }
+
+    #[test]
+    fn applies_windows_only_to_subscription_billing() {
+        let monthly = StoredProviderQuotaSnapshot::new(
+            "provider-1".to_string(),
+            "monthly_quota".to_string(),
+            Some(100.0),
+            1.0,
+            Some(30),
+            Some(1_000),
+            None,
+            true,
+        )
+        .expect("quota should build");
+        let window = ProviderQuotaWindow::new(86_400, 5.0).expect("window should build");
+
+        assert!(!should_skip_provider_quota_with_windows(
+            &monthly,
+            90_000,
+            &[window],
+            &[4.99]
+        ));
+        assert!(should_skip_provider_quota_with_windows(
+            &monthly,
+            90_000,
+            &[window],
+            &[5.0]
+        ));
+
+        let payg = StoredProviderQuotaSnapshot::new(
+            "provider-1".to_string(),
+            "pay_as_you_go".to_string(),
+            None,
+            50.0,
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect("quota should build");
+        assert!(!should_skip_provider_quota_with_windows(
+            &payg,
+            90_000,
+            &[window],
+            &[50.0]
+        ));
     }
 }

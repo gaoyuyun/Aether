@@ -7,6 +7,7 @@ use aether_data_contracts::repository::usage::{
     UsageCounterFlushSummary, UsageCounterHealthSnapshot, UsageCounterPendingHealthSnapshot,
 };
 use aether_data_contracts::DataLayerError;
+use aether_wallet::{quota_window_start_unix_secs, quota_windows_from_config, ProviderBillingType};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::error::SqlResultExt;
@@ -38,7 +39,8 @@ SELECT
   last_used_ip,
   candidate_last_used_at_unix_secs,
   removed_last_used_at_unix_secs,
-  usage_created_at_unix_secs
+  usage_created_at_unix_secs,
+  created_at
 FROM usage_counter_deltas
 WHERE processed_at IS NULL
 ORDER BY created_at ASC, id ASC
@@ -63,6 +65,13 @@ struct DeltaRow {
     candidate_last_used_at_unix_secs: Option<u64>,
     removed_last_used_at_unix_secs: Option<u64>,
     usage_created_at_unix_secs: Option<u64>,
+    created_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderMonthlyDelta {
+    total_cost_usd: f64,
+    usage_created_at_unix_secs: u64,
 }
 
 #[derive(Default)]
@@ -70,7 +79,7 @@ struct Aggregates {
     api_keys: BTreeMap<String, ApiKeyUsageDelta>,
     provider_api_keys: BTreeMap<String, ProviderApiKeyUsageDelta>,
     models: BTreeMap<String, ModelUsageDelta>,
-    provider_monthly: BTreeMap<String, f64>,
+    provider_monthly: BTreeMap<String, Vec<ProviderMonthlyDelta>>,
     proxy_nodes: BTreeMap<String, ProxyNodeCounterDelta>,
     management_tokens: BTreeMap<String, ManagementTokenCounterDelta>,
     api_key_last_used: BTreeMap<String, ApiKeyLastUsedDelta>,
@@ -136,10 +145,16 @@ impl Aggregates {
                         .request_count += row.request_count_delta;
                 }
                 KIND_PROVIDER_MONTHLY => {
-                    *aggregates
+                    aggregates
                         .provider_monthly
                         .entry(row.target_id.clone())
-                        .or_default() += row.total_cost_usd_delta;
+                        .or_default()
+                        .push(ProviderMonthlyDelta {
+                            total_cost_usd: row.total_cost_usd_delta,
+                            usage_created_at_unix_secs: row
+                                .usage_created_at_unix_secs
+                                .unwrap_or(row.created_at_unix_secs),
+                        });
                 }
                 KIND_PROXY_NODE => {
                     let entry = aggregates
@@ -245,7 +260,7 @@ pub(super) async fn flush(
         apply_provider_api_key(&mut tx, target_id, delta).await?;
     }
     for (target_id, delta) in &aggregates.provider_monthly {
-        apply_provider_monthly(&mut tx, target_id, *delta).await?;
+        apply_provider_monthly(&mut tx, target_id, delta).await?;
     }
     for (target_id, delta) in &aggregates.proxy_nodes {
         apply_proxy_node(&mut tx, target_id, delta).await?;
@@ -845,6 +860,7 @@ fn map_row(row: &sqlx::sqlite::SqliteRow) -> Result<DeltaRow, DataLayerError> {
             "usage_counter_deltas.usage_created_at_unix_secs",
             row.try_get("usage_created_at_unix_secs").map_sql_err()?,
         )?,
+        created_at_unix_secs: row.try_get::<i64, _>("created_at").map_sql_err()?.max(0) as u64,
     })
 }
 
@@ -975,25 +991,109 @@ WHERE id = ?
 async fn apply_provider_monthly(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     target_id: &str,
-    delta: f64,
+    deltas: &[ProviderMonthlyDelta],
 ) -> Result<(), DataLayerError> {
-    if target_id.trim().is_empty() || delta == 0.0 {
+    if target_id.trim().is_empty() || deltas.is_empty() {
         return Ok(());
     }
-    if !delta.is_finite() {
+    let provider = sqlx::query(
+        "SELECT billing_type, quota_last_reset_at, config FROM providers WHERE id = ? LIMIT 1",
+    )
+    .bind(target_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?;
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let billing_type = provider
+        .try_get::<Option<String>, _>("billing_type")
+        .map_sql_err()?
+        .unwrap_or_default();
+    if !matches!(
+        ProviderBillingType::parse(&billing_type),
+        ProviderBillingType::MonthlyQuota | ProviderBillingType::FreeTier
+    ) {
+        return Ok(());
+    }
+    let anchor = provider
+        .try_get::<Option<i64>, _>("quota_last_reset_at")
+        .map_sql_err()?
+        .map(|value| value.max(0) as u64);
+    let now_db = current_unix_secs();
+    let now = now_db.max(0) as u64;
+    let accepted = deltas
+        .iter()
+        .copied()
+        .filter(|delta| {
+            delta.usage_created_at_unix_secs <= now
+                && anchor.map_or(true, |anchor| delta.usage_created_at_unix_secs >= anchor)
+        })
+        .collect::<Vec<_>>();
+    let total_delta = accepted
+        .iter()
+        .map(|delta| delta.total_cost_usd)
+        .sum::<f64>();
+    if !total_delta.is_finite() {
         return Err(DataLayerError::UnexpectedValue(format!(
             "providers.monthly_used_usd delta is not finite for {target_id}"
         )));
     }
+    if total_delta == 0.0 {
+        return Ok(());
+    }
     sqlx::query(
-        "UPDATE providers SET monthly_used_usd = COALESCE(monthly_used_usd, 0) + ?, updated_at = ? WHERE id = ?",
+        "UPDATE providers SET monthly_used_usd = COALESCE(monthly_used_usd, 0) + ?, updated_at = ? WHERE id = ? AND (billing_type IS NULL OR billing_type IN ('monthly_quota', 'free_tier'))",
     )
-    .bind(delta)
-    .bind(current_unix_secs())
+    .bind(total_delta)
+    .bind(now_db)
     .bind(target_id)
     .execute(&mut **tx)
     .await
     .map_sql_err()?;
+
+    let config = provider
+        .try_get::<Option<String>, _>("config")
+        .map_sql_err()?
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    for window in quota_windows_from_config(config.as_ref()) {
+        let window_start = quota_window_start_unix_secs(now, anchor, window.duration_secs);
+        let window_delta = accepted
+            .iter()
+            .filter(|delta| delta.usage_created_at_unix_secs >= window_start)
+            .map(|delta| delta.total_cost_usd)
+            .sum::<f64>();
+        if window_delta == 0.0 {
+            continue;
+        }
+        sqlx::query(
+            r#"
+INSERT INTO provider_quota_window_counters (
+  provider_id, duration_secs, window_start, used_usd, updated_at
+) VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (provider_id, duration_secs) DO UPDATE SET
+  used_usd = CASE
+    WHEN provider_quota_window_counters.window_start = excluded.window_start
+    THEN provider_quota_window_counters.used_usd + excluded.used_usd
+    ELSE excluded.used_usd
+  END,
+  window_start = excluded.window_start,
+  updated_at = excluded.updated_at
+"#,
+        )
+        .bind(target_id)
+        .bind(i64::try_from(window.duration_secs).map_err(|_| {
+            DataLayerError::InvalidInput("provider quota window duration overflow".to_string())
+        })?)
+        .bind(i64::try_from(window_start).map_err(|_| {
+            DataLayerError::InvalidInput("provider quota window start overflow".to_string())
+        })?)
+        .bind(window_delta)
+        .bind(now_db)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
     Ok(())
 }
 
@@ -1158,9 +1258,99 @@ fn optional_nonnegative_u64(value: Option<i64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_processed, enqueue_api_key_last_used, enqueue_management_token, enqueue_proxy_node,
-        flush, read_health, read_pending_health,
+        apply_provider_monthly, cleanup_processed, current_unix_secs, enqueue_api_key_last_used,
+        enqueue_management_token, enqueue_proxy_node, flush, read_health, read_pending_health,
+        ProviderMonthlyDelta,
     };
+
+    #[tokio::test]
+    async fn provider_quota_counters_ignore_old_epochs_and_payg_mode() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let now = current_unix_secs().max(100);
+        let anchor = now - 30;
+        sqlx::query(
+            r#"
+INSERT INTO providers (
+  id, name, provider_type, billing_type, monthly_used_usd,
+  quota_last_reset_at, config, created_at, updated_at
+) VALUES (?, 'quota provider', 'custom', 'monthly_quota', 0, ?, ?, ?, ?)
+"#,
+        )
+        .bind("quota-provider")
+        .bind(anchor)
+        .bind(r#"{"quota_windows":[{"duration_secs":86400,"limit_usd":10}]}"#)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("provider should seed");
+
+        let mut tx = pool.begin().await.expect("transaction should begin");
+        apply_provider_monthly(
+            &mut tx,
+            "quota-provider",
+            &[
+                ProviderMonthlyDelta {
+                    total_cost_usd: 100.0,
+                    usage_created_at_unix_secs: (anchor - 1) as u64,
+                },
+                ProviderMonthlyDelta {
+                    total_cost_usd: 2.5,
+                    usage_created_at_unix_secs: (now - 1) as u64,
+                },
+            ],
+        )
+        .await
+        .expect("monthly counters should apply");
+        tx.commit().await.expect("transaction should commit");
+
+        let monthly_used: f64 = sqlx::query_scalar(
+            "SELECT monthly_used_usd FROM providers WHERE id = 'quota-provider'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("monthly counter should load");
+        let window_used: f64 = sqlx::query_scalar(
+            "SELECT used_usd FROM provider_quota_window_counters WHERE provider_id = 'quota-provider' AND duration_secs = 86400",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("window counter should load");
+        assert_eq!(monthly_used, 2.5);
+        assert_eq!(window_used, 2.5);
+
+        sqlx::query("UPDATE providers SET billing_type = 'pay_as_you_go' WHERE id = ?")
+            .bind("quota-provider")
+            .execute(&pool)
+            .await
+            .expect("billing mode should update");
+        let mut tx = pool.begin().await.expect("transaction should begin");
+        apply_provider_monthly(
+            &mut tx,
+            "quota-provider",
+            &[ProviderMonthlyDelta {
+                total_cost_usd: 7.5,
+                usage_created_at_unix_secs: now as u64,
+            }],
+        )
+        .await
+        .expect("payg counter event should be ignored");
+        tx.commit().await.expect("transaction should commit");
+        let unchanged: f64 = sqlx::query_scalar(
+            "SELECT monthly_used_usd FROM providers WHERE id = 'quota-provider'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("monthly counter should load");
+        assert_eq!(unchanged, 2.5);
+    }
     use aether_data_contracts::repository::usage::{
         ApiKeyLastUsedDelta, ManagementTokenCounterDelta, ProxyNodeCounterDelta,
     };

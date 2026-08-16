@@ -331,6 +331,7 @@ pub struct StoredRequestUsageAudit {
     pub local_execution_runtime_miss_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_metadata: Option<Value>,
+    /// Unix seconds stored in the legacy `created_at_unix_ms` column.
     pub created_at_unix_ms: u64,
     pub updated_at_unix_secs: u64,
     pub finalized_at_unix_secs: Option<u64>,
@@ -372,6 +373,7 @@ impl StoredRequestUsageAudit {
         first_byte_time_ms: Option<i32>,
         status: String,
         billing_status: String,
+        // Unix seconds despite the legacy `*_unix_ms` field name.
         created_at_unix_ms: i64,
         updated_at_unix_secs: i64,
         finalized_at_unix_secs: Option<i64>,
@@ -931,6 +933,23 @@ pub struct StoredProviderApiKeyWindowUsageSummary {
     pub request_count: u64,
     pub total_tokens: u64,
     pub total_cost_usd: f64,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct ProviderQuotaWindowUsageRequest {
+    pub provider_id: String,
+    pub duration_secs: u64,
+    pub window_start_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct StoredProviderQuotaWindowUsage {
+    pub provider_id: String,
+    pub duration_secs: u64,
+    pub window_start_unix_secs: u64,
+    pub used_usd: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -1853,6 +1872,27 @@ pub trait UsageReadRepository: Send + Sync {
         provider_id: &str,
         since_unix_secs: u64,
     ) -> Result<StoredProviderUsageSummary, crate::DataLayerError>;
+
+    /// Returns the provider's actual upstream spend for a time range. Native adapters override
+    /// this with the authoritative `actual_total_cost_usd` column; older adapters can safely
+    /// fall back to the modeled cost through this default implementation.
+    async fn summarize_provider_actual_usage_since(
+        &self,
+        provider_id: &str,
+        since_unix_secs: u64,
+    ) -> Result<f64, crate::DataLayerError> {
+        Ok(self
+            .summarize_provider_usage_since(provider_id, since_unix_secs)
+            .await?
+            .total_cost_usd)
+    }
+
+    async fn read_provider_quota_window_usage(
+        &self,
+        _requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, crate::DataLayerError> {
+        Ok(Vec::new())
+    }
 
     async fn summarize_usage_daily_heatmap(
         &self,

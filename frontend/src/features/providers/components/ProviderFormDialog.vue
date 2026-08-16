@@ -260,7 +260,7 @@
             />
           </div>
           <div class="space-y-1.5">
-            <Label class="text-xs">{{ legacyT('重置周期 (天)') }}</Label>
+            <Label class="text-xs">{{ legacyT('总额周期 (天，1=日卡)') }}</Label>
             <Input
               :model-value="form.quota_reset_day ?? ''"
               type="number"
@@ -270,12 +270,53 @@
             />
           </div>
           <div class="space-y-1.5">
+            <Label class="text-xs">{{ legacyT('窗口限额类型') }}</Label>
+            <Select
+              :model-value="form.quota_window_type"
+              @update:model-value="(v) => setQuotaWindowType(String(v))"
+            >
+              <SelectTrigger>
+                <SelectValue :placeholder="legacyT('不限窗口')" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">{{ legacyT('不限窗口') }}</SelectItem>
+                <SelectItem value="daily">{{ legacyT('每日限额') }}</SelectItem>
+                <SelectItem value="weekly">{{ legacyT('每周限额') }}</SelectItem>
+                <SelectItem value="custom">{{ legacyT('自定义时长') }}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div
+            v-if="form.quota_window_type !== 'none'"
+            class="space-y-1.5"
+          >
+            <template v-if="form.quota_window_type === 'custom'">
+              <Label class="text-xs">{{ legacyT('窗口时长 (小时)') }}</Label>
+              <Input
+                :model-value="form.quota_window_duration_secs / 3_600"
+                type="number"
+                min="1"
+                max="8784"
+                step="1"
+                @update:model-value="setQuotaWindowDurationHours"
+              />
+            </template>
+            <Label class="text-xs">{{ legacyT('窗口额度 (USD)') }}</Label>
+            <Input
+              v-model.number="form.quota_window_limit_usd"
+              type="number"
+              min="0"
+              step="0.01"
+            />
+          </div>
+          <div class="space-y-1.5">
             <Label class="text-xs">
-              {{ legacyT('周期开始时间') }} <span class="text-red-500">*</span>
+              {{ legacyT('周期开始时间（精确到分）') }} <span class="text-red-500">*</span>
             </Label>
             <Input
               v-model="form.quota_last_reset_at"
               type="datetime-local"
+              step="60"
             />
           </div>
           <div class="space-y-1.5">
@@ -388,6 +429,7 @@ import {
   createProvider,
   normalizePoolAdvancedConfig,
   updateProvider,
+  type ProviderQuotaWindow,
   type ProviderType,
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
@@ -441,6 +483,9 @@ const form = ref({
   quota_reset_day: 30,
   quota_last_reset_at: '',  // 周期开始时间
   quota_expires_at: '',
+  quota_window_type: 'none' as 'none' | 'daily' | 'weekly' | 'custom',
+  quota_window_duration_secs: 3600,
+  quota_window_limit_usd: undefined as number | undefined,
   provider_priority: 100,
   keep_priority_on_conversion: false,  // 格式转换时是否保持优先级
   // 状态配置
@@ -472,6 +517,9 @@ function resetForm() {
     quota_reset_day: 30,
     quota_last_reset_at: '',
     quota_expires_at: '',
+    quota_window_type: 'none',
+    quota_window_duration_secs: 3600,
+    quota_window_limit_usd: undefined,
     provider_priority: defaultPriority.value,
     keep_priority_on_conversion: false,
     is_active: true,
@@ -495,6 +543,14 @@ function resetForm() {
 function loadProviderData() {
   if (!props.provider) return
   const poolAdvanced = normalizePoolAdvancedConfig(props.provider.pool_advanced)
+  const quotaWindow = props.provider.quota_windows?.[0] as ProviderQuotaWindow | undefined
+  const quotaWindowType: 'none' | 'daily' | 'weekly' | 'custom' = quotaWindow == null
+    ? 'none'
+    : quotaWindow.duration_secs === 86_400
+      ? 'daily'
+      : quotaWindow.duration_secs === 604_800
+        ? 'weekly'
+        : 'custom'
 
   form.value = {
     name: props.provider.name,
@@ -506,6 +562,9 @@ function loadProviderData() {
     quota_reset_day: props.provider.quota_reset_day || 30,
     quota_last_reset_at: formatDateTimeLocalInput(props.provider.quota_last_reset_at),
     quota_expires_at: formatDateTimeLocalInput(props.provider.quota_expires_at),
+    quota_window_type: quotaWindowType,
+    quota_window_duration_secs: quotaWindow?.duration_secs ?? 3600,
+    quota_window_limit_usd: quotaWindow?.limit_usd,
     provider_priority: props.provider.provider_priority || 999,
     keep_priority_on_conversion: props.provider.keep_priority_on_conversion ?? false,
     is_active: props.provider.is_active,
@@ -523,6 +582,20 @@ function loadProviderData() {
     // Kiro 专属配置
     kiro_simulated_cache_enabled: props.provider.kiro_simulated_cache_enabled ?? false,
   }
+}
+
+function setQuotaWindowType(value: string) {
+  const type = (['none', 'daily', 'weekly', 'custom'] as const).includes(value as never)
+    ? value as 'none' | 'daily' | 'weekly' | 'custom'
+    : 'none'
+  form.value.quota_window_type = type
+  if (type === 'daily') form.value.quota_window_duration_secs = 86_400
+  if (type === 'weekly') form.value.quota_window_duration_secs = 604_800
+}
+
+function setQuotaWindowDurationHours(value: string | number | null | undefined) {
+  const hours = parseNumberInput(value, { allowFloat: true, min: 1, max: 8_784 }) ?? 1
+  form.value.quota_window_duration_secs = Math.round(hours * 3_600)
 }
 
 // 使用 useFormDialog 统一处理对话框逻辑
@@ -577,6 +650,16 @@ const handleSubmit = async () => {
       quota_reset_day: form.value.quota_reset_day,
       quota_last_reset_at: quotaLastResetAt,
       quota_expires_at: quotaExpiresAt,
+      // Leave the saved window policy intact while a provider is temporarily pay-as-you-go;
+      // switching back to a subscription can then resume the same policy.
+      quota_windows: form.value.billing_type === 'monthly_quota'
+        ? (form.value.quota_window_type !== 'none' && form.value.quota_window_limit_usd != null
+            ? [{
+                duration_secs: form.value.quota_window_duration_secs,
+                limit_usd: form.value.quota_window_limit_usd,
+              }]
+            : [])
+        : undefined,
       keep_priority_on_conversion: form.value.keep_priority_on_conversion,
       is_active: form.value.is_active,
       // 请求配置

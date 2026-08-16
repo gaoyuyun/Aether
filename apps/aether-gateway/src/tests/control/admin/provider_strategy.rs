@@ -313,7 +313,7 @@ async fn gateway_updates_admin_provider_strategy_billing_locally_with_trusted_ad
         .expect("provider query should succeed");
     assert_eq!(updated[0].billing_type.as_deref(), Some("monthly_quota"));
     assert_eq!(updated[0].monthly_quota_usd, Some(50.0));
-    assert_eq!(updated[0].monthly_used_usd, Some(12.5));
+    assert_eq!(updated[0].monthly_used_usd, Some(0.0));
     assert_eq!(updated[0].quota_reset_day, Some(30));
     assert_eq!(updated[0].provider_priority, 100);
     assert_eq!(
@@ -345,11 +345,11 @@ async fn gateway_syncs_admin_provider_strategy_monthly_usage_from_reset_window_l
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![
             sample_provider("provider-openai", "openai", 7).with_billing_fields(
-                Some("pay_as_you_go".to_string()),
-                None,
+                Some("monthly_quota".to_string()),
+                Some(50.0),
                 Some(12.5),
-                Some(9),
-                Some(1_711_000_000),
+                Some(30),
+                Some(1_772_323_200),
                 None,
             ),
         ],

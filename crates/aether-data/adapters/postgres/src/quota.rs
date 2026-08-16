@@ -119,6 +119,20 @@ impl ProviderQuotaWriteRepository for SqlxProviderQuotaRepository {
             .map_postgres_err()?;
         Ok(result.rows_affected() as usize)
     }
+
+    async fn clear_window_counters(&self, provider_id: &str) -> Result<(), DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider quota provider_id is empty".to_string(),
+            ));
+        }
+        sqlx::query("DELETE FROM provider_quota_window_counters WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await
+            .map_postgres_err()?;
+        Ok(())
+    }
 }
 
 fn map_row(row: &sqlx::postgres::PgRow) -> Result<StoredProviderQuotaSnapshot, DataLayerError> {

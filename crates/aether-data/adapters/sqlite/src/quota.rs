@@ -120,6 +120,20 @@ WHERE billing_type = 'monthly_quota'
         .rows_affected();
         Ok(usize::try_from(rows_affected).unwrap_or_default())
     }
+
+    async fn clear_window_counters(&self, provider_id: &str) -> Result<(), DataLayerError> {
+        if provider_id.trim().is_empty() {
+            return Err(DataLayerError::InvalidInput(
+                "provider quota provider_id is empty".to_string(),
+            ));
+        }
+        sqlx::query("DELETE FROM provider_quota_window_counters WHERE provider_id = ?")
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await
+            .map_sql_err()?;
+        Ok(())
+    }
 }
 
 fn map_row(row: &SqliteRow) -> Result<StoredProviderQuotaSnapshot, DataLayerError> {
@@ -195,6 +209,18 @@ mod tests {
             .expect("quota should exist");
         assert_eq!(quota.monthly_used_usd, 0.0);
         assert_eq!(quota.quota_last_reset_at_unix_secs, Some(605_800));
+
+        repository
+            .clear_window_counters("provider-1")
+            .await
+            .expect("window counters should clear");
+        let remaining_window_counters: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_quota_window_counters WHERE provider_id = 'provider-1'",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .expect("window counter count should load");
+        assert_eq!(remaining_window_counters, 0);
     }
 
     async fn seed_provider_quotas(pool: &sqlx::SqlitePool) {
@@ -208,6 +234,11 @@ VALUES
   ('provider-1', 'Provider One', 'openai', 'monthly_quota', 20.0, 5.0, 7, 1000, 1, 1, 1),
   ('provider-2', 'Provider Two', 'openai', 'payg', NULL, 1.5, NULL, NULL, 1, 1, 1),
   ('provider-null-used', 'Provider Null Used', 'openai', 'payg', NULL, NULL, NULL, NULL, 1, 1, 1)
+;
+
+INSERT INTO provider_quota_window_counters (
+  provider_id, duration_secs, window_start, used_usd, updated_at
+) VALUES ('provider-1', 86400, 1000, 2.5, 1)
 "#,
         )
         .execute(pool)

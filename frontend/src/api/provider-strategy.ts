@@ -12,6 +12,7 @@ export interface ProviderBillingConfig {
   quota_reset_day?: number;
   quota_last_reset_at?: string;  // 当前周期开始时间
   quota_expires_at?: string;
+  quota_windows?: Array<{ duration_secs: number; limit_usd: number }>;
   rpm_limit?: number | null;
   cache_ttl_minutes?: number;  // 0表示不支持缓存，>0表示支持缓存并设置TTL(分钟)
   provider_priority?: number;

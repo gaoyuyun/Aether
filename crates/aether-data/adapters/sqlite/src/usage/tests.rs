@@ -1,14 +1,72 @@
 use super::{SqliteUsageReadRepository, SqliteUsageWriteRepository};
 use crate::run_migrations;
 use aether_data_contracts::repository::usage::{
-    ProviderApiKeyWindowUsageRequest, UpsertUsageRecord, UsageAuditAggregationGroupBy,
-    UsageAuditAggregationQuery, UsageAuditListQuery, UsageAuditSummaryQuery, UsageBodyCaptureState,
-    UsageBreakdownGroupBy, UsageBreakdownSummaryQuery, UsageCleanupExecutionMode,
-    UsageCleanupTargets, UsageCleanupWindow, UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery,
-    UsageDashboardDailyBreakdownQuery, UsageDashboardSummaryQuery, UsageProviderPerformanceQuery,
-    UsageReadRepository, UsageTimeSeriesGranularity, UsageWriteRepository,
+    ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest, UpsertUsageRecord,
+    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditListQuery,
+    UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBreakdownGroupBy,
+    UsageBreakdownSummaryQuery, UsageCleanupExecutionMode, UsageCleanupTargets, UsageCleanupWindow,
+    UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery, UsageDashboardDailyBreakdownQuery,
+    UsageDashboardSummaryQuery, UsageProviderPerformanceQuery, UsageReadRepository,
+    UsageTimeSeriesGranularity, UsageWriteRepository,
 };
 use chrono::{DateTime, Utc};
+
+#[tokio::test]
+async fn sqlite_reads_only_exact_provider_quota_window_counters() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::query(
+        r#"
+INSERT INTO providers (id, name, provider_type, created_at, updated_at) VALUES
+  ('provider-a', 'Provider A', 'custom', 1, 1),
+  ('provider-b', 'Provider B', 'custom', 1, 1);
+INSERT INTO provider_quota_window_counters (
+  provider_id, duration_secs, window_start, used_usd, updated_at
+) VALUES
+  ('provider-a', 86400, 100, 5.0, 1),
+  ('provider-a', 604800, 100, 20.0, 1),
+  ('provider-b', 86400, 200, 7.0, 1);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("quota counters should seed");
+
+    let rows = SqliteUsageReadRepository::new(pool)
+        .read_provider_quota_window_usage(&[
+            ProviderQuotaWindowUsageRequest {
+                provider_id: "provider-a".to_string(),
+                duration_secs: 86_400,
+                window_start_unix_secs: 100,
+            },
+            ProviderQuotaWindowUsageRequest {
+                provider_id: "provider-a".to_string(),
+                duration_secs: 604_800,
+                window_start_unix_secs: 999,
+            },
+            ProviderQuotaWindowUsageRequest {
+                provider_id: "provider-b".to_string(),
+                duration_secs: 86_400,
+                window_start_unix_secs: 200,
+            },
+        ])
+        .await
+        .expect("quota counters should load");
+
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row.provider_id == "provider-a"
+        && row.duration_secs == 86_400
+        && row.used_usd == 5.0));
+    assert!(rows.iter().any(|row| row.provider_id == "provider-b"
+        && row.window_start_unix_secs == 200
+        && row.used_usd == 7.0));
+}
 
 #[test]
 fn sqlite_usage_upsert_guards_candidate_identity_metadata_and_routing_from_late_lifecycle() {

@@ -42,6 +42,7 @@ SELECT
   ) AS wallet_gift_balance_after,
   CAST(usage_settlement_snapshots.provider_monthly_used_usd AS DOUBLE PRECISION) AS provider_monthly_used_usd,
   usage_record.provider_id,
+  FLOOR(EXTRACT(EPOCH FROM usage_record.created_at))::BIGINT AS usage_created_at_unix_secs,
   CAST(
     EXTRACT(
       EPOCH FROM COALESCE(usage_settlement_snapshots.finalized_at, usage_record.finalized_at)
@@ -133,13 +134,15 @@ INSERT INTO usage_counter_deltas (
   request_id,
   kind,
   target_id,
-  total_cost_usd_delta
+  total_cost_usd_delta,
+  usage_created_at_unix_secs
 ) VALUES (
   $1,
   $2,
   'provider_monthly',
   $3,
-  $4
+  $4,
+  $5
 )
 "#;
 
@@ -216,6 +219,7 @@ async fn enqueue_provider_monthly_usage_delta<'e, E>(
     request_id: &str,
     provider_id: &str,
     total_cost_usd_delta: f64,
+    usage_created_at_unix_secs: i64,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -236,6 +240,7 @@ where
         .bind(request_id)
         .bind(provider_id)
         .bind(total_cost_usd_delta)
+        .bind(usage_created_at_unix_secs)
         .execute(executor)
         .await
         .map_postgres_err()?;
@@ -715,6 +720,9 @@ WHERE id = $1
                                 &input.request_id,
                                 provider_id,
                                 input.actual_total_cost_usd,
+                                usage_row
+                                    .try_get("usage_created_at_unix_secs")
+                                    .map_postgres_err()?,
                             )
                             .await?;
                         }
