@@ -24,7 +24,8 @@ pub fn should_skip_provider_quota(
 
     match snapshot.billing_type {
         ProviderBillingType::MonthlyQuota => {
-            quota.quota_last_reset_at_unix_secs.is_none()
+            !quota.is_active
+                || quota.quota_last_reset_at_unix_secs.is_none()
                 || quota
                     .quota_reset_day
                     .is_some_and(|days| days == 0 || days > 30)
@@ -134,7 +135,7 @@ mod tests {
             false,
         )
         .expect("quota should build");
-        assert!(!should_skip_provider_quota(&inactive, 2_000));
+        assert!(should_skip_provider_quota(&inactive, 2_000));
 
         let expired = StoredProviderQuotaSnapshot::new(
             "provider-1".to_string(),

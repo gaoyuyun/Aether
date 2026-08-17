@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use sqlx::{mysql::MySqlRow, MySql, MySqlConnection, QueryBuilder, Row};
 
 use aether_data_contracts::repository::candidates::{
-    request_candidate_lifecycle_would_regress, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
-    StoredRequestCandidate, UpsertRequestCandidateRecord,
+    provider_quota_dispatch_snapshot, request_candidate_lifecycle_would_regress,
+    PublicHealthStatusCount, PublicHealthTimelineBucket, RequestCandidateReadRepository,
+    RequestCandidateStatus, RequestCandidateWriteRepository, StoredRequestCandidate,
+    UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -320,6 +321,7 @@ async fn upsert_candidate_in_transaction(
     })?;
     let merged = merge_candidate(candidate, Some(existing))?;
     upsert_merged_candidate(tx, &merged).await?;
+    upsert_provider_quota_attempt_delta(tx, &merged).await?;
     find_by_unique_for_update(
         tx,
         &merged.request_id,
@@ -332,6 +334,77 @@ async fn upsert_candidate_in_transaction(
             "request candidate row disappeared after atomic upsert".to_string(),
         )
     })
+}
+
+async fn upsert_provider_quota_attempt_delta(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    candidate: &StoredRequestCandidate,
+) -> Result<(), DataLayerError> {
+    let Some(snapshot) = provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())? else {
+        return Ok(());
+    };
+    if !snapshot.is_monthly_quota() {
+        return Ok(());
+    }
+    let provider_id = candidate
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DataLayerError::InvalidInput(
+                "monthly provider quota attempt is missing provider_id".to_string(),
+            )
+        })?;
+    let quota_epoch = snapshot.quota_epoch_start_at_usage.ok_or_else(|| {
+        DataLayerError::InvalidInput(
+            "monthly provider quota attempt is missing quota epoch".to_string(),
+        )
+    })?;
+    let delta_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("provider-quota-attempt:{}", candidate.id).as_bytes(),
+    )
+    .to_string();
+    let pricing_snapshot = snapshot
+        .provider_pricing_snapshot_at_usage
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+    let cost = snapshot.provider_quota_cost_usd.unwrap_or(0.0);
+    sqlx::query(
+        r#"
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage, quota_accounting_status, created_at
+)
+VALUES (?, ?, 'provider_monthly', ?, ?, ?, 'monthly_quota', ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  provider_quota_cost_usd = IF(processed_at IS NULL, VALUES(provider_quota_cost_usd), provider_quota_cost_usd),
+  total_cost_usd_delta = IF(processed_at IS NULL, VALUES(total_cost_usd_delta), total_cost_usd_delta),
+  quota_accounting_status = IF(processed_at IS NULL, VALUES(quota_accounting_status), quota_accounting_status)
+"#,
+    )
+    .bind(delta_id)
+    .bind(&candidate.id)
+    .bind(provider_id)
+    .bind(cost)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .bind(quota_epoch as i64)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .bind(cost)
+    .bind(snapshot.pricing_rule_version_at_usage.as_deref())
+    .bind(pricing_snapshot)
+    .bind(snapshot.quota_accounting_status)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .execute(&mut **tx)
+    .await
+    .map_sql_err()?;
+    Ok(())
 }
 
 async fn insert_candidate_if_absent(

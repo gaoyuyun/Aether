@@ -57,6 +57,15 @@ diagnostics, and are removed separately only after the relevant outbox watermark
 barrier are safe. Schema migration preserves the previous fixed-window table as a legacy copy until
 the rolling counters have been validated.
 
+Historical migration is a resumable, provider-scoped maintenance task. It captures a quota-delta
+sequence high-water mark, scans the current epoch in bounded dispatch-time batches, and persists its
+cursor and row counts after every batch. Deltas at or below that cutover are marked as absorbed by the
+backfill; later deltas remain owned by the normal flusher. For legacy candidates without the new
+dispatch snapshot, their persisted attempt `started_at` is the only dispatch-time fallback. Missing
+dispatch, billing-type, or cost evidence is reported as an unknown row and keeps the provider fail
+closed for operator review. While a backfill is pending, running, or failed, quota reads and upstream
+dispatch do not treat an uninitialized counter as zero usage.
+
 ## Reset And Configuration Changes
 
 Automatic reset checks run every minute. The quota read/dispatch path also attempts any due reset, so

@@ -42,6 +42,7 @@ SELECT
   ) AS wallet_gift_balance_after,
   CAST(usage_settlement_snapshots.provider_monthly_used_usd AS DOUBLE PRECISION) AS provider_monthly_used_usd,
   usage_record.provider_id,
+  usage_routing_snapshots.candidate_id AS provider_attempt_id,
   FLOOR(EXTRACT(EPOCH FROM usage_record.created_at))::BIGINT AS usage_created_at_unix_secs,
   COALESCE(
     usage_settlement_snapshots.settlement_snapshot #>> '{pricing_snapshot,provider_billing_type}',
@@ -52,6 +53,11 @@ SELECT
     FLOOR(EXTRACT(EPOCH FROM provider.quota_last_reset_at))::BIGINT
   ) AS quota_epoch_start_at_usage,
   NULLIF(usage_settlement_snapshots.settlement_snapshot #>> '{provider_quota_cost_usd}', '')::DOUBLE PRECISION AS provider_quota_cost_usd,
+  (
+    COALESCE(usage_settlement_snapshots.settlement_snapshot #>> '{status}', '') = 'complete'
+    OR LOWER(COALESCE(usage_record.endpoint_api_format, '')) = 'openai:search'
+  )
+    AS provider_quota_cost_is_resolved,
   usage_settlement_snapshots.billing_rule_version AS pricing_rule_version_at_usage,
   usage_settlement_snapshots.settlement_snapshot -> 'pricing_snapshot' AS provider_pricing_snapshot_at_usage,
   CAST(
@@ -64,6 +70,8 @@ LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = usage_record.request_id
 LEFT JOIN providers AS provider
   ON provider.id = usage_record.provider_id
+LEFT JOIN usage_routing_snapshots
+  ON usage_routing_snapshots.request_id = usage_record.request_id
 WHERE usage_record.request_id = $1
 FOR UPDATE OF usage_record
 "#;
@@ -250,6 +258,7 @@ async fn enqueue_provider_monthly_usage_delta<'e, E>(
     quota_epoch_start_at_usage: i64,
     pricing_rule_version_at_usage: Option<&str>,
     provider_pricing_snapshot_at_usage: Option<&serde_json::Value>,
+    cost_is_resolved: bool,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -274,15 +283,139 @@ where
         .bind(quota_epoch_start_at_usage)
         .bind(pricing_rule_version_at_usage)
         .bind(provider_pricing_snapshot_at_usage)
-        .bind(if total_cost_usd_delta > 0.0 {
-            "ready"
-        } else {
-            "pending"
-        })
+        .bind(
+            if total_cost_usd_delta > SETTLEMENT_EPSILON_USD || cost_is_resolved {
+                "ready"
+            } else {
+                "failed"
+            },
+        )
         .execute(executor)
         .await
         .map_postgres_err()?;
     Ok(())
+}
+
+async fn reconcile_provider_monthly_attempt_postgres(
+    tx: &mut crate::PostgresTransaction,
+    candidate_id: &str,
+    actual_cost_usd: f64,
+    cost_is_resolved: bool,
+) -> Result<bool, DataLayerError> {
+    let delta_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("provider-quota-attempt:{}", candidate_id).as_bytes(),
+    )
+    .to_string();
+    let row = sqlx::query(
+        "SELECT provider_quota_cost_usd, quota_accounting_status, processed_at, provider_pricing_snapshot_at_usage, pricing_rule_version_at_usage, provider_dispatch_at_unix_secs, quota_epoch_start_at_usage, target_id FROM usage_counter_deltas WHERE id = $1 AND kind = 'provider_monthly' LIMIT 1 FOR UPDATE",
+    )
+    .bind(&delta_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_postgres_err()?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let base_cost = row
+        .try_get::<Option<f64>, _>("provider_quota_cost_usd")
+        .map_postgres_err()?
+        .unwrap_or(0.0);
+    let base_status = row
+        .try_get::<Option<String>, _>("quota_accounting_status")
+        .map_postgres_err()?;
+    let processed_at = row
+        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("processed_at")
+        .map_postgres_err()?;
+    let reconciled_cost = if base_status.as_deref() == Some("ready") {
+        actual_cost_usd.max(base_cost)
+    } else {
+        actual_cost_usd
+    };
+    if !reconciled_cost.is_finite() || reconciled_cost < 0.0 {
+        return Err(DataLayerError::InvalidInput(
+            "provider quota attempt settlement cost is invalid".to_string(),
+        ));
+    }
+    if base_status.as_deref() != Some("ready") && reconciled_cost <= SETTLEMENT_EPSILON_USD {
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET provider_quota_cost_usd = 0, total_cost_usd_delta = 0, quota_accounting_status = $1 WHERE id = $2",
+        )
+        .bind(if cost_is_resolved { "ready" } else { "failed" })
+        .bind(&delta_id)
+        .execute(&mut **tx)
+        .await
+        .map_postgres_err()?;
+        return Ok(true);
+    }
+    if processed_at.is_none() {
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET provider_quota_cost_usd = $1, total_cost_usd_delta = $1, quota_accounting_status = 'ready' WHERE id = $2 AND processed_at IS NULL",
+        )
+        .bind(reconciled_cost)
+        .bind(&delta_id)
+        .execute(&mut **tx)
+        .await
+        .map_postgres_err()?;
+        return Ok(true);
+    }
+    let adjustment = reconciled_cost - base_cost;
+    if adjustment.abs() <= SETTLEMENT_EPSILON_USD {
+        return Ok(true);
+    }
+    let adjustment_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("provider-quota-attempt-actual:{}", candidate_id).as_bytes(),
+    )
+    .to_string();
+    let pricing_snapshot: Option<serde_json::Value> = row
+        .try_get("provider_pricing_snapshot_at_usage")
+        .map_postgres_err()?;
+    let pricing_rule_version: Option<String> = row
+        .try_get("pricing_rule_version_at_usage")
+        .map_postgres_err()?;
+    let dispatch_at: i64 = row
+        .try_get("provider_dispatch_at_unix_secs")
+        .map_postgres_err()?;
+    let epoch: i64 = row
+        .try_get("quota_epoch_start_at_usage")
+        .map_postgres_err()?;
+    let target_id: String = row.try_get("target_id").map_postgres_err()?;
+    sqlx::query(
+        r#"
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage, quota_accounting_status
+)
+VALUES ($1, $2, 'provider_monthly', $3, $4, $5, 'monthly_quota', $6, $5,
+        $4, $7, $8, 'ready')
+ON CONFLICT (id) DO NOTHING
+"#,
+    )
+    .bind(adjustment_id)
+    .bind(candidate_id)
+    .bind(target_id)
+    .bind(adjustment)
+    .bind(dispatch_at)
+    .bind(epoch)
+    .bind(pricing_rule_version)
+    .bind(pricing_snapshot)
+    .execute(&mut **tx)
+    .await
+    .map_postgres_err()?;
+    if base_status.as_deref() != Some("ready") {
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET quota_accounting_status = 'reconciled' WHERE id = $1",
+        )
+        .bind(delta_id)
+        .execute(&mut **tx)
+        .await
+        .map_postgres_err()?;
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Default)]
@@ -509,7 +642,30 @@ impl SettlementWriteRepository for SqlxSettlementRepository {
                     let quota_epoch_start_at_usage = usage_row
                         .try_get::<Option<i64>, _>("quota_epoch_start_at_usage")
                         .map_postgres_err()?;
-                    if provider_billing_type_at_usage.eq_ignore_ascii_case("monthly_quota") {
+                    let provider_attempt_id = usage_row
+                        .try_get::<Option<String>, _>("provider_attempt_id")
+                        .map_postgres_err()?;
+                    let provider_quota_cost_is_resolved = usage_row
+                        .try_get::<bool, _>("provider_quota_cost_is_resolved")
+                        .map_postgres_err()?;
+                    let attempt_reconciled =
+                        if let Some(candidate_id) = provider_attempt_id.as_deref() {
+                            reconcile_provider_monthly_attempt_postgres(
+                                tx,
+                                candidate_id,
+                                usage_row
+                                    .try_get::<Option<f64>, _>("provider_quota_cost_usd")
+                                    .map_postgres_err()?
+                                    .unwrap_or(input.actual_total_cost_usd),
+                                provider_quota_cost_is_resolved,
+                            )
+                            .await?
+                        } else {
+                            false
+                        };
+                    if !attempt_reconciled
+                        && provider_billing_type_at_usage.eq_ignore_ascii_case("monthly_quota")
+                    {
                         if let (Some(provider_id), Some(quota_epoch_start_at_usage)) = (
                             input
                                 .provider_id
@@ -540,6 +696,7 @@ impl SettlementWriteRepository for SqlxSettlementRepository {
                                 quota_epoch_start_at_usage / 60 * 60,
                                 pricing_rule_version.as_deref(),
                                 provider_pricing_snapshot.as_ref(),
+                                provider_quota_cost_is_resolved,
                             )
                             .await?;
                         }
@@ -919,7 +1076,7 @@ mod tests {
             .expect("postgres commerce api key should insert");
         }
         sqlx::query(
-            "INSERT INTO public.providers (id, name, provider_type, created_at, updated_at) VALUES ($1, $2, 'custom', $3, $3)",
+            "INSERT INTO public.providers (id, name, provider_type, billing_type, quota_last_reset_at, created_at, updated_at) VALUES ($1, $2, 'custom', 'monthly_quota', TO_TIMESTAMP(1980), $3, $3)",
         )
         .bind(&provider_id)
         .bind(format!("Commerce Provider {}", &suffix[..8]))
@@ -1075,6 +1232,6 @@ WHERE kind = 'provider_monthly'
         .fetch_one(&pool)
         .await
         .expect("postgres commerce provider delta should load");
-        assert_eq!(provider_delta, (2, 12.0));
+        assert_eq!(provider_delta, (3, 18.0));
     }
 }

@@ -586,7 +586,11 @@ SELECT name
 FROM sqlite_master
 WHERE type = 'table'
   AND name NOT LIKE 'sqlite_%'
-  AND name NOT IN ('_sqlx_migrations', 'schema_backfills')
+  AND name NOT IN (
+      '_sqlx_migrations',
+      'schema_backfills',
+      'provider_quota_window_counters_legacy'
+  )
 ORDER BY name
 "#,
     )
@@ -1088,6 +1092,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260731000000,
             20260815010000,
             20260816000000,
+            20260817000000,
+            20260817020000,
         ]
     );
     assert_eq!(
@@ -1125,6 +1131,8 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260731000000,
             20260815010000,
             20260816000000,
+            20260817000000,
+            20260817020000,
         ]
     );
 }
@@ -2235,6 +2243,8 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260815000000,
             20260815010000,
             20260816000000,
+            20260817000000,
+            20260817020000,
         ]
     );
 }
@@ -2258,7 +2268,12 @@ fn pending_migrations_from_applied_keeps_post_snapshot_incrementals_pending() {
         .collect::<Vec<_>>();
     assert_eq!(
         pending_versions,
-        vec![20260815010000, 20260816000000],
+        vec![
+            20260815010000,
+            20260816000000,
+            20260817000000,
+            20260817020000,
+        ],
         "data and schema migrations added after the empty database snapshot must remain pending"
     );
 }

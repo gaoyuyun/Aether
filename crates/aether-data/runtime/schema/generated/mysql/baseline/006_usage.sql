@@ -193,14 +193,16 @@ CREATE TABLE IF NOT EXISTS usage_counter_deltas (
     `provider_quota_cost_usd` DOUBLE,
     `pricing_rule_version_at_usage` VARCHAR(128),
     `provider_pricing_snapshot_at_usage` JSON,
-    `quota_delta_sequence` BIGINT,
+    `quota_delta_sequence` BIGINT NOT NULL AUTO_INCREMENT,
     `quota_accounting_status` VARCHAR(32),
     `created_at` BIGINT NOT NULL,
     `processed_at` BIGINT,
     PRIMARY KEY (`id`),
+    UNIQUE KEY ix_usage_counter_deltas_quota_sequence (`quota_delta_sequence`),
     KEY ix_usage_counter_deltas_unprocessed (`created_at`, `id`),
     KEY ix_usage_counter_deltas_processed (`processed_at`, `created_at`, `id`),
-    KEY ix_usage_counter_deltas_request_kind (`request_id`, `kind`, `target_id`)
+    KEY ix_usage_counter_deltas_request_kind (`request_id`, `kind`, `target_id`(191)),
+    KEY ix_usage_counter_deltas_provider_quota_pending (`kind`, `target_id`(191), `quota_accounting_status`, `quota_delta_sequence`)
 );
 
 CREATE TABLE IF NOT EXISTS usage_settlement_snapshots (

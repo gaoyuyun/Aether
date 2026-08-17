@@ -4,9 +4,9 @@ use sqlx::{postgres::PgRow, PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
 use aether_data_contracts::repository::candidates::{
-    PublicHealthStatusCount, PublicHealthTimelineBucket, RequestCandidateReadRepository,
-    RequestCandidateStatus, RequestCandidateWriteRepository, StoredRequestCandidate,
-    UpsertRequestCandidateRecord,
+    provider_quota_dispatch_snapshot, PublicHealthStatusCount, PublicHealthTimelineBucket,
+    RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
+    StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::DataLayerError;
 use aether_data_query::{push_eq, push_in, push_limit, WhereClause};
@@ -814,7 +814,9 @@ impl SqlxRequestCandidateReadRepository {
                         .fetch_one(&mut **tx)
                         .await
                         .map_postgres_err()?;
-                    map_request_candidate_row(&row)
+                    let stored = map_request_candidate_row(&row)?;
+                    upsert_provider_quota_attempt_delta(tx, &stored).await?;
+                    Ok(stored)
                 }) as BoxFuture<'_, Result<StoredRequestCandidate, DataLayerError>>
             })
             .await
@@ -879,6 +881,77 @@ impl SqlxRequestCandidateReadRepository {
             .map_postgres_err()?;
         Ok(result.rows_affected() as usize)
     }
+}
+
+async fn upsert_provider_quota_attempt_delta(
+    tx: &mut PostgresTransaction,
+    candidate: &StoredRequestCandidate,
+) -> Result<(), DataLayerError> {
+    let Some(snapshot) = provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())? else {
+        return Ok(());
+    };
+    if !snapshot.is_monthly_quota() {
+        return Ok(());
+    }
+    let provider_id = candidate
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DataLayerError::InvalidInput(
+                "monthly provider quota attempt is missing provider_id".to_string(),
+            )
+        })?;
+    let quota_epoch = snapshot.quota_epoch_start_at_usage.ok_or_else(|| {
+        DataLayerError::InvalidInput(
+            "monthly provider quota attempt is missing quota epoch".to_string(),
+        )
+    })?;
+    let delta_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("provider-quota-attempt:{}", candidate.id).as_bytes(),
+    )
+    .to_string();
+    let cost = snapshot.provider_quota_cost_usd.unwrap_or(0.0);
+    sqlx::query(
+        r#"
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage, quota_accounting_status, created_at
+)
+VALUES (
+  $1, $2, 'provider_monthly', $3, $4, $5, 'monthly_quota', $6, $7,
+  $8, $9, $10, $11, TO_TIMESTAMP($12::double precision)
+)
+ON CONFLICT (id) DO UPDATE SET
+  provider_quota_cost_usd = CASE WHEN usage_counter_deltas.processed_at IS NULL
+    THEN EXCLUDED.provider_quota_cost_usd ELSE usage_counter_deltas.provider_quota_cost_usd END,
+  total_cost_usd_delta = CASE WHEN usage_counter_deltas.processed_at IS NULL
+    THEN EXCLUDED.total_cost_usd_delta ELSE usage_counter_deltas.total_cost_usd_delta END,
+  quota_accounting_status = CASE WHEN usage_counter_deltas.processed_at IS NULL
+    THEN EXCLUDED.quota_accounting_status ELSE usage_counter_deltas.quota_accounting_status END
+"#,
+    )
+    .bind(delta_id)
+    .bind(&candidate.id)
+    .bind(provider_id)
+    .bind(cost)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .bind(quota_epoch as i64)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .bind(cost)
+    .bind(snapshot.pricing_rule_version_at_usage.as_deref())
+    .bind(snapshot.provider_pricing_snapshot_at_usage)
+    .bind(snapshot.quota_accounting_status)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .execute(&mut **tx)
+    .await
+    .map_postgres_err()?;
+    Ok(())
 }
 
 async fn execute_partitioned_upsert_many_batch(
