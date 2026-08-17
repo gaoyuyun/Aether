@@ -439,14 +439,6 @@ fn local_admin_user_agent(headers: &http::HeaderMap) -> Option<String> {
         .map(|value| value.chars().take(1000).collect())
 }
 
-fn local_auth_secret() -> String {
-    std::env::var("JWT_SECRET_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "aether-rust-dev-jwt-secret".to_string())
-}
-
 fn decode_local_auth_token(
     token: &str,
     expected_type: &str,
@@ -469,7 +461,8 @@ fn decode_local_auth_token(
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(signature_segment)
         .map_err(|_| "invalid token".to_string())?;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(local_auth_secret().as_bytes())
+    let secret = crate::security_config::jwt_signing_secret()?;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|_| "invalid token".to_string())?;
     mac.update(signing_input.as_bytes());
     mac.verify_slice(&signature)

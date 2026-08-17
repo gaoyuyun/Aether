@@ -60,10 +60,18 @@
             class="oauth-btn"
             @click="handleOAuthLogin(oauthProviders[0].provider_type)"
           >
+            <img
+              v-if="getOAuthIconUrl(oauthProviders[0].provider_type, oauthProviders[0].icon_url)"
+              class="oauth-icon object-contain"
+              :src="getOAuthIconUrl(oauthProviders[0].provider_type, oauthProviders[0].icon_url) || undefined"
+              alt=""
+              referrerpolicy="no-referrer"
+            >
             <!-- eslint-disable vue/no-v-html -->
             <span
+              v-else
               class="oauth-icon"
-              v-html="getOAuthIcon(oauthProviders[0].provider_type, oauthProviders[0].icon_url)"
+              v-html="getOAuthIcon(oauthProviders[0].provider_type)"
             />
             <!-- eslint-enable vue/no-v-html -->
             <span>{{ t('auth.login.oauthWithProvider', { provider: oauthProviders[0].display_name }) }}</span>
@@ -85,10 +93,18 @@
               :title="p.display_name"
               @click="handleOAuthLogin(p.provider_type)"
             >
+              <img
+                v-if="getOAuthIconUrl(p.provider_type, p.icon_url)"
+                class="oauth-icon-lg object-contain"
+                :src="getOAuthIconUrl(p.provider_type, p.icon_url) || undefined"
+                alt=""
+                referrerpolicy="no-referrer"
+              >
               <!-- eslint-disable vue/no-v-html -->
               <span
+                v-else
                 class="oauth-icon-lg"
-                v-html="getOAuthIcon(p.provider_type, p.icon_url)"
+                v-html="getOAuthIcon(p.provider_type)"
               />
               <!-- eslint-enable vue/no-v-html -->
             </button>
@@ -264,7 +280,7 @@ import { authApi, type RegistrationPrivacyPolicySettings } from '@/api/auth'
 import { oauthApi, type OAuthProviderInfo } from '@/api/oauth'
 import { getClientDeviceId } from '@/utils/deviceId'
 import { getApiUrl } from '@/utils/url'
-import { getOAuthIcon } from '@/utils/oauth-icons'
+import { getOAuthIcon, getOAuthIconUrl } from '@/utils/oauth-icons'
 import { navigateAfterLogin } from '@/features/auth/utils/loginRedirect'
 import { useI18n } from '@/i18n'
 

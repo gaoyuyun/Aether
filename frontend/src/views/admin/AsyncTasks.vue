@@ -568,11 +568,18 @@
                 <div v-if="selectedTask.video_url">
                   <div class="rounded-lg overflow-hidden border border-border/60 bg-black">
                     <video
+                      v-if="getVideoUrl(selectedTask.id, selectedTask.video_url)"
                       :src="getVideoUrl(selectedTask.id, selectedTask.video_url)"
                       controls
                       preload="none"
                       class="w-full max-h-[300px] object-contain"
                     />
+                    <div
+                      v-else
+                      class="h-32 flex items-center justify-center text-muted-foreground"
+                    >
+                      <Loader2 class="w-5 h-5 animate-spin" />
+                    </div>
                   </div>
                   <!-- 视频信息 -->
                   <div class="mt-2 space-y-2">
@@ -623,11 +630,18 @@
                     </p>
                     <div class="rounded-lg overflow-hidden border border-border/60 bg-black">
                       <video
+                        v-if="getVideoUrl(selectedTask.id, url)"
                         :src="getVideoUrl(selectedTask.id, url)"
                         controls
                         preload="none"
                         class="w-full max-h-[250px] object-contain"
                       />
+                      <div
+                        v-else
+                        class="h-28 flex items-center justify-center text-muted-foreground"
+                      >
+                        <Loader2 class="w-5 h-5 animate-spin" />
+                      </div>
                     </div>
                     <div class="mt-1.5 flex items-center gap-1 p-1.5 bg-muted/50 rounded border border-border/40">
                       <code
@@ -919,6 +933,9 @@ const filterStatus = ref('all')
 const filterModel = ref('')
 const showDetail = ref(false)
 const selectedTask = ref<AsyncTaskDetail | null>(null)
+const videoObjectUrls = ref<Record<string, string>>({})
+const videoLoadsInFlight = new Set<string>()
+const videoLoadFailures = new Set<string>()
 const detailAutoRefresh = ref(false)
 let detailRefreshInterval: ReturnType<typeof setInterval> | null = null
 const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hidden)
@@ -1015,8 +1032,10 @@ async function refreshOverview() {
 // 打开任务详情
 async function openTaskDetail(task: AsyncTaskItem) {
   try {
+    releaseVideoObjectUrls()
     selectedTask.value = await asyncTasksApi.getDetail(task.id)
     showDetail.value = true
+    void prepareTaskVideo(selectedTask.value)
   } catch (error: unknown) {
     toast({
       title: '获取任务详情失败',
@@ -1031,6 +1050,7 @@ async function refreshTaskDetail() {
   if (!selectedTask.value) return
   try {
     selectedTask.value = await asyncTasksApi.getDetail(selectedTask.value.id)
+    void prepareTaskVideo(selectedTask.value)
   } catch (error: unknown) {
     toast({
       title: '刷新失败',
@@ -1080,6 +1100,7 @@ function stopDetailAutoRefresh() {
 function closeDetail() {
   stopDetailAutoRefresh()
   showDetail.value = false
+  releaseVideoObjectUrls()
   selectedTask.value = null
 }
 
@@ -1215,18 +1236,43 @@ function formatFileSize(bytes: number | null): string {
   return `${size.toFixed(unitIndex > 0 ? 2 : 0)} ${units[unitIndex]}`
 }
 
-// 获取视频 URL（需要认证的 Google URL 使用代理）
-function getVideoUrl(taskId: string, originalUrl: string): string {
-  // Google API 链接需要代理
-  if (originalUrl.includes('generativelanguage.googleapis.com')) {
-    // 从 localStorage 获取 token 作为 query param
-    const token = localStorage.getItem('access_token')
-    if (token) {
-      return `/api/admin/video-tasks/${taskId}/video?token=${encodeURIComponent(token)}`
-    }
-    return `/api/admin/video-tasks/${taskId}/video`
+function videoNeedsAuthenticatedProxy(originalUrl: string): boolean {
+  return originalUrl.includes('generativelanguage.googleapis.com')
+}
+
+async function prepareTaskVideo(task: AsyncTaskDetail): Promise<void> {
+  const urls = [task.video_url, ...(task.video_urls || [])]
+    .filter((url): url is string => Boolean(url))
+  if (!urls.some(videoNeedsAuthenticatedProxy)) return
+  if (videoObjectUrls.value[task.id] || videoLoadsInFlight.has(task.id) || videoLoadFailures.has(task.id)) return
+
+  videoLoadsInFlight.add(task.id)
+  try {
+    const blob = await asyncTasksApi.getVideo(task.id)
+    const objectUrl = URL.createObjectURL(blob)
+    videoObjectUrls.value = { ...videoObjectUrls.value, [task.id]: objectUrl }
+  } catch (error) {
+    videoLoadFailures.add(task.id)
+    log.warn('Failed to load authenticated task video', error)
+  } finally {
+    videoLoadsInFlight.delete(task.id)
   }
-  return originalUrl
+}
+
+function releaseVideoObjectUrls() {
+  for (const objectUrl of Object.values(videoObjectUrls.value)) {
+    URL.revokeObjectURL(objectUrl)
+  }
+  videoObjectUrls.value = {}
+  videoLoadsInFlight.clear()
+  videoLoadFailures.clear()
+}
+
+// 需要上游凭据的视频只使用已认证请求产生的本地 Object URL。
+function getVideoUrl(taskId: string, originalUrl: string): string {
+  return videoNeedsAuthenticatedProxy(originalUrl)
+    ? videoObjectUrls.value[taskId] || ''
+    : originalUrl
 }
 
 // 计算时间差
@@ -1339,6 +1385,7 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   stopAutoRefresh()
   stopDetailAutoRefresh()
+  releaseVideoObjectUrls()
   clearTimeout(filterTimeout)
 })
 </script>

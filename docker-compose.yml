@@ -9,7 +9,7 @@ services:
     environment:
       POSTGRES_DB: aether
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be configured}
       TZ: Asia/Shanghai
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -43,7 +43,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: aether-redis
-    command: redis-server --dir /tmp --appendonly no --save "" --requirepass ${REDIS_PASSWORD} --maxclients ${REDIS_MAXCLIENTS:-10000}
+    command: redis-server --dir /tmp --appendonly no --save "" --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be configured} --maxclients ${REDIS_MAXCLIENTS:-10000}
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
@@ -61,8 +61,8 @@ services:
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-aether}
       MYSQL_USER: ${MYSQL_USER:-aether}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-aether}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-aether_root}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-${DB_PASSWORD:?DB_PASSWORD must be configured}}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-${DB_PASSWORD:?DB_PASSWORD must be configured}}
       TZ: Asia/Shanghai
     volumes:
       - mysql_data:/var/lib/mysql
@@ -82,10 +82,11 @@ services:
     container_name: aether-app
     user: "0:0"
     env_file:
-      - .env
+      - ${AETHER_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@postgres:5432/aether
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:?DB_PASSWORD must be configured}@postgres:5432/aether
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be configured}@redis:6379/0
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       TZ: Asia/Shanghai
       AETHER_BASE_DIR: /opt/aether
       AETHER_UPDATE_STRATEGY: docker

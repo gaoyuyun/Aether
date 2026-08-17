@@ -22,6 +22,7 @@ pub struct AdminMonitoringKeyAccountDisplay {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminMonitoringRoute {
     AuditLogs,
+    GatewayMetrics,
     SystemStatus,
     SuspiciousActivities,
     UserBehavior,
@@ -1133,6 +1134,7 @@ pub fn match_admin_monitoring_route(
     match *method {
         http::Method::GET => match path {
             "/api/admin/monitoring/audit-logs" => Some(AdminMonitoringRoute::AuditLogs),
+            "/api/admin/monitoring/metrics" => Some(AdminMonitoringRoute::GatewayMetrics),
             "/api/admin/monitoring/system-status" => Some(AdminMonitoringRoute::SystemStatus),
             "/api/admin/monitoring/suspicious-activities" => {
                 Some(AdminMonitoringRoute::SuspiciousActivities)

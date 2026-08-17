@@ -939,9 +939,6 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
     ));
     assert!(seen_refresh_request
         .body
-        .contains("client_secret=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"));
-    assert!(seen_refresh_request
-        .body
         .contains("refresh_token=rt-gemini-cli-stream-local-123"));
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -1991,9 +1988,6 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
     assert!(seen_refresh_request.body.contains(
         "client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
     ));
-    assert!(seen_refresh_request
-        .body
-        .contains("client_secret=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"));
     assert!(seen_refresh_request
         .body
         .contains("refresh_token=rt-antigravity-cli-stream-local-123"));

@@ -138,6 +138,7 @@ ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     RUST_LOG=aether_gateway=info \
     APP_PORT=8084 \
+    ENVIRONMENT=production \
     AETHER_BASE_DIR=/opt/aether \
     AETHER_UPDATE_STRATEGY=self \
     AETHER_GATEWAY_STATIC_DIR=/opt/aether/current/frontend

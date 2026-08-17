@@ -1072,7 +1072,7 @@ impl GatewayUsageArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 struct GatewayFrontdoorArgs {
-    #[arg(long, env = "ENVIRONMENT", default_value = "development")]
+    #[arg(long, env = "ENVIRONMENT", default_value = "production")]
     environment: String,
 
     #[arg(long, env = "CORS_ORIGINS")]
@@ -1804,6 +1804,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     init_service_runtime(args.runtime_config()?)?;
     let sql_database_config = args.data.effective_sql_database_config();
+    aether_gateway::validate_runtime_secrets(
+        sql_database_config.is_some(),
+        args.data.effective_encryption_key().as_deref(),
+    )?;
     let data_redis_url = args.data.effective_redis_url();
     let runtime_backend =
         args.effective_runtime_backend(sql_database_config.as_ref(), data_redis_url.as_deref());

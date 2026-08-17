@@ -1505,9 +1505,6 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
     ));
     assert!(seen_refresh_request
         .body
-        .contains("client_secret=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"));
-    assert!(seen_refresh_request
-        .body
         .contains("refresh_token=rt-antigravity-cli-local-123"));
 
     let seen_remote_execution_runtime_request = seen_remote_execution_runtime

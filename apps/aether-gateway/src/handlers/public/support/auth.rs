@@ -134,9 +134,9 @@ async fn handle_auth_login(
                     )
                 }
                 Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("auth user lookup failed: {err:?}"),
+                    return build_auth_internal_error_response(
+                        "auth user lookup failed",
+                        &err,
                         false,
                     )
                 }
@@ -162,9 +162,9 @@ async fn handle_auth_login(
                     )
                 }
                 Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("auth settings lookup failed: {err:?}"),
+                    return build_auth_internal_error_response(
+                        "auth settings lookup failed",
+                        &err,
                         false,
                     )
                 }
@@ -196,9 +196,9 @@ async fn handle_auth_login(
                         )
                     }
                     Err(err) => {
-                        return build_auth_error_response(
-                            http::StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("auth ldap login failed: {err:?}"),
+                        return build_auth_internal_error_response(
+                            "auth ldap login failed",
+                            &err,
                             false,
                         )
                     }
@@ -210,9 +210,9 @@ async fn handle_auth_login(
             {
                 Ok(value) => system_config_f64(value.as_ref(), 10.0),
                 Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("auth settings lookup failed: {err:?}"),
+                    return build_auth_internal_error_response(
+                        "auth settings lookup failed",
+                        &err,
                         false,
                     )
                 }
@@ -238,9 +238,9 @@ async fn handle_auth_login(
                     )
                 }
                 Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("auth ldap user sync failed: {err:?}"),
+                    return build_auth_internal_error_response(
+                        "auth ldap user sync failed",
+                        &err,
                         false,
                     )
                 }

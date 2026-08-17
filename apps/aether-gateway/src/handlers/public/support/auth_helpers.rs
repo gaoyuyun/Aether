@@ -147,25 +147,29 @@ pub(crate) fn build_auth_error_response(
     build_auth_json_response(status, json!({ "detail": detail.into() }), cookie)
 }
 
+pub(super) fn build_auth_internal_error_response(
+    context: &'static str,
+    error: &impl std::fmt::Debug,
+    clear_cookie: bool,
+) -> Response<Body> {
+    tracing::warn!(context, error = ?error, "authentication request failed internally");
+    build_auth_error_response(
+        http::StatusCode::INTERNAL_SERVER_ERROR,
+        "认证服务暂时不可用",
+        clear_cookie,
+    )
+}
+
 fn auth_environment() -> String {
     std::env::var("ENVIRONMENT")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "development".to_string())
+        .unwrap_or_else(|| "production".to_string())
 }
 
 pub(super) fn auth_jwt_secret() -> Result<String, String> {
-    if let Ok(value) = std::env::var("JWT_SECRET_KEY") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Ok(value.to_string());
-        }
-    }
-    if auth_environment().eq_ignore_ascii_case("production") {
-        return Err("JWT_SECRET_KEY 未配置".to_string());
-    }
-    Ok("aether-rust-dev-jwt-secret".to_string())
+    crate::security_config::jwt_signing_secret()
 }
 
 pub(super) fn auth_access_token_expiry_hours() -> i64 {
@@ -212,7 +216,6 @@ fn auth_refresh_cookie_samesite() -> &'static str {
         Ok(value) if value.trim().eq_ignore_ascii_case("strict") => "Strict",
         Ok(value) if value.trim().eq_ignore_ascii_case("none") => "None",
         Ok(value) if value.trim().eq_ignore_ascii_case("lax") => "Lax",
-        _ if auth_environment().eq_ignore_ascii_case("production") => "None",
         _ => "Lax",
     }
 }

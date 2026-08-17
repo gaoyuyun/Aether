@@ -19,8 +19,45 @@ use crate::constants::{
 };
 use crate::control::resolve_public_request_context;
 
-#[tokio::test]
-async fn gateway_blocks_blacklisted_ip_before_routing() {
+const ADMIN_SECURITY_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_admin_security_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(ADMIN_SECURITY_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("admin security test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("admin security test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+macro_rules! admin_security_gateway_test {
+    ($test_name:ident, $implementation:ident) => {
+        #[test]
+        fn $test_name() {
+            run_admin_security_test(stringify!($test_name), $implementation);
+        }
+    };
+}
+
+admin_security_gateway_test!(
+    gateway_blocks_blacklisted_ip_before_routing,
+    gateway_blocks_blacklisted_ip_before_routing_impl
+);
+
+async fn gateway_blocks_blacklisted_ip_before_routing_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -48,8 +85,12 @@ async fn gateway_blocks_blacklisted_ip_before_routing() {
     assert_eq!(payload["error"]["message"], "当前 IP 已被禁止访问");
 }
 
-#[tokio::test]
-async fn gateway_shapes_blacklist_rejections_for_claude_routes_before_routing() {
+admin_security_gateway_test!(
+    gateway_shapes_blacklist_rejections_for_claude_routes_before_routing,
+    gateway_shapes_blacklist_rejections_for_claude_routes_before_routing_impl
+);
+
+async fn gateway_shapes_blacklist_rejections_for_claude_routes_before_routing_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -87,8 +128,12 @@ async fn gateway_shapes_blacklist_rejections_for_claude_routes_before_routing() 
     }
 }
 
-#[tokio::test]
-async fn gateway_blocks_forwarded_ip_from_trusted_proxy() {
+admin_security_gateway_test!(
+    gateway_blocks_forwarded_ip_from_trusted_proxy,
+    gateway_blocks_forwarded_ip_from_trusted_proxy_impl
+);
+
+async fn gateway_blocks_forwarded_ip_from_trusted_proxy_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -271,8 +316,12 @@ async fn local_admin_security_response(
     .expect("security route should resolve locally")
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_security_blacklist_add_locally_with_trusted_admin_principal() {
+admin_security_gateway_test!(
+    gateway_handles_admin_security_blacklist_add_locally_with_trusted_admin_principal,
+    gateway_handles_admin_security_blacklist_add_locally_with_trusted_admin_principal_impl
+);
+
+async fn gateway_handles_admin_security_blacklist_add_locally_with_trusted_admin_principal_impl() {
     let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
 
     let (status, payload, upstream_count) = send_admin_security_request(
@@ -291,8 +340,12 @@ async fn gateway_handles_admin_security_blacklist_add_locally_with_trusted_admin
     assert_eq!(upstream_count, 0);
 }
 
-#[tokio::test]
-async fn gateway_rejects_invalid_admin_security_blacklist_ip() {
+admin_security_gateway_test!(
+    gateway_rejects_invalid_admin_security_blacklist_ip,
+    gateway_rejects_invalid_admin_security_blacklist_ip_impl
+);
+
+async fn gateway_rejects_invalid_admin_security_blacklist_ip_impl() {
     let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
 
     let (status, payload, upstream_count) = send_admin_security_request(
@@ -334,8 +387,13 @@ async fn local_admin_security_blacklist_add_attaches_explicit_audit() {
     assert_eq!(audit.target_id, "1.2.3.4");
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_security_blacklist_remove_locally_with_trusted_admin_principal() {
+admin_security_gateway_test!(
+    gateway_handles_admin_security_blacklist_remove_locally_with_trusted_admin_principal,
+    gateway_handles_admin_security_blacklist_remove_locally_with_trusted_admin_principal_impl
+);
+
+async fn gateway_handles_admin_security_blacklist_remove_locally_with_trusted_admin_principal_impl()
+{
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -359,8 +417,12 @@ async fn gateway_handles_admin_security_blacklist_remove_locally_with_trusted_ad
     assert_eq!(upstream_count, 0);
 }
 
-#[tokio::test]
-async fn gateway_rejects_admin_security_blacklist_remove_without_ip_address() {
+admin_security_gateway_test!(
+    gateway_rejects_admin_security_blacklist_remove_without_ip_address,
+    gateway_rejects_admin_security_blacklist_remove_without_ip_address_impl
+);
+
+async fn gateway_rejects_admin_security_blacklist_remove_without_ip_address_impl() {
     let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
 
     let (status, payload, upstream_count) = send_admin_security_request(
@@ -376,8 +438,13 @@ async fn gateway_rejects_admin_security_blacklist_remove_without_ip_address() {
     assert_eq!(upstream_count, 0);
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_security_blacklist_stats_locally_with_trusted_admin_principal() {
+admin_security_gateway_test!(
+    gateway_handles_admin_security_blacklist_stats_locally_with_trusted_admin_principal,
+    gateway_handles_admin_security_blacklist_stats_locally_with_trusted_admin_principal_impl
+);
+
+async fn gateway_handles_admin_security_blacklist_stats_locally_with_trusted_admin_principal_impl()
+{
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -429,8 +496,12 @@ async fn local_admin_security_blacklist_list_attaches_explicit_audit() {
     assert_eq!(audit.target_id, "global");
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_security_whitelist_add_locally_with_trusted_admin_principal() {
+admin_security_gateway_test!(
+    gateway_handles_admin_security_whitelist_add_locally_with_trusted_admin_principal,
+    gateway_handles_admin_security_whitelist_add_locally_with_trusted_admin_principal_impl
+);
+
+async fn gateway_handles_admin_security_whitelist_add_locally_with_trusted_admin_principal_impl() {
     let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
 
     let (status, payload, upstream_count) = send_admin_security_request(
@@ -470,8 +541,13 @@ async fn local_admin_security_whitelist_add_attaches_explicit_audit() {
     assert_eq!(audit.target_id, "1.2.3.4");
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_security_whitelist_remove_locally_with_trusted_admin_principal() {
+admin_security_gateway_test!(
+    gateway_handles_admin_security_whitelist_remove_locally_with_trusted_admin_principal,
+    gateway_handles_admin_security_whitelist_remove_locally_with_trusted_admin_principal_impl
+);
+
+async fn gateway_handles_admin_security_whitelist_remove_locally_with_trusted_admin_principal_impl()
+{
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -492,8 +568,12 @@ async fn gateway_handles_admin_security_whitelist_remove_locally_with_trusted_ad
     assert_eq!(upstream_count, 0);
 }
 
-#[tokio::test]
-async fn gateway_removes_percent_encoded_whitelist_cidr() {
+admin_security_gateway_test!(
+    gateway_removes_percent_encoded_whitelist_cidr,
+    gateway_removes_percent_encoded_whitelist_cidr_impl
+);
+
+async fn gateway_removes_percent_encoded_whitelist_cidr_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -514,8 +594,12 @@ async fn gateway_removes_percent_encoded_whitelist_cidr() {
     assert_eq!(upstream_count, 0);
 }
 
-#[tokio::test]
-async fn gateway_rejects_admin_security_whitelist_remove_without_ip_address() {
+admin_security_gateway_test!(
+    gateway_rejects_admin_security_whitelist_remove_without_ip_address,
+    gateway_rejects_admin_security_whitelist_remove_without_ip_address_impl
+);
+
+async fn gateway_rejects_admin_security_whitelist_remove_without_ip_address_impl() {
     let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
 
     let (status, payload, upstream_count) = send_admin_security_request(
@@ -531,8 +615,12 @@ async fn gateway_rejects_admin_security_whitelist_remove_without_ip_address() {
     assert_eq!(upstream_count, 0);
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_security_whitelist_list_locally_with_trusted_admin_principal() {
+admin_security_gateway_test!(
+    gateway_handles_admin_security_whitelist_list_locally_with_trusted_admin_principal,
+    gateway_handles_admin_security_whitelist_list_locally_with_trusted_admin_principal_impl
+);
+
+async fn gateway_handles_admin_security_whitelist_list_locally_with_trusted_admin_principal_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -584,8 +672,12 @@ async fn local_admin_security_whitelist_list_attaches_explicit_audit() {
     assert_eq!(audit.target_id, "global");
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_security_blacklist_list_locally_with_trusted_admin_principal() {
+admin_security_gateway_test!(
+    gateway_handles_admin_security_blacklist_list_locally_with_trusted_admin_principal,
+    gateway_handles_admin_security_blacklist_list_locally_with_trusted_admin_principal_impl
+);
+
+async fn gateway_handles_admin_security_blacklist_list_locally_with_trusted_admin_principal_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")

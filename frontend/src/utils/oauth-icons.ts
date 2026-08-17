@@ -10,9 +10,19 @@ export const OAUTH_ICONS: Record<string, string> = {
 // Default icon when provider type is not found
 const DEFAULT_ICON = OAUTH_ICONS.github
 
-export function getOAuthIcon(providerType: string, iconUrl?: string | null): string {
+export function getOAuthIcon(providerType: string): string {
   const builtin = OAUTH_ICONS[providerType.toLowerCase()]
   if (builtin) return builtin
-  if (iconUrl) return `<img src="${iconUrl}" alt="" style="width:100%;height:100%;object-fit:contain;" />`
   return DEFAULT_ICON
+}
+
+export function getOAuthIconUrl(providerType: string, iconUrl?: string | null): string | null {
+  if (OAUTH_ICONS[providerType.toLowerCase()] || !iconUrl?.trim()) return null
+  try {
+    const parsed = new URL(iconUrl.trim())
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return null
+    return parsed.href
+  } catch {
+    return null
+  }
 }
