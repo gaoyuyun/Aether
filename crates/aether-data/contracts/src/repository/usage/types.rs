@@ -953,6 +953,7 @@ pub struct StoredProviderQuotaWindowUsage {
     pub accounted_until_unix_secs: u64,
     pub used_usd: f64,
     pub status: String,
+    pub rebuild_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

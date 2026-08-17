@@ -869,6 +869,32 @@ mod tests {
     }
 
     #[test]
+    fn mysql_indexes_unbounded_text_with_a_safe_prefix() {
+        let mut schema = announcements_schema();
+        let table = schema
+            .tables
+            .get_mut("announcements")
+            .expect("fixture table exists");
+        table.columns.push(Column {
+            name: "target_id".to_string(),
+            logical_type: LogicalType::Text,
+            nullable: false,
+            auto_increment: false,
+            default: None,
+            length: None,
+            driver: DriverColumnOverrides::default(),
+        });
+        table.indexes.push(Index {
+            name: "announcements_target_id_idx".to_string(),
+            columns: vec!["is_active".to_string(), "target_id".to_string()],
+            unique: false,
+        });
+
+        let sql = mysql::emit_schema(&schema);
+        assert!(sql.contains("KEY announcements_target_id_idx (`is_active`, `target_id`(191))"));
+    }
+
+    #[test]
     fn emitters_generate_expected_driver_types() {
         let schema = announcements_schema();
         validate_schema(&schema).expect("fixture schema should be valid");

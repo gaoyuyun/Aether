@@ -18,6 +18,147 @@ async fn repository_builds_from_lazy_pool() {
     let _repository = MysqlUsageWriteRepository::new(pool);
 }
 
+#[tokio::test]
+async fn mysql_provider_quota_backfill_resumes_and_rebuilds_when_url_is_set() {
+    let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!(
+            "skipping mysql provider quota backfill test because AETHER_TEST_MYSQL_URL is unset"
+        );
+        return;
+    };
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("mysql test pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("mysql migrations should run");
+
+    let suffix = unique_suffix();
+    let provider_id = format!("quota-backfill-provider-{suffix}");
+    let request_id = format!("quota-backfill-request-{suffix}");
+    let candidate_id = format!("quota-backfill-candidate-{suffix}");
+    let epoch = 1_700_000_000i64 / 60 * 60;
+    let now = epoch + 600;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, created_at, updated_at) VALUES (?, ?, 'custom', 'monthly_quota', 100, 99, 30, ?, ?, ?)",
+    )
+    .bind(&provider_id)
+    .bind(format!("Quota Backfill Provider {suffix}"))
+    .bind(epoch)
+    .bind(epoch)
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .expect("backfill provider should seed");
+    sqlx::query(
+        "INSERT INTO `usage` (request_id, provider_id, status, billing_status, actual_total_cost_usd, finalized_at, created_at_unix_ms, updated_at_unix_secs) VALUES (?, ?, 'completed', 'settled', 2.5, ?, ?, ?)",
+    )
+    .bind(&request_id)
+    .bind(&provider_id)
+    .bind(epoch + 300)
+    .bind(epoch + 300)
+    .bind(epoch + 300)
+    .execute(&pool)
+    .await
+    .expect("backfill usage should seed");
+    sqlx::query(
+        "INSERT INTO request_candidates (id, request_id, candidate_index, retry_index, provider_id, status, extra_data, created_at, started_at, finished_at) VALUES (?, ?, 0, 0, ?, 'success', ?, ?, ?, ?)",
+    )
+    .bind(&candidate_id)
+    .bind(&request_id)
+    .bind(&provider_id)
+    .bind(
+        serde_json::json!({
+            "provider_quota_dispatch_snapshot": {
+                "schema_version": 1,
+                "provider_billing_type_at_usage": "monthly_quota",
+                "quota_epoch_start_at_usage": epoch,
+                "provider_dispatch_at_unix_secs": epoch + 60
+            }
+        })
+        .to_string(),
+    )
+    .bind((epoch + 60) * 1000)
+    .bind((epoch + 60) * 1000)
+    .bind((epoch + 300) * 1000)
+    .execute(&pool)
+    .await
+    .expect("backfill candidate should seed");
+    sqlx::query(
+        "INSERT INTO usage_routing_snapshots (request_id, candidate_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&request_id)
+    .bind(&candidate_id)
+    .bind(epoch + 60)
+    .bind(epoch + 300)
+    .execute(&pool)
+    .await
+    .expect("backfill routing snapshot should seed");
+    sqlx::query(
+        "INSERT INTO usage_settlement_snapshots (request_id, billing_status, settlement_snapshot, created_at, updated_at) VALUES (?, 'settled', ?, ?, ?)",
+    )
+    .bind(&request_id)
+    .bind(
+        serde_json::json!({
+            "provider_quota_cost_usd": 2.5,
+            "pricing_snapshot": {"provider_billing_type": "monthly_quota"}
+        })
+        .to_string(),
+    )
+    .bind(epoch + 300)
+    .bind(epoch + 300)
+    .execute(&pool)
+    .await
+    .expect("backfill settlement snapshot should seed");
+    sqlx::query(
+        "INSERT INTO provider_quota_maintenance_state (provider_id, quota_epoch_start, task_kind, status, cursor_dispatch_at, cursor_request_id, created_at, updated_at) VALUES (?, ?, 'historical_backfill', 'pending', ?, '', ?, ?)",
+    )
+    .bind(&provider_id)
+    .bind(epoch)
+    .bind(epoch)
+    .bind(epoch)
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .expect("backfill task should seed");
+
+    let repository = MysqlUsageWriteRepository::new(pool.clone());
+    repository
+        .maintain_provider_quota_windows(now as u64)
+        .await
+        .expect("first backfill batch should run");
+    repository
+        .maintain_provider_quota_windows(now as u64)
+        .await
+        .expect("backfill completion should run");
+
+    let report: (String, i64, i64) = sqlx::query_as(
+        "SELECT status, included_rows, unknown_rows FROM provider_quota_maintenance_state WHERE provider_id = ?",
+    )
+    .bind(&provider_id)
+    .fetch_one(&pool)
+    .await
+    .expect("backfill report should load");
+    assert_eq!(report, ("complete".to_string(), 1, 0));
+    let used: f64 = sqlx::query_scalar("SELECT monthly_used_usd FROM providers WHERE id = ?")
+        .bind(&provider_id)
+        .fetch_one(&pool)
+        .await
+        .expect("backfill total should load");
+    assert_eq!(used, 2.5);
+
+    sqlx::query("DELETE FROM providers WHERE id = ?")
+        .bind(&provider_id)
+        .execute(&pool)
+        .await
+        .expect("backfill fixtures should clean up");
+}
+
 #[test]
 fn mysql_usage_daily_heatmap_reads_imported_daily_aggregates() {
     let source = include_str!("../usage.rs");
@@ -1121,7 +1262,7 @@ async fn mysql_usage_cleanup_executes_when_url_is_set() {
 
     let window = UsageCleanupWindow {
         detail_cutoff: DateTime::from_timestamp(20, 0).expect("valid detail cutoff"),
-        compressed_cutoff: DateTime::from_timestamp(5, 0).expect("valid compressed cutoff"),
+        compressed_cutoff: DateTime::from_timestamp(20, 0).expect("valid compressed cutoff"),
         header_cutoff: DateTime::from_timestamp(20, 0).expect("valid header cutoff"),
         log_cutoff: DateTime::from_timestamp(5, 0).expect("valid log cutoff"),
     };

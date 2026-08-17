@@ -915,6 +915,7 @@ export interface ProviderQuotaWindow {
   accounted_until?: string | null
   quota_epoch_start?: string | null
   status?: 'ready' | 'rebuilding' | 'failed' | string
+  rebuild_error?: string | null
 }
 
 export interface HealthStatus {

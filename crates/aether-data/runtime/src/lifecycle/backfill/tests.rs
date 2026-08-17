@@ -48,7 +48,8 @@ fn pending_backfills_from_applied_returns_all_versions_when_none_applied() {
             20260505120000,
             20260517012000,
             20260716010000,
-            20260817010000
+            20260817010000,
+            20260817020000
         ]
     );
 }
@@ -70,7 +71,8 @@ fn pending_backfills_from_applied_skips_versions_already_applied() {
             20260505120000,
             20260517012000,
             20260716010000,
-            20260817010000
+            20260817010000,
+            20260817020000
         ]
     );
 }
@@ -320,7 +322,8 @@ INSERT INTO usage_settlement_snapshots (
             20260517012000,
             20260716010000,
             20260816010000,
-            20260817010000
+            20260817010000,
+            20260817020000
         ]
     );
 
@@ -553,7 +556,8 @@ INSERT INTO usage_settlement_snapshots (
             20260517012000,
             20260716010000,
             20260816010000,
-            20260817010000
+            20260817010000,
+            20260817020000
         ]
     );
 
@@ -578,7 +582,8 @@ INSERT INTO usage_settlement_snapshots (
             20260517012000,
             20260716010000,
             20260816010000,
-            20260817010000
+            20260817010000,
+            20260817020000
         ]
     );
     let provider_monthly_used: f64 = query_scalar(
@@ -624,7 +629,7 @@ INSERT INTO usage_settlement_snapshots (
         .fetch_one(&pool)
         .await
         .expect("sqlite applied backfill count should load");
-    assert_eq!(applied_count, 6);
+    assert_eq!(applied_count, 7);
 
     query("UPDATE schema_backfills SET checksum = X'00' WHERE version = 20260422120000")
         .execute(&pool)
@@ -719,7 +724,7 @@ END
         .fetch_one(&pool)
         .await
         .expect("sqlite resumed applied backfill count should load");
-    assert_eq!(applied_count, 6);
+    assert_eq!(applied_count, 7);
 }
 
 #[derive(Debug)]
@@ -1046,7 +1051,7 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     let pending_before = pending_backfills(&pool)
         .await
         .expect("pending backfills should load");
-    assert_eq!(pending_before.len(), 7);
+    assert_eq!(pending_before.len(), 8);
     assert_eq!(pending_before[0].version, 20260422110000);
     assert_eq!(pending_before[1].version, 20260422120000);
     assert_eq!(pending_before[2].version, 20260504120000);
@@ -1054,6 +1059,7 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     assert_eq!(pending_before[4].version, 20260517012000);
     assert_eq!(pending_before[5].version, 20260716010000);
     assert_eq!(pending_before[6].version, 20260817010000);
+    assert_eq!(pending_before[7].version, 20260817020000);
 
     run_backfills(&pool)
         .await
@@ -1078,7 +1084,8 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
             20260505120000,
             20260517012000,
             20260716010000,
-            20260817010000
+            20260817010000,
+            20260817020000
         ]
     );
 

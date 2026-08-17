@@ -17,6 +17,15 @@ const SETTLEMENT_SNAPSHOT_SCHEMA_VERSION: &str = "3.0";
 
 #[async_trait]
 pub trait BillingModelContextLookup: Send + Sync {
+    async fn find_dispatch_pricing_snapshot(
+        &self,
+        request_id: &str,
+        candidate_id: &str,
+    ) -> Result<Option<BillingModelPricingSnapshot>, DataLayerError> {
+        let _ = (request_id, candidate_id);
+        Ok(None)
+    }
+
     async fn find_billing_model_context_by_model_id(
         &self,
         provider_id: &str,
@@ -39,6 +48,30 @@ pub async fn enrich_usage_event_with_billing(
     data: &dyn BillingModelContextLookup,
     event: &mut UsageEvent,
 ) -> Result<(), DataLayerError> {
+    if matches!(
+        event.event_type,
+        UsageEventType::Pending | UsageEventType::Streaming
+    ) {
+        return Ok(());
+    }
+
+    if let Some(candidate_id) = event
+        .data
+        .candidate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(pricing) = data
+            .find_dispatch_pricing_snapshot(&event.request_id, candidate_id)
+            .await?
+        {
+            let computation = calculate_billing_computation(&pricing, event)?;
+            apply_billing_computation(event, &pricing, computation)?;
+            return Ok(());
+        }
+    }
+
     if !matches!(event.event_type, UsageEventType::Completed) {
         event.data.total_cost_usd = Some(0.0);
         event.data.actual_total_cost_usd = Some(0.0);
@@ -409,6 +442,7 @@ mod tests {
     use super::{
         enrich_usage_event_with_billing, usage_event_processing_tiers, BillingModelContextLookup,
     };
+    use crate::BillingModelPricingSnapshot;
 
     struct TestLookup {
         name_context: Option<StoredBillingModelContext>,
@@ -436,6 +470,120 @@ mod tests {
         {
             Ok(self.name_context.clone())
         }
+    }
+
+    struct DispatchSnapshotLookup {
+        dispatch_pricing: BillingModelPricingSnapshot,
+        current_context: StoredBillingModelContext,
+    }
+
+    #[async_trait]
+    impl BillingModelContextLookup for DispatchSnapshotLookup {
+        async fn find_dispatch_pricing_snapshot(
+            &self,
+            _request_id: &str,
+            candidate_id: &str,
+        ) -> Result<Option<BillingModelPricingSnapshot>, aether_data_contracts::DataLayerError>
+        {
+            assert_eq!(candidate_id, "candidate-dispatch-pricing");
+            Ok(Some(self.dispatch_pricing.clone()))
+        }
+
+        async fn find_billing_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _global_model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, aether_data_contracts::DataLayerError>
+        {
+            Ok(Some(self.current_context.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_billing_uses_dispatch_pricing_instead_of_current_catalog() {
+        let dispatch_pricing = BillingModelPricingSnapshot {
+            provider_id: "provider-1".to_string(),
+            provider_billing_type: Some("monthly_quota".to_string()),
+            provider_quota_epoch_start_unix_secs: Some(1_700_000_000),
+            provider_api_key_id: Some("key-1".to_string()),
+            provider_api_key_rate_multipliers: None,
+            provider_api_key_cache_ttl_minutes: None,
+            global_model_id: "global-model-1".to_string(),
+            global_model_name: "gpt-dispatch".to_string(),
+            global_model_config: None,
+            default_price_per_request: Some(1.0),
+            default_tiered_pricing: None,
+            model_id: Some("model-1".to_string()),
+            model_provider_model_name: Some("gpt-dispatch-upstream".to_string()),
+            model_config: None,
+            model_price_per_request: None,
+            model_tiered_pricing: None,
+        };
+        let current_context = StoredBillingModelContext::new(
+            "provider-1".to_string(),
+            Some("pay_as_you_go".to_string()),
+            Some("key-1".to_string()),
+            None,
+            None,
+            "global-model-1".to_string(),
+            "gpt-dispatch".to_string(),
+            None,
+            Some(100.0),
+            None,
+            Some("model-1".to_string()),
+            Some("gpt-dispatch-upstream".to_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("current billing context should build");
+        let lookup = DispatchSnapshotLookup {
+            dispatch_pricing,
+            current_context,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "request-dispatch-pricing",
+            UsageEventData {
+                candidate_id: Some("candidate-dispatch-pricing".to_string()),
+                provider_name: "provider".to_string(),
+                provider_id: Some("provider-1".to_string()),
+                provider_api_key_id: Some("key-1".to_string()),
+                model: "gpt-dispatch".to_string(),
+                model_id: Some("model-1".to_string()),
+                request_type: Some("chat".to_string()),
+                status_code: Some(200),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("dispatch billing should succeed");
+
+        assert_eq!(event.data.actual_total_cost_usd, Some(1.0));
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata
+                    .pointer("/settlement_snapshot/pricing_snapshot/provider_billing_type"))
+                .and_then(Value::as_str),
+            Some("monthly_quota")
+        );
+        assert_eq!(
+            event
+                .data
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pointer(
+                    "/settlement_snapshot/pricing_snapshot/provider_quota_epoch_start_unix_secs"
+                ))
+                .and_then(Value::as_u64),
+            Some(1_700_000_000)
+        );
     }
 
     #[test]

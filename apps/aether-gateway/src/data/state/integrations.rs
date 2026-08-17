@@ -1,5 +1,5 @@
 use aether_billing::enrich_usage_event_with_billing;
-use aether_billing::BillingModelContextLookup;
+use aether_billing::{BillingModelContextLookup, BillingModelPricingSnapshot};
 use aether_data::repository::audit::RequestAuditReader;
 use aether_data::repository::auth::{
     AuthApiKeyLookupKey, ResolvedAuthApiKeySnapshotReader, StoredAuthApiKeySnapshot,
@@ -7,7 +7,9 @@ use aether_data::repository::auth::{
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::billing::StoredBillingModelContext;
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
-use aether_data_contracts::repository::candidates::DecisionTrace;
+use aether_data_contracts::repository::candidates::{
+    provider_quota_dispatch_snapshot, DecisionTrace,
+};
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -182,6 +184,32 @@ impl MinimalCandidateSelectionRowSource for GatewayDataState {
 
 #[async_trait]
 impl BillingModelContextLookup for GatewayDataState {
+    async fn find_dispatch_pricing_snapshot(
+        &self,
+        request_id: &str,
+        candidate_id: &str,
+    ) -> Result<Option<BillingModelPricingSnapshot>, DataLayerError> {
+        let candidates = self
+            .list_request_candidates_by_request_id(request_id)
+            .await?;
+        let Some(candidate) = candidates.iter().find(|value| value.id == candidate_id) else {
+            return Ok(None);
+        };
+        let Some(snapshot) = provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())?
+        else {
+            return Ok(None);
+        };
+        snapshot
+            .provider_pricing_snapshot_at_usage
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| {
+                DataLayerError::UnexpectedValue(format!(
+                    "invalid dispatch pricing snapshot for candidate {candidate_id}: {err}"
+                ))
+            })
+    }
+
     async fn find_billing_model_context_by_model_id(
         &self,
         provider_id: &str,

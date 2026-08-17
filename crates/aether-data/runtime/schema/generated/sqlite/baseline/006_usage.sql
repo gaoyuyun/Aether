@@ -192,11 +192,13 @@ CREATE TABLE IF NOT EXISTS usage_counter_deltas (
     quota_delta_sequence INTEGER,
     quota_accounting_status TEXT,
     created_at INTEGER NOT NULL,
-    processed_at INTEGER
+    processed_at INTEGER,
+    UNIQUE (quota_delta_sequence)
 );
 CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_unprocessed ON usage_counter_deltas (created_at, id);
 CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_processed ON usage_counter_deltas (processed_at, created_at, id);
 CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_request_kind ON usage_counter_deltas (request_id, kind, target_id);
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_provider_quota_pending ON usage_counter_deltas (kind, target_id, quota_accounting_status, quota_delta_sequence);
 
 CREATE TABLE IF NOT EXISTS usage_settlement_snapshots (
     request_id TEXT PRIMARY KEY NOT NULL,

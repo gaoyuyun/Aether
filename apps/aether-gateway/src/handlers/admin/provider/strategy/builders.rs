@@ -290,6 +290,7 @@ pub(crate) async fn build_provider_strategy_stats_response(
                 "quota_epoch_start": usage
                     .and_then(|usage| unix_secs_to_rfc3339(usage.quota_epoch_start_unix_secs)),
                 "status": usage.map(|usage| usage.status.as_str()).unwrap_or("rebuilding"),
+                "rebuild_error": usage.and_then(|usage| usage.rebuild_error.as_deref()),
             })
         })
         .collect::<Vec<_>>();

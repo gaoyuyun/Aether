@@ -60,7 +60,7 @@ pub fn emit_named_schema(schema: &LogicalSchema, table_names: &[String]) -> Stri
                 index
                     .columns
                     .iter()
-                    .map(|column| format!("`{column}`"))
+                    .map(|column| mysql_index_column(table, column))
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -98,6 +98,20 @@ pub fn emit_named_schema(schema: &LogicalSchema, table_names: &[String]) -> Stri
         out.push_str("\n);\n\n");
     }
     out
+}
+
+fn mysql_index_column(table: &crate::Table, column_name: &str) -> String {
+    let column = table
+        .columns
+        .iter()
+        .find(|column| column.name == column_name)
+        .expect("validated index column should exist");
+    let sql_type = mysql_type(column).to_ascii_uppercase();
+    if matches!(sql_type.as_str(), "TEXT" | "LONGTEXT") {
+        format!("`{column_name}`(191)")
+    } else {
+        format!("`{column_name}`")
+    }
 }
 
 fn quote_identifier_if_needed(identifier: &str) -> String {
