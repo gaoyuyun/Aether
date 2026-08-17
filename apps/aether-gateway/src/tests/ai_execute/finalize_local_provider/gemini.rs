@@ -2091,9 +2091,6 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
     ));
     assert!(seen_refresh_request
         .body
-        .contains("client_secret=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"));
-    assert!(seen_refresh_request
-        .body
         .contains("refresh_token=rt-antigravity-cli-local-123"));
 
     let seen_remote_execution_runtime_request = seen_remote_execution_runtime

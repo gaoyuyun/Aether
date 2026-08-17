@@ -9,9 +9,9 @@ use aether_data_contracts::repository::video_tasks::{
 };
 
 use super::{
-    any, build_router_with_state, build_state_with_execution_runtime_override, json, start_server,
-    to_bytes, AppState, Arc, Body, Bytes, HeaderValue, Json, Mutex, Request, Response, Router,
-    StatusCode,
+    any, build_router_with_operational_routes_for_tests,
+    build_state_with_execution_runtime_override, json, start_server, to_bytes, AppState, Arc, Body,
+    Bytes, HeaderValue, Json, Mutex, Request, Response, Router, StatusCode,
 };
 
 fn sample_video_task(
@@ -112,7 +112,7 @@ async fn gateway_lists_video_tasks_via_internal_async_task_endpoint() {
         .await
         .expect("upsert should succeed");
 
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         AppState::new()
             .expect("gateway state should build")
             .with_video_task_data_repository_for_tests(repository),
@@ -169,7 +169,7 @@ async fn gateway_exposes_video_task_stats_via_internal_async_task_endpoint() {
         .await
         .expect("upsert should succeed");
 
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         AppState::new()
             .expect("gateway state should build")
             .with_video_task_data_repository_for_tests(repository),
@@ -212,7 +212,7 @@ async fn gateway_reads_video_task_detail_via_internal_async_task_endpoint() {
         .await
         .expect("upsert should succeed");
 
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         AppState::new()
             .expect("gateway state should build")
             .with_video_task_data_repository_for_tests(repository),
@@ -254,7 +254,7 @@ async fn gateway_redirects_direct_video_task_video_from_internal_async_task_endp
         .await
         .expect("upsert should succeed");
 
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         AppState::new()
             .expect("gateway state should build")
             .with_video_task_data_repository_for_tests(repository),
@@ -397,7 +397,7 @@ async fn gateway_proxies_gemini_video_task_video_from_internal_async_task_endpoi
         .expect("key transport should build")],
     ));
 
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         AppState::new()
         .expect("gateway state should build")
         .with_data_state_for_tests(
@@ -564,7 +564,7 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint() {
         .expect("upsert should succeed");
 
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         build_state_with_execution_runtime_override(execution_runtime_url)
             .with_video_task_data_repository_for_tests(Arc::clone(&repository)),
     );
@@ -726,7 +726,7 @@ async fn gateway_cancels_openai_video_task_via_internal_async_task_endpoint_with
         .await
         .expect("upsert should succeed");
 
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         AppState::new()
             .expect("gateway state should build")
             .with_video_task_data_repository_for_tests(Arc::clone(&repository)),
@@ -798,7 +798,7 @@ async fn gateway_rejects_terminal_video_task_cancel_via_internal_async_task_endp
         .await
         .expect("upsert should succeed");
 
-    let gateway = build_router_with_state(
+    let gateway = build_router_with_operational_routes_for_tests(
         AppState::new()
             .expect("gateway state should build")
             .with_video_task_data_repository_for_tests(repository),

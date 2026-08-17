@@ -577,7 +577,7 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
             client_id: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-            client_secret: "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",
+            client_secret: "",
             scopes: &[
                 "https://www.googleapis.com/auth/cloud-platform",
                 "https://www.googleapis.com/auth/userinfo.email",
@@ -592,7 +592,7 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
             client_id: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-            client_secret: "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",
+            client_secret: "",
             scopes: &[
                 "https://www.googleapis.com/auth/cloud-platform",
                 "https://www.googleapis.com/auth/userinfo.email",

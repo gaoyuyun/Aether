@@ -78,7 +78,7 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
         token_url: "https://oauth2.googleapis.com/token",
         client_id: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-        client_secret: "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",
+        client_secret: "",
         scopes: &[
             "https://www.googleapis.com/auth/cloud-platform",
             "https://www.googleapis.com/auth/userinfo.email",
@@ -95,7 +95,7 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
         token_url: "https://oauth2.googleapis.com/token",
         client_id: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-        client_secret: "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",
+        client_secret: "",
         scopes: &[
             "https://www.googleapis.com/auth/cloud-platform",
             "https://www.googleapis.com/auth/userinfo.email",
@@ -114,13 +114,23 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
 pub struct GenericProviderOAuthAdapter {
     template: GenericProviderOAuthTemplate,
     token_url_override: Option<String>,
+    client_secret_override: Option<String>,
 }
 
 impl GenericProviderOAuthAdapter {
     pub fn new(template: GenericProviderOAuthTemplate) -> Self {
+        let configured_secret = oauth_client_secret_env_name(template.provider_type)
+            .and_then(|env_name| std::env::var(env_name).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                (!template.client_secret.trim().is_empty())
+                    .then(|| template.client_secret.to_string())
+            });
         Self {
             template,
             token_url_override: None,
+            client_secret_override: configured_secret,
         }
     }
 
@@ -133,6 +143,11 @@ impl GenericProviderOAuthAdapter {
         self
     }
 
+    pub fn with_client_secret(mut self, client_secret: impl Into<String>) -> Self {
+        self.client_secret_override = Some(client_secret.into());
+        self
+    }
+
     pub fn with_token_url_for_tests(self, token_url: impl Into<String>) -> Self {
         self.with_token_url_override(token_url)
     }
@@ -141,6 +156,13 @@ impl GenericProviderOAuthAdapter {
         self.token_url_override
             .clone()
             .unwrap_or_else(|| self.template.token_url.to_string())
+    }
+
+    fn client_secret(&self) -> Option<&str> {
+        self.client_secret_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     }
 
     async fn exchange_grant(
@@ -233,8 +255,8 @@ impl GenericProviderOAuthAdapter {
                         form.append_pair("scope", scope);
                     }
                 }
-                if !self.template.client_secret.trim().is_empty() {
-                    form.append_pair("client_secret", self.template.client_secret);
+                if let Some(client_secret) = self.client_secret() {
+                    form.append_pair("client_secret", client_secret);
                 }
                 form.finish().into_bytes()
             };
@@ -427,6 +449,14 @@ pub fn template_for_provider_type(provider_type: &str) -> Option<GenericProvider
         .iter()
         .find(|template| normalized.eq_ignore_ascii_case(template.provider_type))
         .copied()
+}
+
+fn oauth_client_secret_env_name(provider_type: &str) -> Option<&'static str> {
+    match provider_type.trim().to_ascii_lowercase().as_str() {
+        "gemini_cli" => Some("AETHER_OAUTH_GEMINI_CLI_CLIENT_SECRET"),
+        "antigravity" => Some("AETHER_OAUTH_ANTIGRAVITY_CLIENT_SECRET"),
+        _ => None,
+    }
 }
 
 fn form_headers() -> BTreeMap<String, String> {
@@ -677,6 +707,16 @@ mod tests {
             .expect("codex template should exist");
         assert_eq!(adapter.provider_type(), "codex");
         assert!(adapter.capabilities().supports_refresh_token_import);
+    }
+
+    #[test]
+    fn google_oauth_client_secret_is_runtime_configured() {
+        let template =
+            template_for_provider_type("gemini_cli").expect("gemini cli template should exist");
+        assert!(template.client_secret.is_empty());
+        let adapter =
+            GenericProviderOAuthAdapter::new(template).with_client_secret("runtime-secret");
+        assert_eq!(adapter.client_secret(), Some("runtime-secret"));
     }
 
     #[test]

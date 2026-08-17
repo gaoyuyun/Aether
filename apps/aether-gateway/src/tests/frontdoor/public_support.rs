@@ -1951,7 +1951,7 @@ async fn gateway_handles_public_providers_with_endpoints_without_proxying_upstre
 }
 
 #[tokio::test]
-async fn gateway_handles_test_connection_alias_without_proxying_upstream() {
+async fn gateway_rejects_removed_test_connection_alias_without_proxying_upstream() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -1966,7 +1966,7 @@ async fn gateway_handles_test_connection_alias_without_proxying_upstream() {
     );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
-    let gateway = build_router().expect("gateway should build");
+    let gateway = crate::tests::build_router_with_execution_runtime_override(upstream_url);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -1975,12 +1975,7 @@ async fn gateway_handles_test_connection_alias_without_proxying_upstream() {
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::GONE);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(
-        payload["detail"],
-        "Deprecated endpoint. Please use /v1/test-connection."
-    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -1988,7 +1983,7 @@ async fn gateway_handles_test_connection_alias_without_proxying_upstream() {
 }
 
 #[tokio::test]
-async fn gateway_handles_public_test_connection_without_hitting_fallback_probe() {
+async fn gateway_rejects_public_test_connection_without_billing_upstream() {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
     let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
     let fallback_probe = Router::new().route(
@@ -2071,14 +2066,8 @@ async fn gateway_handles_public_test_connection_without_hitting_fallback_probe()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["status"], "success");
-    assert!(payload.get("provider").is_none());
-    assert_eq!(payload["provider_id"], "provider-1");
-    assert_eq!(payload["api_format"], "openai:chat");
-    assert_eq!(payload["response_id"], "resp_local_test");
-    assert_eq!(*provider_hits.lock().expect("mutex should lock"), 1);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(*provider_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -2087,7 +2076,7 @@ async fn gateway_handles_public_test_connection_without_hitting_fallback_probe()
 }
 
 #[tokio::test]
-async fn gateway_gemini_test_connection_does_not_force_low_max_output_tokens() {
+async fn gateway_rejects_public_gemini_test_connection_without_billing_upstream() {
     let provider_hits = Arc::new(Mutex::new(0usize));
     let provider_hits_clone = Arc::clone(&provider_hits);
     let provider = Router::new().route(
@@ -2159,13 +2148,8 @@ async fn gateway_gemini_test_connection_does_not_force_low_max_output_tokens() {
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["status"], "success");
-    assert_eq!(payload["provider_id"], "provider-gemini");
-    assert_eq!(payload["endpoint_id"], "endpoint-gemini");
-    assert_eq!(payload["api_format"], "gemini:generate_content");
-    assert_eq!(*provider_hits.lock().expect("mutex should lock"), 1);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(*provider_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
     provider_handle.abort();

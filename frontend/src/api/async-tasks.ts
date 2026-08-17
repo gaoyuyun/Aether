@@ -194,6 +194,14 @@ export const asyncTasksApi = {
     return response.data
   },
 
+  async getVideo(taskId: string): Promise<Blob> {
+    const response = await apiClient.get<Blob>(
+      `/api/admin/video-tasks/${encodeURIComponent(taskId)}/video`,
+      { responseType: 'blob' },
+    )
+    return response.data
+  },
+
   async getEvents(taskId: string): Promise<{ items: AsyncTaskEvent[] }> {
     const response = await apiClient.get(`/api/admin/tasks/${taskId}/events`)
     return response.data

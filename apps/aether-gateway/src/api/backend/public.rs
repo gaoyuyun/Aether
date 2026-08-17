@@ -1,18 +1,19 @@
-use axum::routing::get;
+use axum::http::StatusCode;
+use axum::routing::{any, get};
 use axum::Router;
 
 use crate::{handlers::proxy::proxy_request, state::AppState};
 
 pub(crate) fn mount_public_support_routes(router: Router<AppState>) -> Router<AppState> {
     router
+        .route("/v1/test-connection", any(removed_public_route))
+        .route("/test-connection", any(removed_public_route))
         .route("/v1/models", get(proxy_request))
         .route("/v1beta/models", get(proxy_request))
         .route("/v1/health", get(proxy_request))
         .route("/health", get(proxy_request))
         .route("/v1/providers", get(proxy_request))
         .route("/v1/providers/{*provider_path}", get(proxy_request))
-        .route("/v1/test-connection", get(proxy_request))
-        .route("/test-connection", get(proxy_request))
         .route("/api/public/site-info", get(proxy_request))
         .route("/api/public/providers", get(proxy_request))
         .route("/api/public/models", get(proxy_request))
@@ -30,4 +31,8 @@ pub(crate) fn mount_public_support_routes(router: Router<AppState>) -> Router<Ap
         .route("/install-tunnel/{*install_path}", get(proxy_request))
         .route("/i/{*install_path}", get(proxy_request))
         .route("/", get(proxy_request))
+}
+
+async fn removed_public_route() -> StatusCode {
+    StatusCode::NOT_FOUND
 }

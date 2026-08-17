@@ -15,6 +15,7 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data::repository::usage::InMemoryUsageReadRepository;
 use axum::Json;
 
+use super::run_frontdoor_async_test;
 use crate::data::GatewayDataState;
 
 #[tokio::test]
@@ -53,6 +54,10 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
     assert_eq!(payload["entrypoints"]["readiness"], READYZ_PATH);
     assert_eq!(payload["entrypoints"]["health"], "/_gateway/health");
     assert_eq!(
+        payload["entrypoints"]["metrics"],
+        "/api/admin/monitoring/metrics"
+    );
+    assert_eq!(
         payload["rust_frontdoor"]["capabilities"]["public_proxy_catch_all"],
         true
     );
@@ -77,10 +82,10 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
     assert!(owned_routes
         .iter()
         .any(|value| value == "/v1/providers/{path...}"));
-    assert!(owned_routes
+    assert!(!owned_routes
         .iter()
         .any(|value| value == "/v1/test-connection"));
-    assert!(owned_routes.iter().any(|value| value == "/test-connection"));
+    assert!(!owned_routes.iter().any(|value| value == "/test-connection"));
     assert!(owned_routes
         .iter()
         .any(|value| value == "/api/public/providers"));
@@ -194,6 +199,87 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
     assert!(payload["features"]
         .get("remote_executor_configured")
         .is_none());
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_does_not_expose_or_proxy_disabled_operational_routes() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/{*path}",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("proxied"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_execution_runtime_override(upstream_url);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/_gateway/metrics",
+        "/_gateway/audit/request-usage/request-1",
+        "/_gateway/async-tasks/video-tasks",
+    ] {
+        let response = client
+            .get(format!("{gateway_url}{path}"))
+            .send()
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path: {path}");
+    }
+
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[test]
+fn gateway_requires_admin_authentication_for_metrics() {
+    run_frontdoor_async_test(
+        "admin-metrics-requires-authentication",
+        gateway_requires_admin_authentication_for_metrics_impl(),
+    );
+}
+
+async fn gateway_requires_admin_authentication_for_metrics_impl() {
+    let upstream_hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits_clone = Arc::clone(&upstream_hits);
+    let upstream = Router::new().route(
+        "/{*path}",
+        any(move |_request: Request| {
+            let upstream_hits_inner = Arc::clone(&upstream_hits_clone);
+            async move {
+                *upstream_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Body::from("proxied"))
+            }
+        }),
+    );
+
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let gateway = build_router_with_execution_runtime_override(upstream_url);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{gateway_url}/api/admin/monitoring/metrics"))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert!(matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

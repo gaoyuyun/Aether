@@ -403,10 +403,18 @@
                 class="flex items-center justify-between gap-3 rounded-lg border border-dashed border-border p-4 hover:border-primary/50 transition-colors"
               >
                 <div class="flex items-center gap-3 min-w-0 flex-1">
+                  <img
+                    v-if="getOAuthIconUrl(p.provider_type, p.icon_url)"
+                    class="oauth-icon shrink-0 object-contain"
+                    :src="getOAuthIconUrl(p.provider_type, p.icon_url) || undefined"
+                    alt=""
+                    referrerpolicy="no-referrer"
+                  >
                   <!-- eslint-disable vue/no-v-html -->
                   <div
+                    v-else
                     class="oauth-icon shrink-0"
-                    v-html="getOAuthIcon(p.provider_type, p.icon_url)"
+                    v-html="getOAuthIcon(p.provider_type)"
                   />
                   <!-- eslint-enable vue/no-v-html -->
                   <div class="min-w-0">
@@ -666,7 +674,7 @@ import { type UserSession, formatSessionMeta } from '@/types/session'
 import { authApi } from '@/api/auth'
 import { oauthApi, type OAuthLinkInfo, type OAuthProviderInfo } from '@/api/oauth'
 import { getClientDeviceId } from '@/utils/deviceId'
-import { getOAuthIcon } from '@/utils/oauth-icons'
+import { getOAuthIcon, getOAuthIconUrl } from '@/utils/oauth-icons'
 import { useDarkMode, type ThemeMode } from '@/composables/useDarkMode'
 import {
   getPasswordPolicyHint,

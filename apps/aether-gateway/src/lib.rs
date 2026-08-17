@@ -72,6 +72,7 @@ mod roles;
 mod router;
 mod routing;
 mod scheduler;
+mod security_config;
 mod server_chan_push;
 mod stage_metrics;
 mod standalone_keys;
@@ -115,6 +116,8 @@ pub use self::middleware::strip_cf_headers_middleware;
 pub use self::rate_limit::FrontdoorUserRpmConfig;
 pub(crate) use self::rate_limit::FrontdoorUserRpmOutcome;
 pub use self::router::{attach_static_frontend, build_router, build_router_with_state, serve_tcp};
+#[doc(hidden)]
+pub use self::security_config::validate_runtime_secrets;
 pub(crate) use self::state::{
     AdminBillingCollectorRecord, AdminBillingCollectorWriteInput, AdminBillingRuleRecord,
     AdminBillingRuleWriteInput, AdminWalletMutationOutcome, AdminWalletPaymentOrderRecord,

@@ -1,4 +1,5 @@
-use axum::routing::{get, post};
+use axum::http::StatusCode;
+use axum::routing::{any, get, post};
 use axum::Router;
 
 use crate::async_task::{
@@ -50,4 +51,18 @@ pub(crate) fn mount_operational_routes(router: Router<AppState>) -> Router<AppSt
             "/_gateway/audit/request-usage/{request_id}",
             get(get_request_usage_audit),
         )
+}
+
+pub(crate) fn mount_disabled_operational_routes(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route("/_gateway/metrics", any(disabled_operational_route))
+        .route(
+            "/_gateway/async-tasks/{*path}",
+            any(disabled_operational_route),
+        )
+        .route("/_gateway/audit/{*path}", any(disabled_operational_route))
+}
+
+async fn disabled_operational_route() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
