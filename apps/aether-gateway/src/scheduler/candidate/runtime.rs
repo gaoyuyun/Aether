@@ -329,7 +329,7 @@ async fn read_provider_quota_block_map(
         >,
     >::new();
     for usage in state
-        .read_provider_quota_window_usage(&window_requests)
+        .read_provider_quota_window_usage(&window_requests, now_unix_secs)
         .await?
     {
         window_usage

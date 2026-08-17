@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_data_contracts::repository::usage::{
-    parse_usage_body_ref, usage_body_ref, StoredUsageAuditAggregation, StoredUsageAuditSummary,
+    parse_usage_body_ref, usage_body_ref, ProviderQuotaWindowUsageRequest,
+    StoredProviderQuotaWindowUsage, StoredUsageAuditAggregation, StoredUsageAuditSummary,
     StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
     StoredUsageCacheAffinityIntervalRow, StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
     StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardProviderCount,
@@ -48,6 +50,8 @@ pub struct InMemoryUsageReadRepository {
     by_request_id: RwLock<BTreeMap<String, StoredRequestUsageAudit>>,
     detached_bodies: RwLock<BTreeMap<String, Value>>,
     provider_usage_windows: RwLock<Vec<StoredProviderUsageWindow>>,
+    provider_quota_window_usage: RwLock<Vec<StoredProviderQuotaWindowUsage>>,
+    provider_quota_window_maintenance_count: AtomicUsize,
     auth_api_keys: Option<Arc<InMemoryAuthApiKeySnapshotRepository>>,
     provider_catalog: Option<Arc<InMemoryProviderCatalogReadRepository>>,
 }
@@ -67,6 +71,8 @@ impl InMemoryUsageReadRepository {
             by_request_id: RwLock::new(by_request_id),
             detached_bodies: RwLock::new(BTreeMap::new()),
             provider_usage_windows: RwLock::new(Vec::new()),
+            provider_quota_window_usage: RwLock::new(Vec::new()),
+            provider_quota_window_maintenance_count: AtomicUsize::new(0),
             auth_api_keys: None,
             provider_catalog: None,
         }
@@ -120,6 +126,8 @@ impl InMemoryUsageReadRepository {
             by_request_id: RwLock::new(by_request_id),
             detached_bodies: RwLock::new(detached_bodies),
             provider_usage_windows: RwLock::new(Vec::new()),
+            provider_quota_window_usage: RwLock::new(Vec::new()),
+            provider_quota_window_maintenance_count: AtomicUsize::new(0),
             auth_api_keys: None,
             provider_catalog: None,
         }
@@ -133,9 +141,31 @@ impl InMemoryUsageReadRepository {
             by_request_id: self.by_request_id,
             detached_bodies: self.detached_bodies,
             provider_usage_windows: RwLock::new(items.into_iter().collect()),
+            provider_quota_window_usage: self.provider_quota_window_usage,
+            provider_quota_window_maintenance_count: self.provider_quota_window_maintenance_count,
             auth_api_keys: self.auth_api_keys,
             provider_catalog: self.provider_catalog,
         }
+    }
+
+    pub fn with_provider_quota_window_usage<I>(self, items: I) -> Self
+    where
+        I: IntoIterator<Item = StoredProviderQuotaWindowUsage>,
+    {
+        Self {
+            by_request_id: self.by_request_id,
+            detached_bodies: self.detached_bodies,
+            provider_usage_windows: self.provider_usage_windows,
+            provider_quota_window_usage: RwLock::new(items.into_iter().collect()),
+            provider_quota_window_maintenance_count: self.provider_quota_window_maintenance_count,
+            auth_api_keys: self.auth_api_keys,
+            provider_catalog: self.provider_catalog,
+        }
+    }
+
+    pub fn provider_quota_window_maintenance_count(&self) -> usize {
+        self.provider_quota_window_maintenance_count
+            .load(Ordering::Relaxed)
     }
 
     pub fn with_auth_api_key_repository(
@@ -2568,6 +2598,30 @@ impl UsageReadRepository for InMemoryUsageReadRepository {
         Ok(summary)
     }
 
+    async fn read_provider_quota_window_usage(
+        &self,
+        requests: &[ProviderQuotaWindowUsageRequest],
+    ) -> Result<Vec<StoredProviderQuotaWindowUsage>, DataLayerError> {
+        let requested = requests
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok(self
+            .provider_quota_window_usage
+            .read()
+            .expect("provider quota window repository lock")
+            .iter()
+            .filter(|row| {
+                requested.contains(&ProviderQuotaWindowUsageRequest {
+                    provider_id: row.provider_id.clone(),
+                    duration_secs: row.duration_secs,
+                    quota_epoch_start_unix_secs: row.quota_epoch_start_unix_secs,
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn summarize_usage_daily_heatmap(
         &self,
         query: &UsageDailyHeatmapQuery,
@@ -3331,6 +3385,30 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
             }
         }
         Ok(stored)
+    }
+
+    async fn maintain_provider_quota_windows(
+        &self,
+        now_unix_secs: u64,
+    ) -> Result<usize, DataLayerError> {
+        self.provider_quota_window_maintenance_count
+            .fetch_add(1, Ordering::Relaxed);
+        let clock_minute = aether_wallet::quota_clock_minute(now_unix_secs);
+        let mut rows = self
+            .provider_quota_window_usage
+            .write()
+            .expect("provider quota window repository lock");
+        let mut maintained = 0;
+        for row in rows.iter_mut().filter(|row| row.status == "ready") {
+            row.rolling_start_unix_secs = aether_wallet::quota_window_start_unix_secs(
+                clock_minute,
+                Some(row.quota_epoch_start_unix_secs),
+                row.duration_secs,
+            );
+            row.accounted_until_unix_secs = clock_minute;
+            maintained += 1;
+        }
+        Ok(maintained)
     }
 
     async fn rebuild_api_key_usage_stats(&self) -> Result<u64, DataLayerError> {

@@ -380,6 +380,40 @@ CREATE TABLE IF NOT EXISTS public.provider_quota_usage_buckets (
 ALTER TABLE ONLY public.provider_quota_usage_buckets ADD CONSTRAINT provider_quota_usage_buckets_pkey PRIMARY KEY (provider_id, quota_epoch_start, bucket_start);
 ALTER TABLE ONLY public.provider_quota_usage_buckets ADD CONSTRAINT provider_quota_usage_buckets_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
 
+CREATE TABLE IF NOT EXISTS public.provider_quota_maintenance_state (
+    provider_id character varying(64) NOT NULL,
+    quota_epoch_start bigint NOT NULL,
+    task_kind character varying(32) NOT NULL,
+    status character varying(32) DEFAULT 'pending' NOT NULL,
+    cursor_dispatch_at bigint DEFAULT 0 NOT NULL,
+    cursor_request_id character varying(128) DEFAULT '' NOT NULL,
+    cutover_delta_sequence bigint,
+    absorbed_delta_sequence bigint DEFAULT 0 NOT NULL,
+    included_rows bigint DEFAULT 0 NOT NULL,
+    excluded_payg_rows bigint DEFAULT 0 NOT NULL,
+    excluded_free_tier_rows bigint DEFAULT 0 NOT NULL,
+    unknown_rows bigint DEFAULT 0 NOT NULL,
+    lock_owner character varying(128),
+    lock_expires_at bigint,
+    last_error text,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.provider_quota_maintenance_state ADD CONSTRAINT provider_quota_maintenance_state_pkey PRIMARY KEY (provider_id, quota_epoch_start, task_kind);
+CREATE INDEX IF NOT EXISTS ix_provider_quota_maintenance_state_status ON public.provider_quota_maintenance_state USING btree (status, updated_at);
+ALTER TABLE ONLY public.provider_quota_maintenance_state ADD CONSTRAINT provider_quota_maintenance_state_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
+
+CREATE TABLE IF NOT EXISTS public.provider_quota_applied_watermarks (
+    provider_id character varying(64) NOT NULL,
+    quota_epoch_start bigint NOT NULL,
+    applied_delta_sequence bigint DEFAULT 0 NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.provider_quota_applied_watermarks ADD CONSTRAINT provider_quota_applied_watermarks_pkey PRIMARY KEY (provider_id, quota_epoch_start);
+ALTER TABLE ONLY public.provider_quota_applied_watermarks ADD CONSTRAINT provider_quota_applied_watermarks_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
+
 CREATE TABLE IF NOT EXISTS public.models (
     id character varying(64) NOT NULL,
     provider_id character varying(64) NOT NULL,

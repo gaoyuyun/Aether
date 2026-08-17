@@ -163,6 +163,44 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
     ),
     GatewayError,
 > {
+    collect_selectable_candidates_with_skip_reasons_and_ranking_seed(
+        selection_row_source,
+        runtime_state,
+        api_format,
+        global_model_name,
+        require_streaming,
+        required_capabilities,
+        auth_snapshot,
+        client_session_affinity,
+        now_unix_secs,
+        now_unix_secs,
+        enable_model_directives,
+        request_operation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ranking_seed(
+    selection_row_source: &(impl MinimalCandidateSelectionRowSource + Sync),
+    runtime_state: &impl SchedulerRuntimeState,
+    api_format: &str,
+    global_model_name: &str,
+    require_streaming: bool,
+    required_capabilities: Option<&serde_json::Value>,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    now_unix_secs: u64,
+    ranking_seed: u64,
+    enable_model_directives: bool,
+    request_operation: Option<&str>,
+) -> Result<
+    (
+        Vec<SchedulerMinimalCandidateSelectionCandidate>,
+        Vec<SchedulerSkippedCandidate>,
+    ),
+    GatewayError,
+> {
     let ordering_config = runtime_state.read_scheduler_ordering_config().await?;
     let priority_affinity_key = scheduling_priority_affinity_key(
         auth_snapshot,
@@ -180,7 +218,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
         request_operation,
     )
     .await?;
-    collect_selectable_enumerated_candidates_with_skip_reasons(
+    collect_selectable_enumerated_candidates_with_skip_reasons_and_ranking_seed(
         runtime_state,
         api_format,
         global_model_name,
@@ -189,6 +227,7 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons(
         auth_snapshot,
         client_session_affinity,
         now_unix_secs,
+        ranking_seed,
         ordering_config,
         priority_affinity_key,
     )
@@ -200,11 +239,47 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
     runtime_state: &impl SchedulerRuntimeState,
     api_format: &str,
     global_model_name: &str,
+    candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
+    required_capabilities: Option<&serde_json::Value>,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    client_session_affinity: Option<&ClientSessionAffinity>,
+    now_unix_secs: u64,
+    ordering_config: crate::scheduler::config::SchedulerOrderingConfig,
+    priority_affinity_key: Option<&str>,
+) -> Result<
+    (
+        Vec<SchedulerMinimalCandidateSelectionCandidate>,
+        Vec<SchedulerSkippedCandidate>,
+    ),
+    GatewayError,
+> {
+    collect_selectable_enumerated_candidates_with_skip_reasons_and_ranking_seed(
+        runtime_state,
+        api_format,
+        global_model_name,
+        candidates,
+        required_capabilities,
+        auth_snapshot,
+        client_session_affinity,
+        now_unix_secs,
+        now_unix_secs,
+        ordering_config,
+        priority_affinity_key,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons_and_ranking_seed(
+    runtime_state: &impl SchedulerRuntimeState,
+    api_format: &str,
+    global_model_name: &str,
     mut candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     client_session_affinity: Option<&ClientSessionAffinity>,
     now_unix_secs: u64,
+    ranking_seed: u64,
     ordering_config: crate::scheduler::config::SchedulerOrderingConfig,
     priority_affinity_key: Option<&str>,
 ) -> Result<
@@ -246,7 +321,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
             required_capabilities,
             priority_affinity_key,
             cached_affinity_target.as_ref(),
-            now_unix_secs,
+            ranking_seed,
         );
         return Ok((
             Vec::new(),
@@ -269,7 +344,7 @@ pub(super) async fn collect_selectable_enumerated_candidates_with_skip_reasons(
         required_capabilities,
         priority_affinity_key,
         cached_affinity_target.as_ref(),
-        now_unix_secs,
+        ranking_seed,
     );
 
     Ok((selected, skipped))

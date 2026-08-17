@@ -67,6 +67,12 @@ describe('provider quota display components', () => {
           rolling_start: '2026-08-17T00:00:00Z',
         },
         { duration_secs: 604_800, limit_usd: 20, status: 'rebuilding' },
+        {
+          duration_secs: 2_592_000,
+          limit_usd: 50,
+          status: 'failed',
+          rebuild_error: 'quota cost is unavailable for a dispatched monthly request',
+        },
       ],
     })
 
@@ -74,6 +80,8 @@ describe('provider quota display components', () => {
     expect(text).toContain('$2.50 / $5.00')
     expect(text).toContain('$20.00')
     expect(text).toContain('统计重建中')
+    expect(root.querySelector('[data-testid="provider-quota-window-error"]')?.textContent)
+      .toContain('请检查该模型的价格配置')
 
     unmount()
   })

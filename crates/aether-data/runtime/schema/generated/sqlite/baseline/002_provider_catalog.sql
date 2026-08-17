@@ -356,6 +356,38 @@ CREATE TABLE IF NOT EXISTS provider_quota_usage_buckets (
     CONSTRAINT provider_quota_usage_buckets_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS provider_quota_maintenance_state (
+    provider_id TEXT NOT NULL,
+    quota_epoch_start INTEGER NOT NULL,
+    task_kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    cursor_dispatch_at INTEGER NOT NULL DEFAULT 0,
+    cursor_request_id TEXT NOT NULL DEFAULT '',
+    cutover_delta_sequence INTEGER,
+    absorbed_delta_sequence INTEGER NOT NULL DEFAULT 0,
+    included_rows INTEGER NOT NULL DEFAULT 0,
+    excluded_payg_rows INTEGER NOT NULL DEFAULT 0,
+    excluded_free_tier_rows INTEGER NOT NULL DEFAULT 0,
+    unknown_rows INTEGER NOT NULL DEFAULT 0,
+    lock_owner TEXT,
+    lock_expires_at INTEGER,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, quota_epoch_start, task_kind),
+    CONSTRAINT provider_quota_maintenance_state_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_provider_quota_maintenance_state_status ON provider_quota_maintenance_state (status, updated_at);
+
+CREATE TABLE IF NOT EXISTS provider_quota_applied_watermarks (
+    provider_id TEXT NOT NULL,
+    quota_epoch_start INTEGER NOT NULL,
+    applied_delta_sequence INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (provider_id, quota_epoch_start),
+    CONSTRAINT provider_quota_applied_watermarks_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS models (
     id TEXT PRIMARY KEY NOT NULL,
     provider_id TEXT NOT NULL,

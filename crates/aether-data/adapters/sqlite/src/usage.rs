@@ -4376,7 +4376,7 @@ WHERE "usage".provider_id = ?
         }
 
         let mut builder = QueryBuilder::<Sqlite>::new(
-            "SELECT provider_id, duration_secs, quota_epoch_start, rolling_start, accounted_until, used_usd, status FROM provider_quota_window_counters WHERE provider_id IN (",
+            "SELECT provider_id, duration_secs, quota_epoch_start, rolling_start, accounted_until, used_usd, status, rebuild_error FROM provider_quota_window_counters WHERE provider_id IN (",
         );
         {
             let mut separated = builder.separated(", ");
@@ -4413,6 +4413,7 @@ WHERE "usage".provider_id = ?
                     .max(0) as u64,
                 used_usd: sqlite_real(&row, "used_usd")?,
                 status: row.try_get("status").map_sql_err()?,
+                rebuild_error: row.try_get("rebuild_error").map_sql_err()?,
             };
             if requested.contains(&(
                 usage.provider_id.clone(),

@@ -1809,7 +1809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_balance_allows_a_proven_free_tier_execution_plan() {
+    async fn zero_balance_rejects_a_free_upstream_tier_with_billable_user_pricing() {
         let context = billing_context_with_pricing(
             Some(json!({
                 "tiers": [{
@@ -1841,9 +1841,14 @@ mod tests {
             Some(&report_context),
         )
         .await
-        .expect("free tier capacity check should resolve");
+        .expect("capacity check should resolve");
 
-        assert_eq!(rejection, None);
+        assert_eq!(
+            rejection,
+            Some(GatewayLocalAuthRejection::BalanceDenied {
+                remaining: Some(0.0),
+            })
+        );
     }
 
     #[tokio::test]

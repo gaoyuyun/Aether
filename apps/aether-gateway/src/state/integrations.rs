@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot};
 use aether_data_contracts::repository::candidates::{
-    StoredRequestCandidate, UpsertRequestCandidateRecord,
+    attach_provider_quota_dispatch_snapshot, ProviderQuotaDispatchSnapshot, StoredRequestCandidate,
+    UpsertRequestCandidateRecord, PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
 };
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, StoredAdminGlobalModelPage,
@@ -31,8 +32,8 @@ use crate::clock::current_unix_secs;
 use crate::model_fetch::{CodexCatalogRuntime, ModelFetchRuntimeState};
 use crate::provider_transport::{GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth};
 use crate::request_candidate_runtime::{
-    RequestCandidateRuntimeCapabilityReader, RequestCandidateRuntimeReader,
-    RequestCandidateRuntimeWriter,
+    ProviderQuotaDispatchContext, RequestCandidateRuntimeCapabilityReader,
+    RequestCandidateRuntimeReader, RequestCandidateRuntimeWriter,
 };
 use crate::scheduler::state::SchedulerRuntimeState;
 use crate::{execution_runtime, provider_transport};
@@ -595,6 +596,148 @@ impl RequestCandidateRuntimeWriter for AppState {
         AppState::upsert_request_candidate(self, candidate).await
     }
 
+    async fn prepare_provider_quota_dispatch(
+        &self,
+        context: &ProviderQuotaDispatchContext,
+        candidate: &mut UpsertRequestCandidateRecord,
+    ) -> Result<(), GatewayError> {
+        let quota = AppState::read_provider_quota_snapshot(self, &context.provider_id).await?;
+        let billing_context = match context.model_id.as_deref() {
+            Some(model_id) => self
+                .data
+                .find_billing_model_context_by_model_id(
+                    &context.provider_id,
+                    Some(&context.key_id),
+                    model_id,
+                )
+                .await
+                .map_err(|err| GatewayError::Internal(err.to_string()))?,
+            None => match context.global_model_name.as_deref() {
+                Some(global_model_name) => self
+                    .data
+                    .find_billing_model_context(
+                        &context.provider_id,
+                        Some(&context.key_id),
+                        global_model_name,
+                    )
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?,
+                None => None,
+            },
+        };
+
+        let billing_type = billing_context
+            .as_ref()
+            .and_then(|value| value.provider_billing_type.clone())
+            .or_else(|| quota.as_ref().map(|value| value.billing_type.clone()))
+            .unwrap_or_else(|| "pay_as_you_go".to_string());
+        let quota_epoch = billing_context
+            .as_ref()
+            .and_then(|value| value.provider_quota_epoch_start_unix_secs)
+            .or_else(|| {
+                quota
+                    .as_ref()
+                    .and_then(|value| value.quota_last_reset_at_unix_secs)
+            });
+        if billing_type.eq_ignore_ascii_case("monthly_quota")
+            && (billing_context.is_none()
+                || quota_epoch.is_none()
+                || quota.as_ref().is_none_or(|value| !value.is_active))
+        {
+            return Err(GatewayError::Internal(format!(
+                "monthly provider quota dispatch is unavailable or fail-closed for provider {}",
+                context.provider_id
+            )));
+        }
+
+        let is_monthly_quota = billing_type.eq_ignore_ascii_case("monthly_quota");
+        // OpenAI's dedicated Search endpoint is a zero-cost provider route. It is intentionally
+        // not represented as a model price, so treat the route itself as an explicit free rule.
+        let is_known_free_provider_route = context
+            .provider_api_format
+            .eq_ignore_ascii_case("openai:search");
+        let pricing = billing_context.map(aether_billing::BillingModelPricingSnapshot::from);
+        let pricing_resolution = pricing
+            .as_ref()
+            .map(|pricing| {
+                if is_monthly_quota && !is_known_free_provider_route {
+                    pricing.resolve_pricing_checked(None, None)
+                } else {
+                    Ok(pricing.resolve_pricing(None, None))
+                }
+            })
+            .transpose()
+            .map_err(|err| {
+                GatewayError::Internal(format!(
+                    "monthly provider pricing configuration is invalid for provider {}: {err}",
+                    context.provider_id
+                ))
+            })?;
+        if is_monthly_quota
+            && !is_known_free_provider_route
+            && pricing_resolution.as_ref().is_none_or(|resolution| {
+                resolution.price_per_request.is_none()
+                    && resolution.tiered_pricing.as_ref().is_none_or(|pricing| {
+                        pricing.as_object().is_none_or(serde_json::Map::is_empty)
+                    })
+            })
+        {
+            return Err(GatewayError::Internal(format!(
+                "monthly provider pricing is unavailable for provider {} and model {}",
+                context.provider_id,
+                context
+                    .global_model_name
+                    .as_deref()
+                    .or(context.model_id.as_deref())
+                    .unwrap_or("unknown")
+            )));
+        }
+        let minimum_cost = if is_monthly_quota && is_known_free_provider_route {
+            Some(0.0)
+        } else {
+            pricing_resolution
+                .as_ref()
+                .and_then(|resolution| resolution.price_per_request)
+                .zip(pricing.as_ref())
+                .map(|(cost, pricing)| {
+                    (cost
+                        * pricing.rate_multiplier_for_api_format(Some(
+                            context.provider_api_format.as_str(),
+                        )))
+                    .max(0.0)
+                })
+        };
+        let pricing_value = pricing
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let snapshot = ProviderQuotaDispatchSnapshot {
+            schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
+            provider_billing_type_at_usage: billing_type,
+            quota_epoch_start_at_usage: quota_epoch.map(|value| value / 60 * 60),
+            provider_dispatch_at_unix_secs: candidate
+                .started_at_unix_ms
+                .unwrap_or_else(|| current_unix_secs().saturating_mul(1000))
+                / 1000,
+            pricing_rule_version_at_usage: pricing
+                .as_ref()
+                .map(|_| "dispatch-pricing-v1".to_string()),
+            provider_pricing_snapshot_at_usage: pricing_value,
+            provider_quota_cost_usd: is_monthly_quota.then_some(minimum_cost).flatten(),
+            quota_accounting_status: if !is_monthly_quota {
+                "not_applicable"
+            } else if minimum_cost.is_some() {
+                "ready"
+            } else {
+                "pending"
+            }
+            .to_string(),
+        };
+        attach_provider_quota_dispatch_snapshot(&mut candidate.extra_data, &snapshot)
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     async fn enqueue_request_candidate_status(
         &self,
         candidate: UpsertRequestCandidateRecord,
@@ -629,8 +772,9 @@ impl SchedulerRuntimeState for AppState {
     async fn read_provider_quota_window_usage(
         &self,
         requests: &[ProviderQuotaWindowUsageRequest],
+        now_unix_secs: u64,
     ) -> Result<Vec<StoredProviderQuotaWindowUsage>, GatewayError> {
-        AppState::read_provider_quota_window_usage(self, requests).await
+        AppState::read_current_provider_quota_window_usage(self, requests, now_unix_secs).await
     }
 
     async fn read_provider_catalog_providers_by_ids(

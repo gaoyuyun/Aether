@@ -29,6 +29,154 @@ fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")
 }
 
+#[tokio::test]
+async fn postgres_provider_quota_backfill_resumes_and_rebuilds_when_url_is_set() {
+    let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!(
+            "skipping postgres provider quota backfill test because AETHER_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("postgres test pool should connect");
+    crate::run_migrations(&pool)
+        .await
+        .expect("postgres migrations should run");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let short = &suffix[..8];
+    let provider_id = format!("quota-bf-provider-{short}");
+    let request_id = format!("quota-bf-request-{short}");
+    let candidate_id = format!("quota-bf-candidate-{short}");
+    let usage_id = format!("quota-bf-usage-{short}");
+    let epoch = 1_700_000_000i64 / 60 * 60;
+    let now = epoch + 600;
+    sqlx::query(
+        "INSERT INTO public.providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, created_at, updated_at) VALUES ($1, $2, 'custom', 'monthly_quota', 100, 99, 30, TO_TIMESTAMP($3::double precision), NOW(), NOW())",
+    )
+    .bind(&provider_id)
+    .bind(format!("Quota Backfill Provider {short}"))
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .expect("backfill provider should seed");
+    sqlx::query(
+        "INSERT INTO public.usage (id, request_id, provider_name, model, provider_id, status, billing_status, actual_total_cost_usd, finalized_at, created_at, created_at_unix_ms, updated_at_unix_secs) VALUES ($1, $2, 'Quota Backfill', 'model', $3, 'completed', 'settled', 2.5, TO_TIMESTAMP($4::double precision), TO_TIMESTAMP($4::double precision), $4, $4)",
+    )
+    .bind(&usage_id)
+    .bind(&request_id)
+    .bind(&provider_id)
+    .bind(epoch + 300)
+    .execute(&pool)
+    .await
+    .expect("backfill usage should seed");
+    sqlx::query(
+        r#"
+INSERT INTO public.request_candidates (
+  id, request_id, candidate_index, retry_index, provider_id, status,
+  extra_data, created_at, started_at, finished_at
+)
+VALUES (
+  $1, $2, 0, 0, $3, 'success',
+  JSON_BUILD_OBJECT(
+    'provider_quota_dispatch_snapshot', JSON_BUILD_OBJECT(
+      'schema_version', 1,
+      'provider_billing_type_at_usage', 'monthly_quota',
+      'quota_epoch_start_at_usage', $4,
+      'provider_dispatch_at_unix_secs', $5
+    )
+  ),
+  TO_TIMESTAMP($5::double precision), TO_TIMESTAMP($5::double precision),
+  TO_TIMESTAMP($6::double precision)
+)
+"#,
+    )
+    .bind(&candidate_id)
+    .bind(&request_id)
+    .bind(&provider_id)
+    .bind(epoch)
+    .bind(epoch + 60)
+    .bind(epoch + 300)
+    .execute(&pool)
+    .await
+    .expect("backfill candidate should seed");
+    sqlx::query(
+        "INSERT INTO public.usage_routing_snapshots (request_id, candidate_id, created_at, updated_at) VALUES ($1, $2, TO_TIMESTAMP($3::double precision), TO_TIMESTAMP($4::double precision))",
+    )
+    .bind(&request_id)
+    .bind(&candidate_id)
+    .bind(epoch + 60)
+    .bind(epoch + 300)
+    .execute(&pool)
+    .await
+    .expect("backfill routing snapshot should seed");
+    sqlx::query(
+        r#"
+INSERT INTO public.usage_settlement_snapshots (
+  request_id, billing_status, settlement_snapshot, created_at, updated_at
+)
+VALUES (
+  $1, 'settled',
+  JSONB_BUILD_OBJECT(
+    'provider_quota_cost_usd', 2.5,
+    'pricing_snapshot', JSONB_BUILD_OBJECT('provider_billing_type', 'monthly_quota')
+  ),
+  TO_TIMESTAMP($2::double precision), TO_TIMESTAMP($2::double precision)
+)
+"#,
+    )
+    .bind(&request_id)
+    .bind(epoch + 300)
+    .execute(&pool)
+    .await
+    .expect("backfill settlement snapshot should seed");
+    sqlx::query(
+        "INSERT INTO public.provider_quota_maintenance_state (provider_id, quota_epoch_start, task_kind, status, cursor_dispatch_at, cursor_request_id) VALUES ($1, $2, 'historical_backfill', 'pending', $2, '')",
+    )
+    .bind(&provider_id)
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .expect("backfill task should seed");
+
+    let repository = SqlxUsageReadRepository::new(pool.clone());
+    repository
+        .maintain_provider_quota_windows(now as u64)
+        .await
+        .expect("first backfill batch should run");
+    repository
+        .maintain_provider_quota_windows(now as u64)
+        .await
+        .expect("backfill completion should run");
+
+    let report: (String, i64, i64) = sqlx::query_as(
+        "SELECT status, included_rows, unknown_rows FROM public.provider_quota_maintenance_state WHERE provider_id = $1",
+    )
+    .bind(&provider_id)
+    .fetch_one(&pool)
+    .await
+    .expect("backfill report should load");
+    assert_eq!(report, ("complete".to_string(), 1, 0));
+    let used: f64 = sqlx::query_scalar(
+        "SELECT CAST(monthly_used_usd AS DOUBLE PRECISION) FROM public.providers WHERE id = $1",
+    )
+    .bind(&provider_id)
+    .fetch_one(&pool)
+    .await
+    .expect("backfill total should load");
+    assert_eq!(used, 2.5);
+
+    sqlx::query("DELETE FROM public.providers WHERE id = $1")
+        .bind(&provider_id)
+        .execute(&pool)
+        .await
+        .expect("backfill fixtures should clean up");
+}
+
 fn fast_clear_usage_record(
     request_id: &str,
     provider_name: &str,

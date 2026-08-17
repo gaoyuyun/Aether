@@ -80,9 +80,10 @@ use crate::orchestration::{
 };
 use crate::provider_pool_demand::acquire_provider_pool_in_flight_guard;
 use crate::request_candidate_runtime::{
-    ensure_execution_request_candidate_slot, record_local_request_candidate_extra_data,
-    record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
-    snapshot_local_request_candidate_status, with_request_terminal_lifecycle_report_context,
+    ensure_execution_request_candidate_slot, record_local_request_candidate_dispatch,
+    record_local_request_candidate_extra_data, record_local_request_candidate_status,
+    record_local_request_candidate_status_snapshot, snapshot_local_request_candidate_status,
+    with_request_terminal_lifecycle_report_context,
 };
 use crate::request_diagnostics::{
     attach_current_request_diagnostics_and_candidate_start_timing_to_report_context,
@@ -2027,7 +2028,7 @@ async fn execute_execution_runtime_sync_impl(
         .usage_runtime
         .record_pending_direct(&usage_data, lifecycle_seed)
         .await;
-    record_local_request_candidate_status(
+    record_local_request_candidate_dispatch(
         state,
         &plan,
         report_context.as_ref(),
@@ -2041,7 +2042,7 @@ async fn execute_execution_runtime_sync_impl(
             finished_at_unix_ms: None,
         },
     )
-    .await;
+    .await?;
     let mut terminal_guard = SyncAttemptTerminalGuard::new(
         state,
         &plan,

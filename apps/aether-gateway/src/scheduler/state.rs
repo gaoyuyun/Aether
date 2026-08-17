@@ -30,6 +30,7 @@ pub(crate) trait SchedulerRuntimeState {
     async fn read_provider_quota_window_usage(
         &self,
         requests: &[ProviderQuotaWindowUsageRequest],
+        now_unix_secs: u64,
     ) -> Result<Vec<StoredProviderQuotaWindowUsage>, GatewayError>;
 
     async fn read_provider_catalog_providers_by_ids(

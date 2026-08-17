@@ -565,9 +565,11 @@ const form = ref({
   // Responses WebSocket 配置
   responses_websocket_enabled: false,
 })
+const initialQuotaLastResetAt = ref<string | undefined>(undefined)
 
 // 重置表单
 function resetForm() {
+  initialQuotaLastResetAt.value = undefined
   form.value = {
     name: '',
     provider_type: 'custom',
@@ -639,6 +641,7 @@ function loadProviderData() {
     // Responses WebSocket 配置
     responses_websocket_enabled: props.provider.responses_websocket_enabled ?? false,
   }
+  initialQuotaLastResetAt.value = dateTimeLocalToRfc3339(form.value.quota_last_reset_at)
 }
 
 function addQuotaWindow() {
@@ -704,6 +707,8 @@ const handleSubmit = async () => {
   loading.value = true
   try {
     const currentPoolAdvanced = normalizePoolAdvancedConfig(props.provider?.pool_advanced)
+    const quotaLastResetAtChanged = !isEditMode.value
+      || quotaLastResetAt !== initialQuotaLastResetAt.value
     const basePayload = {
       name: form.value.name,
       provider_type: form.value.provider_type,
@@ -712,7 +717,7 @@ const handleSubmit = async () => {
       billing_type: form.value.billing_type,
       monthly_quota_usd: form.value.monthly_quota_usd,
       quota_reset_day: form.value.quota_reset_day,
-      quota_last_reset_at: quotaLastResetAt,
+      ...(quotaLastResetAtChanged ? { quota_last_reset_at: quotaLastResetAt } : {}),
       // 编辑时清空过期时间需显式发送 null，后端只有收到 null 才会清除已保存的值
       quota_expires_at: quotaExpiresAt ?? (isEditMode.value ? null : undefined),
       // Leave the saved window policy intact while a provider is temporarily pay-as-you-go;

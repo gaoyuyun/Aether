@@ -5,7 +5,16 @@ use tracing::warn;
 use crate::data::GatewayDataState;
 use crate::AppState;
 
-const QUOTA_RESET_INTERVAL: Duration = Duration::from_secs(60);
+const QUOTA_RESET_INTERVAL_SECS: u64 = 60;
+
+fn duration_until_next_quota_minute(now_unix_secs: u64) -> Duration {
+    let elapsed = now_unix_secs % QUOTA_RESET_INTERVAL_SECS;
+    Duration::from_secs(if elapsed == 0 {
+        QUOTA_RESET_INTERVAL_SECS
+    } else {
+        QUOTA_RESET_INTERVAL_SECS - elapsed
+    })
+}
 
 pub(crate) async fn reset_due_provider_quotas_once(
     data: &GatewayDataState,
@@ -46,11 +55,12 @@ pub(crate) fn spawn_provider_quota_reset_worker(
                     warn!(error = %err, "gateway provider rolling quota maintenance startup failed")
                 }
             }
-            let mut interval = tokio::time::interval(QUOTA_RESET_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await;
             loop {
-                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                tokio::time::sleep(duration_until_next_quota_minute(now)).await;
                 match reset_due_provider_quotas_once(&data).await {
                     Ok(reset) if reset > 0 => app.invalidate_provider_routing_caches(),
                     Ok(_) => {}
@@ -84,9 +94,28 @@ mod tests {
         ProviderQuotaReadRepository, StoredProviderQuotaSnapshot,
     };
 
-    use super::{reset_due_provider_quotas_once, spawn_provider_quota_reset_worker};
+    use super::{
+        duration_until_next_quota_minute, reset_due_provider_quotas_once,
+        spawn_provider_quota_reset_worker,
+    };
     use crate::data::GatewayDataState;
     use crate::AppState;
+
+    #[test]
+    fn quota_worker_wait_aligns_with_natural_minute() {
+        assert_eq!(
+            duration_until_next_quota_minute(68),
+            Duration::from_secs(52)
+        );
+        assert_eq!(
+            duration_until_next_quota_minute(119),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            duration_until_next_quota_minute(120),
+            Duration::from_secs(60)
+        );
+    }
 
     #[tokio::test]
     async fn resets_due_provider_quotas_from_runtime() {

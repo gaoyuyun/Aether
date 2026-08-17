@@ -16,6 +16,12 @@ use crate::lifecycle::migrate::{prepare_database_for_startup, run_sqlite_migrati
 const LEGACY_SYNC_ENABLED_ACTIVE_FLAGS_VERSION: i64 = 20260517012000;
 const LEGACY_SYNC_ENABLED_ACTIVE_FLAGS_SQL: &str =
     include_str!("../../../backfills/postgres/20260517012000_sync_legacy_enabled_active_flags.sql");
+const SQLITE_REPAIR_RESOLVED_PROVIDER_QUOTA_ATTEMPTS_SQL: &str = include_str!(
+    "../../../backfills/sqlite/20260818000000_repair_resolved_provider_quota_attempts.sql"
+);
+const SQLITE_RECONCILE_LATE_PROVIDER_QUOTA_ATTEMPTS_SQL: &str = include_str!(
+    "../../../backfills/sqlite/20260819000000_reconcile_late_provider_quota_attempts.sql"
+);
 
 #[test]
 fn legacy_enabled_backfill_preserves_canonical_active_flags() {
@@ -48,7 +54,10 @@ fn pending_backfills_from_applied_returns_all_versions_when_none_applied() {
             20260505120000,
             20260517012000,
             20260716010000,
-            20260817010000
+            20260817010000,
+            20260817020000,
+            20260818000000,
+            20260819000000
         ]
     );
 }
@@ -70,7 +79,10 @@ fn pending_backfills_from_applied_skips_versions_already_applied() {
             20260505120000,
             20260517012000,
             20260716010000,
-            20260817010000
+            20260817010000,
+            20260817020000,
+            20260818000000,
+            20260819000000
         ]
     );
 }
@@ -175,6 +187,7 @@ CREATE TEMPORARY TABLE `usage` (
     total_cost_usd DOUBLE NOT NULL DEFAULT 0,
     actual_total_cost_usd DOUBLE NOT NULL DEFAULT 0,
     billing_status VARCHAR(64) NOT NULL DEFAULT 'pending',
+    finalized_at BIGINT,
     created_at BIGINT,
     created_at_unix_ms BIGINT NOT NULL DEFAULT 0,
     updated_at_unix_secs BIGINT NOT NULL DEFAULT 0
@@ -190,7 +203,36 @@ CREATE TEMPORARY TABLE usage_settlement_snapshots (
     billing_cache_creation_1h_tokens BIGINT,
     billing_cache_read_tokens BIGINT,
     billing_total_input_context BIGINT,
+    finalized_at BIGINT,
     settlement_snapshot JSON
+);
+CREATE TEMPORARY TABLE usage_routing_snapshots (
+    request_id VARCHAR(128) PRIMARY KEY,
+    candidate_id VARCHAR(128)
+);
+CREATE TEMPORARY TABLE usage_counter_deltas (
+    id VARCHAR(64) PRIMARY KEY,
+    request_id VARCHAR(128) NOT NULL,
+    kind VARCHAR(64) NOT NULL,
+    target_id VARCHAR(191) NOT NULL,
+    total_cost_usd_delta DOUBLE NOT NULL DEFAULT 0,
+    quota_epoch_start_at_usage BIGINT,
+    provider_quota_cost_usd DOUBLE,
+    quota_delta_sequence BIGINT,
+    quota_accounting_status VARCHAR(32),
+    processed_at BIGINT
+);
+CREATE TEMPORARY TABLE provider_quota_maintenance_state (
+    provider_id VARCHAR(64) NOT NULL,
+    quota_epoch_start BIGINT NOT NULL,
+    task_kind VARCHAR(32) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    cursor_dispatch_at BIGINT NOT NULL DEFAULT 0,
+    cursor_request_id VARCHAR(128) NOT NULL DEFAULT '',
+    cutover_delta_sequence BIGINT,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (provider_id, quota_epoch_start, task_kind)
 );
 CREATE TEMPORARY TABLE provider_quota_usage_buckets (
     provider_id VARCHAR(64) NOT NULL,
@@ -320,7 +362,10 @@ INSERT INTO usage_settlement_snapshots (
             20260517012000,
             20260716010000,
             20260816010000,
-            20260817010000
+            20260817010000,
+            20260817020000,
+            20260818000000,
+            20260819000000
         ]
     );
 
@@ -553,7 +598,10 @@ INSERT INTO usage_settlement_snapshots (
             20260517012000,
             20260716010000,
             20260816010000,
-            20260817010000
+            20260817010000,
+            20260817020000,
+            20260818000000,
+            20260819000000
         ]
     );
 
@@ -578,7 +626,10 @@ INSERT INTO usage_settlement_snapshots (
             20260517012000,
             20260716010000,
             20260816010000,
-            20260817010000
+            20260817010000,
+            20260817020000,
+            20260818000000,
+            20260819000000
         ]
     );
     let provider_monthly_used: f64 = query_scalar(
@@ -624,7 +675,7 @@ INSERT INTO usage_settlement_snapshots (
         .fetch_one(&pool)
         .await
         .expect("sqlite applied backfill count should load");
-    assert_eq!(applied_count, 6);
+    assert_eq!(applied_count, 9);
 
     query("UPDATE schema_backfills SET checksum = X'00' WHERE version = 20260422120000")
         .execute(&pool)
@@ -654,6 +705,126 @@ INSERT INTO schema_backfills (
         error,
         sqlx::migrate::MigrateError::VersionMissing(99999999999999)
     ));
+}
+
+#[tokio::test]
+async fn sqlite_backfills_repair_resolved_provider_quota_attempts_without_guessing() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite backfill test pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite schema should migrate");
+
+    sqlx::raw_sql(
+        r#"
+INSERT INTO providers (
+  id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd,
+  quota_last_reset_at, is_active, created_at, updated_at
+) VALUES (
+  'quota-repair-provider', 'quota repair provider', 'custom', 'monthly_quota',
+  10, 0, 60, 1, 1, 1
+);
+
+INSERT INTO "usage" (
+  request_id, provider_id, status, billing_status, endpoint_api_format,
+  actual_total_cost_usd, finalized_at, created_at_unix_ms
+) VALUES (
+  'quota-repair-request', 'quota-repair-provider', 'completed', 'settled',
+  'custom:zero-cost', 0, 120, 120
+), (
+  'quota-repair-late-request', 'quota-repair-provider', 'completed', 'settled',
+  'openai:chat', 2.5, 180, 180
+);
+
+INSERT INTO request_candidates (
+  id, request_id, candidate_index, retry_index, provider_id, status, created_at
+) VALUES (
+  'quota-repair-candidate', 'quota-repair-request', 0, 0,
+  'quota-repair-provider', 'success', 120
+), (
+  'quota-repair-late-candidate', 'quota-repair-late-request', 0, 0,
+  'quota-repair-provider', 'success', 180
+);
+
+INSERT INTO usage_routing_snapshots (
+  request_id, candidate_id, selected_provider_id, created_at, updated_at
+) VALUES (
+  'quota-repair-request', 'quota-repair-candidate', 'quota-repair-provider', 120, 120
+);
+
+INSERT INTO usage_settlement_snapshots (
+  request_id, billing_status, finalized_at, settlement_snapshot, created_at, updated_at
+) VALUES (
+  'quota-repair-request', 'settled', 120,
+  '{"status":"complete","provider_quota_cost_usd":0,"pricing_snapshot":{"provider_billing_type":"monthly_quota"}}',
+  120, 120
+), (
+  'quota-repair-late-request', 'settled', 180,
+  '{"status":"complete","provider_quota_cost_usd":2.5,"pricing_snapshot":{"provider_billing_type":"monthly_quota"}}',
+  180, 180
+);
+
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, quota_delta_sequence,
+  quota_accounting_status, created_at, processed_at
+) VALUES
+  (
+    'quota-repair-resolved', 'quota-repair-candidate', 'provider_monthly',
+    'quota-repair-provider', 0, 120, 'monthly_quota', 60, 120, 0, 1,
+    'pending', 120, 121
+  ),
+  (
+    'quota-repair-unresolved', 'missing-candidate', 'provider_monthly',
+    'quota-repair-provider', 0, 120, 'monthly_quota', 60, 120, 0, 2,
+    'pending', 120, 121
+  ),
+  (
+    'quota-repair-late', 'quota-repair-late-candidate', 'provider_monthly',
+    'quota-repair-provider', 0, 180, 'monthly_quota', 60, 180, 0, 3,
+    'pending', 180, NULL
+  );
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("quota repair fixtures should insert");
+
+    sqlx::raw_sql(SQLITE_REPAIR_RESOLVED_PROVIDER_QUOTA_ATTEMPTS_SQL)
+        .execute(&pool)
+        .await
+        .expect("quota repair backfill should run");
+    sqlx::raw_sql(SQLITE_RECONCILE_LATE_PROVIDER_QUOTA_ATTEMPTS_SQL)
+        .execute(&pool)
+        .await
+        .expect("late quota attempt backfill should run");
+
+    let statuses: Vec<(String, String, f64)> =
+        query_as("SELECT id, quota_accounting_status, provider_quota_cost_usd FROM usage_counter_deltas ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("quota repair statuses should load");
+    assert_eq!(
+        statuses,
+        vec![
+            ("quota-repair-late".to_string(), "ready".to_string(), 2.5,),
+            (
+                "quota-repair-resolved".to_string(),
+                "ready".to_string(),
+                0.0,
+            ),
+            (
+                "quota-repair-unresolved".to_string(),
+                "pending".to_string(),
+                0.0,
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -719,7 +890,7 @@ END
         .fetch_one(&pool)
         .await
         .expect("sqlite resumed applied backfill count should load");
-    assert_eq!(applied_count, 6);
+    assert_eq!(applied_count, 9);
 }
 
 #[derive(Debug)]
@@ -1046,7 +1217,7 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     let pending_before = pending_backfills(&pool)
         .await
         .expect("pending backfills should load");
-    assert_eq!(pending_before.len(), 7);
+    assert_eq!(pending_before.len(), 10);
     assert_eq!(pending_before[0].version, 20260422110000);
     assert_eq!(pending_before[1].version, 20260422120000);
     assert_eq!(pending_before[2].version, 20260504120000);
@@ -1054,6 +1225,9 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     assert_eq!(pending_before[4].version, 20260517012000);
     assert_eq!(pending_before[5].version, 20260716010000);
     assert_eq!(pending_before[6].version, 20260817010000);
+    assert_eq!(pending_before[7].version, 20260817020000);
+    assert_eq!(pending_before[8].version, 20260818000000);
+    assert_eq!(pending_before[9].version, 20260819000000);
 
     run_backfills(&pool)
         .await
@@ -1078,7 +1252,10 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
             20260505120000,
             20260517012000,
             20260716010000,
-            20260817010000
+            20260817010000,
+            20260817020000,
+            20260818000000,
+            20260819000000
         ]
     );
 
@@ -1752,5 +1929,5 @@ ORDER BY total_tokens
         .fetch_one(&pool)
         .await
         .expect("backfill count should load");
-    assert_eq!(applied_count, 6);
+    assert_eq!(applied_count, 10);
 }

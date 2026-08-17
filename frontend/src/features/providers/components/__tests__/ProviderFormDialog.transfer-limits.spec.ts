@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints/types'
+import { dateTimeLocalToRfc3339 } from '@/utils/date'
 import ProviderFormDialog from '../ProviderFormDialog.vue'
 
 const endpointMocks = vi.hoisted(() => ({
@@ -221,6 +222,45 @@ describe('ProviderFormDialog transfer limits', () => {
       expect.objectContaining({
         max_transfer_count: 8,
         max_transfer_timeout_seconds: 30,
+      }),
+    )
+  })
+})
+
+describe('ProviderFormDialog quota cycle updates', () => {
+  it('does not overwrite a concurrently reset cycle when the field was not edited', async () => {
+    mountDialog(makeProvider({
+      billing_type: 'monthly_quota',
+      monthly_quota_usd: 10,
+      quota_reset_day: 30,
+      quota_last_reset_at: '2026-08-18T00:00:00Z',
+    }))
+    await settle()
+
+    clickButton('保存')
+    await settle()
+
+    const payload = endpointMocks.updateProvider.mock.calls[0]?.[1]
+    expect(payload).not.toHaveProperty('quota_last_reset_at')
+  })
+
+  it('submits the cycle start when the administrator edits it', async () => {
+    mountDialog(makeProvider({
+      billing_type: 'monthly_quota',
+      monthly_quota_usd: 10,
+      quota_reset_day: 30,
+      quota_last_reset_at: '2026-08-18T00:00:00Z',
+    }))
+    await settle()
+
+    await setInput('input[type="datetime-local"]', '2026-08-19T00:00')
+    clickButton('保存')
+    await settle()
+
+    expect(endpointMocks.updateProvider).toHaveBeenCalledWith(
+      'provider-1',
+      expect.objectContaining({
+        quota_last_reset_at: dateTimeLocalToRfc3339('2026-08-19T00:00'),
       }),
     )
   })
