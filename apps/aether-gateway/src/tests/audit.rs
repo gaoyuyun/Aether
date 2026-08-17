@@ -22,8 +22,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    any, build_router_with_state, json, start_server, AppState, Json, Request, Router, StatusCode,
-    UsageRuntimeConfig, CONTROL_CANDIDATE_ID_HEADER, CONTROL_REQUEST_ID_HEADER, TRACE_ID_HEADER,
+    any, build_router_with_operational_routes_for_tests, json, start_server, AppState, Json,
+    Request, Router, StatusCode, UsageRuntimeConfig, CONTROL_CANDIDATE_ID_HEADER,
+    CONTROL_REQUEST_ID_HEADER, TRACE_ID_HEADER,
 };
 
 fn hash_api_key(value: &str) -> String {
@@ -241,7 +242,7 @@ async fn gateway_exposes_request_id_header_for_local_execution_response_impl() {
             enabled: true,
             ..UsageRuntimeConfig::default()
         });
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_operational_routes_for_tests(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -446,7 +447,7 @@ async fn gateway_exposes_request_usage_via_internal_audit_endpoint() {
     let gateway_state = AppState::new()
         .expect("gateway state should build")
         .with_usage_data_reader_for_tests(repository);
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_operational_routes_for_tests(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -503,7 +504,7 @@ async fn gateway_exposes_request_audit_bundle_via_internal_audit_endpoint() {
             provider_catalog,
             usage_repository,
         );
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_operational_routes_for_tests(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -556,7 +557,7 @@ async fn gateway_exposes_request_candidate_trace_via_internal_audit_endpoint() {
     let gateway_state = AppState::new()
         .expect("gateway state should build")
         .with_request_candidate_data_reader_for_tests(repository);
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_operational_routes_for_tests(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -605,7 +606,7 @@ async fn gateway_exposes_decision_trace_via_internal_audit_endpoint() {
     let gateway_state = AppState::new()
         .expect("gateway state should build")
         .with_decision_trace_data_readers_for_tests(request_candidates, provider_catalog);
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_operational_routes_for_tests(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -652,7 +653,7 @@ async fn gateway_exposes_auth_api_key_snapshot_via_internal_audit_endpoint() {
     let gateway_state = AppState::new()
         .expect("gateway state should build")
         .with_auth_api_key_data_reader_for_tests(repository);
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_operational_routes_for_tests(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()

@@ -59,6 +59,9 @@ pub(crate) async fn maybe_build_local_admin_monitoring_response(
             "audit_log",
             &admin_monitoring_audit_target_id(request_context),
         ))),
+        AdminMonitoringRoute::GatewayMetrics => Ok(Some(aether_runtime::prometheus_response(
+            &state.app().metric_samples().await,
+        ))),
         AdminMonitoringRoute::ResilienceStatus => Ok(Some(
             build_admin_monitoring_resilience_status_response(state).await?,
         )),

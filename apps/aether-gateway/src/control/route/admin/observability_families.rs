@@ -636,6 +636,19 @@ pub(super) fn classify_admin_observability_family_route(
             false,
         ))
     } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
+            "/api/admin/monitoring/metrics" | "/api/admin/monitoring/metrics/"
+        )
+    {
+        Some(classified(
+            "admin_proxy",
+            "monitoring",
+            "gateway_metrics",
+            "admin:monitoring",
+            false,
+        ))
+    } else if method == http::Method::GET
         && (matches!(
             normalized_path,
             "/api/admin/monitoring/system-status"

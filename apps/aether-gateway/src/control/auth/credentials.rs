@@ -85,7 +85,20 @@ pub(in crate::control) fn resolve_gateway_credential_carrier(
         })
 }
 
+// Legacy trusted-header fixtures remain available only to in-crate tests. A
+// production request must authenticate with a real API key, session, or
+// management token instead of caller-controlled identity headers.
 fn has_trusted_gateway_marker(headers: &http::HeaderMap) -> bool {
+    has_trusted_gateway_marker_with_policy(headers, cfg!(test))
+}
+
+fn has_trusted_gateway_marker_with_policy(
+    headers: &http::HeaderMap,
+    accept_legacy_trusted_headers: bool,
+) -> bool {
+    if !accept_legacy_trusted_headers {
+        return false;
+    }
     header_value_str(headers, crate::constants::GATEWAY_HEADER)
         .unwrap_or_default()
         .trim()
@@ -416,8 +429,8 @@ pub(super) fn current_unix_secs() -> u64 {
 mod tests {
     use super::{
         build_auth_context_cache_key, extract_request_credentials, extract_requested_model,
-        GatewayCredentialCarrier, GatewayPrimaryCredential, GatewayTrustedAdminHeaders,
-        GatewayTrustedAuthHeaders,
+        has_trusted_gateway_marker_with_policy, GatewayCredentialCarrier, GatewayPrimaryCredential,
+        GatewayTrustedAdminHeaders, GatewayTrustedAuthHeaders,
     };
     use crate::control::GatewayControlDecision;
     use axum::body::Bytes;
@@ -835,5 +848,28 @@ mod tests {
             "admin:endpoints_health",
         );
         assert_eq!(extracted.trusted_admin_headers, None);
+    }
+
+    #[test]
+    fn production_policy_rejects_spoofed_trusted_admin_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_ADMIN_USER_ID_HEADER,
+            "attacker".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_ADMIN_USER_ROLE_HEADER,
+            "admin".parse().unwrap(),
+        );
+        headers.insert(
+            crate::constants::TRUSTED_ADMIN_SESSION_ID_HEADER,
+            "forged-session".parse().unwrap(),
+        );
+
+        assert!(!has_trusted_gateway_marker_with_policy(&headers, false));
     }
 }

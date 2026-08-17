@@ -796,14 +796,13 @@ pub(super) fn classify_public_support_route(
     } else if method == http::Method::GET
         && matches!(
             normalized_path,
-            "/" | "/health" | "/v1/health" | "/v1/providers" | "/v1/test-connection"
+            "/" | "/health" | "/v1/health" | "/v1/providers"
         )
     {
         let route_kind = match normalized_path {
             "/" => "root",
             "/health" | "/v1/health" => "health",
             "/v1/providers" => "providers",
-            "/v1/test-connection" => "test_connection",
             _ => "root",
         };
         Some(classified(
@@ -831,14 +830,6 @@ pub(super) fn classify_public_support_route(
             "install",
             "script",
             "public:install",
-            false,
-        ))
-    } else if method == http::Method::GET && normalized_path == "/test-connection" {
-        Some(classified(
-            "public_support",
-            "system_catalog",
-            "test_connection",
-            "public:system_catalog",
             false,
         ))
     } else {
