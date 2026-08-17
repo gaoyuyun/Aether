@@ -11,6 +11,10 @@ use std::sync::Arc;
 #[test]
 fn admin_monitoring_matches_typical_routes() {
     assert_eq!(
+        match_admin_monitoring_route(&http::Method::GET, "/api/admin/monitoring/metrics"),
+        Some(AdminMonitoringRoute::GatewayMetrics)
+    );
+    assert_eq!(
         match_admin_monitoring_route(&http::Method::GET, "/api/admin/monitoring/audit-logs"),
         Some(AdminMonitoringRoute::AuditLogs)
     );
@@ -65,6 +69,28 @@ fn admin_monitoring_matches_cache_delete_shapes_and_trailing_slashes() {
         ),
         Some(AdminMonitoringRoute::CacheAffinityDelete)
     );
+}
+
+#[tokio::test]
+async fn admin_monitoring_metrics_returns_prometheus_payload() {
+    let state = AppState::new().expect("state should build");
+    let context = request_context(http::Method::GET, "/api/admin/monitoring/metrics");
+    let response = local_monitoring_response(&state, &context)
+        .await
+        .expect("handler should not error")
+        .expect("monitoring route should be handled locally");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert!(response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/plain")));
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let body = String::from_utf8(body.to_vec()).expect("metrics should be utf-8");
+    assert!(body.contains("service_up{service=\"aether-gateway\"} 1"));
 }
 
 #[tokio::test]

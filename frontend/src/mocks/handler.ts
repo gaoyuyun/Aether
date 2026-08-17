@@ -5460,7 +5460,7 @@ mockHandlers['GET /api/admin/proxy-nodes/metrics/fleet'] = async () => {
   })
 }
 
-mockHandlers['GET /_gateway/metrics'] = async () => {
+mockHandlers['GET /api/admin/monitoring/metrics'] = async () => {
   await delay(60)
   requireAdmin()
   return createMockResponse(`# HELP aether_gateway_service_up Whether the service process is currently up.

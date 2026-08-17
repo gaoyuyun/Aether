@@ -65,7 +65,7 @@ http.workspace = true
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-pool", "server-auto", "service", "tokio"] }
-ldap3 = { version = "0.11", default-features = false, features = ["sync", "tls-rustls"] }
+ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-ring"] }
 libc = "0.2"
 md-5 = "0.10"
 object_store.workspace = true

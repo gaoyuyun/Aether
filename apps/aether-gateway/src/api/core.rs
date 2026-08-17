@@ -119,7 +119,7 @@ pub(crate) async fn frontdoor_manifest(State(state): State<AppState>) -> impl In
             "operational_manifest": INTERNAL_FRONTDOOR_MANIFEST_PATH,
             "readiness": READYZ_PATH,
             "health": "/_gateway/health",
-            "metrics": "/_gateway/metrics",
+            "metrics": "/api/admin/monitoring/metrics",
         },
         "rust_frontdoor": {
             "owned_route_patterns": RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS,

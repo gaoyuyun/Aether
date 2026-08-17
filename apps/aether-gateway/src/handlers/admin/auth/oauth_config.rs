@@ -207,6 +207,22 @@ fn validate_admin_oauth_url_override_for_domains(
     validate_admin_oauth_url_override(url, &allowed)
 }
 
+fn normalize_admin_oauth_icon_url(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed =
+        Url::parse(value).map_err(|_| "icon_url 必须是有效的绝对 HTTPS URL".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("icon_url 必须是无用户信息的绝对 HTTPS URL".to_string());
+    }
+    Ok(Some(parsed.to_string()))
+}
+
 pub(super) fn build_admin_oauth_upsert_record(
     state: &AdminAppState<'_>,
     provider_type: &str,
@@ -321,6 +337,7 @@ pub(super) fn build_admin_oauth_upsert_record(
     {
         return Err("scopes 不能为空".to_string());
     }
+    let icon_url = normalize_admin_oauth_icon_url(payload.icon_url.as_deref())?;
 
     let client_secret_encrypted = match payload.client_secret.as_deref() {
         None => EncryptedSecretUpdate::Preserve,
@@ -367,10 +384,26 @@ pub(super) fn build_admin_oauth_upsert_record(
         frontend_callback_url: frontend_callback_url.to_string(),
         attribute_mapping: payload.attribute_mapping,
         extra_config: payload.extra_config,
-        icon_url: payload.icon_url.and_then(|value| {
-            let value = value.trim().to_string();
-            (!value.is_empty()).then_some(value)
-        }),
+        icon_url,
         is_enabled: payload.is_enabled,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_admin_oauth_icon_url;
+
+    #[test]
+    fn oauth_icon_url_accepts_only_absolute_https_urls_without_credentials() {
+        assert_eq!(
+            normalize_admin_oauth_icon_url(Some(" https://cdn.example.com/icon.png ")).unwrap(),
+            Some("https://cdn.example.com/icon.png".to_string())
+        );
+        assert!(normalize_admin_oauth_icon_url(Some("javascript:alert(1)")).is_err());
+        assert!(normalize_admin_oauth_icon_url(Some("http://example.com/icon.png")).is_err());
+        assert!(
+            normalize_admin_oauth_icon_url(Some("https://user:pass@example.com/icon.png")).is_err()
+        );
+        assert!(normalize_admin_oauth_icon_url(Some("/relative/icon.png")).is_err());
+    }
 }

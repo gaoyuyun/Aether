@@ -26,10 +26,23 @@ struct FrontendStaticState {
 }
 
 pub fn build_router_with_state(state: AppState) -> Router {
+    build_router_with_state_inner(state, false)
+}
+
+#[cfg(test)]
+pub(crate) fn build_router_with_operational_routes_for_tests(state: AppState) -> Router {
+    build_router_with_state_inner(state, true)
+}
+
+fn build_router_with_state_inner(state: AppState, mount_operational_routes: bool) -> Router {
     let cors_state = state.clone();
     let mut router = Router::<AppState>::new();
     router = api::mount_core_routes(router);
-    router = api::mount_operational_routes(router);
+    if mount_operational_routes {
+        router = api::mount_operational_routes(router);
+    } else {
+        router = api::mount_disabled_operational_routes(router);
+    }
     router = api::mount_ai_routes(router);
     router = api::mount_public_support_routes(router);
     router = api::mount_oauth_routes(router);

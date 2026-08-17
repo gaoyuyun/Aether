@@ -25,7 +25,10 @@ pub(super) use super::async_task::VideoTaskTruthSourceMode;
 pub(super) use super::constants::*;
 pub(super) use super::fallback_metrics::{GatewayFallbackMetricKind, GatewayFallbackReason};
 pub(super) use super::rate_limit::FrontdoorUserRpmConfig;
-pub(super) use super::router::{attach_static_frontend, build_router, build_router_with_state};
+pub(super) use super::router::{
+    attach_static_frontend, build_router, build_router_with_operational_routes_for_tests,
+    build_router_with_state,
+};
 pub(super) use super::state::{AppState, FrontdoorCorsConfig};
 pub(super) use super::usage::UsageRuntimeConfig;
 

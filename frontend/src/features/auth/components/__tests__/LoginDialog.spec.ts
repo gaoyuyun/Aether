@@ -81,6 +81,7 @@ vi.mock('@/utils/url', () => ({
 
 vi.mock('@/utils/oauth-icons', () => ({
   getOAuthIcon: () => '',
+  getOAuthIconUrl: () => null,
 }))
 
 vi.mock('../RegisterDialog.vue', () => ({

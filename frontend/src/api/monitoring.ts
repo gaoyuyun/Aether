@@ -884,7 +884,7 @@ export function buildGatewayMetricsSummary(text: string): GatewayMetricsSummary 
 }
 
 async function fetchGatewayMetricsText(): Promise<string> {
-  const response = await apiClient.get<string>('/_gateway/metrics', {
+  const response = await apiClient.get<string>('/api/admin/monitoring/metrics', {
     responseType: 'text',
     transformResponse: [(data: string) => data],
   })
