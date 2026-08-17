@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures_util::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
-use object_store::{ClientOptions, ObjectStore};
+use object_store::{ClientOptions, ObjectStore, ObjectStoreExt};
 use reqwest::header::HeaderValue;
 use tokio::sync::RwLock;
 

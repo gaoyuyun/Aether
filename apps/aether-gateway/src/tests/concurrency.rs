@@ -5,10 +5,10 @@ use super::usage::{
     sample_local_openai_endpoint, sample_local_openai_key, sample_local_openai_provider,
 };
 use super::{
-    any, build_router_with_state, build_state_with_execution_runtime_override, start_server,
-    wait_until, AppState, Arc, Body, Bytes, GatewayFallbackMetricKind, GatewayFallbackReason,
-    HeaderValue, Infallible, Request, Response, Router, StatusCode,
-    EXECUTION_PATH_DISTRIBUTED_OVERLOADED, EXECUTION_PATH_HEADER,
+    any, build_router_with_operational_routes_for_tests, build_router_with_state,
+    build_state_with_execution_runtime_override, start_server, wait_until, AppState, Arc, Body,
+    Bytes, GatewayFallbackMetricKind, GatewayFallbackReason, HeaderValue, Infallible, Request,
+    Response, Router, StatusCode, EXECUTION_PATH_DISTRIBUTED_OVERLOADED, EXECUTION_PATH_HEADER,
     EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, EXECUTION_PATH_LOCAL_OVERLOADED,
 };
 use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
@@ -321,7 +321,7 @@ async fn gateway_exposes_request_concurrency_metrics_impl() {
             5,
         ));
     assert!(state.prewarm_metric_snapshot().await);
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -441,7 +441,7 @@ async fn gateway_exposes_fallback_metrics_impl() {
         GatewayFallbackReason::LocalExecutionPathRequired,
     );
     assert!(state.prewarm_metric_snapshot().await);
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()

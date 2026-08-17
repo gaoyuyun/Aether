@@ -44,8 +44,6 @@ mod support_monitoring;
 mod support_oauth;
 #[path = "support/payment.rs"]
 mod support_payment;
-#[path = "support/test_connection.rs"]
-mod support_test_connection;
 #[path = "support/user_me.rs"]
 mod support_user_me;
 #[path = "support/wallet.rs"]
@@ -85,7 +83,6 @@ use self::support_models::{
 use self::support_monitoring::maybe_build_local_user_monitoring_response;
 use self::support_oauth::maybe_build_local_oauth_response;
 use self::support_payment::maybe_build_local_payment_callback_response;
-use self::support_test_connection::maybe_build_local_test_connection_response;
 use self::support_user_me::maybe_build_local_users_me_response;
 use self::support_wallet::{
     build_wallet_balance_payload_for_auth_scope, build_wallet_balance_payload_for_user,
@@ -745,7 +742,6 @@ pub(crate) async fn maybe_build_local_public_support_response(
                         "count_tokens": "/v1/messages/count_tokens",
                         "health": "/v1/health",
                         "providers": "/v1/providers",
-                        "test_connection": "/v1/test-connection",
                     },
                 }))
                 .into_response(),
@@ -897,26 +893,6 @@ pub(crate) async fn maybe_build_local_public_support_response(
                 );
             }
             return Some(Json(payload).into_response());
-        }
-
-        if decision.route_kind.as_deref() == Some("test_connection")
-            && request_context.request_path == "/v1/test-connection"
-        {
-            return maybe_build_local_test_connection_response(state, request_context).await;
-        }
-
-        if decision.route_kind.as_deref() == Some("test_connection")
-            && request_context.request_path == "/test-connection"
-        {
-            return Some(
-                (
-                    http::StatusCode::GONE,
-                    Json(json!({
-                        "detail": "Deprecated endpoint. Please use /v1/test-connection.",
-                    })),
-                )
-                    .into_response(),
-            );
         }
     }
 
