@@ -27,6 +27,7 @@ use super::super::runtime::should_skip_provider_quota;
 use super::super::selection::{
     collect_selectable_candidates as collect_selectable_candidates_impl,
     collect_selectable_candidates_with_skip_reasons as collect_selectable_candidates_with_skip_reasons_impl,
+    collect_selectable_candidates_with_skip_reasons_and_ranking_seed,
     is_exact_all_skipped_by_auth_limit, select_minimal_candidate as select_candidate_impl,
 };
 use super::support::{sample_auth_snapshot, sample_key, sample_provider, sample_row};
@@ -1921,14 +1922,19 @@ async fn keeps_refresh_failed_oauth_candidate_selectable_before_local_auth_resol
             ),
         );
 
-    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons_and_ranking_seed(
         state.data.as_ref(),
         &state,
         "openai:responses",
         "gpt-4.1",
         false,
         None,
+        None,
+        None,
         1_710_000_100,
+        u64::MAX,
+        false,
+        None,
     )
     .await
     .expect("selection should succeed");

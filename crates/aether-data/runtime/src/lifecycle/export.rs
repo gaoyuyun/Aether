@@ -148,6 +148,18 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
         primary_key: &["provider_id", "duration_secs"],
     },
     AuxiliaryTable {
+        name: "provider_quota_usage_buckets",
+        primary_key: &["provider_id", "quota_epoch_start", "bucket_start"],
+    },
+    AuxiliaryTable {
+        name: "provider_quota_maintenance_state",
+        primary_key: &["provider_id", "quota_epoch_start", "task_kind"],
+    },
+    AuxiliaryTable {
+        name: "provider_quota_applied_watermarks",
+        primary_key: &["provider_id", "quota_epoch_start"],
+    },
+    AuxiliaryTable {
         name: "gemini_file_mappings",
         primary_key: &["id"],
     },

@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, SqliteConnection};
 
 use aether_data_contracts::repository::candidates::{
-    request_candidate_lifecycle_would_regress, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
-    StoredRequestCandidate, UpsertRequestCandidateRecord,
+    provider_quota_dispatch_snapshot, request_candidate_lifecycle_would_regress,
+    PublicHealthStatusCount, PublicHealthTimelineBucket, RequestCandidateReadRepository,
+    RequestCandidateStatus, RequestCandidateWriteRepository, StoredRequestCandidate,
+    UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::DataLayerError;
 use aether_data_query::{push_in, WhereClause};
@@ -321,6 +322,7 @@ async fn upsert_candidate_in_transaction(
     })?;
     let merged = merge_candidate(candidate, Some(existing))?;
     upsert_merged_candidate(tx, &merged).await?;
+    upsert_provider_quota_attempt_delta(tx, &merged).await?;
     find_by_unique(
         tx,
         &merged.request_id,
@@ -333,6 +335,189 @@ async fn upsert_candidate_in_transaction(
             "request candidate row disappeared after atomic upsert".to_string(),
         )
     })
+}
+
+async fn upsert_provider_quota_attempt_delta(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    candidate: &StoredRequestCandidate,
+) -> Result<(), DataLayerError> {
+    let Some(snapshot) = provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())? else {
+        return Ok(());
+    };
+    if !snapshot.is_monthly_quota() {
+        return Ok(());
+    }
+    let provider_id = candidate
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DataLayerError::InvalidInput(
+                "monthly provider quota attempt is missing provider_id".to_string(),
+            )
+        })?;
+    let quota_epoch = snapshot.quota_epoch_start_at_usage.ok_or_else(|| {
+        DataLayerError::InvalidInput(
+            "monthly provider quota attempt is missing quota epoch".to_string(),
+        )
+    })?;
+    let delta_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("provider-quota-attempt:{}", candidate.id).as_bytes(),
+    )
+    .to_string();
+    let pricing_snapshot = snapshot
+        .provider_pricing_snapshot_at_usage
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+    let cost = snapshot.provider_quota_cost_usd.unwrap_or(0.0);
+    sqlx::query(
+        r#"
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage, quota_delta_sequence,
+  quota_accounting_status, created_at
+)
+VALUES (
+  ?, ?, 'provider_monthly', ?, ?, ?, 'monthly_quota', ?, ?, ?, ?, ?,
+  (SELECT COALESCE(MAX(quota_delta_sequence), 0) + 1 FROM usage_counter_deltas),
+  ?, ?
+)
+ON CONFLICT (id) DO UPDATE SET
+  provider_quota_cost_usd = CASE WHEN usage_counter_deltas.processed_at IS NULL
+    AND COALESCE(usage_counter_deltas.quota_accounting_status, 'pending') IN ('pending', 'failed')
+    THEN excluded.provider_quota_cost_usd ELSE usage_counter_deltas.provider_quota_cost_usd END,
+  total_cost_usd_delta = CASE WHEN usage_counter_deltas.processed_at IS NULL
+    AND COALESCE(usage_counter_deltas.quota_accounting_status, 'pending') IN ('pending', 'failed')
+    THEN excluded.total_cost_usd_delta ELSE usage_counter_deltas.total_cost_usd_delta END,
+  quota_accounting_status = CASE WHEN usage_counter_deltas.processed_at IS NULL
+    AND COALESCE(usage_counter_deltas.quota_accounting_status, 'pending') IN ('pending', 'failed')
+    THEN excluded.quota_accounting_status ELSE usage_counter_deltas.quota_accounting_status END
+"#,
+    )
+    .bind(&delta_id)
+    .bind(&candidate.id)
+    .bind(provider_id)
+    .bind(cost)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .bind(quota_epoch as i64)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .bind(cost)
+    .bind(snapshot.pricing_rule_version_at_usage.as_deref())
+    .bind(pricing_snapshot)
+    .bind(snapshot.quota_accounting_status)
+    .bind(snapshot.provider_dispatch_at_unix_secs as i64)
+    .execute(&mut **tx)
+    .await
+    .map_sql_err()?;
+    reconcile_settled_provider_quota_attempt(tx, &delta_id, candidate).await?;
+    Ok(())
+}
+
+async fn reconcile_settled_provider_quota_attempt(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    delta_id: &str,
+    candidate: &StoredRequestCandidate,
+) -> Result<(), DataLayerError> {
+    sqlx::query(
+        r#"
+UPDATE usage_counter_deltas AS delta
+SET provider_quota_cost_usd = COALESCE((
+      SELECT COALESCE(
+        CAST(json_extract(settlement.settlement_snapshot, '$.provider_quota_cost_usd') AS REAL),
+        CAST(settlement.billing_actual_total_cost_usd AS REAL),
+        CAST(usage_record.actual_total_cost_usd AS REAL)
+      )
+      FROM "usage" AS usage_record
+      JOIN usage_settlement_snapshots AS settlement
+        ON settlement.request_id = usage_record.request_id
+      LEFT JOIN usage_routing_snapshots AS routing
+        ON routing.request_id = usage_record.request_id
+      WHERE usage_record.request_id = ?
+        AND (
+          routing.candidate_id = ?
+          OR (routing.candidate_id IS NULL AND usage_record.provider_id = ? AND ?)
+        )
+        AND settlement.billing_status = 'settled'
+        AND COALESCE(usage_record.finalized_at, settlement.finalized_at) IS NOT NULL
+        AND (
+          json_extract(settlement.settlement_snapshot, '$.status') = 'complete'
+          OR lower(COALESCE(usage_record.endpoint_api_format, '')) = 'openai:search'
+        )
+      LIMIT 1
+    ), 0),
+    total_cost_usd_delta = COALESCE((
+      SELECT COALESCE(
+        CAST(json_extract(settlement.settlement_snapshot, '$.provider_quota_cost_usd') AS REAL),
+        CAST(settlement.billing_actual_total_cost_usd AS REAL),
+        CAST(usage_record.actual_total_cost_usd AS REAL)
+      )
+      FROM "usage" AS usage_record
+      JOIN usage_settlement_snapshots AS settlement
+        ON settlement.request_id = usage_record.request_id
+      LEFT JOIN usage_routing_snapshots AS routing
+        ON routing.request_id = usage_record.request_id
+      WHERE usage_record.request_id = ?
+        AND (
+          routing.candidate_id = ?
+          OR (routing.candidate_id IS NULL AND usage_record.provider_id = ? AND ?)
+        )
+        AND settlement.billing_status = 'settled'
+        AND COALESCE(usage_record.finalized_at, settlement.finalized_at) IS NOT NULL
+        AND (
+          json_extract(settlement.settlement_snapshot, '$.status') = 'complete'
+          OR lower(COALESCE(usage_record.endpoint_api_format, '')) = 'openai:search'
+        )
+      LIMIT 1
+    ), 0),
+    quota_accounting_status = 'ready'
+WHERE delta.id = ? AND delta.kind = 'provider_monthly'
+  AND delta.processed_at IS NULL
+  AND delta.quota_accounting_status IN ('pending', 'failed')
+  AND EXISTS (
+    SELECT 1
+    FROM "usage" AS usage_record
+    JOIN usage_settlement_snapshots AS settlement
+      ON settlement.request_id = usage_record.request_id
+    LEFT JOIN usage_routing_snapshots AS routing
+      ON routing.request_id = usage_record.request_id
+    WHERE usage_record.request_id = ?
+      AND (
+        routing.candidate_id = ?
+        OR (routing.candidate_id IS NULL AND usage_record.provider_id = ? AND ?)
+      )
+      AND settlement.billing_status = 'settled'
+      AND COALESCE(usage_record.finalized_at, settlement.finalized_at) IS NOT NULL
+      AND (
+        json_extract(settlement.settlement_snapshot, '$.status') = 'complete'
+        OR lower(COALESCE(usage_record.endpoint_api_format, '')) = 'openai:search'
+      )
+  )
+"#,
+    )
+    .bind(&candidate.request_id)
+    .bind(&candidate.id)
+    .bind(candidate.provider_id.as_deref())
+    .bind(candidate.status == RequestCandidateStatus::Success)
+    .bind(&candidate.request_id)
+    .bind(&candidate.id)
+    .bind(candidate.provider_id.as_deref())
+    .bind(candidate.status == RequestCandidateStatus::Success)
+    .bind(delta_id)
+    .bind(&candidate.request_id)
+    .bind(&candidate.id)
+    .bind(candidate.provider_id.as_deref())
+    .bind(candidate.status == RequestCandidateStatus::Success)
+    .execute(&mut **tx)
+    .await
+    .map_sql_err()?;
+    Ok(())
 }
 
 async fn insert_candidate_if_absent(
@@ -873,8 +1058,9 @@ mod tests {
     use super::SqliteRequestCandidateRepository;
     use crate::run_migrations;
     use aether_data_contracts::repository::candidates::{
-        RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
-        UpsertRequestCandidateRecord,
+        ProviderQuotaDispatchSnapshot, RequestCandidateReadRepository, RequestCandidateStatus,
+        RequestCandidateWriteRepository, UpsertRequestCandidateRecord,
+        PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY, PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
     };
     use serde_json::json;
 
@@ -966,6 +1152,136 @@ mod tests {
                 .expect("old candidates should delete"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_candidate_dispatch_persists_attempt_quota_delta_atomically() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteRequestCandidateRepository::new(pool.clone());
+        let snapshot = ProviderQuotaDispatchSnapshot {
+            schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
+            provider_billing_type_at_usage: "monthly_quota".to_string(),
+            quota_epoch_start_at_usage: Some(1_699_999_980),
+            provider_dispatch_at_unix_secs: 1_700_000_040,
+            pricing_rule_version_at_usage: Some("dispatch-pricing-v1".to_string()),
+            provider_pricing_snapshot_at_usage: Some(json!({"provider_id": "provider-1"})),
+            provider_quota_cost_usd: None,
+            quota_accounting_status: "pending".to_string(),
+        };
+        let mut candidate = sample_upsert(
+            "candidate-quota-attempt",
+            RequestCandidateStatus::Pending,
+            Some(json!({
+                PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY: snapshot
+            })),
+            1_700_000_040_000,
+        );
+        candidate.request_id = "request-quota-attempt".to_string();
+        candidate.started_at_unix_ms = Some(1_700_000_040_000);
+        repository
+            .upsert(candidate)
+            .await
+            .expect("candidate dispatch should persist");
+
+        let delta = sqlx::query_as::<_, (String, String, i64, Option<f64>, String)>(
+            "SELECT request_id, provider_billing_type_at_usage, provider_dispatch_at_unix_secs, provider_quota_cost_usd, quota_accounting_status FROM usage_counter_deltas WHERE kind = 'provider_monthly'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("attempt delta should load");
+        assert_eq!(delta.0, "candidate-quota-attempt");
+        assert_eq!(delta.1, "monthly_quota");
+        assert_eq!(delta.2, 1_700_000_040);
+        assert_eq!(delta.3, Some(0.0));
+        assert_eq!(delta.4, "pending");
+    }
+
+    #[tokio::test]
+    async fn sqlite_candidate_dispatch_reconciles_earlier_settlement_without_regression() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        sqlx::raw_sql(
+            r#"
+INSERT INTO "usage" (
+  request_id, provider_id, status, billing_status, endpoint_api_format,
+  actual_total_cost_usd, finalized_at, created_at_unix_ms
+) VALUES (
+  'request-settled-first', 'provider-1', 'completed', 'settled', 'openai:chat', 2.5, 1700000100, 1700000100
+);
+INSERT INTO usage_settlement_snapshots (
+  request_id, billing_status, billing_actual_total_cost_usd,
+  finalized_at, settlement_snapshot, created_at, updated_at
+) VALUES (
+  'request-settled-first', 'settled', 2.5, 1700000100,
+  '{"status":"complete","provider_quota_cost_usd":2.5}', 1700000100, 1700000100
+);
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("settled usage should seed");
+
+        let repository = SqliteRequestCandidateRepository::new(pool.clone());
+        let snapshot = ProviderQuotaDispatchSnapshot {
+            schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
+            provider_billing_type_at_usage: "monthly_quota".to_string(),
+            quota_epoch_start_at_usage: Some(1_699_999_980),
+            provider_dispatch_at_unix_secs: 1_700_000_100,
+            pricing_rule_version_at_usage: Some("dispatch-pricing-v1".to_string()),
+            provider_pricing_snapshot_at_usage: Some(json!({"provider_id": "provider-1"})),
+            provider_quota_cost_usd: None,
+            quota_accounting_status: "pending".to_string(),
+        };
+        let mut candidate = sample_upsert(
+            "candidate-settled-first",
+            RequestCandidateStatus::Success,
+            Some(json!({ PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY: snapshot })),
+            1_700_000_100_000,
+        );
+        candidate.request_id = "request-settled-first".to_string();
+        repository
+            .upsert(candidate.clone())
+            .await
+            .expect("late candidate should persist");
+
+        let reconciled: (f64, String) = sqlx::query_as(
+            "SELECT provider_quota_cost_usd, quota_accounting_status FROM usage_counter_deltas WHERE request_id = 'candidate-settled-first'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("reconciled delta should load");
+        assert_eq!(reconciled, (2.5, "ready".to_string()));
+
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET provider_quota_cost_usd = 3, total_cost_usd_delta = 3 WHERE request_id = 'candidate-settled-first'",
+        )
+        .execute(&pool)
+        .await
+        .expect("resolved delta should update");
+        repository
+            .upsert(candidate)
+            .await
+            .expect("duplicate candidate should remain idempotent");
+        let retained: (f64, String) = sqlx::query_as(
+            "SELECT provider_quota_cost_usd, quota_accounting_status FROM usage_counter_deltas WHERE request_id = 'candidate-settled-first'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("retained delta should load");
+        assert_eq!(retained, (3.0, "ready".to_string()));
     }
 
     #[tokio::test]

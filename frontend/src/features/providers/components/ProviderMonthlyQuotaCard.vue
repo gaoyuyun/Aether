@@ -87,6 +87,13 @@
           >
             {{ legacyT('有效起点') }}：{{ formatPendingReset(window.rolling_start) }}
           </span>
+          <span
+            v-if="window.status === 'failed' && window.rebuild_error"
+            class="col-span-2 text-[11px] text-red-600 dark:text-red-400"
+            data-testid="provider-quota-window-error"
+          >
+            {{ legacyT('失败原因') }}：{{ formatRebuildError(window.rebuild_error) }}
+          </span>
         </div>
       </div>
     </div>
@@ -153,6 +160,13 @@ function formatWindowUsage(window: ProviderQuotaWindow): string {
   const limit = `$${window.limit_usd.toFixed(2)}`
   if (window.status !== 'ready' || window.used_usd == null) return limit
   return `$${window.used_usd.toFixed(2)} / ${limit}`
+}
+
+function formatRebuildError(error: string): string {
+  if (error === 'quota cost is unavailable for a dispatched monthly request') {
+    return legacyT('请求已发送，但无法计算月卡费用；请检查该模型的价格配置')
+  }
+  return error
 }
 
 function formatPendingReset(value: string): string {

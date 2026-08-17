@@ -197,16 +197,18 @@ CREATE TABLE IF NOT EXISTS public.usage_counter_deltas (
     provider_quota_cost_usd double precision,
     pricing_rule_version_at_usage character varying(128),
     provider_pricing_snapshot_at_usage jsonb,
-    quota_delta_sequence bigint,
+    quota_delta_sequence bigserial NOT NULL,
     quota_accounting_status character varying(32),
     created_at timestamp with time zone NOT NULL,
     processed_at timestamp with time zone
 );
 
 ALTER TABLE ONLY public.usage_counter_deltas ADD CONSTRAINT usage_counter_deltas_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.usage_counter_deltas ADD CONSTRAINT ix_usage_counter_deltas_quota_sequence UNIQUE (quota_delta_sequence);
 CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_unprocessed ON public.usage_counter_deltas USING btree (created_at, id);
 CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_processed ON public.usage_counter_deltas USING btree (processed_at, created_at, id);
 CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_request_kind ON public.usage_counter_deltas USING btree (request_id, kind, target_id);
+CREATE INDEX IF NOT EXISTS ix_usage_counter_deltas_provider_quota_pending ON public.usage_counter_deltas USING btree (kind, target_id, quota_accounting_status, quota_delta_sequence);
 
 CREATE TABLE IF NOT EXISTS public.usage_settlement_snapshots (
     request_id character varying(128) NOT NULL,

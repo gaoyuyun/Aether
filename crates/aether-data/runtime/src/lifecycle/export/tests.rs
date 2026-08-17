@@ -86,7 +86,11 @@ SELECT name
 FROM sqlite_master
 WHERE type = 'table'
   AND name NOT LIKE 'sqlite_%'
-  AND name NOT IN ('_sqlx_migrations', 'schema_backfills')
+  AND name NOT IN (
+      '_sqlx_migrations',
+      'schema_backfills',
+      'provider_quota_window_counters_legacy'
+  )
 ORDER BY name
 "#,
     )

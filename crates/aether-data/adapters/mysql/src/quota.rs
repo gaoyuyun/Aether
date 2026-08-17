@@ -50,7 +50,16 @@ fn quota_snapshot_select() -> SelectQuery<'static> {
             .with_mysql("quota_expires_at"),
         )
         .alias("quota_expires_at_unix_secs"),
-        SelectColumn::expr("is_active"),
+        SelectColumn::expr(
+            DialectSql::dialect(
+                "CASE WHEN is_active AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.quota_epoch_start = CAST(FLOOR(EXTRACT(EPOCH FROM providers.quota_last_reset_at) / 60) * 60 AS BIGINT) AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_epoch_start_at_usage = CAST(FLOOR(EXTRACT(EPOCH FROM providers.quota_last_reset_at) / 60) * 60 AS BIGINT) AND delta.quota_accounting_status IN ('pending', 'failed')) THEN TRUE ELSE FALSE END",
+                "CASE WHEN is_active = 1 AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.quota_epoch_start = (providers.quota_last_reset_at / 60) * 60 AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_epoch_start_at_usage = (providers.quota_last_reset_at / 60) * 60 AND delta.quota_accounting_status IN ('pending', 'failed')) THEN 1 ELSE 0 END",
+            )
+            .with_mysql(
+                "CASE WHEN is_active = 1 AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.quota_epoch_start = (providers.quota_last_reset_at DIV 60) * 60 AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_epoch_start_at_usage = (providers.quota_last_reset_at DIV 60) * 60 AND delta.quota_accounting_status IN ('pending', 'failed')) THEN 1 ELSE 0 END",
+            ),
+        )
+        .alias("is_active"),
     ])
 }
 

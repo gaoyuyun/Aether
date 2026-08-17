@@ -1612,9 +1612,140 @@ references_table = "providers"
 references_columns = ["id"]
 on_delete = "cascade"
 
-[table.models]
+[table.provider_quota_maintenance_state]
+domain = "provider_catalog"
+order = 89
+primary_key = ["provider_id", "quota_epoch_start", "task_kind"]
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "quota_epoch_start"
+type = "unix_seconds"
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "task_kind"
+type = "text"
+length = 32
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "status"
+type = "text"
+length = 32
+default = "pending"
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "cursor_dispatch_at"
+type = "unix_seconds"
+default = 0
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "cursor_request_id"
+type = "text"
+length = 128
+default = ""
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "cutover_delta_sequence"
+type = "int64"
+nullable = true
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "absorbed_delta_sequence"
+type = "int64"
+default = 0
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "included_rows"
+type = "int64"
+default = 0
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "excluded_payg_rows"
+type = "int64"
+default = 0
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "excluded_free_tier_rows"
+type = "int64"
+default = 0
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "unknown_rows"
+type = "int64"
+default = 0
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "lock_owner"
+type = "text"
+length = 128
+nullable = true
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "lock_expires_at"
+type = "unix_seconds"
+nullable = true
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "last_error"
+type = "long_text"
+nullable = true
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.provider_quota_maintenance_state.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.provider_quota_maintenance_state.foreign_keys]]
+name = "provider_quota_maintenance_state_provider_id_fkey"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[[table.provider_quota_maintenance_state.indexes]]
+name = "ix_provider_quota_maintenance_state_status"
+columns = ["status", "updated_at"]
+
+[table.provider_quota_applied_watermarks]
 domain = "provider_catalog"
 order = 90
+primary_key = ["provider_id", "quota_epoch_start"]
+
+[[table.provider_quota_applied_watermarks.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.provider_quota_applied_watermarks.columns]]
+name = "quota_epoch_start"
+type = "unix_seconds"
+
+[[table.provider_quota_applied_watermarks.columns]]
+name = "applied_delta_sequence"
+type = "int64"
+default = 0
+
+[[table.provider_quota_applied_watermarks.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.provider_quota_applied_watermarks.foreign_keys]]
+name = "provider_quota_applied_watermarks_provider_id_fkey"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "cascade"
+
+[table.models]
+domain = "provider_catalog"
+order = 91
 primary_key = ["id"]
 
 [[table.models.columns]]

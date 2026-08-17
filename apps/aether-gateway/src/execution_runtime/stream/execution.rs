@@ -125,7 +125,8 @@ use crate::provider_pool_demand::{
 };
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, persist_local_request_candidate_status_record,
-    record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
+    record_local_request_candidate_dispatch_snapshot, record_local_request_candidate_status,
+    record_local_request_candidate_status_snapshot,
     record_request_terminal_local_request_candidate_status,
     snapshot_local_request_candidate_status, try_enqueue_local_request_candidate_status_snapshot,
     LocalRequestCandidateStatusSnapshot,
@@ -3939,7 +3940,7 @@ async fn execute_execution_runtime_stream_inner(
         lifecycle_pending_recorded = true;
     }
     if let Some(snapshot) = request_candidate_status_snapshot.clone() {
-        record_local_request_candidate_status_snapshot(
+        record_local_request_candidate_dispatch_snapshot(
             state,
             &snapshot,
             SchedulerRequestCandidateStatusUpdate {
@@ -3952,7 +3953,7 @@ async fn execute_execution_runtime_stream_inner(
                 finished_at_unix_ms: None,
             },
         )
-        .await;
+        .await?;
     }
     let result = execute_execution_runtime_stream_after_pending(
         state,
