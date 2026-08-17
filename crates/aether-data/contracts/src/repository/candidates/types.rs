@@ -6,6 +6,92 @@ use crate::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 
+pub const PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY: &str = "provider_quota_dispatch_snapshot";
+pub const PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProviderQuotaDispatchSnapshot {
+    pub schema_version: u32,
+    pub provider_billing_type_at_usage: String,
+    pub quota_epoch_start_at_usage: Option<u64>,
+    pub provider_dispatch_at_unix_secs: u64,
+    pub pricing_rule_version_at_usage: Option<String>,
+    pub provider_pricing_snapshot_at_usage: Option<serde_json::Value>,
+    pub provider_quota_cost_usd: Option<f64>,
+    pub quota_accounting_status: String,
+}
+
+impl ProviderQuotaDispatchSnapshot {
+    pub fn validate(&self) -> Result<(), crate::DataLayerError> {
+        if self.schema_version != PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION {
+            return Err(crate::DataLayerError::InvalidInput(format!(
+                "unsupported provider quota dispatch snapshot schema version: {}",
+                self.schema_version
+            )));
+        }
+        if self.provider_billing_type_at_usage.trim().is_empty()
+            || self.quota_accounting_status.trim().is_empty()
+        {
+            return Err(crate::DataLayerError::InvalidInput(
+                "provider quota dispatch snapshot identity is empty".to_string(),
+            ));
+        }
+        if self
+            .provider_quota_cost_usd
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(crate::DataLayerError::InvalidInput(
+                "provider quota dispatch snapshot cost is invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_monthly_quota(&self) -> bool {
+        self.provider_billing_type_at_usage
+            .eq_ignore_ascii_case("monthly_quota")
+    }
+}
+
+pub fn provider_quota_dispatch_snapshot(
+    extra_data: Option<&serde_json::Value>,
+) -> Result<Option<ProviderQuotaDispatchSnapshot>, crate::DataLayerError> {
+    let Some(value) = extra_data
+        .and_then(serde_json::Value::as_object)
+        .and_then(|object| object.get(PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let snapshot =
+        serde_json::from_value::<ProviderQuotaDispatchSnapshot>(value.clone()).map_err(|err| {
+            crate::DataLayerError::UnexpectedValue(format!(
+                "invalid provider quota dispatch snapshot: {err}"
+            ))
+        })?;
+    snapshot.validate()?;
+    Ok(Some(snapshot))
+}
+
+pub fn attach_provider_quota_dispatch_snapshot(
+    extra_data: &mut Option<serde_json::Value>,
+    snapshot: &ProviderQuotaDispatchSnapshot,
+) -> Result<(), crate::DataLayerError> {
+    snapshot.validate()?;
+    let value = serde_json::to_value(snapshot).map_err(|err| {
+        crate::DataLayerError::UnexpectedValue(format!(
+            "failed to serialize provider quota dispatch snapshot: {err}"
+        ))
+    })?;
+    let mut object = match extra_data.take() {
+        Some(serde_json::Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    };
+    object.insert(PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY.to_string(), value);
+    *extra_data = Some(serde_json::Value::Object(object));
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestCandidateStatus {

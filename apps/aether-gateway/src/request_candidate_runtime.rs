@@ -1,6 +1,7 @@
 use aether_contracts::ExecutionPlan;
 use aether_data_contracts::repository::candidates::{
-    RequestCandidateStatus, StoredRequestCandidate, UpsertRequestCandidateRecord,
+    provider_quota_dispatch_snapshot, RequestCandidateStatus, StoredRequestCandidate,
+    UpsertRequestCandidateRecord,
 };
 use aether_scheduler_core::{
     build_execution_request_candidate_seed, build_local_request_candidate_status_record,
@@ -218,6 +219,18 @@ pub(crate) struct LocalRequestCandidateStatusSnapshot {
     provider_id: String,
     endpoint_id: String,
     key_id: String,
+    model_id: Option<String>,
+    global_model_name: Option<String>,
+    provider_api_format: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderQuotaDispatchContext {
+    pub(crate) provider_id: String,
+    pub(crate) key_id: String,
+    pub(crate) model_id: Option<String>,
+    pub(crate) global_model_name: Option<String>,
+    pub(crate) provider_api_format: String,
 }
 
 #[async_trait]
@@ -236,6 +249,14 @@ pub(crate) trait RequestCandidateRuntimeWriter: Sync {
         &self,
         candidate: UpsertRequestCandidateRecord,
     ) -> Result<Option<StoredRequestCandidate>, GatewayError>;
+
+    async fn prepare_provider_quota_dispatch(
+        &self,
+        _context: &ProviderQuotaDispatchContext,
+        _candidate: &mut UpsertRequestCandidateRecord,
+    ) -> Result<(), GatewayError> {
+        Ok(())
+    }
 
     async fn enqueue_request_candidate_status(
         &self,
@@ -414,7 +435,92 @@ pub(crate) fn snapshot_local_request_candidate_status(
         provider_id: plan.provider_id.clone(),
         endpoint_id: plan.endpoint_id.clone(),
         key_id: plan.key_id.clone(),
+        model_id: report_context_string(report_context, "model_id"),
+        global_model_name: report_context_string(report_context, "global_model_name"),
+        provider_api_format: plan.provider_api_format.clone(),
     })
+}
+
+fn report_context_string(report_context: Option<&Value>, key: &str) -> Option<String> {
+    report_context
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn plan_provider_quota_dispatch_context(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> ProviderQuotaDispatchContext {
+    ProviderQuotaDispatchContext {
+        provider_id: plan.provider_id.clone(),
+        key_id: plan.key_id.clone(),
+        model_id: report_context_string(report_context, "model_id"),
+        global_model_name: report_context_string(report_context, "global_model_name"),
+        provider_api_format: plan.provider_api_format.clone(),
+    }
+}
+
+fn snapshot_provider_quota_dispatch_context(
+    snapshot: &LocalRequestCandidateStatusSnapshot,
+) -> ProviderQuotaDispatchContext {
+    ProviderQuotaDispatchContext {
+        provider_id: snapshot.provider_id.clone(),
+        key_id: snapshot.key_id.clone(),
+        model_id: snapshot.model_id.clone(),
+        global_model_name: snapshot.global_model_name.clone(),
+        provider_api_format: snapshot.provider_api_format.clone(),
+    }
+}
+
+async fn persist_local_request_candidate_dispatch_record(
+    state: &(impl RequestCandidateRuntimeWriter + ?Sized),
+    context: &ProviderQuotaDispatchContext,
+    mut record: UpsertRequestCandidateRecord,
+) -> Result<(), GatewayError> {
+    state
+        .prepare_provider_quota_dispatch(context, &mut record)
+        .await?;
+    let is_monthly_quota = provider_quota_dispatch_snapshot(record.extra_data.as_ref())
+        .map_err(|err| GatewayError::Internal(err.to_string()))?
+        .is_some_and(|snapshot| snapshot.is_monthly_quota());
+    if !is_monthly_quota {
+        persist_local_request_candidate_status_record(state, record).await;
+        return Ok(());
+    }
+
+    let candidate_id = record.id.clone();
+    match state.upsert_request_candidate(record).await? {
+        Some(_) => Ok(()),
+        None => Err(GatewayError::Internal(format!(
+            "monthly provider quota dispatch snapshot writer is unavailable for candidate {candidate_id}"
+        ))),
+    }
+}
+
+pub(crate) async fn record_local_request_candidate_dispatch(
+    state: &(impl RequestCandidateRuntimeWriter + ?Sized),
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    status_update: SchedulerRequestCandidateStatusUpdate,
+) -> Result<(), GatewayError> {
+    let Some(record) =
+        build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
+            plan,
+            report_context,
+            status_update,
+        })
+    else {
+        return Ok(());
+    };
+    persist_local_request_candidate_dispatch_record(
+        state,
+        &plan_provider_quota_dispatch_context(plan, report_context),
+        record,
+    )
+    .await
 }
 
 pub(crate) async fn persist_local_request_candidate_status_record(
@@ -622,6 +728,20 @@ pub(crate) async fn record_local_request_candidate_status_snapshot(
 ) {
     let record = build_local_request_candidate_status_snapshot_record(snapshot, status_update);
     persist_local_request_candidate_status_record(state, record).await;
+}
+
+pub(crate) async fn record_local_request_candidate_dispatch_snapshot(
+    state: &(impl RequestCandidateRuntimeWriter + ?Sized),
+    snapshot: &LocalRequestCandidateStatusSnapshot,
+    status_update: SchedulerRequestCandidateStatusUpdate,
+) -> Result<(), GatewayError> {
+    let record = build_local_request_candidate_status_snapshot_record(snapshot, status_update);
+    persist_local_request_candidate_dispatch_record(
+        state,
+        &snapshot_provider_quota_dispatch_context(snapshot),
+        record,
+    )
+    .await
 }
 
 pub(crate) async fn record_report_request_candidate_status(
@@ -1112,15 +1232,17 @@ mod tests {
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::candidates::{
-        RequestCandidateReadRepository, RequestCandidateStatus, StoredRequestCandidate,
-        UpsertRequestCandidateRecord,
+        attach_provider_quota_dispatch_snapshot, provider_quota_dispatch_snapshot,
+        ProviderQuotaDispatchSnapshot, RequestCandidateReadRepository, RequestCandidateStatus,
+        StoredRequestCandidate, UpsertRequestCandidateRecord,
+        PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
     };
     use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
     use serde_json::json;
 
     use super::{
         ensure_execution_request_candidate_slot, persist_available_local_candidate,
-        record_report_request_candidate_status,
+        record_local_request_candidate_dispatch, record_report_request_candidate_status,
         record_request_terminal_local_request_candidate_status,
         record_request_terminal_report_request_candidate_status,
         request_candidate_marks_request_terminal, resolve_request_candidate_required_capabilities,
@@ -1187,6 +1309,92 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MonthlyDispatchWriter {
+        records: Mutex<Vec<UpsertRequestCandidateRecord>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RequestCandidateRuntimeWriter for MonthlyDispatchWriter {
+        fn has_request_candidate_data_writer(&self) -> bool {
+            true
+        }
+
+        async fn prepare_provider_quota_dispatch(
+            &self,
+            context: &super::ProviderQuotaDispatchContext,
+            candidate: &mut UpsertRequestCandidateRecord,
+        ) -> Result<(), crate::GatewayError> {
+            assert_eq!(context.provider_id, "provider-request-candidate-seed-123");
+            assert_eq!(context.key_id, "key-request-candidate-seed-123");
+            assert_eq!(context.model_id.as_deref(), Some("model-dispatch"));
+            assert_eq!(context.global_model_name.as_deref(), Some("gpt-5"));
+            assert_eq!(context.provider_api_format, "openai:chat");
+            attach_provider_quota_dispatch_snapshot(
+                &mut candidate.extra_data,
+                &ProviderQuotaDispatchSnapshot {
+                    schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
+                    provider_billing_type_at_usage: "monthly_quota".to_string(),
+                    quota_epoch_start_at_usage: Some(1_699_999_980),
+                    provider_dispatch_at_unix_secs: 1_700_000_040,
+                    pricing_rule_version_at_usage: Some("dispatch-v1".to_string()),
+                    provider_pricing_snapshot_at_usage: Some(json!({
+                        "provider_id": context.provider_id.clone(),
+                        "model_id": context.model_id.clone(),
+                    })),
+                    provider_quota_cost_usd: Some(0.25),
+                    quota_accounting_status: "ready".to_string(),
+                },
+            )
+            .map_err(|error| crate::GatewayError::Internal(error.to_string()))
+        }
+
+        async fn upsert_request_candidate(
+            &self,
+            candidate: UpsertRequestCandidateRecord,
+        ) -> Result<Option<StoredRequestCandidate>, crate::GatewayError> {
+            self.records
+                .lock()
+                .expect("monthly dispatch records lock")
+                .push(candidate.clone());
+            StoredRequestCandidate::new(
+                candidate.id,
+                candidate.request_id,
+                candidate.user_id,
+                candidate.api_key_id,
+                candidate.username,
+                candidate.api_key_name,
+                candidate.candidate_index as i32,
+                candidate.retry_index as i32,
+                candidate.provider_id,
+                candidate.endpoint_id,
+                candidate.key_id,
+                candidate.status,
+                candidate.skip_reason,
+                candidate.is_cached.unwrap_or(false),
+                candidate.status_code.map(i32::from),
+                candidate.error_type,
+                candidate.error_message,
+                candidate.latency_ms.map(|value| value as i32),
+                candidate.concurrent_requests.map(|value| value as i32),
+                candidate.extra_data,
+                candidate.required_capabilities,
+                candidate.created_at_unix_ms.unwrap_or(1) as i64,
+                candidate.started_at_unix_ms.map(|value| value as i64),
+                candidate.finished_at_unix_ms.map(|value| value as i64),
+            )
+            .map(Some)
+            .map_err(|error| crate::GatewayError::Internal(error.to_string()))
+        }
+
+        async fn enqueue_request_candidate_status(
+            &self,
+            _candidate: UpsertRequestCandidateRecord,
+        ) -> Result<Option<()>, crate::GatewayError> {
+            panic!("monthly dispatch must be durably upserted before upstream execution")
+        }
+    }
+
     fn sample_plan() -> ExecutionPlan {
         ExecutionPlan {
             request_id: "req-request-candidate-seed-123".to_string(),
@@ -1241,6 +1449,49 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, RequestCandidateStatus::Streaming);
         assert_eq!(records[0].status_code, Some(200));
+    }
+
+    #[tokio::test]
+    async fn monthly_dispatch_is_durably_persisted_with_attempt_snapshot() {
+        let mut plan = sample_plan();
+        plan.candidate_id = Some("candidate-monthly-dispatch".to_string());
+        let writer = MonthlyDispatchWriter::default();
+        let report_context = json!({
+            "request_id": plan.request_id.clone(),
+            "candidate_id": "candidate-monthly-dispatch",
+            "model_id": "model-dispatch",
+            "global_model_name": "gpt-5",
+        });
+
+        record_local_request_candidate_dispatch(
+            &writer,
+            &plan,
+            Some(&report_context),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Pending,
+                status_code: None,
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(1_700_000_040_000),
+                finished_at_unix_ms: None,
+            },
+        )
+        .await
+        .expect("monthly dispatch should persist");
+
+        let records = writer
+            .records
+            .lock()
+            .expect("monthly dispatch records lock");
+        assert_eq!(records.len(), 1);
+        let snapshot = provider_quota_dispatch_snapshot(records[0].extra_data.as_ref())
+            .expect("dispatch snapshot should parse")
+            .expect("dispatch snapshot should exist");
+        assert_eq!(snapshot.provider_billing_type_at_usage, "monthly_quota");
+        assert_eq!(snapshot.quota_epoch_start_at_usage, Some(1_699_999_980));
+        assert_eq!(snapshot.provider_dispatch_at_unix_secs, 1_700_000_040);
+        assert_eq!(snapshot.provider_quota_cost_usd, Some(0.25));
     }
 
     fn sample_minimal_candidate() -> SchedulerMinimalCandidateSelectionCandidate {

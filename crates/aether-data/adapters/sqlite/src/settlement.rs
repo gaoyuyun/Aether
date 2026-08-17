@@ -42,6 +42,7 @@ SELECT
   ) AS wallet_gift_balance_after,
   CAST(usage_settlement_snapshots.provider_monthly_used_usd AS REAL) AS provider_monthly_used_usd,
   usage_record.provider_id,
+  usage_routing_snapshots.candidate_id AS provider_attempt_id,
   usage_record.created_at_unix_ms AS usage_created_at_unix_secs,
   COALESCE(
     json_extract(usage_settlement_snapshots.settlement_snapshot, '$.pricing_snapshot.provider_billing_type'),
@@ -60,6 +61,8 @@ LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = usage_record.request_id
 LEFT JOIN providers AS provider
   ON provider.id = usage_record.provider_id
+LEFT JOIN usage_routing_snapshots
+  ON usage_routing_snapshots.request_id = usage_record.request_id
 WHERE usage_record.request_id = ?
 "#;
 
@@ -225,6 +228,122 @@ async fn enqueue_provider_monthly_usage_delta_sqlite(
         .await
         .map_sql_err()?;
     Ok(())
+}
+
+async fn reconcile_provider_monthly_attempt_sqlite(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    candidate_id: &str,
+    actual_cost_usd: f64,
+    updated_at: i64,
+) -> Result<bool, DataLayerError> {
+    let delta_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("provider-quota-attempt:{}", candidate_id).as_bytes(),
+    )
+    .to_string();
+    let row = sqlx::query(
+        "SELECT provider_quota_cost_usd, quota_accounting_status, processed_at, provider_pricing_snapshot_at_usage, pricing_rule_version_at_usage, provider_dispatch_at_unix_secs, quota_epoch_start_at_usage, target_id FROM usage_counter_deltas WHERE id = ? AND kind = 'provider_monthly' LIMIT 1",
+    )
+    .bind(&delta_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let base_cost = row
+        .try_get::<Option<f64>, _>("provider_quota_cost_usd")
+        .map_sql_err()?
+        .unwrap_or(0.0);
+    let base_status = row
+        .try_get::<Option<String>, _>("quota_accounting_status")
+        .map_sql_err()?;
+    let processed_at = row
+        .try_get::<Option<i64>, _>("processed_at")
+        .map_sql_err()?;
+    let reconciled_cost = if base_status.as_deref() == Some("ready") {
+        actual_cost_usd.max(base_cost)
+    } else {
+        actual_cost_usd
+    };
+    if !reconciled_cost.is_finite() || reconciled_cost < 0.0 {
+        return Err(DataLayerError::InvalidInput(
+            "provider quota attempt settlement cost is invalid".to_string(),
+        ));
+    }
+    if base_status.as_deref() != Some("ready") && reconciled_cost <= SETTLEMENT_EPSILON_USD {
+        return Ok(true);
+    }
+    if processed_at.is_none() {
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET provider_quota_cost_usd = ?, total_cost_usd_delta = ?, quota_accounting_status = 'ready' WHERE id = ? AND processed_at IS NULL",
+        )
+        .bind(reconciled_cost)
+        .bind(reconciled_cost)
+        .bind(&delta_id)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+        return Ok(true);
+    }
+    let adjustment = reconciled_cost - base_cost;
+    if adjustment.abs() <= SETTLEMENT_EPSILON_USD {
+        return Ok(true);
+    }
+    let adjustment_id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("provider-quota-attempt-actual:{}", candidate_id).as_bytes(),
+    )
+    .to_string();
+    let pricing_snapshot: Option<String> = row
+        .try_get("provider_pricing_snapshot_at_usage")
+        .map_sql_err()?;
+    let pricing_rule_version: Option<String> =
+        row.try_get("pricing_rule_version_at_usage").map_sql_err()?;
+    let dispatch_at: i64 = row
+        .try_get("provider_dispatch_at_unix_secs")
+        .map_sql_err()?;
+    let epoch: i64 = row.try_get("quota_epoch_start_at_usage").map_sql_err()?;
+    let target_id: String = row.try_get("target_id").map_sql_err()?;
+    sqlx::query(
+        r#"
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage, quota_delta_sequence,
+  quota_accounting_status, created_at
+)
+VALUES (?, ?, 'provider_monthly', ?, ?, ?, 'monthly_quota', ?, ?, ?, ?, ?,
+  (SELECT COALESCE(MAX(quota_delta_sequence), 0) + 1 FROM usage_counter_deltas), 'ready', ?)
+ON CONFLICT (id) DO NOTHING
+"#,
+    )
+    .bind(adjustment_id)
+    .bind(candidate_id)
+    .bind(target_id)
+    .bind(adjustment)
+    .bind(dispatch_at)
+    .bind(epoch)
+    .bind(dispatch_at)
+    .bind(adjustment)
+    .bind(pricing_rule_version)
+    .bind(pricing_snapshot)
+    .bind(updated_at)
+    .execute(&mut **tx)
+    .await
+    .map_sql_err()?;
+    if base_status.as_deref() != Some("ready") {
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET quota_accounting_status = 'reconciled' WHERE id = ?",
+        )
+        .bind(delta_id)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Default)]
@@ -469,7 +588,26 @@ impl SettlementWriteRepository for SqliteSettlementRepository {
         let quota_epoch_start_at_usage = usage_row
             .try_get::<Option<i64>, _>("quota_epoch_start_at_usage")
             .map_sql_err()?;
-        if provider_billing_type_at_usage.eq_ignore_ascii_case("monthly_quota") {
+        let provider_attempt_id = usage_row
+            .try_get::<Option<String>, _>("provider_attempt_id")
+            .map_sql_err()?;
+        let attempt_reconciled = if let Some(candidate_id) = provider_attempt_id.as_deref() {
+            reconcile_provider_monthly_attempt_sqlite(
+                &mut tx,
+                candidate_id,
+                usage_row
+                    .try_get::<Option<f64>, _>("provider_quota_cost_usd")
+                    .map_sql_err()?
+                    .unwrap_or(input.actual_total_cost_usd),
+                updated_at,
+            )
+            .await?
+        } else {
+            false
+        };
+        if !attempt_reconciled
+            && provider_billing_type_at_usage.eq_ignore_ascii_case("monthly_quota")
+        {
             if let (Some(provider_id), Some(quota_epoch_start_at_usage)) = (
                 input
                     .provider_id
@@ -789,13 +927,74 @@ WHERE id = ?
 
 #[cfg(test)]
 mod tests {
-    use super::SqliteSettlementRepository;
+    use super::{reconcile_provider_monthly_attempt_sqlite, SqliteSettlementRepository};
     use crate::run_migrations;
     use aether_data_contracts::repository::settlement::{
         SettlementWriteRepository, UsageSettlementInput,
     };
     use sqlx::Row;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn sqlite_reconciles_processed_attempt_with_idempotent_adjustment() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let candidate_id = "candidate-settlement-adjustment";
+        let base_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("provider-quota-attempt:{candidate_id}").as_bytes(),
+        )
+        .to_string();
+        sqlx::query(
+            r#"
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  usage_created_at_unix_secs, provider_billing_type_at_usage,
+  quota_epoch_start_at_usage, provider_dispatch_at_unix_secs,
+  provider_quota_cost_usd, pricing_rule_version_at_usage,
+  provider_pricing_snapshot_at_usage, quota_delta_sequence,
+  quota_accounting_status, created_at, processed_at
+) VALUES (?, ?, 'provider_monthly', 'provider-1', 1.0, 1700000040,
+          'monthly_quota', 1699999980, 1700000040, 1.0, 'dispatch-v1',
+          '{"provider_id":"provider-1"}', 1, 'ready', 1700000040, 1700000041)
+"#,
+        )
+        .bind(&base_id)
+        .bind(candidate_id)
+        .execute(&pool)
+        .await
+        .expect("processed attempt delta should seed");
+
+        for _ in 0..2 {
+            let mut tx = pool.begin().await.expect("transaction should begin");
+            assert!(reconcile_provider_monthly_attempt_sqlite(
+                &mut tx,
+                candidate_id,
+                2.5,
+                1_700_000_100
+            )
+            .await
+            .expect("attempt should reconcile"));
+            tx.commit().await.expect("transaction should commit");
+        }
+
+        let rows: Vec<(String, f64, String)> = sqlx::query_as(
+            "SELECT id, total_cost_usd_delta, quota_accounting_status FROM usage_counter_deltas ORDER BY quota_delta_sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("attempt deltas should load");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (base_id, 1.0, "ready".to_string()));
+        assert_eq!(rows[1].1, 1.5);
+        assert_eq!(rows[1].2, "ready");
+    }
 
     #[tokio::test]
     async fn sqlite_repository_settles_usage_once() {

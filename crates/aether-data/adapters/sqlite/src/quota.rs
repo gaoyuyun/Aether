@@ -42,7 +42,11 @@ fn quota_snapshot_select() -> SelectQuery<'static> {
             "quota_expires_at",
         ))
         .alias("quota_expires_at_unix_secs"),
-        SelectColumn::expr("is_active"),
+        SelectColumn::expr(DialectSql::dialect(
+            "CASE WHEN is_active AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_accounting_status = 'pending') THEN TRUE ELSE FALSE END",
+            "CASE WHEN is_active = 1 AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_accounting_status = 'pending') THEN 1 ELSE 0 END",
+        ))
+        .alias("is_active"),
     ])
 }
 
@@ -281,6 +285,56 @@ mod tests {
         .await
         .expect("window counter count should load");
         assert_eq!(remaining_window_counters, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_fail_closes_on_unresolved_monthly_attempt() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_provider_quotas(&pool).await;
+        sqlx::query(
+            r#"
+INSERT INTO usage_counter_deltas (
+  id, request_id, kind, target_id, total_cost_usd_delta,
+  provider_billing_type_at_usage, quota_epoch_start_at_usage,
+  provider_dispatch_at_unix_secs, provider_quota_cost_usd,
+  quota_delta_sequence, quota_accounting_status, created_at
+) VALUES (
+  'pending-attempt', 'candidate-pending', 'provider_monthly', 'provider-1', 0,
+  'monthly_quota', 960, 1020, 0, 1, 'pending', 1020
+)
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("pending attempt should seed");
+        let repository = SqliteProviderQuotaRepository::new(pool.clone());
+
+        let quota = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .expect("quota should load")
+            .expect("quota should exist");
+        assert!(!quota.is_active);
+
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET quota_accounting_status = 'ready', provider_quota_cost_usd = 1, total_cost_usd_delta = 1 WHERE id = 'pending-attempt'",
+        )
+        .execute(&pool)
+        .await
+        .expect("attempt should reconcile");
+        let quota = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .expect("quota should reload")
+            .expect("quota should exist");
+        assert!(quota.is_active);
     }
 
     async fn seed_provider_quotas(pool: &sqlx::SqlitePool) {

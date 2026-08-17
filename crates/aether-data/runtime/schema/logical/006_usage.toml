@@ -937,7 +937,7 @@ nullable = true
 [[table.usage_counter_deltas.columns]]
 name = "quota_delta_sequence"
 type = "int64"
-nullable = true
+auto_increment = true
 
 [[table.usage_counter_deltas.columns]]
 name = "quota_accounting_status"
@@ -965,6 +965,14 @@ columns = ["processed_at", "created_at", "id"]
 [[table.usage_counter_deltas.indexes]]
 name = "ix_usage_counter_deltas_request_kind"
 columns = ["request_id", "kind", "target_id"]
+
+[[table.usage_counter_deltas.indexes]]
+name = "ix_usage_counter_deltas_provider_quota_pending"
+columns = ["kind", "target_id", "quota_accounting_status", "quota_delta_sequence"]
+
+[[table.usage_counter_deltas.uniques]]
+name = "ix_usage_counter_deltas_quota_sequence"
+columns = ["quota_delta_sequence"]
 
 [table.usage_settlement_snapshots]
 domain = "usage"

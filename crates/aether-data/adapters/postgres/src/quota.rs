@@ -41,7 +41,11 @@ fn quota_snapshot_select() -> SelectQuery<'static> {
             "quota_expires_at",
         ))
         .alias("quota_expires_at_unix_secs"),
-        SelectColumn::expr("is_active"),
+        SelectColumn::expr(DialectSql::dialect(
+            "CASE WHEN is_active AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_accounting_status = 'pending') THEN TRUE ELSE FALSE END",
+            "CASE WHEN is_active = 1 AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_accounting_status = 'pending') THEN 1 ELSE 0 END",
+        ))
+        .alias("is_active"),
     ])
 }
 
