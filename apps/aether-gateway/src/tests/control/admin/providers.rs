@@ -848,7 +848,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
             "stream_first_byte_timeout": 11.0,
             "enable_format_conversion": false,
             "config": {
-                "provider_ops": {"architecture_id": "cubence"},
+                "provider_ops": {"architecture_id": "new_api"},
                 "chat_pii_redaction": {"enabled": true}
             },
             "claude_code_advanced": {"pool_size": 2},
@@ -885,7 +885,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     assert_eq!(payload["failover_rules"], json!({"strategy": "ordered"}));
     assert_eq!(payload["chat_pii_redaction"], json!({"enabled": true}));
     assert_eq!(payload["ops_configured"], true);
-    assert_eq!(payload["ops_architecture_id"], "cubence");
+    assert_eq!(payload["ops_architecture_id"], "new_api");
 
     let same_minute_response = reqwest::Client::new()
         .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))
@@ -1002,7 +1002,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         disable_payload["failover_rules"],
         json!({"strategy": "ordered"})
     );
-    assert_eq!(disable_payload["ops_architecture_id"], "cubence");
+    assert_eq!(disable_payload["ops_architecture_id"], "new_api");
 
     let invalid_response = reqwest::Client::new()
         .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))

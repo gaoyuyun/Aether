@@ -1301,7 +1301,6 @@ fn admin_provider_ops_actions_mod_stays_thin() {
         "fn admin_provider_ops_action_response(",
         "fn admin_provider_ops_checkin_payload(",
         "fn admin_provider_ops_new_api_balance_payload(",
-        "fn admin_provider_ops_yescode_balance_payload(",
         "fn admin_provider_ops_run_checkin_action(",
         "fn admin_provider_ops_run_query_balance_action(",
     ] {
@@ -1340,7 +1339,6 @@ fn admin_provider_ops_actions_mod_stays_thin() {
         "pub(super) fn admin_provider_ops_json_object_map(",
         "pub(super) fn admin_provider_ops_request_url(",
         "pub(super) fn admin_provider_ops_request_method(",
-        "pub(super) fn admin_provider_ops_parse_rfc3339_unix_secs(",
     ] {
         assert!(
             actions_support.contains(pattern),
@@ -1402,10 +1400,8 @@ fn admin_provider_ops_actions_mod_stays_thin() {
     );
     for pattern in [
         "mod sub2api;",
-        "mod yescode;",
         "pub(super) async fn admin_provider_ops_run_query_balance_action(",
         "parse_query_balance_payload(",
-        "yescode::admin_provider_ops_yescode_balance_payload(",
         "sub2api::admin_provider_ops_sub2api_balance_payload(",
     ] {
         assert!(
@@ -1423,7 +1419,6 @@ fn admin_provider_ops_actions_mod_stays_thin() {
     for pattern in [
         "pub fn parse_query_balance_payload(",
         "pub fn parse_sub2api_balance_payload(",
-        "pub fn parse_yescode_combined_balance_payload(",
         "pub fn attach_balance_checkin_outcome(",
     ] {
         assert!(
@@ -1431,14 +1426,6 @@ fn admin_provider_ops_actions_mod_stays_thin() {
             "crates/aether-admin/src/provider/ops/actions.rs should own {pattern}"
         );
     }
-    let actions_query_balance_yescode = read_workspace_file(
-        "apps/aether-gateway/src/handlers/admin/provider/ops/providers/actions/query_balance/yescode.rs",
-    );
-    assert!(
-        actions_query_balance_yescode
-            .contains("pub(super) async fn admin_provider_ops_yescode_balance_payload("),
-        "handlers/admin/provider/ops/providers/actions/query_balance/yescode.rs should own yescode balance flow"
-    );
     assert!(
         !workspace_file_exists(
             "apps/aether-gateway/src/handlers/admin/provider/ops/providers/actions/query_balance.rs"

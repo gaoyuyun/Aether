@@ -103,6 +103,12 @@ fn assert_provider_ops_architectures_payload(payload: &serde_json::Value) {
     assert!(items
         .iter()
         .all(|item| item["architecture_id"] != "generic_api"));
+    for removed_id in ["cubence", "nekocode", "yescode"] {
+        assert!(
+            !architecture_ids.contains(&removed_id),
+            "removed architecture {removed_id} should not be exposed"
+        );
+    }
 
     let anyrouter = items
         .iter()
@@ -392,7 +398,7 @@ async fn gateway_handles_admin_provider_ops_config_locally_with_trusted_admin_pr
                 None,
                 Some(json!({
                     "provider_ops": {
-                        "architecture_id": "cubence",
+                        "architecture_id": "new_api",
                         "connector": {
                             "auth_type": "session_login",
                             "config": {"username": "alice"},
@@ -448,7 +454,7 @@ async fn gateway_handles_admin_provider_ops_config_locally_with_trusted_admin_pr
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["provider_id"], "provider-openai");
     assert_eq!(payload["is_configured"], true);
-    assert_eq!(payload["architecture_id"], "cubence");
+    assert_eq!(payload["architecture_id"], "new_api");
     assert_eq!(payload["base_url"], "https://api.openai.example");
     assert_eq!(payload["connector"]["auth_type"], "session_login");
     assert_eq!(payload["connector"]["config"]["username"], "alice");
@@ -499,7 +505,7 @@ async fn gateway_saves_admin_provider_ops_config_locally_with_trusted_admin_prin
                 Some(json!({
                     "feature_flag": true,
                     "provider_ops": {
-                        "architecture_id": "cubence",
+                        "architecture_id": "new_api",
                         "connector": {
                             "auth_type": "session_login",
                             "config": {"username": "alice"},
