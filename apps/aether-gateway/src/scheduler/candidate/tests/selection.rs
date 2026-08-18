@@ -208,7 +208,7 @@ fn provider_key_concurrency_state(
 }
 
 #[test]
-fn skips_expired_or_exhausted_monthly_quota_provider() {
+fn skips_inactive_expired_or_exhausted_monthly_quota_provider() {
     let inactive = StoredProviderQuotaSnapshot::new(
         "provider-1".to_string(),
         "monthly_quota".to_string(),
@@ -220,7 +220,7 @@ fn skips_expired_or_exhausted_monthly_quota_provider() {
         false,
     )
     .expect("quota should build");
-    assert!(!should_skip_provider_quota(&inactive, 2_000));
+    assert!(should_skip_provider_quota(&inactive, 2_000));
 
     let expired = StoredProviderQuotaSnapshot::new(
         "provider-1".to_string(),

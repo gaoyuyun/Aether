@@ -58,8 +58,9 @@ export default defineConfig(({ mode }) => {
             'vue-vendor': ['vue', 'vue-router', 'pinia'],
             // UI 组件库
             'ui-vendor': ['radix-vue', 'lucide-vue-next'],
-            // 工具库
-            'utils-vendor': ['axios', 'marked', 'dompurify'],
+            // HTTP is needed during bootstrap; Markdown is loaded only by views that render it.
+            'http-vendor': ['axios'],
+            'markdown-vendor': ['marked', 'dompurify'],
             // 图表库
             'chart-vendor': ['chart.js', 'vue-chartjs'],
           },

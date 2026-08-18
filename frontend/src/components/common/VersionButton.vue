@@ -343,9 +343,7 @@ import { Button, Dialog, Popover, PopoverContent, PopoverTrigger } from '@/compo
 import { normalizeReleaseNotesForDisplay } from '@/utils/releaseNotes'
 import { formatDisplayVersion } from '@/utils/version'
 import { describeUpdateStatus } from '@/utils/updateStatus'
-import { sanitizeMarkdown } from '@/utils/sanitize'
 import { useI18n } from '@/i18n'
-import { marked } from 'marked'
 import { ChevronRight, ExternalLink, Info, RefreshCw } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -500,22 +498,7 @@ const selectedReleaseHelpText = computed(() => {
 const selectedReleaseDisplayNotes = computed(() => {
   return normalizeReleaseNotesForDisplay(selectedRelease.value?.release_notes)
 })
-const selectedReleaseNotesHtml = computed(() => {
-  if (!selectedReleaseDisplayNotes.value) return ''
-  try {
-    const html = marked.parse(selectedReleaseDisplayNotes.value, {
-      async: false,
-      breaks: true
-    }) as string
-    return sanitizeMarkdown(html)
-  } catch {
-    return selectedReleaseDisplayNotes.value
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br>')
-  }
-})
+const selectedReleaseNotesHtml = ref('')
 
 function formatDate(dateStr: string): string {
   try {
@@ -553,10 +536,39 @@ function toggleReleases() {
   }
 }
 
+function escapeReleaseNotes(notes: string): string {
+  return notes
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>')
+}
+
+async function renderReleaseNotes(release: ReleaseEntry, notes: string) {
+  try {
+    const [{ marked }, { sanitizeMarkdown }] = await Promise.all([
+      import('marked'),
+      import('@/utils/sanitize')
+    ])
+    const html = sanitizeMarkdown(marked.parse(notes, {
+      async: false,
+      breaks: true
+    }) as string)
+    if (selectedRelease.value === release) {
+      selectedReleaseNotesHtml.value = html
+    }
+  } catch {
+    // Keep the escaped text fallback when the optional renderer cannot load.
+  }
+}
+
 function openReleaseDetails(release: ReleaseEntry) {
   selectedRelease.value = release
+  const notes = normalizeReleaseNotesForDisplay(release.release_notes)
+  selectedReleaseNotesHtml.value = escapeReleaseNotes(notes)
   isOpen.value = false
   showReleaseDetails.value = true
+  if (notes) void renderReleaseNotes(release, notes)
 }
 
 function handleRefresh() {

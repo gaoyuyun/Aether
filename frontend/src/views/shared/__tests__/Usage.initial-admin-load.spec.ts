@@ -8,17 +8,29 @@ const source = readFileSync(
 )
 
 describe('admin usage initial loading', () => {
-  it('starts the user filter request before analytics completes', () => {
+  it('renders records before scheduling non-critical analytics', () => {
     const mountedBlock = source
       .split('onMounted(async () => {')[1]
       ?.split('// 处理时间范围变化')[0]
 
     expect(mountedBlock).toBeTruthy()
-    expect(mountedBlock).toContain('const adminUsersPromise = loadAdminUsers()')
-    expect(mountedBlock).toContain('Promise.all([heatmapPromise, adminUsersPromise])')
-    expect(mountedBlock?.indexOf('const adminUsersPromise = loadAdminUsers()'))
-      .toBeLessThan(mountedBlock?.indexOf('await loadRecords(') ?? -1)
-    expect(mountedBlock).not.toContain('await loadAdminUsers()')
+    expect(mountedBlock).toContain('await loadRecords(')
+    expect(mountedBlock).toContain('{ loadExactTotal: false }')
+    expect(mountedBlock).toContain('scheduleDeferredAnalytics()')
+    expect(mountedBlock?.indexOf('await loadRecords('))
+      .toBeLessThan(mountedBlock?.indexOf('scheduleDeferredAnalytics()') ?? -1)
+    expect(mountedBlock).not.toContain('loadAdminUsers')
+  })
+
+  it('uses requestIdleCallback before mounting analytics charts', () => {
+    const schedulerBlock = source
+      .split('function scheduleDeferredAnalytics()')[1]
+      ?.split('// 时间范围选择')[0]
+
+    expect(schedulerBlock).toBeTruthy()
+    expect(schedulerBlock).toContain('idleWindow.requestIdleCallback')
+    expect(schedulerBlock).toContain('analyticsReady.value = true')
+    expect(source).toContain('v-if="statsExpanded && analyticsReady"')
   })
 
   it('derives the polling set from the backend lifecycle status, not the display status', () => {

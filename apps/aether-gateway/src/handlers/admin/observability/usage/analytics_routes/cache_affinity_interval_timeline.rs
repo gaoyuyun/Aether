@@ -57,6 +57,7 @@ pub(super) async fn build_admin_usage_cache_affinity_interval_timeline_response(
         UsageCacheAffinityIntervalGroupBy::User,
         user_id.as_deref(),
         None,
+        Some(limit.saturating_mul(4).max(limit.saturating_add(1))),
     )
     .await?;
     let mut grouped: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
