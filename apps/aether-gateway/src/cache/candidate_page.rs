@@ -116,6 +116,7 @@ enum CandidatePageAuthIdentity {
 pub(crate) struct CandidateResolvedPageCacheKey {
     page_key: CandidatePageCacheKey,
     resolution_mode: &'static str,
+    candidate_page_hash: String,
 }
 
 impl CandidateRowPageCacheKey {
@@ -206,6 +207,7 @@ impl CandidateResolvedPageCacheKey {
         client_session_affinity: Option<&ClientSessionAffinity>,
         model_directive_policy_hash: &str,
         resolution_mode: AiCandidateResolutionMode,
+        candidates: &[SchedulerMinimalCandidateSelectionCandidate],
     ) -> Self {
         Self {
             page_key: CandidatePageCacheKey::new(
@@ -224,6 +226,7 @@ impl CandidateResolvedPageCacheKey {
                 model_directive_policy_hash,
             ),
             resolution_mode: resolution_mode_name(resolution_mode),
+            candidate_page_hash: stable_json_hash(Some(candidates)),
         }
     }
 }
@@ -496,7 +499,7 @@ fn client_session_affinity_key(affinity: Option<&ClientSessionAffinity>) -> Stri
 
 fn stable_json_hash<T>(value: Option<&T>) -> String
 where
-    T: serde::Serialize,
+    T: serde::Serialize + ?Sized,
 {
     let Some(value) = value else {
         return String::new();
@@ -737,6 +740,7 @@ mod tests {
             None,
             "policy-a",
             AiCandidateResolutionMode::Standard,
+            &[],
         );
         let resolved_same_policy = CandidateResolvedPageCacheKey::new(
             "gpt-4o",
@@ -753,6 +757,7 @@ mod tests {
             None,
             "policy-a",
             AiCandidateResolutionMode::Standard,
+            &[],
         );
         let resolved_different_policy = CandidateResolvedPageCacheKey::new(
             "gpt-4o",
@@ -769,6 +774,7 @@ mod tests {
             None,
             "policy-b",
             AiCandidateResolutionMode::Standard,
+            &[],
         );
         assert_eq!(resolved_base, resolved_same_policy);
         assert_ne!(resolved_base, resolved_different_policy);
