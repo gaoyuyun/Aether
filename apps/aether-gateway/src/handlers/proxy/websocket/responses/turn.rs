@@ -518,6 +518,9 @@ fn websocket_auth_rejection_error(rejection: GatewayLocalAuthRejection) -> Gatew
         GatewayLocalAuthRejection::InvalidApiKey => {
             (StatusCode::UNAUTHORIZED, "The API key is invalid")
         }
+        GatewayLocalAuthRejection::StandaloneKeysDisabled => {
+            (StatusCode::FORBIDDEN, "Standalone API keys are disabled")
+        }
         GatewayLocalAuthRejection::LockedApiKey => (
             StatusCode::FORBIDDEN,
             "The API key is locked and cannot be used",

@@ -289,6 +289,8 @@ mod tests {
             user_rate_limit: None,
             api_key_rate_limit: None,
             api_key_is_standalone: false,
+            wallet_billing_enabled: false,
+            billing_plans_enabled: false,
             admin_bypass_limits: false,
             local_rejection: None,
             allowed_models: None,

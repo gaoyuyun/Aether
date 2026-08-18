@@ -793,6 +793,7 @@ fn provider_query_standard_test_rejects_other_empty_generation_successes() {
             candidate_id: Some("candidate-0".to_string()),
             status_code: 200,
             headers: BTreeMap::new(),
+            response_observation: None,
             body: Some(aether_contracts::ResponseBody {
                 json_body: Some(body),
                 body_bytes_b64: None,

@@ -1357,6 +1357,10 @@ async fn prepare_and_seed_database(
         backends.run_database_migrations().await?;
     }
 
+    // Every request in this suite authenticates through a standalone key.
+    backends
+        .upsert_system_config_entry("module.standalone_keys.enabled", &json!(true), None)
+        .await?;
     seed_provider_catalog(&backends, upstream_base_url, fixture).await?;
     seed_models(&backends).await?;
     let user_id = seed_user(&backends).await?;

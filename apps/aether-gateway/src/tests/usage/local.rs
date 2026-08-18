@@ -2377,6 +2377,7 @@ async fn gateway_keeps_request_usage_clean_when_retryable_candidate_precedes_suc
                     "content-type".to_string(),
                     "application/json".to_string(),
                 )]),
+                response_observation: None,
                 body: Some(aether_contracts::ResponseBody {
                     json_body: Some(body),
                     body_bytes_b64: None,
@@ -2641,6 +2642,7 @@ async fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_req
                     "content-type".to_string(),
                     "application/json".to_string(),
                 )]),
+                response_observation: None,
                 body: Some(aether_contracts::ResponseBody {
                     json_body: Some(json!({
                         "type": "error",

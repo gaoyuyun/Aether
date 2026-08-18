@@ -23,10 +23,10 @@ use crate::execution_runtime::{
     acquire_upstream_execution_gate, build_transport_error_stop_response,
     execute_execution_runtime_stream_with_retry_scope,
     execute_execution_runtime_sync_with_retry_scope,
-    mark_stream_candidate_watchdog_terminal_started, StreamCandidateWatchdogProgress,
-    UpstreamExecutionGateProvider, UPSTREAM_EXECUTION_GATE_NAME,
     mark_stream_candidate_watchdog_precise_timeout_armed,
-    mark_stream_candidate_watchdog_upstream_started,
+    mark_stream_candidate_watchdog_terminal_started,
+    mark_stream_candidate_watchdog_upstream_started, StreamCandidateWatchdogProgress,
+    UpstreamExecutionGateProvider, UPSTREAM_EXECUTION_GATE_NAME,
 };
 use crate::executor::{
     build_local_execution_exhaustion, mark_deferred_upstream_response, LocalExecutionRequestOutcome,
