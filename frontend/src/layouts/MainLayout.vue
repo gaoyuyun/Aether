@@ -436,7 +436,7 @@
         <!-- eslint-disable vue/no-v-html -->
         <div
           class="prose prose-sm dark:prose-invert max-h-[50vh] max-w-none overflow-y-auto"
-          v-html="renderRequiredAnnouncement(currentRequiredAnnouncement.content)"
+          v-html="requiredAnnouncementHtml"
         />
         <!-- eslint-enable vue/no-v-html -->
       </div>
@@ -482,10 +482,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
+import { computed, defineAsyncComponent, ref, watch, onMounted, onUnmounted } from 'vue'
 import { useLocalStorage } from '@vueuse/core'
 import { useRoute, useRouter } from 'vue-router'
-import { marked } from 'marked'
 import { useAuthStore } from '@/stores/auth'
 import { useModuleStore } from '@/stores/modules'
 import { inactiveModuleRouteRedirect } from '@/router/guards/moduleGuard'
@@ -502,7 +501,6 @@ import SidebarNav from '@/components/layout/SidebarNav.vue'
 import HeaderLogo from '@/components/HeaderLogo.vue'
 import LanguageSwitcher from '@/components/common/LanguageSwitcher.vue'
 import ThemeModeButton from '@/components/common/ThemeModeButton.vue'
-import UpdateDialog from '@/components/common/UpdateDialog.vue'
 import VersionButton from '@/components/common/VersionButton.vue'
 import { buildUpdateErrorStatus } from '@/utils/updateStatus'
 import {
@@ -518,9 +516,10 @@ import {
 
 import GithubIcon from '@/components/icons/GithubIcon.vue'
 import { prefetchNavigationTarget } from '@/utils/adminNavigationPrefetch'
-import { sanitizeMarkdown } from '@/utils/sanitize'
 import { useI18n, type MessageKey } from '@/i18n'
 import { buildBreadcrumbs, buildNavigation } from './main-layout/navigation'
+
+const UpdateDialog = defineAsyncComponent(() => import('@/components/common/UpdateDialog.vue'))
 
 type SystemUpdatePhase = 'download' | 'restart' | 'reconnecting'
 
@@ -538,6 +537,7 @@ const showAuthError = ref(false)
 const mobileMenuOpen = ref(false)
 const sidebarCollapsed = useLocalStorage('aether-sidebar-collapsed', false)
 const requiredAnnouncements = ref<Announcement[]>([])
+const requiredAnnouncementHtml = ref('')
 const acknowledgingRequiredAnnouncement = ref(false)
 const announcementsModuleActive = computed(() => moduleStore.isActive('announcements'))
 const requiredAnnouncementOpen = computed({
@@ -547,6 +547,7 @@ const requiredAnnouncementOpen = computed({
   }
 })
 const currentRequiredAnnouncement = computed(() => requiredAnnouncements.value[0] ?? null)
+let requiredAnnouncementRenderId = 0
 
 // 更新检查相关
 const showUpdateDialog = ref(false)
@@ -1130,6 +1131,31 @@ watch(
   { immediate: true }
 )
 
+watch(
+  currentRequiredAnnouncement,
+  async (announcement) => {
+    const renderId = ++requiredAnnouncementRenderId
+    requiredAnnouncementHtml.value = announcement
+      ? escapeRequiredAnnouncement(announcement.content)
+      : ''
+    if (!announcement) return
+
+    try {
+      const [{ marked }, { sanitizeMarkdown }] = await Promise.all([
+        import('marked'),
+        import('@/utils/sanitize')
+      ])
+      const html = sanitizeMarkdown(marked(announcement.content || '') as string)
+      if (renderId === requiredAnnouncementRenderId) {
+        requiredAnnouncementHtml.value = html
+      }
+    } catch {
+      // Keep the escaped text fallback when the optional renderer cannot load.
+    }
+  },
+  { immediate: true }
+)
+
 async function loadRequiredAnnouncements() {
   if (!authStore.user || !authStore.token || !announcementsModuleActive.value) {
     requiredAnnouncements.value = []
@@ -1153,8 +1179,12 @@ async function loadRequiredAnnouncements() {
   return requiredAnnouncementsPromise
 }
 
-function renderRequiredAnnouncement(content: string): string {
-  return sanitizeMarkdown(marked(content || '') as string)
+function escapeRequiredAnnouncement(content: string): string {
+  return (content || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>')
 }
 
 function formatRequiredAnnouncementDate(value: string): string {

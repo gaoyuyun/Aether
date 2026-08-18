@@ -1551,6 +1551,21 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn aggregate_usage_audit_dimensions(
+        &self,
+        query: &aether_data_contracts::repository::usage::UsageAuditDimensionsAggregationQuery,
+    ) -> Result<
+        aether_data_contracts::repository::usage::StoredUsageAuditDimensionsAggregation,
+        DataLayerError,
+    > {
+        match &self.usage_reader {
+            Some(repository) => repository.aggregate_usage_audit_dimensions(query).await,
+            None => Ok(
+                aether_data_contracts::repository::usage::StoredUsageAuditDimensionsAggregation::default(),
+            ),
+        }
+    }
+
     pub(crate) async fn summarize_usage_audits(
         &self,
         query: &aether_data_contracts::repository::usage::UsageAuditSummaryQuery,

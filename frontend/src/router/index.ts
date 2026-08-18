@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useModuleStore } from '@/stores/modules'
 import { log } from '@/utils/logger'
+import { prefetchNavigationTarget } from '@/utils/adminNavigationPrefetch'
 import {
   ensureUserLoaded,
   resolveHomeRedirect,
@@ -20,6 +21,9 @@ router.beforeEach(async (to, from, next) => {
   const moduleStore = useModuleStore()
 
   try {
+    if (authStore.token) {
+      prefetchNavigationTarget(router, to.fullPath)
+    }
     const isAuthenticated = await ensureUserLoaded(authStore)
 
     // 首页重定向

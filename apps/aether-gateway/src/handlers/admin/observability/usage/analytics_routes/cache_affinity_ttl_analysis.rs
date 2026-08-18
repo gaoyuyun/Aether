@@ -46,6 +46,7 @@ pub(super) async fn build_admin_usage_cache_affinity_ttl_analysis_response(
         },
         user_id.as_deref(),
         api_key_id.as_deref(),
+        None,
     )
     .await?;
     let grouped =

@@ -87,6 +87,16 @@ impl<'a> AdminAppState<'a> {
         self.app.aggregate_usage_audits(query).await
     }
 
+    pub(crate) async fn aggregate_usage_audit_dimensions(
+        &self,
+        query: &aether_data_contracts::repository::usage::UsageAuditDimensionsAggregationQuery,
+    ) -> Result<
+        aether_data_contracts::repository::usage::StoredUsageAuditDimensionsAggregation,
+        GatewayError,
+    > {
+        self.app.aggregate_usage_audit_dimensions(query).await
+    }
+
     pub(crate) async fn summarize_usage_audits(
         &self,
         query: &aether_data_contracts::repository::usage::UsageAuditSummaryQuery,

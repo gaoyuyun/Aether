@@ -4583,7 +4583,7 @@ WHERE hour_utc >= $1
         };
         let mut builder = QueryBuilder::<Postgres>::new(
             r#"
-WITH filtered_usage AS (
+WITH filtered_source AS (
   SELECT
     "#,
         );
@@ -4627,8 +4627,21 @@ WITH filtered_usage AS (
                 .push("\"usage\".api_key_id = ")
                 .push_bind(api_key_id.to_string());
         }
+        if let Some(limit) = query.max_source_rows {
+            builder
+                .push(" ORDER BY \"usage\".created_at DESC, \"usage\".id DESC LIMIT ")
+                .push_bind(limit.max(2) as i64);
+        }
         builder.push(
             r#"
+), filtered_usage AS (
+  SELECT
+    group_id,
+    username,
+    model,
+    created_at,
+    usage_id
+  FROM filtered_source
 ),
 intervals AS (
   SELECT

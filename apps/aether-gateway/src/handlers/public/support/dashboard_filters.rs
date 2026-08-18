@@ -922,6 +922,14 @@ pub(super) async fn handle_dashboard_stats_get(
             .body(Body::from(cached))
             .unwrap_or_else(|_| http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
+    let _cache_guard = state.dashboard_response_cache.acquire(&cache_key).await;
+    if let Some(cached) = state.dashboard_response_cache.get(&cache_key, cache_ttl) {
+        return Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(cached))
+            .unwrap_or_else(|_| http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
 
     let query = request_context.request_query_string.as_deref();
     let summary_range = match dashboard_parse_stats_range(query) {
@@ -1030,20 +1038,23 @@ pub(super) async fn handle_dashboard_stats_get(
 
     if is_admin {
         let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
-        let site_rate_summary = match dashboard_summary_for_unix_range_raw(
-            state,
-            now_unix_secs.saturating_sub(DASHBOARD_SITE_RATE_WINDOW_SECS),
-            now_unix_secs.saturating_add(1),
-            None,
-            "dashboard realtime site stats lookup failed",
-        )
-        .await
-        {
+        let (site_rate_result, online_users_result, user_counts_result) = tokio::join!(
+            dashboard_summary_for_unix_range_raw(
+                state,
+                now_unix_secs.saturating_sub(DASHBOARD_SITE_RATE_WINDOW_SECS),
+                now_unix_secs.saturating_add(1),
+                None,
+                "dashboard realtime site stats lookup failed",
+            ),
+            dashboard_load_online_user_count(state, now_unix_secs),
+            dashboard_load_user_counts(state, summary_range),
+        );
+        let site_rate_summary = match site_rate_result {
             Ok(value) => value,
             Err(response) => return response,
         };
         let site_rate_totals = dashboard_usage_totals_from_summary(&site_rate_summary);
-        let online_users = match dashboard_load_online_user_count(state, now_unix_secs).await {
+        let online_users = match online_users_result {
             Ok(value) => value,
             Err(err) => {
                 return build_auth_error_response(
@@ -1053,17 +1064,16 @@ pub(super) async fn handle_dashboard_stats_get(
                 );
             }
         };
-        let (total_users, active_users) =
-            match dashboard_load_user_counts(state, summary_range).await {
-                Ok(value) => value,
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("dashboard user stats lookup failed: {err:?}"),
-                        false,
-                    );
-                }
-            };
+        let (total_users, active_users) = match user_counts_result {
+            Ok(value) => value,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("dashboard user stats lookup failed: {err:?}"),
+                    false,
+                );
+            }
+        };
         let success_rate = if today_totals.requests == 0 {
             0.0
         } else {
@@ -1309,6 +1319,14 @@ pub(super) async fn handle_dashboard_daily_stats_get(
             .body(Body::from(cached))
             .unwrap_or_else(|_| http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
+    let _cache_guard = state.dashboard_response_cache.acquire(&cache_key).await;
+    if let Some(cached) = state.dashboard_response_cache.get(&cache_key, cache_ttl) {
+        return Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(cached))
+            .unwrap_or_else(|_| http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
 
     let query = request_context.request_query_string.as_deref();
     let range = match dashboard_parse_daily_range(query) {
@@ -1464,6 +1482,14 @@ pub(super) async fn handle_dashboard_provider_status_get(
     let cache_key = format!("provider:{cache_identity}");
     let cache_ttl = std::time::Duration::from_secs(20);
 
+    if let Some(cached) = state.dashboard_response_cache.get(&cache_key, cache_ttl) {
+        return Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(cached))
+            .unwrap_or_else(|_| http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let _cache_guard = state.dashboard_response_cache.acquire(&cache_key).await;
     if let Some(cached) = state.dashboard_response_cache.get(&cache_key, cache_ttl) {
         return Response::builder()
             .status(http::StatusCode::OK)

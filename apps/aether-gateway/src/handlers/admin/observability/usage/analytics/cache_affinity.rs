@@ -11,6 +11,7 @@ pub(in super::super) async fn list_usage_cache_affinity_intervals(
     group_by: UsageCacheAffinityIntervalGroupBy,
     user_id: Option<&str>,
     api_key_id: Option<&str>,
+    max_source_rows: Option<usize>,
 ) -> Result<Vec<StoredUsageCacheAffinityIntervalRow>, GatewayError> {
     let now_unix_secs = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default();
     state
@@ -20,6 +21,7 @@ pub(in super::super) async fn list_usage_cache_affinity_intervals(
             group_by,
             user_id: user_id.map(ToOwned::to_owned),
             api_key_id: api_key_id.map(ToOwned::to_owned),
+            max_source_rows,
         })
         .await
 }

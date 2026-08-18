@@ -1386,7 +1386,7 @@ pub(super) async fn enqueue_usage_transition_for_request(
 ) -> Result<(), DataLayerError> {
     let row = sqlx::query(&format!(
         "{} WHERE \"usage\".request_id = ? LIMIT 1",
-        super::USAGE_COLUMNS
+        super::usage_columns(false)
     ))
     .bind(request_id)
     .fetch_optional(&mut **tx)
@@ -1414,7 +1414,7 @@ pub(super) async fn lock_and_load_usage(
         .map_sql_err()?;
     let row = sqlx::query(&format!(
         "{} WHERE \"usage\".request_id = ? LIMIT 1",
-        super::USAGE_COLUMNS
+        super::usage_columns(false)
     ))
     .bind(request_id)
     .fetch_optional(&mut **tx)

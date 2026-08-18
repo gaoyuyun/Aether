@@ -1,15 +1,73 @@
-use super::{SqliteUsageReadRepository, SqliteUsageWriteRepository};
+use super::{usage_columns, SqliteUsageReadRepository, SqliteUsageWriteRepository};
 use crate::run_migrations;
 use aether_data_contracts::repository::usage::{
     ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest, UpsertUsageRecord,
-    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditListQuery,
-    UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBreakdownGroupBy,
-    UsageBreakdownSummaryQuery, UsageCleanupExecutionMode, UsageCleanupTargets, UsageCleanupWindow,
+    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditDimensionsAggregationQuery,
+    UsageAuditListQuery, UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBreakdownGroupBy,
+    UsageBreakdownSummaryQuery, UsageCacheAffinityIntervalGroupBy, UsageCacheAffinityIntervalQuery,
+    UsageCleanupExecutionMode, UsageCleanupTargets, UsageCleanupWindow,
     UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery, UsageDashboardDailyBreakdownQuery,
     UsageDashboardSummaryQuery, UsageProviderPerformanceQuery, UsageReadRepository,
     UsageTimeSeriesGranularity, UsageWriteRepository,
 };
 use chrono::{DateTime, Utc};
+
+#[test]
+fn sqlite_usage_list_projection_skips_http_capture_storage() {
+    let list_sql = usage_columns(false);
+    assert!(!list_sql.contains("JOIN usage_http_audits"));
+    assert!(!list_sql.contains("\"usage\".request_body"));
+    assert!(!list_sql.contains("\"usage\".response_body"));
+    assert!(list_sql.contains("NULL AS request_headers"));
+    assert!(list_sql.contains("NULL AS client_response_body_compressed"));
+
+    let detail_sql = usage_columns(true);
+    assert!(detail_sql.contains("JOIN usage_http_audits"));
+    assert!(detail_sql.contains("\"usage\".request_body"));
+    assert!(detail_sql.contains("\"usage\".response_body"));
+}
+
+#[tokio::test]
+async fn sqlite_cache_affinity_intervals_support_a_limited_source_cte() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::query(
+        r#"
+INSERT INTO "usage" (
+  request_id, id, user_id, model, status, created_at_unix_ms
+) VALUES
+  ('request-1', 'usage-1', 'user-1', 'gpt-5', 'completed', 1000),
+  ('request-2', 'usage-2', 'user-1', 'gpt-5', 'completed', 1060),
+  ('request-3', 'usage-3', 'user-1', 'gpt-5', 'completed', 1120);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("usage rows should seed");
+
+    let rows = SqliteUsageReadRepository::new(pool)
+        .list_usage_cache_affinity_intervals(&UsageCacheAffinityIntervalQuery {
+            created_from_unix_secs: 900,
+            created_until_unix_secs: 1_200,
+            group_by: UsageCacheAffinityIntervalGroupBy::User,
+            user_id: None,
+            api_key_id: None,
+            max_source_rows: Some(2),
+        })
+        .await
+        .expect("limited interval query should execute");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].group_id, "user-1");
+    assert_eq!(rows[0].created_at_unix_secs, 1_120);
+    assert_eq!(rows[0].interval_minutes, 1.0);
+}
 
 #[tokio::test]
 async fn sqlite_reads_only_exact_provider_quota_window_counters() {
@@ -224,6 +282,109 @@ WHERE request_id = 'cost-savings-settlement';
     assert!((summary.cache_read_cost_usd - 0.04).abs() < 1e-9);
     assert!((summary.cache_creation_cost_usd - 0.05).abs() < 1e-9);
     assert!((summary.estimated_full_cost_usd - 0.3).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn sqlite_cost_savings_combines_daily_rollups_with_live_usage() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_daily_cost_savings (
+  id, "date", cache_read_tokens, cache_read_cost, cache_creation_cost,
+  estimated_full_cost, created_at, updated_at
+) VALUES ('cost-rollup', 86400, 100, 0.1, 0.2, 0.5, 1, 1);
+INSERT INTO "usage" (
+  request_id, id, provider_name, model, cache_read_input_tokens,
+  cache_read_cost_usd, cache_creation_cost_usd, request_metadata,
+  status, billing_status, created_at_unix_ms, updated_at_unix_secs
+) VALUES
+  ('covered-raw', 'covered-raw', 'provider', 'model', 999, 9.0, 9.0,
+   '{"input_price_per_1m": 9.0}', 'completed', 'settled', 90000, 90000),
+  ('live-raw', 'live-raw', 'provider', 'model', 5, 0.01, 0.02,
+   '{"input_price_per_1m": 2.0}', 'completed', 'settled', 180000, 180000);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("cost savings fixtures should seed");
+
+    let summary = SqliteUsageReadRepository::new(pool)
+        .summarize_usage_cost_savings(&UsageCostSavingsSummaryQuery {
+            created_from_unix_secs: 86_400,
+            created_until_unix_secs: 259_200,
+            user_id: None,
+            provider_name: None,
+            model: None,
+        })
+        .await
+        .expect("cost savings should merge rollups and live usage");
+
+    assert_eq!(summary.cache_read_tokens, 105);
+    assert!((summary.cache_read_cost_usd - 0.11).abs() < 1e-9);
+    assert!((summary.cache_creation_cost_usd - 0.22).abs() < 1e-9);
+    assert!((summary.estimated_full_cost_usd - 0.50001).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn sqlite_cost_savings_uses_scoped_daily_rollups() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    sqlx::query(
+        r#"
+INSERT INTO stats_user_daily_cost_savings_model_provider (
+  id, user_id, "date", model, provider_name, cache_read_tokens,
+  cache_read_cost, cache_creation_cost, estimated_full_cost, created_at, updated_at
+) VALUES (
+  'scoped-cost-rollup', 'user-1', 86400, 'model-1', 'provider-1',
+  20, 0.02, 0.03, 0.08, 1, 1
+);
+INSERT INTO "usage" (
+  request_id, id, user_id, provider_name, model, cache_read_input_tokens,
+  cache_read_cost_usd, cache_creation_cost_usd, request_metadata,
+  status, billing_status, created_at_unix_ms, updated_at_unix_secs
+) VALUES
+  ('scoped-live', 'scoped-live', 'user-1', 'provider-1', 'model-1', 3,
+   0.003, 0.004, '{"input_price_per_1m": 2.0}',
+   'completed', 'settled', 180000, 180000),
+  ('other-live', 'other-live', 'user-2', 'provider-1', 'model-1', 99,
+   0.9, 0.9, '{"input_price_per_1m": 9.0}',
+   'completed', 'settled', 180000, 180000);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("scoped cost savings fixtures should seed");
+
+    let summary = SqliteUsageReadRepository::new(pool)
+        .summarize_usage_cost_savings(&UsageCostSavingsSummaryQuery {
+            created_from_unix_secs: 86_400,
+            created_until_unix_secs: 259_200,
+            user_id: Some("user-1".to_string()),
+            provider_name: Some("provider-1".to_string()),
+            model: Some("model-1".to_string()),
+        })
+        .await
+        .expect("scoped cost savings should merge rollups and live usage");
+
+    assert_eq!(summary.cache_read_tokens, 23);
+    assert!((summary.cache_read_cost_usd - 0.023).abs() < 1e-9);
+    assert!((summary.cache_creation_cost_usd - 0.034).abs() < 1e-9);
+    assert!((summary.estimated_full_cost_usd - 0.080006).abs() < 1e-9);
 }
 
 #[tokio::test]
@@ -456,6 +617,25 @@ WHERE request_id = 'rebuild-completed';
         .expect("usage audit aggregation should load");
     assert_eq!(aggregation[0].total_tokens, 29);
 
+    let dimensions = reader
+        .aggregate_usage_audit_dimensions(&UsageAuditDimensionsAggregationQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 3_000,
+            limit: 10,
+            exclude_reserved_provider_labels: false,
+        })
+        .await
+        .expect("usage audit dimensions should load");
+    assert_eq!(dimensions.model.len(), 1);
+    assert_eq!(dimensions.model[0].group_key, "model-1");
+    assert_eq!(dimensions.model[0].total_tokens, 29);
+    assert_eq!(dimensions.provider.len(), 1);
+    assert_eq!(dimensions.provider[0].group_key, "provider-1");
+    assert_eq!(dimensions.provider[0].success_count, Some(1));
+    assert_eq!(dimensions.api_format.len(), 1);
+    assert_eq!(dimensions.api_format[0].group_key, "openai");
+    assert_eq!(dimensions.api_format[0].avg_response_time_ms, Some(42.0));
+
     let breakdown = reader
         .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
             created_from_unix_secs: 0,
@@ -577,6 +757,34 @@ async fn sqlite_usage_http_capture_round_trips_and_preserves_sparse_updates() {
     .expect("canonical blobs should count");
     assert_eq!(blob_count, 4);
 
+    let reader = SqliteUsageReadRepository::new(pool.clone());
+    let listed = reader
+        .list_usage_audits(&UsageAuditListQuery {
+            provider_name: Some("Provider One".to_string()),
+            limit: Some(10),
+            newest_first: true,
+            ..UsageAuditListQuery::default()
+        })
+        .await
+        .expect("usage list should load")
+        .into_iter()
+        .find(|item| item.request_id == "canonical-capture")
+        .expect("captured usage should be listed");
+    assert!(listed.request_headers.is_none());
+    assert!(listed.provider_request_headers.is_none());
+    assert!(listed.response_headers.is_none());
+    assert!(listed.client_response_headers.is_none());
+    assert!(listed.request_body.is_none());
+    assert!(listed.provider_request_body.is_none());
+    assert!(listed.response_body.is_none());
+    assert!(listed.client_response_body.is_none());
+    assert!(listed.request_body_ref.is_none());
+    assert!(listed.provider_request_body_ref.is_none());
+    assert_eq!(
+        listed.request_metadata.as_ref().unwrap()["trace_id"],
+        "canonical-trace"
+    );
+
     let sparse = sample_usage("canonical-capture", "streaming", "pending", 1_001);
     let sparse_stored = writer
         .upsert(sparse)
@@ -616,7 +824,6 @@ async fn sqlite_usage_http_capture_round_trips_and_preserves_sparse_updates() {
     .expect("remaining blobs should count");
     assert_eq!(cleared_blob_count, 3);
 
-    let reader = SqliteUsageReadRepository::new(pool.clone());
     let resolved = reader
         .resolve_body_ref("usage://request/canonical-capture/provider_request_body")
         .await

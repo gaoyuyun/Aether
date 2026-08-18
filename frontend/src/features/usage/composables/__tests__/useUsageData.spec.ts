@@ -5,17 +5,13 @@ const {
   getAllUsageRecordsMock,
   getAllUsageRecordTotalMock,
   getUsageStatsMock,
-  getUsageByModelMock,
-  getUsageByProviderMock,
-  getUsageByApiFormatMock,
+  getUsageAggregationsMock,
   meGetUsageMock,
 } = vi.hoisted(() => ({
   getAllUsageRecordsMock: vi.fn(),
   getAllUsageRecordTotalMock: vi.fn(),
   getUsageStatsMock: vi.fn(),
-  getUsageByModelMock: vi.fn(),
-  getUsageByProviderMock: vi.fn(),
-  getUsageByApiFormatMock: vi.fn(),
+  getUsageAggregationsMock: vi.fn(),
   meGetUsageMock: vi.fn(),
 }))
 
@@ -24,9 +20,7 @@ vi.mock('@/api/usage', () => ({
     getAllUsageRecords: getAllUsageRecordsMock,
     getAllUsageRecordTotal: getAllUsageRecordTotalMock,
     getUsageStats: getUsageStatsMock,
-    getUsageByModel: getUsageByModelMock,
-    getUsageByProvider: getUsageByProviderMock,
-    getUsageByApiFormat: getUsageByApiFormatMock,
+    getUsageAggregations: getUsageAggregationsMock,
   },
 }))
 
@@ -95,9 +89,11 @@ describe('useUsageData', () => {
       response: { status: 500 },
       message: 'stats failed',
     })
-    getUsageByModelMock.mockResolvedValue([])
-    getUsageByProviderMock.mockResolvedValue([])
-    getUsageByApiFormatMock.mockResolvedValue([])
+    getUsageAggregationsMock.mockResolvedValue({
+      model: [],
+      provider: [],
+      api_format: [],
+    })
     meGetUsageMock.mockResolvedValue({})
   })
 
@@ -147,6 +143,68 @@ describe('useUsageData', () => {
     expect(providerVisibilityEnabled.value).toBe(true)
     expect(currentRecords.value[0]?.provider).toBe('OpenAI')
     expect(availableProviders.value).toEqual(['OpenAI'])
+  })
+
+  it('loads user records without summary aggregation', async () => {
+    const isAdminPage = ref(false)
+    meGetUsageMock.mockResolvedValueOnce({
+      provider_visibility_enabled: true,
+      records: [buildUsageRecord({ model: 'gpt-5', provider: 'OpenAI' })],
+      pagination: { total: 1 },
+    })
+
+    const {
+      loadRecords,
+      currentRecords,
+      availableModels,
+      availableProviders,
+    } = useUsageData({ isAdminPage })
+
+    await loadRecords(
+      { page: 1, pageSize: 100 },
+      undefined,
+      { preset: 'today', tz_offset_minutes: 0 },
+      { loadExactTotal: false },
+    )
+
+    expect(meGetUsageMock).toHaveBeenCalledWith(expect.objectContaining({
+      include_summary: false,
+      include_total: false,
+      limit: 100,
+      offset: 0,
+    }))
+    expect(currentRecords.value).toHaveLength(1)
+    expect(availableModels.value).toEqual(['gpt-5'])
+    expect(availableProviders.value).toEqual(['OpenAI'])
+  })
+
+  it('loads deferred user stats without replacing visible records', async () => {
+    const isAdminPage = ref(false)
+    const { loadRecords, loadStats, currentRecords, stats } = useUsageData({ isAdminPage })
+    const dateRange = { preset: 'today', tz_offset_minutes: 0 }
+
+    meGetUsageMock.mockResolvedValueOnce({
+      records: [buildUsageRecord({ id: 'visible-record' })],
+      pagination: { total: 1 },
+    })
+    await loadRecords({ page: 1, pageSize: 100 }, undefined, dateRange)
+
+    meGetUsageMock.mockResolvedValueOnce({
+      total_requests: 42,
+      total_tokens: 420,
+      total_cost: 1.25,
+      avg_response_time: 2,
+      records: [],
+      summary_by_model: [],
+      summary_by_api_format: [],
+    })
+    await loadStats(dateRange, { includeRecords: false })
+
+    expect(meGetUsageMock).toHaveBeenLastCalledWith(expect.objectContaining({
+      include_records: false,
+    }))
+    expect(currentRecords.value[0]?.id).toBe('visible-record')
+    expect(stats.value.total_requests).toBe(42)
   })
 
   it('keeps locally resolved failure fields when a stale active record refreshes', async () => {
@@ -533,6 +591,29 @@ describe('useUsageData', () => {
     expect(totalRecords.value).toBe(122101)
   })
 
+  it('can keep the estimated admin total on the initial paint', async () => {
+    const isAdminPage = ref(true)
+    const { loadRecords, totalRecords } = useUsageData({ isAdminPage })
+
+    getAllUsageRecordsMock.mockResolvedValueOnce({
+      records: [buildUsageRecord()],
+      total: 21,
+      total_is_estimated: true,
+      limit: 20,
+      offset: 0,
+    })
+
+    await loadRecords(
+      { page: 1, pageSize: 20 },
+      undefined,
+      { preset: 'today', tz_offset_minutes: 0 },
+      { loadExactTotal: false },
+    )
+
+    expect(getAllUsageRecordTotalMock).not.toHaveBeenCalled()
+    expect(totalRecords.value).toBe(21)
+  })
+
   it('keeps the exact admin record total while a later page returns an estimate', async () => {
     const isAdminPage = ref(true)
     const { loadRecords, totalRecords } = useUsageData({ isAdminPage })
@@ -589,38 +670,40 @@ describe('useUsageData', () => {
       response: { status: 500 },
       message: 'summary failed',
     })
-    getUsageByModelMock.mockResolvedValueOnce([
-      {
-        model: 'gpt-5',
-        request_count: 3,
-        total_tokens: 300,
-        total_cost: 1.23,
-      },
-    ])
-    getUsageByProviderMock.mockResolvedValueOnce([
-      {
-        provider_id: 'provider-openai',
-        provider_key: 'provider-openai',
-        provider_identity_source: 'provider_id',
-        provider: 'OpenAI',
-        request_count: 3,
-        total_tokens: 300,
-        total_cost: 1.23,
-        actual_cost: 1.5,
-        avg_response_time_ms: 1250,
-        success_rate: 1,
-      },
-    ])
-    getUsageByApiFormatMock.mockResolvedValueOnce([
-      {
-        api_format: 'openai:chat',
-        request_count: 3,
-        total_tokens: 300,
-        total_cost: 1.23,
-        actual_cost: 1.5,
-        avg_response_time_ms: 1250,
-      },
-    ])
+    getUsageAggregationsMock.mockResolvedValueOnce({
+      model: [
+        {
+          model: 'gpt-5',
+          request_count: 3,
+          total_tokens: 300,
+          total_cost: 1.23,
+        },
+      ],
+      provider: [
+        {
+          provider_id: 'provider-openai',
+          provider_key: 'provider-openai',
+          provider_identity_source: 'provider_id',
+          provider: 'OpenAI',
+          request_count: 3,
+          total_tokens: 300,
+          total_cost: 1.23,
+          actual_cost: 1.5,
+          avg_response_time_ms: 1250,
+          success_rate: 1,
+        },
+      ],
+      api_format: [
+        {
+          api_format: 'openai:chat',
+          request_count: 3,
+          total_tokens: 300,
+          total_cost: 1.23,
+          actual_cost: 1.5,
+          avg_response_time_ms: 1250,
+        },
+      ],
+    })
 
     const hadFailure = await loadStats(dateRange)
 
@@ -653,44 +736,48 @@ describe('useUsageData', () => {
       total_cost: 1,
       avg_response_time: 0,
     })
-    getUsageByProviderMock.mockResolvedValueOnce([
-      {
-        provider: 'OpenAI',
-        request_count: 3,
-        total_tokens: 300,
-        total_cost: 1.23,
-        actual_cost: 1.5,
-        avg_response_time_ms: 1250,
-        success_rate: 100,
-      },
-      {
-        provider: 'Unknown',
-        request_count: 1,
-        total_tokens: 100,
-        total_cost: 0,
-        actual_cost: 0,
-        avg_response_time_ms: 0,
-        success_rate: 100,
-      },
-      {
-        provider: 'unknow',
-        request_count: 1,
-        total_tokens: 100,
-        total_cost: 0,
-        actual_cost: 0,
-        avg_response_time_ms: 0,
-        success_rate: 100,
-      },
-      {
-        provider: 'pending',
-        request_count: 1,
-        total_tokens: 100,
-        total_cost: 0,
-        actual_cost: 0,
-        avg_response_time_ms: 0,
-        success_rate: 100,
-      },
-    ])
+    getUsageAggregationsMock.mockResolvedValueOnce({
+      model: [],
+      provider: [
+        {
+          provider: 'OpenAI',
+          request_count: 3,
+          total_tokens: 300,
+          total_cost: 1.23,
+          actual_cost: 1.5,
+          avg_response_time_ms: 1250,
+          success_rate: 100,
+        },
+        {
+          provider: 'Unknown',
+          request_count: 1,
+          total_tokens: 100,
+          total_cost: 0,
+          actual_cost: 0,
+          avg_response_time_ms: 0,
+          success_rate: 100,
+        },
+        {
+          provider: 'unknow',
+          request_count: 1,
+          total_tokens: 100,
+          total_cost: 0,
+          actual_cost: 0,
+          avg_response_time_ms: 0,
+          success_rate: 100,
+        },
+        {
+          provider: 'pending',
+          request_count: 1,
+          total_tokens: 100,
+          total_cost: 0,
+          actual_cost: 0,
+          avg_response_time_ms: 0,
+          success_rate: 100,
+        },
+      ],
+      api_format: [],
+    })
 
     await loadStats(dateRange)
 
@@ -709,17 +796,21 @@ describe('useUsageData', () => {
       total_cost: 1,
       avg_response_time: 0,
     })
-    getUsageByProviderMock.mockResolvedValueOnce([
-      {
-        provider: 'OpenAI',
-        request_count: 3,
-        total_tokens: 300,
-        total_cost: 1.23,
-        actual_cost: 1.5,
-        avg_response_time_ms: 1250,
-        success_rate: 100,
-      },
-    ])
+    getUsageAggregationsMock.mockResolvedValueOnce({
+      model: [],
+      provider: [
+        {
+          provider: 'OpenAI',
+          request_count: 3,
+          total_tokens: 300,
+          total_cost: 1.23,
+          actual_cost: 1.5,
+          avg_response_time_ms: 1250,
+          success_rate: 100,
+        },
+      ],
+      api_format: [],
+    })
 
     await loadStats(dateRange)
 
@@ -729,9 +820,9 @@ describe('useUsageData', () => {
       total_cost: 2,
       avg_response_time: 0,
     })
-    getUsageByProviderMock.mockRejectedValueOnce({
+    getUsageAggregationsMock.mockRejectedValueOnce({
       response: { status: 500 },
-      message: 'provider aggregation failed',
+      message: 'usage aggregation failed',
     })
 
     const hadFailure = await loadStats(dateRange, { preserveOnFailure: true })
