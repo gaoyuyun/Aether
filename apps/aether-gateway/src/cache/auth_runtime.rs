@@ -618,6 +618,13 @@ where
         self.singleflight.clear();
     }
 
+    pub(crate) fn remove(&self, key: &K) -> Option<Option<V>> {
+        let Ok(_mutation) = self.mutation.lock() else {
+            return None;
+        };
+        self.entries.remove(key)
+    }
+
     fn insert_if_generation(&self, key: K, value: Option<V>, ttl: Duration, generation: u64) {
         let Ok(_mutation) = self.mutation.lock() else {
             return;

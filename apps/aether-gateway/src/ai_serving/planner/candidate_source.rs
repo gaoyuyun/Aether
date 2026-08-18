@@ -309,6 +309,7 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     model_directive_policy_cache_key: String,
     ordering_config: SchedulerOrderingConfig,
     ranking_seed: u64,
+    bypass_priority_page_cache: bool,
     priority_page_emitted: bool,
     deferred_pages_by_format: BTreeMap<
         String,
@@ -400,6 +401,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             model_directive_policy_cache_key: model_directive_policy.cache_key().to_string(),
             ordering_config,
             ranking_seed: request_distribution_seed(),
+            bypass_priority_page_cache: false,
             priority_page_emitted: false,
             deferred_pages_by_format: BTreeMap::new(),
             format_index: 0,
@@ -500,6 +502,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     }
 
     pub(crate) fn restart_scan(&mut self) {
+        self.bypass_priority_page_cache = true;
         self.format_index = 0;
         self.requested_name_indexes.clear();
         self.requested_name_offsets.clear();
@@ -547,7 +550,9 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     }
 
     fn should_cache_current_priority_page(&self) -> bool {
-        self.allow_priority_page_cache && self.should_cache_current_priority_resolved_page()
+        self.allow_priority_page_cache
+            && !self.bypass_priority_page_cache
+            && self.should_cache_current_priority_resolved_page()
     }
 
     #[cfg(test)]
@@ -602,7 +607,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         let stale_ttl = candidate_page_cache_stale_ttl(ttl);
         let cached = cache
             .get_or_load_once_stale_while_refreshing(
-                key,
+                key.clone(),
                 ttl,
                 stale_ttl,
                 || async {
@@ -619,6 +624,9 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
 
         match cached {
             Some(snapshot) => {
+                if !snapshot.skipped_candidates.is_empty() {
+                    cache.remove(&key);
+                }
                 let page = snapshot.as_ref().clone();
                 if page.candidates.is_empty() && page.skipped_candidates.is_empty() {
                     record_candidate_page_cache_none();

@@ -1860,8 +1860,9 @@ mod tests {
             ..sample_usage("completed")
         };
 
-        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
-        let active = build_users_me_usage_active_payload(&item);
+        let record =
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item, false);
 
         assert_eq!(record["is_websocket"], true);
         assert_eq!(active["is_websocket"], true);

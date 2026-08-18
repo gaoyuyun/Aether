@@ -2260,11 +2260,8 @@ async fn assert_local_route_not_found_response(response: reqwest::Response) {
 }
 
 fn test_auth_secret() -> String {
-    std::env::var("JWT_SECRET_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "aether-rust-dev-jwt-secret".to_string())
+    crate::security_config::jwt_signing_secret()
+        .expect("test JWT signing secret should match runtime validation")
 }
 
 fn test_base64url_encode(bytes: &[u8]) -> String {

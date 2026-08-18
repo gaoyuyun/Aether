@@ -906,7 +906,15 @@ async fn run_versioned_codex_model_cards_frontdoor_scenario() {
                         "id": "resp-future-dynamic",
                         "object": "response",
                         "model": "gpt-future-dynamic",
-                        "output": [],
+                        "output": [{
+                            "type": "message",
+                            "id": "msg-future-dynamic",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "future dynamic response"
+                            }]
+                        }],
                         "usage": {
                             "input_tokens": 1,
                             "output_tokens": 2,
@@ -1246,11 +1254,16 @@ async fn run_versioned_codex_model_cards_frontdoor_scenario() {
         .send()
         .await
         .expect("manual alias inference should succeed");
-    assert_eq!(inference_response.status(), StatusCode::OK);
+    let inference_status = inference_response.status();
     let inference_payload: serde_json::Value = inference_response
         .json()
         .await
         .expect("inference body should parse");
+    assert_eq!(
+        inference_status,
+        StatusCode::OK,
+        "unexpected inference response: {inference_payload}"
+    );
     assert_eq!(inference_payload["model"], "gpt-future-dynamic");
 
     let standard_response = client

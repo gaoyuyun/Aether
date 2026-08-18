@@ -798,7 +798,7 @@ pub(crate) async fn refresh_execution_runtime_auth_context_with_snapshot(
         None
     } else {
         resolve_wallet_auth_gate_uncached_with_commerce_policy(state, &snapshot, commerce_policy)
-            .await?;
+            .await?
     };
     let refreshed = build_data_backed_auth_context(
         state,
@@ -810,7 +810,7 @@ pub(crate) async fn refresh_execution_runtime_auth_context_with_snapshot(
         commerce_policy,
         standalone_keys_enabled,
     )
-    .await;
+    .await?;
     Ok((refreshed, Some(snapshot)))
 }
 
