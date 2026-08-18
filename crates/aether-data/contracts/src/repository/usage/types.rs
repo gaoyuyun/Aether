@@ -1019,6 +1019,14 @@ pub struct UsageAuditAggregationQuery {
     pub exclude_reserved_provider_labels: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageAuditDimensionsAggregationQuery {
+    pub created_from_unix_secs: u64,
+    pub created_until_unix_secs: u64,
+    pub limit: usize,
+    pub exclude_reserved_provider_labels: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageAuditSummaryQuery {
     pub created_from_unix_secs: u64,
@@ -1046,6 +1054,13 @@ pub struct StoredUsageAuditAggregation {
     pub actual_total_cost_usd: f64,
     pub avg_response_time_ms: Option<f64>,
     pub success_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct StoredUsageAuditDimensionsAggregation {
+    pub model: Vec<StoredUsageAuditAggregation>,
+    pub provider: Vec<StoredUsageAuditAggregation>,
+    pub api_format: Vec<StoredUsageAuditAggregation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -1141,6 +1156,7 @@ pub struct UsageCacheAffinityIntervalQuery {
     pub group_by: UsageCacheAffinityIntervalGroupBy,
     pub user_id: Option<String>,
     pub api_key_id: Option<String>,
+    pub max_source_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -1736,6 +1752,45 @@ pub trait UsageReadRepository: Send + Sync {
         &self,
         query: &UsageAuditAggregationQuery,
     ) -> Result<Vec<StoredUsageAuditAggregation>, crate::DataLayerError>;
+
+    async fn aggregate_usage_audit_dimensions(
+        &self,
+        query: &UsageAuditDimensionsAggregationQuery,
+    ) -> Result<StoredUsageAuditDimensionsAggregation, crate::DataLayerError> {
+        let model = self
+            .aggregate_usage_audits(&UsageAuditAggregationQuery {
+                created_from_unix_secs: query.created_from_unix_secs,
+                created_until_unix_secs: query.created_until_unix_secs,
+                group_by: UsageAuditAggregationGroupBy::Model,
+                limit: query.limit,
+                exclude_reserved_provider_labels: query.exclude_reserved_provider_labels,
+            })
+            .await?;
+        let provider = self
+            .aggregate_usage_audits(&UsageAuditAggregationQuery {
+                created_from_unix_secs: query.created_from_unix_secs,
+                created_until_unix_secs: query.created_until_unix_secs,
+                group_by: UsageAuditAggregationGroupBy::Provider,
+                limit: query.limit,
+                exclude_reserved_provider_labels: query.exclude_reserved_provider_labels,
+            })
+            .await?;
+        let api_format = self
+            .aggregate_usage_audits(&UsageAuditAggregationQuery {
+                created_from_unix_secs: query.created_from_unix_secs,
+                created_until_unix_secs: query.created_until_unix_secs,
+                group_by: UsageAuditAggregationGroupBy::ApiFormat,
+                limit: query.limit,
+                exclude_reserved_provider_labels: query.exclude_reserved_provider_labels,
+            })
+            .await?;
+
+        Ok(StoredUsageAuditDimensionsAggregation {
+            model,
+            provider,
+            api_format,
+        })
+    }
 
     async fn summarize_usage_audits(
         &self,

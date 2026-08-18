@@ -5856,6 +5856,67 @@ async fn gateway_handles_users_me_usage_locally_without_proxying_upstream() {
     assert_eq!(payload["billing"]["id"], "wallet-auth-1");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
+    let records_only_response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/users/me/usage?limit=2&include_summary=false&include_total=false"
+        ))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-usage-1")
+        .send()
+        .await
+        .expect("records-only request should succeed");
+    assert_eq!(records_only_response.status(), StatusCode::OK);
+    let records_only_payload: serde_json::Value = records_only_response
+        .json()
+        .await
+        .expect("records-only json should parse");
+    assert_eq!(records_only_payload["total_requests"], 0);
+    assert_eq!(records_only_payload["pagination"]["total"], 3);
+    assert_eq!(
+        records_only_payload["pagination"]["total_is_estimated"],
+        true
+    );
+    assert_eq!(records_only_payload["pagination"]["has_more"], true);
+    assert_eq!(
+        records_only_payload["records"]
+            .as_array()
+            .expect("records-only records array")
+            .len(),
+        2
+    );
+    assert!(records_only_payload["summary_by_model"]
+        .as_array()
+        .expect("records-only summary array")
+        .is_empty());
+
+    let summary_only_response = reqwest::Client::new()
+        .get(format!(
+            "{gateway_url}/api/users/me/usage?include_records=false"
+        ))
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("x-client-device-id", "device-users-me-usage-1")
+        .send()
+        .await
+        .expect("summary-only request should succeed");
+    assert_eq!(summary_only_response.status(), StatusCode::OK);
+    let summary_only_payload: serde_json::Value = summary_only_response
+        .json()
+        .await
+        .expect("summary-only json should parse");
+    assert_eq!(summary_only_payload["total_requests"], 2);
+    assert_eq!(summary_only_payload["pagination"]["total"], 0);
+    assert!(summary_only_payload["records"]
+        .as_array()
+        .expect("summary-only records array")
+        .is_empty());
+    assert_eq!(
+        summary_only_payload["summary_by_model"]
+            .as_array()
+            .expect("summary-only summary array")
+            .len(),
+        2
+    );
+
     gateway_handle.abort();
     upstream_handle.abort();
 }

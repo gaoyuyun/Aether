@@ -177,6 +177,7 @@ export interface UsageResponse {
     limit: number
     offset: number
     has_more: boolean
+    total_is_estimated?: boolean
   }
   records: UsageRecordDetail[]
   activity_heatmap?: ActivityHeatmap | null
@@ -374,6 +375,9 @@ export const meApi = {
     search?: string  // 通用搜索：密钥名、模型名
     limit?: number
     offset?: number
+    include_records?: boolean
+    include_summary?: boolean
+    include_total?: boolean
   }): Promise<UsageResponse> {
     const response = await apiClient.get<UsageResponse>('/api/users/me/usage', { params })
     return response.data

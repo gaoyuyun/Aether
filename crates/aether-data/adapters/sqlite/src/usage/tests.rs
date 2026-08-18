@@ -1,15 +1,30 @@
-use super::{SqliteUsageReadRepository, SqliteUsageWriteRepository};
+use super::{usage_columns, SqliteUsageReadRepository, SqliteUsageWriteRepository};
 use crate::run_migrations;
 use aether_data_contracts::repository::usage::{
     ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest, UpsertUsageRecord,
-    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditListQuery,
-    UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBreakdownGroupBy,
+    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditDimensionsAggregationQuery,
+    UsageAuditListQuery, UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBreakdownGroupBy,
     UsageBreakdownSummaryQuery, UsageCleanupExecutionMode, UsageCleanupTargets, UsageCleanupWindow,
     UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery, UsageDashboardDailyBreakdownQuery,
     UsageDashboardSummaryQuery, UsageProviderPerformanceQuery, UsageReadRepository,
     UsageTimeSeriesGranularity, UsageWriteRepository,
 };
 use chrono::{DateTime, Utc};
+
+#[test]
+fn sqlite_usage_list_projection_skips_http_capture_storage() {
+    let list_sql = usage_columns(false);
+    assert!(!list_sql.contains("JOIN usage_http_audits"));
+    assert!(!list_sql.contains("\"usage\".request_body"));
+    assert!(!list_sql.contains("\"usage\".response_body"));
+    assert!(list_sql.contains("NULL AS request_headers"));
+    assert!(list_sql.contains("NULL AS client_response_body_compressed"));
+
+    let detail_sql = usage_columns(true);
+    assert!(detail_sql.contains("JOIN usage_http_audits"));
+    assert!(detail_sql.contains("\"usage\".request_body"));
+    assert!(detail_sql.contains("\"usage\".response_body"));
+}
 
 #[tokio::test]
 async fn sqlite_reads_only_exact_provider_quota_window_counters() {
@@ -456,6 +471,25 @@ WHERE request_id = 'rebuild-completed';
         .expect("usage audit aggregation should load");
     assert_eq!(aggregation[0].total_tokens, 29);
 
+    let dimensions = reader
+        .aggregate_usage_audit_dimensions(&UsageAuditDimensionsAggregationQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 3_000,
+            limit: 10,
+            exclude_reserved_provider_labels: false,
+        })
+        .await
+        .expect("usage audit dimensions should load");
+    assert_eq!(dimensions.model.len(), 1);
+    assert_eq!(dimensions.model[0].group_key, "model-1");
+    assert_eq!(dimensions.model[0].total_tokens, 29);
+    assert_eq!(dimensions.provider.len(), 1);
+    assert_eq!(dimensions.provider[0].group_key, "provider-1");
+    assert_eq!(dimensions.provider[0].success_count, Some(1));
+    assert_eq!(dimensions.api_format.len(), 1);
+    assert_eq!(dimensions.api_format[0].group_key, "openai");
+    assert_eq!(dimensions.api_format[0].avg_response_time_ms, Some(42.0));
+
     let breakdown = reader
         .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
             created_from_unix_secs: 0,
@@ -577,6 +611,34 @@ async fn sqlite_usage_http_capture_round_trips_and_preserves_sparse_updates() {
     .expect("canonical blobs should count");
     assert_eq!(blob_count, 4);
 
+    let reader = SqliteUsageReadRepository::new(pool.clone());
+    let listed = reader
+        .list_usage_audits(&UsageAuditListQuery {
+            provider_name: Some("Provider One".to_string()),
+            limit: Some(10),
+            newest_first: true,
+            ..UsageAuditListQuery::default()
+        })
+        .await
+        .expect("usage list should load")
+        .into_iter()
+        .find(|item| item.request_id == "canonical-capture")
+        .expect("captured usage should be listed");
+    assert!(listed.request_headers.is_none());
+    assert!(listed.provider_request_headers.is_none());
+    assert!(listed.response_headers.is_none());
+    assert!(listed.client_response_headers.is_none());
+    assert!(listed.request_body.is_none());
+    assert!(listed.provider_request_body.is_none());
+    assert!(listed.response_body.is_none());
+    assert!(listed.client_response_body.is_none());
+    assert!(listed.request_body_ref.is_none());
+    assert!(listed.provider_request_body_ref.is_none());
+    assert_eq!(
+        listed.request_metadata.as_ref().unwrap()["trace_id"],
+        "canonical-trace"
+    );
+
     let sparse = sample_usage("canonical-capture", "streaming", "pending", 1_001);
     let sparse_stored = writer
         .upsert(sparse)
@@ -616,7 +678,6 @@ async fn sqlite_usage_http_capture_round_trips_and_preserves_sparse_updates() {
     .expect("remaining blobs should count");
     assert_eq!(cleared_blob_count, 3);
 
-    let reader = SqliteUsageReadRepository::new(pool.clone());
     let resolved = reader
         .resolve_body_ref("usage://request/canonical-capture/provider_request_body")
         .await

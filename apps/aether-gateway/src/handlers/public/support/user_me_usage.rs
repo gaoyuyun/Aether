@@ -19,7 +19,7 @@ use axum::{
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use crate::handlers::shared::system_config_bool;
+use crate::handlers::shared::{query_param_bool, system_config_bool};
 use crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override;
 use crate::GatewayError;
 
@@ -76,6 +76,12 @@ fn parse_users_me_usage_offset(query: Option<&str>) -> Result<usize, String> {
             .map_err(|_| "offset must be a non-negative integer".to_string()),
         None => Ok(0),
     }
+}
+
+fn users_me_usage_fast_page_total(offset: usize, limit: usize, record_count: usize) -> usize {
+    offset
+        .saturating_add(record_count)
+        .saturating_add(usize::from(record_count == limit))
 }
 
 fn parse_users_me_usage_hours(query: Option<&str>) -> Result<u32, String> {
@@ -944,6 +950,9 @@ pub(super) async fn handle_users_me_usage_get(
             }
         };
     let query = request_context.request_query_string.as_deref();
+    let include_records = query_param_bool(query, "include_records", true);
+    let include_summary = query_param_bool(query, "include_summary", true);
+    let include_total = query_param_bool(query, "include_total", true);
     let time_range = match AdminStatsTimeRange::resolve_optional(query) {
         Ok(value) => value,
         Err(detail) => return admin_stats_bad_request_response(detail),
@@ -982,235 +991,259 @@ pub(super) async fn handle_users_me_usage_get(
     let mut total_record_count = 0usize;
     let mut record_items = Vec::<StoredRequestUsageAudit>::new();
 
-    if let Some((created_from_unix_secs, created_until_unix_secs)) = effective_time_range
-        .as_ref()
-        .and_then(AdminStatsTimeRange::to_unix_bounds)
-    {
-        usage_summary = match state
-            .summarize_dashboard_usage(&UsageDashboardSummaryQuery {
-                created_from_unix_secs,
-                created_until_unix_secs,
-                user_id: Some(auth.user.id.clone()),
-            })
-            .await
+    if include_summary || include_records {
+        if let Some((created_from_unix_secs, created_until_unix_secs)) = effective_time_range
+            .as_ref()
+            .and_then(AdminStatsTimeRange::to_unix_bounds)
         {
-            Ok(value) => value,
-            Err(err) => {
-                return build_auth_error_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("user usage summary lookup failed: {err:?}"),
-                    false,
-                );
-            }
-        };
-        summary_by_model = match state
-            .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
-                created_from_unix_secs,
-                created_until_unix_secs,
-                user_id: Some(auth.user.id.clone()),
-                provider_name: None,
-                model: None,
-                api_format: None,
-                exclude_status_codes: Vec::new(),
-                group_by: UsageBreakdownGroupBy::Model,
-            })
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                return build_auth_error_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("user usage model breakdown lookup failed: {err:?}"),
-                    false,
-                );
-            }
-        };
-        if include_actual_cost {
-            summary_by_provider = match state
-                .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
-                    created_from_unix_secs,
-                    created_until_unix_secs,
-                    user_id: Some(auth.user.id.clone()),
-                    provider_name: None,
-                    model: None,
-                    api_format: None,
-                    exclude_status_codes: Vec::new(),
-                    group_by: UsageBreakdownGroupBy::Provider,
-                })
-                .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user usage provider breakdown lookup failed: {err:?}"),
-                        false,
-                    );
-                }
-            };
-        }
-        summary_by_api_format = match state
-            .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
-                created_from_unix_secs,
-                created_until_unix_secs,
-                user_id: Some(auth.user.id.clone()),
-                provider_name: None,
-                model: None,
-                api_format: None,
-                exclude_status_codes: Vec::new(),
-                group_by: UsageBreakdownGroupBy::ApiFormat,
-            })
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                return build_auth_error_response(
-                    http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("user usage api_format breakdown lookup failed: {err:?}"),
-                    false,
-                );
-            }
-        };
-
-        let active_search = search.as_deref().filter(|value| !value.trim().is_empty());
-        if let Some(search) = active_search {
-            let keywords = parse_users_me_usage_search_keywords(search);
-            let matched_api_key_ids_by_keyword;
-            (api_key_names, matched_api_key_ids_by_keyword) =
-                match resolve_users_me_search_api_key_context(state, &auth.user.id, &keywords).await
+            if include_summary {
+                usage_summary = match state
+                    .summarize_dashboard_usage(&UsageDashboardSummaryQuery {
+                        created_from_unix_secs,
+                        created_until_unix_secs,
+                        user_id: Some(auth.user.id.clone()),
+                    })
+                    .await
                 {
                     Ok(value) => value,
                     Err(err) => {
                         return build_auth_error_response(
                             http::StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("user api key search context lookup failed: {err:?}"),
+                            format!("user usage summary lookup failed: {err:?}"),
                             false,
                         );
                     }
                 };
-            let keyword_query = UsageAuditKeywordSearchQuery {
-                created_from_unix_secs: Some(created_from_unix_secs),
-                created_until_unix_secs: Some(created_until_unix_secs),
-                user_id: Some(auth.user.id.clone()),
-                provider_name: None,
-                model: None,
-                api_format: None,
-                client_family: None,
-                exclude_unknown_model_or_provider: false,
-                statuses: None,
-                exclude_status_codes: Vec::new(),
-                is_stream: None,
-                error_only: false,
-                keywords,
-                matched_user_ids_by_keyword: Vec::new(),
-                auth_user_reader_available: false,
-                matched_api_key_ids_by_keyword,
-                auth_api_key_reader_available,
-                username_keyword: None,
-                matched_user_ids_for_username: Vec::new(),
-                limit: None,
-                offset: None,
-                newest_first: true,
-            };
-            total_record_count = match state
-                .count_usage_audits_by_keyword_search(&keyword_query)
-                .await
-            {
-                Ok(value) => usize::try_from(value).unwrap_or(usize::MAX),
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user usage search count lookup failed: {err:?}"),
-                        false,
-                    );
+                summary_by_model = match state
+                    .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
+                        created_from_unix_secs,
+                        created_until_unix_secs,
+                        user_id: Some(auth.user.id.clone()),
+                        provider_name: None,
+                        model: None,
+                        api_format: None,
+                        exclude_status_codes: Vec::new(),
+                        group_by: UsageBreakdownGroupBy::Model,
+                    })
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return build_auth_error_response(
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("user usage model breakdown lookup failed: {err:?}"),
+                            false,
+                        );
+                    }
+                };
+                if include_actual_cost {
+                    summary_by_provider = match state
+                        .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
+                            created_from_unix_secs,
+                            created_until_unix_secs,
+                            user_id: Some(auth.user.id.clone()),
+                            provider_name: None,
+                            model: None,
+                            api_format: None,
+                            exclude_status_codes: Vec::new(),
+                            group_by: UsageBreakdownGroupBy::Provider,
+                        })
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return build_auth_error_response(
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("user usage provider breakdown lookup failed: {err:?}"),
+                                false,
+                            );
+                        }
+                    };
                 }
-            };
-            record_items = match state
-                .list_usage_audits_by_keyword_search(&UsageAuditKeywordSearchQuery {
-                    limit: Some(limit),
-                    offset: Some(offset),
-                    ..keyword_query
-                })
-                .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user usage search lookup failed: {err:?}"),
-                        false,
-                    );
+                summary_by_api_format = match state
+                    .summarize_usage_breakdown(&UsageBreakdownSummaryQuery {
+                        created_from_unix_secs,
+                        created_until_unix_secs,
+                        user_id: Some(auth.user.id.clone()),
+                        provider_name: None,
+                        model: None,
+                        api_format: None,
+                        exclude_status_codes: Vec::new(),
+                        group_by: UsageBreakdownGroupBy::ApiFormat,
+                    })
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return build_auth_error_response(
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("user usage api_format breakdown lookup failed: {err:?}"),
+                            false,
+                        );
+                    }
+                };
+            }
+
+            if include_records {
+                let active_search = search.as_deref().filter(|value| !value.trim().is_empty());
+                if let Some(search) = active_search {
+                    let keywords = parse_users_me_usage_search_keywords(search);
+                    let matched_api_key_ids_by_keyword;
+                    (api_key_names, matched_api_key_ids_by_keyword) =
+                        match resolve_users_me_search_api_key_context(
+                            state,
+                            &auth.user.id,
+                            &keywords,
+                        )
+                        .await
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                return build_auth_error_response(
+                                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("user api key search context lookup failed: {err:?}"),
+                                    false,
+                                );
+                            }
+                        };
+                    let keyword_query = UsageAuditKeywordSearchQuery {
+                        created_from_unix_secs: Some(created_from_unix_secs),
+                        created_until_unix_secs: Some(created_until_unix_secs),
+                        user_id: Some(auth.user.id.clone()),
+                        provider_name: None,
+                        model: None,
+                        api_format: None,
+                        client_family: None,
+                        exclude_unknown_model_or_provider: false,
+                        statuses: None,
+                        exclude_status_codes: Vec::new(),
+                        is_stream: None,
+                        error_only: false,
+                        keywords,
+                        matched_user_ids_by_keyword: Vec::new(),
+                        auth_user_reader_available: false,
+                        matched_api_key_ids_by_keyword,
+                        auth_api_key_reader_available,
+                        username_keyword: None,
+                        matched_user_ids_for_username: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        newest_first: true,
+                    };
+                    if include_total {
+                        total_record_count = match state
+                            .count_usage_audits_by_keyword_search(&keyword_query)
+                            .await
+                        {
+                            Ok(value) => usize::try_from(value).unwrap_or(usize::MAX),
+                            Err(err) => {
+                                return build_auth_error_response(
+                                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("user usage search count lookup failed: {err:?}"),
+                                    false,
+                                );
+                            }
+                        };
+                    }
+                    record_items = match state
+                        .list_usage_audits_by_keyword_search(&UsageAuditKeywordSearchQuery {
+                            limit: Some(limit),
+                            offset: Some(offset),
+                            ..keyword_query
+                        })
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return build_auth_error_response(
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("user usage search lookup failed: {err:?}"),
+                                false,
+                            );
+                        }
+                    };
+                    if !include_total {
+                        total_record_count =
+                            users_me_usage_fast_page_total(offset, limit, record_items.len());
+                    }
+                } else {
+                    if include_total {
+                        total_record_count = match state
+                            .count_usage_audits(&UsageAuditListQuery {
+                                created_from_unix_secs: Some(created_from_unix_secs),
+                                created_until_unix_secs: Some(created_until_unix_secs),
+                                user_id: Some(auth.user.id.clone()),
+                                provider_name: None,
+                                model: None,
+                                api_format: None,
+                                client_family: None,
+                                exclude_unknown_model_or_provider: false,
+                                statuses: None,
+                                exclude_status_codes: Vec::new(),
+                                is_stream: None,
+                                error_only: false,
+                                limit: None,
+                                offset: None,
+                                newest_first: true,
+                            })
+                            .await
+                        {
+                            Ok(value) => usize::try_from(value).unwrap_or(usize::MAX),
+                            Err(err) => {
+                                return build_auth_error_response(
+                                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("user usage count lookup failed: {err:?}"),
+                                    false,
+                                );
+                            }
+                        };
+                    }
+                    record_items = match state
+                        .list_usage_audits(&UsageAuditListQuery {
+                            created_from_unix_secs: Some(created_from_unix_secs),
+                            created_until_unix_secs: Some(created_until_unix_secs),
+                            user_id: Some(auth.user.id.clone()),
+                            provider_name: None,
+                            model: None,
+                            api_format: None,
+                            client_family: None,
+                            exclude_unknown_model_or_provider: false,
+                            statuses: None,
+                            exclude_status_codes: Vec::new(),
+                            is_stream: None,
+                            error_only: false,
+                            limit: Some(limit),
+                            offset: Some(offset),
+                            newest_first: true,
+                        })
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return build_auth_error_response(
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("user usage records lookup failed: {err:?}"),
+                                false,
+                            );
+                        }
+                    };
+                    if !include_total {
+                        total_record_count =
+                            users_me_usage_fast_page_total(offset, limit, record_items.len());
+                    }
+                    api_key_names = match resolve_users_me_api_key_names(state, &record_items).await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return build_auth_error_response(
+                                http::StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("user api key name lookup failed: {err:?}"),
+                                false,
+                            );
+                        }
+                    };
                 }
-            };
-        } else {
-            total_record_count = match state
-                .count_usage_audits(&UsageAuditListQuery {
-                    created_from_unix_secs: Some(created_from_unix_secs),
-                    created_until_unix_secs: Some(created_until_unix_secs),
-                    user_id: Some(auth.user.id.clone()),
-                    provider_name: None,
-                    model: None,
-                    api_format: None,
-                    client_family: None,
-                    exclude_unknown_model_or_provider: false,
-                    statuses: None,
-                    exclude_status_codes: Vec::new(),
-                    is_stream: None,
-                    error_only: false,
-                    limit: None,
-                    offset: None,
-                    newest_first: true,
-                })
-                .await
-            {
-                Ok(value) => usize::try_from(value).unwrap_or(usize::MAX),
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user usage count lookup failed: {err:?}"),
-                        false,
-                    );
-                }
-            };
-            record_items = match state
-                .list_usage_audits(&UsageAuditListQuery {
-                    created_from_unix_secs: Some(created_from_unix_secs),
-                    created_until_unix_secs: Some(created_until_unix_secs),
-                    user_id: Some(auth.user.id.clone()),
-                    provider_name: None,
-                    model: None,
-                    api_format: None,
-                    client_family: None,
-                    exclude_unknown_model_or_provider: false,
-                    statuses: None,
-                    exclude_status_codes: Vec::new(),
-                    is_stream: None,
-                    error_only: false,
-                    limit: Some(limit),
-                    offset: Some(offset),
-                    newest_first: true,
-                })
-                .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user usage records lookup failed: {err:?}"),
-                        false,
-                    );
-                }
-            };
-            api_key_names = match resolve_users_me_api_key_names(state, &record_items).await {
-                Ok(value) => value,
-                Err(err) => {
-                    return build_auth_error_response(
-                        http::StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("user api key name lookup failed: {err:?}"),
-                        false,
-                    );
-                }
-            };
+            }
         }
     }
 
@@ -1280,6 +1313,7 @@ pub(super) async fn handle_users_me_usage_get(
             "limit": limit,
             "offset": offset,
             "has_more": offset.saturating_add(limit) < total_record_count,
+            "total_is_estimated": include_records && !include_total,
         },
         "records": records,
     });
@@ -1442,6 +1476,7 @@ pub(super) async fn handle_users_me_usage_interval_timeline_get(
             group_by: UsageCacheAffinityIntervalGroupBy::User,
             user_id: Some(auth.user.id.clone()),
             api_key_id: None,
+            max_source_rows: Some(limit.saturating_mul(2).max(limit.saturating_add(1))),
         })
         .await
     {

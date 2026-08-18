@@ -11,6 +11,7 @@ use aether_admin::observability::usage::{
 };
 use aether_data_contracts::repository::usage::{
     StoredUsageAuditAggregation, UsageAuditAggregationGroupBy, UsageAuditAggregationQuery,
+    UsageAuditDimensionsAggregationQuery,
 };
 use axum::{
     body::Body,
@@ -149,10 +150,10 @@ pub(super) async fn build_admin_usage_aggregation_stats_response(
         .to_ascii_lowercase();
     if !matches!(
         group_by.as_str(),
-        "model" | "user" | "provider" | "api_format"
+        "model" | "user" | "provider" | "api_format" | "all"
     ) {
         return Ok(admin_usage_bad_request_response(
-            "Invalid group_by value: must be one of model, user, provider, api_format",
+            "Invalid group_by value: must be one of model, user, provider, api_format, all",
         ));
     }
     let limit = match admin_usage_parse_aggregation_limit(query) {
@@ -165,8 +166,29 @@ pub(super) async fn build_admin_usage_aggregation_stats_response(
     };
     let Some((created_from_unix_secs, created_until_unix_secs)) = time_range.to_unix_bounds()
     else {
-        return Ok(Json(json!([])).into_response());
+        let response = if group_by == "all" {
+            json!({ "model": [], "provider": [], "api_format": [] })
+        } else {
+            json!([])
+        };
+        return Ok(Json(response).into_response());
     };
+    if group_by == "all" {
+        let usage = state
+            .aggregate_usage_audit_dimensions(&UsageAuditDimensionsAggregationQuery {
+                created_from_unix_secs,
+                created_until_unix_secs,
+                limit,
+                exclude_reserved_provider_labels: true,
+            })
+            .await?;
+        return Ok(Json(json!({
+            "model": admin_usage_aggregation_by_model_json(&usage.model),
+            "provider": admin_usage_aggregation_by_provider_json(&usage.provider),
+            "api_format": admin_usage_aggregation_by_api_format_json(&usage.api_format),
+        }))
+        .into_response());
+    }
     let group_by_query = match group_by.as_str() {
         "model" => UsageAuditAggregationGroupBy::Model,
         "user" => UsageAuditAggregationGroupBy::User,

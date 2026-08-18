@@ -118,6 +118,12 @@ export interface UsageByApiFormat {
   cache_hit_rate?: number
 }
 
+export interface UsageAggregations {
+  model: UsageByModel[]
+  provider: UsageByProvider[]
+  api_format: UsageByApiFormat[]
+}
+
 export interface UsageFilters {
   user_id?: string // UUID
   provider_id?: string // UUID
@@ -401,11 +407,11 @@ export const usageApi = {
 
   /**
    * Get usage aggregation by dimension (RESTful API)
-   * @param groupBy Aggregation dimension: 'model', 'user', 'provider', or 'api_format'
+   * @param groupBy Aggregation dimension, or 'all' for the usage-page dimensions
    * @param filters Optional filters
    */
-  async getUsageAggregation<T = UsageByModel[] | UsageByUser[] | UsageByProvider[] | UsageByApiFormat[]>(
-    groupBy: 'model' | 'user' | 'provider' | 'api_format',
+  async getUsageAggregation<T = UsageByModel[] | UsageByUser[] | UsageByProvider[] | UsageByApiFormat[] | UsageAggregations>(
+    groupBy: 'model' | 'user' | 'provider' | 'api_format' | 'all',
     filters?: UsageFilters & { limit?: number },
     options?: UsageRequestOptions
   ): Promise<T> {
@@ -421,6 +427,13 @@ export const usageApi = {
       },
       options?.skipCache ? 0 : USAGE_ANALYTICS_CACHE_TTL_MS
     )
+  },
+
+  async getUsageAggregations(
+    filters?: UsageFilters & { limit?: number },
+    options?: UsageRequestOptions
+  ): Promise<UsageAggregations> {
+    return this.getUsageAggregation<UsageAggregations>('all', filters, options)
   },
 
   // Shorthand methods using getUsageAggregation
