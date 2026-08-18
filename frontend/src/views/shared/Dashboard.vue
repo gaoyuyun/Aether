@@ -877,7 +877,7 @@
       <!-- eslint-disable vue/no-v-html -->
       <div
         class="prose prose-sm dark:prose-invert max-w-none"
-        v-html="renderMarkdown(selectedAnnouncement.content)"
+        v-html="selectedAnnouncementHtml"
       />
       <!-- eslint-enable vue/no-v-html -->
     </div>
@@ -903,6 +903,7 @@ import {
   nextTick,
   watch,
   markRaw,
+  defineAsyncComponent,
 } from "vue";
 import type { Component } from "vue";
 import { useAuthStore } from "@/stores/auth";
@@ -930,9 +931,6 @@ import {
   TableCell,
 } from "@/components/ui";
 import { TimeRangePicker } from "@/components/common";
-import BarChart from "@/components/charts/BarChart.vue";
-import DoughnutChart from "@/components/charts/DoughnutChart.vue";
-import LineChart from "@/components/charts/LineChart.vue";
 import {
   Users,
   Activity,
@@ -953,14 +951,22 @@ import {
 } from "lucide-vue-next";
 import { formatTokens, formatCurrency } from "@/utils/format";
 import { parseDateLike } from "@/utils/date";
-import { marked } from "marked";
-import { sanitizeMarkdown } from "@/utils/sanitize";
 import type {
   ChartData,
   ChartOptions,
   ChartDataset,
   TooltipItem,
 } from "chart.js";
+
+const BarChart = defineAsyncComponent(
+  () => import("@/components/charts/BarChart.vue"),
+);
+const DoughnutChart = defineAsyncComponent(
+  () => import("@/components/charts/DoughnutChart.vue"),
+);
+const LineChart = defineAsyncComponent(
+  () => import("@/components/charts/LineChart.vue"),
+);
 
 const authStore = useAuthStore();
 const moduleStore = useModuleStore();
@@ -1163,7 +1169,9 @@ let dailyStatsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 const announcements = ref<Announcement[]>([]);
 const loadingAnnouncements = ref(false);
 const selectedAnnouncement = ref<Announcement | null>(null);
+const selectedAnnouncementHtml = ref("");
 const detailDialogOpen = ref(false);
+const initialDashboardLoadComplete = ref(false);
 
 const iconMap: Record<string, Component> = {
   Users,
@@ -1282,6 +1290,7 @@ const dailyModelCostChartData = computed<ChartData<"bar">>(() => {
 const dailyModelCostChartOptions = computed<ChartOptions<"bar">>(() => ({
   responsive: true,
   maintainAspectRatio: false,
+  animation: false,
   interaction: {
     mode: "index",
     intersect: false,
@@ -1362,6 +1371,7 @@ const providerCostChartData = computed<ChartData<"doughnut">>(() => {
 const providerCostChartOptions = computed<ChartOptions<"doughnut">>(() => ({
   responsive: true,
   maintainAspectRatio: false,
+  animation: false,
   cutout: "60%",
   plugins: {
     legend: {
@@ -1429,6 +1439,7 @@ const dailyUsageTrendChartOptions = computed<ChartOptions<"line">>(() => {
   return {
     responsive: true,
     maintainAspectRatio: false,
+    animation: false,
     interaction: {
       mode: "index",
       intersect: false,
@@ -1490,10 +1501,11 @@ onMounted(async () => {
   if (typeof window !== "undefined") {
     window.addEventListener("resize", handleWindowResize);
   }
-  await Promise.all([
+  await Promise.allSettled([
     loadDashboardData(),
     loadDailyStats(),
   ]);
+  initialDashboardLoadComplete.value = true;
   await nextTick();
   setupTimelineResizeObserver();
   updateAnnouncementsHeight();
@@ -1655,14 +1667,16 @@ async function loadAnnouncements() {
 }
 
 watch(
-  announcementsModuleActive,
-  (active) => {
-    if (active) {
+  [announcementsModuleActive, initialDashboardLoadComplete],
+  ([active, initialLoadComplete]) => {
+    if (active && initialLoadComplete) {
       void loadAnnouncements();
       return;
     }
+    if (active) return;
     announcements.value = [];
     selectedAnnouncement.value = null;
+    selectedAnnouncementHtml.value = "";
     detailDialogOpen.value = false;
     loadingAnnouncements.value = false;
     announcementsHeight.value = null;
@@ -1682,16 +1696,44 @@ watch(
 );
 
 async function viewAnnouncementDetail(announcement: Announcement) {
-  if (!announcement.is_read && !isAdmin.value) {
-    try {
-      await announcementApi.markAsRead(announcement.id);
-      announcement.is_read = true;
-    } catch {
-      /* 静默忽略标记已读错误 */
-    }
-  }
   selectedAnnouncement.value = announcement;
+  selectedAnnouncementHtml.value = escapeAnnouncementContent(
+    announcement.content,
+  );
   detailDialogOpen.value = true;
+
+  const markdownModules = Promise.all([
+    import("marked"),
+    import("@/utils/sanitize"),
+  ]);
+  if (!announcement.is_read && !isAdmin.value) {
+    void announcementApi
+      .markAsRead(announcement.id)
+      .then(() => {
+        announcement.is_read = true;
+      })
+      .catch(() => {
+        /* 静默忽略标记已读错误 */
+      });
+  }
+  try {
+    const [{ marked }, { sanitizeMarkdown }] = await markdownModules;
+    if (selectedAnnouncement.value === announcement) {
+      selectedAnnouncementHtml.value = sanitizeMarkdown(
+        marked(announcement.content) as string,
+      );
+    }
+  } catch {
+    // Keep the escaped text fallback when the optional renderer cannot load.
+  }
+}
+
+function escapeAnnouncementContent(content: string): string {
+  return content
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\n/g, "<br>");
 }
 
 function getPlainText(content: string): string {
@@ -1777,10 +1819,6 @@ function formatFullDate(dateString: string): string {
   });
 }
 
-function renderMarkdown(content: string): string {
-  const rawHtml = marked(content) as string;
-  return sanitizeMarkdown(rawHtml);
-}
 </script>
 
 <style scoped>

@@ -23,7 +23,7 @@
 
     <!-- 用量分析面板（可折叠） -->
     <div
-      v-if="statsExpanded"
+      v-if="statsExpanded && analyticsReady"
       class="space-y-4"
     >
       <!-- 活跃度热图 + 请求间隔时间线 -->
@@ -132,13 +132,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, defineAsyncComponent, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useLocalStorage } from '@vueuse/core'
 import { useAuthStore } from '@/stores/auth'
 import { usageApi } from '@/api/usage'
 import type { ImageProgress } from '@/api/requestTrace'
-import { usersApi } from '@/api/users'
 import { meApi } from '@/api/me'
 import { dashboardApi } from '@/api/dashboard'
 import { PanelTopClose, PanelTopOpen } from 'lucide-vue-next'
@@ -147,9 +146,6 @@ import {
   UsageProviderTable,
   UsageApiFormatTable,
   UsageRecordsTable,
-  ActivityHeatmapCard,
-  RequestDetailDrawer,
-  IntervalTimelineCard
 } from '@/features/usage/components'
 import {
   useUsageData,
@@ -177,6 +173,10 @@ import { log } from '@/utils/logger'
 import type { ActivityHeatmap } from '@/types/activity'
 import { useToast } from '@/composables/useToast'
 
+const RequestDetailDrawer = defineAsyncComponent(() => import('@/features/usage/components/RequestDetailDrawer.vue'))
+const ActivityHeatmapCard = defineAsyncComponent(() => import('@/features/usage/components/ActivityHeatmapCard.vue'))
+const IntervalTimelineCard = defineAsyncComponent(() => import('@/features/usage/components/IntervalTimelineCard.vue'))
+
 const route = useRoute()
 const { warning } = useToast()
 const authStore = useAuthStore()
@@ -184,9 +184,71 @@ const authStore = useAuthStore()
 // 判断是否是管理员页面
 const isAdminPage = computed(() => route.path.startsWith('/admin'))
 
-// 用量分析面板折叠状态（默认展开，持久化到 localStorage）
-const statsExpanded = useLocalStorage('usage-stats-expanded', true)
+// 每次进入页面默认收起分析面板，优先展示使用记录。
+const statsExpanded = ref(false)
 const hideUnknownRecords = useLocalStorage('usage-hide-unknown-records', false)
+const analyticsReady = ref(false)
+let analyticsLoadStarted = false
+let analyticsIdleHandle: number | null = null
+let analyticsFallbackTimer: ReturnType<typeof setTimeout> | null = null
+
+type IdleWindow = Window & {
+  requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number
+  cancelIdleCallback?: (handle: number) => void
+}
+
+function cancelDeferredAnalytics() {
+  if (analyticsIdleHandle !== null && typeof window !== 'undefined') {
+    (window as IdleWindow).cancelIdleCallback?.(analyticsIdleHandle)
+    analyticsIdleHandle = null
+  }
+  if (analyticsFallbackTimer !== null) {
+    clearTimeout(analyticsFallbackTimer)
+    analyticsFallbackTimer = null
+  }
+}
+
+async function loadDeferredAnalytics() {
+  if (isAdminPage.value) {
+    await refreshAdminAnalytics({ force: true, preserveOnFailure: false })
+    await loadHeatmapData()
+    return
+  }
+
+  const hadFailure = await loadStats(timeRange.value, { includeRecords: false })
+  if (hadFailure) {
+    warning('统计数据加载失败，请刷新重试')
+  }
+  await loadHeatmapData()
+}
+
+function scheduleDeferredAnalytics() {
+  if (analyticsLoadStarted || !statsExpanded.value) return
+  cancelDeferredAnalytics()
+
+  const run = () => {
+    analyticsIdleHandle = null
+    analyticsFallbackTimer = null
+    if (analyticsLoadStarted || !statsExpanded.value || !isPageVisible.value) return
+    analyticsLoadStarted = true
+    analyticsReady.value = true
+    void loadDeferredAnalytics().catch(error => {
+      log.error('加载延迟用量分析失败:', error)
+    })
+  }
+
+  if (typeof window !== 'undefined') {
+    const idleWindow = window as IdleWindow
+    if (idleWindow.requestIdleCallback) {
+      analyticsIdleHandle = idleWindow.requestIdleCallback(run, { timeout: 1500 })
+      return
+    }
+    analyticsFallbackTimer = window.setTimeout(run, 300)
+    return
+  }
+
+  run()
+}
 
 // 时间范围选择
 const timeRange = ref<DateRangeParams>(
@@ -298,15 +360,6 @@ async function loadHeatmapData() {
     heatmapError.value = true
   } finally {
     isLoadingHeatmap.value = false
-  }
-}
-
-async function loadAdminUsers() {
-  try {
-    const users = await usersApi.getAllUsers()
-    availableUsers.value = users.map(u => ({ id: u.id, username: u.username, email: u.email }))
-  } catch (error) {
-    log.error('加载用户列表失败:', error)
   }
 }
 
@@ -812,6 +865,9 @@ function handleVisibilityChange() {
   if (hasActiveRequests.value) {
     startAutoRefresh()
   }
+  if (!analyticsLoadStarted && statsExpanded.value) {
+    scheduleDeferredAnalytics()
+  }
   if (globalAutoRefresh.value) {
     startActiveDiscovery()
     refreshData()
@@ -822,9 +878,14 @@ function handleVisibilityChange() {
 // 组件卸载时清理定时器
 onUnmounted(() => {
   document.removeEventListener('visibilitychange', handleVisibilityChange)
+  cancelDeferredAnalytics()
   stopAutoRefresh()
   stopActiveDiscovery()
   stopGlobalAutoRefresh()
+})
+
+watch(statsExpanded, (expanded) => {
+  if (expanded) scheduleDeferredAnalytics()
 })
 
 // 用户页面的前端分页（后端一次性返回所有记录，前端分页+筛选）
@@ -870,32 +931,22 @@ onMounted(async () => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
 
   if (isAdminPage.value) {
-    // 管理员页面优先启动热力图加载，避免被统计聚合链路阻塞。
-    const heatmapPromise = loadHeatmapData().catch(err => {
-      log.error('加载热力图数据失败:', err)
-    })
-    const adminUsersPromise = loadAdminUsers()
-
     await loadRecords(
       { page: currentPage.value, pageSize: pageSize.value },
       getCurrentFilters(),
-      timeRange.value
+      timeRange.value,
+      { loadExactTotal: false }
     )
-    void (async () => {
-      await refreshAdminAnalytics({ force: true, preserveOnFailure: false })
-      await Promise.all([heatmapPromise, adminUsersPromise])
-    })()
+    scheduleDeferredAnalytics()
   } else {
-    // 用户页面：loadStats 已包含记录加载，不需要单独调用 loadRecords
-    await Promise.allSettled([
-      loadStats(timeRange.value).catch(err => {
-        log.error('加载统计数据失败:', err)
-        warning('统计数据加载失败，请刷新重试')
-      }),
-      loadHeatmapData().catch(err => {
-        log.error('加载热力图数据失败:', err)
-      })
-    ])
+    // 用户页面先加载记录，统计和图表延迟到浏览器空闲时加载。
+    await loadRecords(
+      { page: 1, pageSize: 100 },
+      undefined,
+      timeRange.value,
+      { loadExactTotal: false }
+    )
+    scheduleDeferredAnalytics()
   }
 
   if (globalAutoRefresh.value && isPageVisible.value) {
@@ -916,8 +967,8 @@ async function handleTimeRangeChange(value: DateRangeParams) {
     await refreshAdminAnalyticsForSelectionChange()
     return
   }
-  await loadStats(timeRange.value)
-  // 用户页面：loadStats 已包含记录加载
+  await loadRecords({ page: 1, pageSize: 100 }, undefined, timeRange.value)
+  await loadStats(timeRange.value, { includeRecords: false })
 }
 
 // 处理分页变化
@@ -1037,8 +1088,8 @@ async function refreshData() {
       return
     }
 
-    await loadStats(timeRange.value)
-    // 用户页面：loadStats 已包含记录加载
+    await loadRecords({ page: 1, pageSize: 100 }, undefined, timeRange.value)
+    await loadStats(timeRange.value, { includeRecords: false })
   })()
 
   try {

@@ -717,6 +717,37 @@ async fn gateway_handles_admin_usage_aggregation_stats_locally_with_trusted_admi
     assert_eq!(api_format_items[0]["output_tokens"], 40);
     assert_eq!(api_format_items[1]["api_format"], "claude:messages");
     assert_eq!(api_format_items[1]["output_tokens"], 20);
+
+    let combined_response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/aggregation/stats?group_by=all&limit=10&start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(combined_response.status(), StatusCode::OK);
+    let combined_payload: serde_json::Value = combined_response
+        .json()
+        .await
+        .expect("json body should parse");
+    assert_eq!(combined_payload["model"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        combined_payload["provider"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        combined_payload["api_format"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(combined_payload["model"][0]["model"], "gpt-5");
+    assert_eq!(
+        combined_payload["provider"][0]["provider_id"],
+        "provider-openai"
+    );
+    assert_eq!(
+        combined_payload["api_format"][1]["api_format"],
+        "claude:messages"
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
