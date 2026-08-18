@@ -132,6 +132,16 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn aggregate_usage_audit_dimensions(
+        &self,
+        query: &usage::UsageAuditDimensionsAggregationQuery,
+    ) -> Result<usage::StoredUsageAuditDimensionsAggregation, GatewayError> {
+        self.data
+            .aggregate_usage_audit_dimensions(query)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn summarize_usage_audits(
         &self,
         query: &usage::UsageAuditSummaryQuery,

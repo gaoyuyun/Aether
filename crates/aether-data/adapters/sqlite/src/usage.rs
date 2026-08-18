@@ -16,26 +16,28 @@ use aether_data_contracts::repository::usage::{
     ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
     StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
     StoredProviderQuotaWindowUsage, StoredProviderUsageSummary, StoredRequestUsageAudit,
-    StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBreakdownSummaryRow,
-    StoredUsageCacheAffinityHitSummary, StoredUsageCacheAffinityIntervalRow,
-    StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary, StoredUsageDailySummary,
-    StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardProviderCount,
-    StoredUsageDashboardSummary, StoredUsageErrorDistributionRow, StoredUsageLeaderboardSummary,
+    StoredUsageAuditAggregation, StoredUsageAuditDimensionsAggregation, StoredUsageAuditSummary,
+    StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
+    StoredUsageCacheAffinityIntervalRow, StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
+    StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow,
+    StoredUsageDashboardProviderCount, StoredUsageDashboardSummary,
+    StoredUsageErrorDistributionRow, StoredUsageLeaderboardSummary,
     StoredUsagePerformancePercentilesRow, StoredUsageProviderPerformance,
     StoredUsageProviderPerformanceProviderRow, StoredUsageProviderPerformanceSummary,
     StoredUsageProviderPerformanceTimelineRow, StoredUsageSettledCostSummary,
     StoredUsageTimeSeriesBucket, StoredUsageUserTotals, UpsertUsageRecord,
-    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditKeywordSearchQuery,
-    UsageAuditListQuery, UsageAuditSummaryQuery, UsageBreakdownGroupBy, UsageBreakdownSummaryQuery,
-    UsageCacheAffinityHitSummaryQuery, UsageCacheAffinityIntervalGroupBy,
-    UsageCacheAffinityIntervalQuery, UsageCacheHitSummaryQuery, UsageCleanupExecutionMode,
-    UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
-    UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery, UsageDashboardDailyBreakdownQuery,
-    UsageDashboardProviderCountsQuery, UsageDashboardSummaryQuery, UsageErrorDistributionQuery,
-    UsageLeaderboardGroupBy, UsageLeaderboardQuery, UsageMonitoringErrorCountQuery,
-    UsageMonitoringErrorListQuery, UsagePerformancePercentilesQuery, UsageProviderPerformanceQuery,
-    UsageReadRepository, UsageSettledCostSummaryQuery, UsageTimeSeriesGranularity,
-    UsageTimeSeriesQuery, UsageWriteRepository,
+    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditDimensionsAggregationQuery,
+    UsageAuditKeywordSearchQuery, UsageAuditListQuery, UsageAuditSummaryQuery,
+    UsageBreakdownGroupBy, UsageBreakdownSummaryQuery, UsageCacheAffinityHitSummaryQuery,
+    UsageCacheAffinityIntervalGroupBy, UsageCacheAffinityIntervalQuery, UsageCacheHitSummaryQuery,
+    UsageCleanupExecutionMode, UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets,
+    UsageCleanupWindow, UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery,
+    UsageDashboardDailyBreakdownQuery, UsageDashboardProviderCountsQuery,
+    UsageDashboardSummaryQuery, UsageErrorDistributionQuery, UsageLeaderboardGroupBy,
+    UsageLeaderboardQuery, UsageMonitoringErrorCountQuery, UsageMonitoringErrorListQuery,
+    UsagePerformancePercentilesQuery, UsageProviderPerformanceQuery, UsageReadRepository,
+    UsageSettledCostSummaryQuery, UsageTimeSeriesGranularity, UsageTimeSeriesQuery,
+    UsageWriteRepository,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -44,7 +46,7 @@ mod counters;
 mod http_capture;
 mod snapshots;
 
-const USAGE_COLUMNS: &str = r#"
+const USAGE_COLUMNS_PREFIX: &str = r#"
 SELECT
   id,
   "usage".request_id,
@@ -144,6 +146,9 @@ SELECT
   status,
   COALESCE(usage_settlement_snapshots.billing_status, "usage".billing_status)
     AS billing_status,
+"#;
+
+const USAGE_HTTP_CAPTURE_COLUMNS: &str = r#"
   COALESCE(usage_http_audits.request_headers, "usage".request_headers) AS request_headers,
   "usage".request_body,
   "usage".request_body_compressed,
@@ -170,6 +175,32 @@ SELECT
   usage_http_audits.provider_request_body_state AS http_provider_request_body_state,
   usage_http_audits.response_body_state AS http_response_body_state,
   usage_http_audits.client_response_body_state AS http_client_response_body_state,
+"#;
+
+const USAGE_LIST_HTTP_CAPTURE_COLUMNS: &str = r#"
+  NULL AS request_headers,
+  NULL AS request_body,
+  NULL AS request_body_compressed,
+  NULL AS provider_request_headers,
+  NULL AS provider_request_body,
+  NULL AS provider_request_body_compressed,
+  NULL AS response_headers,
+  NULL AS response_body,
+  NULL AS response_body_compressed,
+  NULL AS client_response_headers,
+  NULL AS client_response_body,
+  NULL AS client_response_body_compressed,
+  NULL AS http_request_body_ref,
+  NULL AS http_provider_request_body_ref,
+  NULL AS http_response_body_ref,
+  NULL AS http_client_response_body_ref,
+  NULL AS http_request_body_state,
+  NULL AS http_provider_request_body_state,
+  NULL AS http_response_body_state,
+  NULL AS http_client_response_body_state,
+"#;
+
+const USAGE_COLUMNS_SUFFIX: &str = r#"
   request_metadata,
   CASE
     WHEN usage_routing_snapshots.request_id IS NOT NULL
@@ -262,13 +293,41 @@ SELECT
   created_at_unix_ms,
   updated_at_unix_secs
 FROM "usage"
+"#;
+
+const USAGE_HTTP_CAPTURE_JOIN: &str = r#"
 LEFT JOIN usage_http_audits
   ON usage_http_audits.request_id = "usage".request_id
+"#;
+
+const USAGE_SNAPSHOT_JOINS: &str = r#"
 LEFT JOIN usage_routing_snapshots
   ON usage_routing_snapshots.request_id = "usage".request_id
 LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = "usage".request_id
 "#;
+
+fn usage_columns(include_http_capture: bool) -> String {
+    let capture_columns = if include_http_capture {
+        USAGE_HTTP_CAPTURE_COLUMNS
+    } else {
+        USAGE_LIST_HTTP_CAPTURE_COLUMNS
+    };
+    let http_capture_join = if include_http_capture {
+        USAGE_HTTP_CAPTURE_JOIN
+    } else {
+        ""
+    };
+
+    [
+        USAGE_COLUMNS_PREFIX,
+        capture_columns,
+        USAGE_COLUMNS_SUFFIX,
+        http_capture_join,
+        USAGE_SNAPSHOT_JOINS,
+    ]
+    .concat()
+}
 
 const UPSERT_USAGE_SQL: &str = r#"
 INSERT INTO "usage" (
@@ -1848,7 +1907,7 @@ LEFT JOIN first_byte_percentiles ON first_byte_percentiles.provider_id = provide
         &self,
         query: &UsageAuditListQuery,
     ) -> Result<Vec<StoredRequestUsageAudit>, DataLayerError> {
-        let mut builder = QueryBuilder::<Sqlite>::new(USAGE_COLUMNS);
+        let mut builder = QueryBuilder::<Sqlite>::new(usage_columns(false));
         let mut has_where = false;
         push_sqlite_usage_list_filters(&mut builder, query, &mut has_where);
         push_sqlite_usage_order_limit_offset(
@@ -1878,7 +1937,7 @@ LEFT JOIN first_byte_percentiles ON first_byte_percentiles.provider_id = provide
         &self,
         query: &UsageAuditKeywordSearchQuery,
     ) -> Result<Vec<StoredRequestUsageAudit>, DataLayerError> {
-        let mut builder = QueryBuilder::<Sqlite>::new(USAGE_COLUMNS);
+        let mut builder = QueryBuilder::<Sqlite>::new(usage_columns(false));
         let mut has_where = false;
         push_sqlite_usage_keyword_filters(&mut builder, query, &mut has_where);
         push_sqlite_usage_order_limit_offset(
@@ -2045,6 +2104,172 @@ LEFT JOIN usage_settlement_snapshots AS settlement
         rows.iter()
             .map(decode_sqlite_usage_aggregation_row)
             .collect()
+    }
+
+    pub async fn aggregate_usage_audit_dimensions(
+        &self,
+        query: &UsageAuditDimensionsAggregationQuery,
+    ) -> Result<StoredUsageAuditDimensionsAggregation, DataLayerError> {
+        if query.created_from_unix_secs >= query.created_until_unix_secs || query.limit == 0 {
+            return Ok(StoredUsageAuditDimensionsAggregation::default());
+        }
+
+        let mut builder = QueryBuilder::<Sqlite>::new(format!(
+            r#"
+WITH dimensions(dimension) AS (
+  VALUES ('model'), ('provider'), ('api_format')
+),
+aggregated AS (
+  SELECT
+    dimensions.dimension AS dimension,
+    CASE dimensions.dimension
+      WHEN 'model' THEN COALESCE(NULLIF(model, ''), 'unknown')
+      WHEN 'provider' THEN CASE
+        WHEN provider_id IS NOT NULL
+          AND TRIM(provider_id) <> ''
+          AND LOWER(TRIM(provider_id)) NOT IN ('unknown', 'unknow', 'pending')
+        THEN TRIM(provider_id)
+        ELSE TRIM(provider_name)
+      END
+      ELSE COALESCE(NULLIF(api_format, ''), 'unknown')
+    END AS group_key,
+    CASE
+      WHEN dimensions.dimension = 'provider'
+      THEN CASE
+        WHEN provider_name IS NOT NULL
+          AND TRIM(provider_name) <> ''
+          AND LOWER(TRIM(provider_name)) NOT IN ('unknown', 'unknow', 'pending')
+        THEN TRIM(provider_name)
+        ELSE NULL
+      END
+      ELSE NULL
+    END AS display_name,
+    CASE
+      WHEN dimensions.dimension = 'provider'
+      THEN CASE
+        WHEN SUM(CASE
+          WHEN provider_id IS NOT NULL
+            AND TRIM(provider_id) <> ''
+            AND LOWER(TRIM(provider_id)) NOT IN ('unknown', 'unknow', 'pending')
+          THEN 1 ELSE 0
+        END) > 0 THEN 'provider_id'
+        WHEN SUM(CASE
+          WHEN provider_name IS NOT NULL
+            AND TRIM(provider_name) <> ''
+            AND LOWER(TRIM(provider_name)) NOT IN ('unknown', 'unknow', 'pending')
+          THEN 1 ELSE 0
+        END) > 0 THEN 'legacy_name'
+        ELSE NULL
+      END
+      ELSE NULL
+    END AS secondary_name,
+    COUNT(*) AS request_count,
+    COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
+    COALESCE(SUM(MAX(COALESCE(output_tokens, 0), 0)), 0) AS output_tokens,
+    COALESCE(SUM({effective_input_expr}), 0) AS effective_input_tokens,
+    COALESCE(SUM({total_input_context_expr}), 0) AS total_input_context,
+    COALESCE(SUM({cache_creation_expr}), 0) AS cache_creation_tokens,
+    COALESCE(SUM(MAX(COALESCE(cache_creation_ephemeral_5m_input_tokens, 0), 0)), 0)
+      AS cache_creation_ephemeral_5m_tokens,
+    COALESCE(SUM(MAX(COALESCE(cache_creation_ephemeral_1h_input_tokens, 0), 0)), 0)
+      AS cache_creation_ephemeral_1h_tokens,
+    COALESCE(SUM(MAX(COALESCE(cache_read_input_tokens, 0), 0)), 0) AS cache_read_tokens,
+    COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd,
+    COALESCE(SUM(COALESCE(CAST(actual_total_cost_usd AS REAL), 0)), 0)
+      AS actual_total_cost_usd,
+    CASE
+      WHEN dimensions.dimension IN ('provider', 'api_format')
+      THEN CASE
+        WHEN COUNT(*) = 0 THEN 0
+        ELSE COALESCE(SUM(MAX(COALESCE(response_time_ms, 0), 0)), 0) * 1.0 / COUNT(*)
+      END
+      ELSE NULL
+    END AS avg_response_time_ms,
+    CASE
+      WHEN dimensions.dimension = 'provider'
+      THEN COALESCE(SUM(CASE
+        WHEN status IN ('completed', 'success', 'ok', 'billed', 'settled')
+          AND (status_code IS NULL OR status_code < 400)
+        THEN 1 ELSE 0
+      END), 0)
+      ELSE NULL
+    END AS success_count
+  FROM "usage"
+  LEFT JOIN usage_settlement_snapshots AS settlement
+    ON settlement.request_id = "usage".request_id
+  CROSS JOIN dimensions
+"#,
+            effective_input_expr = SQLITE_USAGE_EFFECTIVE_INPUT_TOKENS_EXPR,
+            total_input_context_expr = SQLITE_USAGE_TOTAL_INPUT_CONTEXT_EXPR,
+            cache_creation_expr = SQLITE_USAGE_CACHE_CREATION_TOKENS_EXPR,
+            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR
+        ));
+        let mut has_where = false;
+        push_sqlite_usage_where(&mut builder, &mut has_where);
+        builder
+            .push("created_at_unix_ms >= ")
+            .push_bind(query.created_from_unix_secs as i64);
+        push_sqlite_usage_where(&mut builder, &mut has_where);
+        builder
+            .push("created_at_unix_ms < ")
+            .push_bind(query.created_until_unix_secs as i64);
+        push_sqlite_usage_where(&mut builder, &mut has_where);
+        builder.push("status NOT IN ('pending', 'streaming')");
+        if query.exclude_reserved_provider_labels {
+            push_sqlite_usage_where(&mut builder, &mut has_where);
+            builder.push(SQLITE_PROVIDER_IDENTITY_IS_NOT_RESERVED);
+        }
+        builder.push(
+            r#"
+  GROUP BY dimensions.dimension, group_key
+),
+ranked AS (
+  SELECT
+    aggregated.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY dimension
+      ORDER BY request_count DESC, group_key ASC
+    ) AS dimension_rank
+  FROM aggregated
+)
+SELECT
+  dimension,
+  group_key,
+  display_name,
+  secondary_name,
+  request_count,
+  total_tokens,
+  output_tokens,
+  effective_input_tokens,
+  total_input_context,
+  cache_creation_tokens,
+  cache_creation_ephemeral_5m_tokens,
+  cache_creation_ephemeral_1h_tokens,
+  cache_read_tokens,
+  total_cost_usd,
+  actual_total_cost_usd,
+  avg_response_time_ms,
+  success_count
+FROM ranked
+WHERE dimension_rank <= "#,
+        );
+        builder
+            .push_bind(query.limit as i64)
+            .push(" ORDER BY dimension ASC, dimension_rank ASC");
+
+        let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
+        let mut result = StoredUsageAuditDimensionsAggregation::default();
+        for row in &rows {
+            let dimension = row.try_get::<String, _>("dimension").map_sql_err()?;
+            let aggregation = decode_sqlite_usage_aggregation_row(row)?;
+            match dimension.as_str() {
+                "model" => result.model.push(aggregation),
+                "provider" => result.provider.push(aggregation),
+                "api_format" => result.api_format.push(aggregation),
+                _ => {}
+            }
+        }
+        Ok(result)
     }
 
     pub async fn summarize_usage_totals_by_user_ids(
@@ -2518,7 +2743,8 @@ impl UsageReadRepository for SqliteUsageReadRepository {
         &self,
         id: &str,
     ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
-        let row = sqlx::query(&format!("{USAGE_COLUMNS} WHERE \"usage\".id = ? LIMIT 1"))
+        let sql = format!("{} WHERE \"usage\".id = ? LIMIT 1", usage_columns(true));
+        let row = sqlx::query(&sql)
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -2535,7 +2761,7 @@ impl UsageReadRepository for SqliteUsageReadRepository {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut builder = QueryBuilder::<Sqlite>::new(USAGE_COLUMNS);
+        let mut builder = QueryBuilder::<Sqlite>::new(usage_columns(true));
         builder.push(" WHERE \"usage\".id IN (");
         {
             let mut separated = builder.separated(", ");
@@ -2551,13 +2777,15 @@ impl UsageReadRepository for SqliteUsageReadRepository {
         &self,
         request_id: &str,
     ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
-        let row = sqlx::query(&format!(
-            "{USAGE_COLUMNS} WHERE \"usage\".request_id = ? LIMIT 1"
-        ))
-        .bind(request_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_sql_err()?;
+        let sql = format!(
+            "{} WHERE \"usage\".request_id = ? LIMIT 1",
+            usage_columns(true)
+        );
+        let row = sqlx::query(&sql)
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_sql_err()?;
         let usage = row
             .as_ref()
             .map(|row| map_usage_row(row, true))
@@ -2607,6 +2835,13 @@ impl UsageReadRepository for SqliteUsageReadRepository {
         query: &UsageAuditAggregationQuery,
     ) -> Result<Vec<StoredUsageAuditAggregation>, DataLayerError> {
         Self::aggregate_usage_audits(self, query).await
+    }
+
+    async fn aggregate_usage_audit_dimensions(
+        &self,
+        query: &UsageAuditDimensionsAggregationQuery,
+    ) -> Result<StoredUsageAuditDimensionsAggregation, DataLayerError> {
+        Self::aggregate_usage_audit_dimensions(self, query).await
     }
 
     async fn summarize_usage_audits(
@@ -2795,17 +3030,13 @@ FROM "usage"
         };
         let mut builder = QueryBuilder::<Sqlite>::new(format!(
             r#"
-WITH filtered_usage AS (
+WITH filtered_source AS (
   SELECT
     {group_expr} AS group_id,
     NULL AS username,
     model,
     created_at_unix_ms,
-    id,
-    LAG(created_at_unix_ms) OVER (
-      PARTITION BY {group_expr}
-      ORDER BY created_at_unix_ms ASC, id ASC
-    ) AS previous_created_at_unix_secs
+    id
   FROM "usage"
 "#
         ));
@@ -2836,9 +3067,29 @@ WITH filtered_usage AS (
             .push(" IS NOT NULL AND TRIM(")
             .push(group_expr)
             .push(") <> ''");
+        if let Some(limit) = query.max_source_rows {
+            builder
+                .push(" ORDER BY created_at_unix_ms DESC, id DESC LIMIT ")
+                .push_bind(limit.max(2) as i64);
+        }
         builder.push(
             r#"
-)
+), filtered_usage AS (
+  SELECT
+    group_id,
+    username,
+    model,
+    created_at_unix_ms,
+    id,
+    LAG(created_at_unix_ms) OVER (
+      PARTITION BY group_id
+      ORDER BY created_at_unix_ms ASC, id ASC
+    ) AS previous_created_at_unix_secs
+  FROM filtered_source
+"#,
+        );
+        builder.push(
+            r#"
 SELECT
   group_id,
   username,
@@ -3248,7 +3499,7 @@ WHERE created_at_unix_ms >= ?
         &self,
         query: &UsageMonitoringErrorListQuery,
     ) -> Result<Vec<StoredRequestUsageAudit>, DataLayerError> {
-        let mut builder = QueryBuilder::<Sqlite>::new(USAGE_COLUMNS);
+        let mut builder = QueryBuilder::<Sqlite>::new(usage_columns(false));
         let mut has_where = false;
         push_sqlite_usage_range(
             &mut builder,
@@ -4113,7 +4364,7 @@ LEFT JOIN usage_settlement_snapshots AS settlement
             return Ok(Vec::new());
         }
 
-        let mut builder = QueryBuilder::<Sqlite>::new(USAGE_COLUMNS);
+        let mut builder = QueryBuilder::<Sqlite>::new(usage_columns(false));
         let mut has_where = false;
         push_sqlite_usage_optional_text_filter(&mut builder, &mut has_where, "user_id", user_id);
         builder.push(" ORDER BY created_at_unix_ms DESC, id ASC LIMIT ");
@@ -4509,13 +4760,15 @@ impl SqliteUsageWriteRepository {
         &self,
         request_id: &str,
     ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
-        let row = sqlx::query(&format!(
-            "{USAGE_COLUMNS} WHERE \"usage\".request_id = ? LIMIT 1"
-        ))
-        .bind(request_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_sql_err()?;
+        let sql = format!(
+            "{} WHERE \"usage\".request_id = ? LIMIT 1",
+            usage_columns(true)
+        );
+        let row = sqlx::query(&sql)
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_sql_err()?;
         let usage = row
             .as_ref()
             .map(|row| map_usage_row(row, true))

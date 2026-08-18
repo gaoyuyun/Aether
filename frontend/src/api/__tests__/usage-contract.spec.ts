@@ -126,11 +126,15 @@ describe('usageApi contract alignment', () => {
         },
       })
       .mockResolvedValueOnce({
-        data: [{ provider: 'OpenAI', request_count: 7 }],
+        data: {
+          model: [],
+          provider: [{ provider: 'OpenAI', request_count: 7 }],
+          api_format: [],
+        },
       })
 
     await usageApi.getUsageStats({ preset: 'last30days' }, { skipCache: true })
-    await usageApi.getUsageByProvider({ preset: 'last30days' }, { skipCache: true })
+    await usageApi.getUsageAggregations({ preset: 'last30days' }, { skipCache: true })
 
     expect(cachedRequestMock).toHaveBeenNthCalledWith(
       1,
@@ -149,7 +153,7 @@ describe('usageApi contract alignment', () => {
       timeout: 120000,
     })
     expect(getMock).toHaveBeenNthCalledWith(2, '/api/admin/usage/aggregation/stats', {
-      params: { group_by: 'provider', preset: 'last30days' },
+      params: { group_by: 'all', preset: 'last30days' },
       timeout: 120000,
     })
   })
