@@ -141,18 +141,38 @@ impl<'a> PlannerAppState<'a> {
         ),
         GatewayError,
     > {
-        crate::scheduler::candidate::list_selectable_enumerated_candidates_with_skip_reasons_and_ranking_seed(
-            self.app(),
-            api_format,
-            global_model_name,
-            candidates,
-            required_capabilities,
-            auth_snapshot,
-            client_session_affinity,
-            current_unix_secs(),
-            ranking_seed,
-        )
-        .await
+        let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
+        let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
+        let wait_deadline = Instant::now() + wait_timeout;
+
+        loop {
+            let result = crate::scheduler::candidate::list_selectable_enumerated_candidates_with_skip_reasons_and_ranking_seed(
+                self.app(),
+                api_format,
+                global_model_name,
+                candidates.clone(),
+                required_capabilities,
+                auth_snapshot,
+                client_session_affinity,
+                current_unix_secs(),
+                ranking_seed,
+            )
+            .await?;
+
+            if !crate::scheduler::candidate::is_exact_all_skipped_by_auth_limit(
+                &result.0, &result.1,
+            ) {
+                return Ok(result);
+            }
+
+            let now = Instant::now();
+            if now >= wait_deadline {
+                return Ok(result);
+            }
+
+            let remaining = wait_deadline.duration_since(now);
+            tokio::time::sleep(wait_interval.min(remaining)).await;
+        }
     }
 
     pub(crate) async fn list_selectable_candidates_for_required_capability_without_requested_model(

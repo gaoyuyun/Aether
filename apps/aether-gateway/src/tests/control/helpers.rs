@@ -74,11 +74,8 @@ pub(super) fn hash_management_token(value: &str) -> String {
 }
 
 pub(super) fn test_auth_secret() -> String {
-    std::env::var("JWT_SECRET_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "aether-rust-dev-jwt-secret".to_string())
+    crate::security_config::jwt_signing_secret()
+        .expect("test JWT signing secret should match runtime validation")
 }
 
 pub(super) fn build_test_auth_token(

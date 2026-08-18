@@ -1319,6 +1319,7 @@ async fn resolve_priority_candidate_page_with_cache(
             .page_cursor
             .resolved_page_cache_model_directive_policy_hash(),
         cursor.resolution_mode,
+        &page_candidates,
     );
     let page_candidates_for_fallback = page_candidates;
     let app = cursor.state.app();
