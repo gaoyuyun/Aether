@@ -1,5 +1,4 @@
 mod sub2api;
-mod yescode;
 
 use super::super::support::AdminProviderOpsCheckinOutcome;
 use super::super::verify::{
@@ -28,16 +27,6 @@ pub(super) async fn admin_provider_ops_run_query_balance_action(
     proxy_snapshot: Option<&ProxySnapshot>,
 ) -> serde_json::Value {
     match architecture.balance_mode {
-        ProviderOpsBalanceMode::YescodeCombined => {
-            return yescode::admin_provider_ops_yescode_balance_payload(
-                state,
-                base_url,
-                headers,
-                action_config,
-                proxy_snapshot,
-            )
-            .await;
-        }
         ProviderOpsBalanceMode::Sub2ApiDualRequest => {
             return sub2api::admin_provider_ops_sub2api_balance_payload(
                 state,

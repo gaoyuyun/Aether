@@ -52,15 +52,3 @@ pub(super) fn admin_provider_ops_request_method(
             reqwest::Method::from_bytes(default_method.as_bytes()).unwrap_or(reqwest::Method::GET)
         })
 }
-
-pub(super) fn admin_provider_ops_parse_rfc3339_unix_secs(
-    value: Option<&serde_json::Value>,
-) -> Option<i64> {
-    let raw = value?.as_str()?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|value| value.timestamp())
-}

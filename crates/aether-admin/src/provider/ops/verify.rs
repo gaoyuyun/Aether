@@ -28,10 +28,7 @@ pub fn parse_verify_payload(
 ) -> Value {
     match normalize_architecture_id(architecture_id) {
         "anyrouter" => admin_provider_ops_anyrouter_verify_payload(status, response_json),
-        "cubence" => admin_provider_ops_cubence_verify_payload(status, response_json),
         "done_hub" => admin_provider_ops_anyrouter_verify_payload(status, response_json),
-        "yescode" => admin_provider_ops_yescode_verify_payload(status, response_json),
-        "nekocode" => admin_provider_ops_nekocode_verify_payload(status, response_json),
         "sub2api" => {
             admin_provider_ops_sub2api_verify_payload(status, response_json, updated_credentials)
         }
@@ -62,76 +59,10 @@ fn admin_provider_ops_strip_cookie_header_prefix(cookie_input: &str) -> &str {
     trimmed
 }
 
-fn admin_provider_ops_is_set_cookie_attribute(name: &str) -> bool {
-    matches!(
-        name,
-        "path"
-            | "domain"
-            | "expires"
-            | "max-age"
-            | "secure"
-            | "httponly"
-            | "samesite"
-            | "partitioned"
-            | "priority"
-    )
-}
-
-fn admin_provider_ops_cubence_cookie_header(cookie_input: &str) -> String {
-    let trimmed = admin_provider_ops_strip_cookie_header_prefix(cookie_input);
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if !trimmed.contains('=') {
-        return format!("token={trimmed}");
-    }
-
-    let cookies = trimmed
-        .split(';')
-        .filter_map(|part| {
-            let part = part.trim();
-            let (name, value) = part.split_once('=')?;
-            let name = name.trim();
-            let value = value.trim();
-            if name.is_empty() || value.is_empty() {
-                return None;
-            }
-            let lower = name.to_ascii_lowercase();
-            if admin_provider_ops_is_set_cookie_attribute(&lower) {
-                return None;
-            }
-            Some(format!("{name}={value}"))
-        })
-        .collect::<Vec<_>>();
-
-    if cookies.is_empty() {
-        let token = admin_provider_ops_extract_cookie_value(trimmed, "token");
-        return format!("token={token}");
-    }
-
-    cookies.join("; ")
-}
-
 fn admin_provider_ops_session_cookie_header(cookie_input: &str) -> String {
     let trimmed = admin_provider_ops_strip_cookie_header_prefix(cookie_input);
     let session = admin_provider_ops_extract_cookie_value(trimmed, "session");
     format!("session={session}")
-}
-
-pub fn admin_provider_ops_yescode_cookie_header(cookie_input: &str) -> String {
-    if cookie_input.contains("yescode_auth=") {
-        let mut parts = Vec::new();
-        for part in cookie_input.split(';') {
-            let trimmed = part.trim();
-            if let Some(value) = trimmed.strip_prefix("yescode_auth=") {
-                parts.push(format!("yescode_auth={}", value.trim()));
-            } else if let Some(value) = trimmed.strip_prefix("yescode_csrf=") {
-                parts.push(format!("yescode_csrf={}", value.trim()));
-            }
-        }
-        return parts.join("; ");
-    }
-    format!("yescode_auth={}", cookie_input.trim())
 }
 
 pub fn admin_provider_ops_anyrouter_compute_acw_sc_v2(arg1: &str) -> Option<String> {
@@ -414,45 +345,6 @@ pub fn admin_provider_ops_verify_headers(
                 }
             }
         }
-        "cubence" => {
-            insert_header(&mut headers, "User-Agent", ADMIN_PROVIDER_OPS_USER_AGENT)?;
-            if let Some(token_cookie) = credentials
-                .get("token_cookie")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                let cookie_header = admin_provider_ops_cubence_cookie_header(token_cookie);
-                if !cookie_header.is_empty() {
-                    insert_header(&mut headers, "Cookie", &cookie_header)?;
-                }
-            }
-        }
-        "yescode" => {
-            if let Some(auth_cookie) = credentials
-                .get("auth_cookie")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                insert_header(
-                    &mut headers,
-                    "Cookie",
-                    &admin_provider_ops_yescode_cookie_header(auth_cookie),
-                )?;
-            }
-        }
-        "nekocode" => {
-            if let Some(session_cookie) = credentials
-                .get("session_cookie")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                insert_header(
-                    &mut headers,
-                    "Cookie",
-                    &admin_provider_ops_session_cookie_header(session_cookie),
-                )?;
-            }
-        }
         "done_hub" => {
             insert_header(&mut headers, "User-Agent", ADMIN_PROVIDER_OPS_USER_AGENT)?;
             if let Some(session_cookie) = credentials
@@ -593,185 +485,6 @@ fn verify_payload_with_auth_messages(
     )
 }
 
-pub fn admin_provider_ops_cubence_verify_payload(
-    status: StatusCode,
-    response_json: &Value,
-) -> Value {
-    if status == StatusCode::UNAUTHORIZED {
-        return admin_provider_ops_verify_failure("Cookie 已失效，请重新配置");
-    }
-    if status == StatusCode::FORBIDDEN {
-        return admin_provider_ops_verify_failure("Cookie 已失效或无权限");
-    }
-    if status != StatusCode::OK {
-        return admin_provider_ops_verify_failure(format!("验证失败：HTTP {}", status.as_u16()));
-    }
-
-    let payload = if response_json.get("success").and_then(Value::as_bool) == Some(true)
-        && response_json.get("data").is_some_and(Value::is_object)
-    {
-        response_json.get("data")
-    } else if response_json.get("success").and_then(Value::as_bool) == Some(false) {
-        return admin_provider_ops_verify_failure(
-            response_json
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("验证失败"),
-        );
-    } else {
-        Some(response_json)
-    };
-
-    let Some(payload) = payload.and_then(admin_provider_ops_json_object) else {
-        return admin_provider_ops_verify_failure("响应格式无效");
-    };
-    let user_info = payload
-        .get("user")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let balance_info = payload
-        .get("balance")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut extra = Map::new();
-    if let Some(role) = user_info.get("role") {
-        extra.insert("role".to_string(), role.clone());
-    }
-    if let Some(invite_code) = user_info.get("invite_code") {
-        extra.insert("invite_code".to_string(), invite_code.clone());
-    }
-
-    admin_provider_ops_verify_success(
-        admin_provider_ops_verify_user_payload(
-            user_info
-                .get("username")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            user_info
-                .get("username")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            None,
-            admin_provider_ops_value_as_f64(balance_info.get("total_balance_dollar")),
-            Some(extra),
-        ),
-        None,
-    )
-}
-
-pub fn admin_provider_ops_yescode_verify_payload(
-    status: StatusCode,
-    response_json: &Value,
-) -> Value {
-    if status == StatusCode::UNAUTHORIZED {
-        return admin_provider_ops_verify_failure("Cookie 已失效，请重新配置");
-    }
-    if status == StatusCode::FORBIDDEN {
-        return admin_provider_ops_verify_failure("Cookie 已失效或无权限");
-    }
-    if status != StatusCode::OK {
-        return admin_provider_ops_verify_failure(format!("验证失败：HTTP {}", status.as_u16()));
-    }
-
-    let Some(payload) = admin_provider_ops_json_object(response_json) else {
-        return admin_provider_ops_verify_failure("响应格式无效");
-    };
-    let Some(username) = payload
-        .get("username")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-    else {
-        return admin_provider_ops_verify_failure("响应格式无效");
-    };
-
-    let pay_as_you_go =
-        admin_provider_ops_value_as_f64(payload.get("pay_as_you_go_balance")).unwrap_or(0.0);
-    let subscription =
-        admin_provider_ops_value_as_f64(payload.get("subscription_balance")).unwrap_or(0.0);
-    let plan = payload
-        .get("subscription_plan")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let weekly_limit = admin_provider_ops_value_as_f64(
-        payload
-            .get("weekly_limit")
-            .or_else(|| plan.get("weekly_limit")),
-    );
-    let weekly_spent = admin_provider_ops_value_as_f64(
-        payload
-            .get("weekly_spent_balance")
-            .or_else(|| payload.get("current_week_spend")),
-    )
-    .unwrap_or(0.0);
-    let subscription_available = weekly_limit
-        .map(|limit| (limit - weekly_spent).max(0.0).min(subscription))
-        .unwrap_or(subscription);
-
-    admin_provider_ops_verify_success(
-        admin_provider_ops_verify_user_payload(
-            Some(username.clone()),
-            Some(username),
-            payload
-                .get("email")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            Some(pay_as_you_go + subscription_available),
-            None,
-        ),
-        None,
-    )
-}
-
-pub fn admin_provider_ops_nekocode_verify_payload(
-    status: StatusCode,
-    response_json: &Value,
-) -> Value {
-    if status == StatusCode::UNAUTHORIZED {
-        return admin_provider_ops_verify_failure("Cookie 已失效，请重新配置");
-    }
-    if status == StatusCode::FORBIDDEN {
-        return admin_provider_ops_verify_failure("Cookie 已失效或无权限");
-    }
-    if status != StatusCode::OK {
-        return admin_provider_ops_verify_failure(format!("验证失败：HTTP {}", status.as_u16()));
-    }
-
-    let user_data = if response_json.get("success").and_then(Value::as_bool) == Some(true)
-        && response_json.get("data").is_some_and(Value::is_object)
-    {
-        response_json.get("data")
-    } else {
-        Some(response_json)
-    };
-    let Some(user_data) = user_data.and_then(admin_provider_ops_json_object) else {
-        return admin_provider_ops_verify_failure("响应格式无效");
-    };
-
-    admin_provider_ops_verify_success(
-        admin_provider_ops_verify_user_payload(
-            user_data
-                .get("username")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            user_data
-                .get("display_name")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            user_data
-                .get("email")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            admin_provider_ops_value_as_f64(user_data.get("balance")),
-            None,
-        ),
-        None,
-    )
-}
-
 pub fn admin_provider_ops_sub2api_verify_payload(
     status: StatusCode,
     response_json: &Value,
@@ -841,7 +554,7 @@ mod tests {
     use super::{
         admin_provider_ops_anyrouter_compute_acw_sc_v2,
         admin_provider_ops_anyrouter_parse_session_user_id,
-        admin_provider_ops_anyrouter_verify_payload, admin_provider_ops_cubence_verify_payload,
+        admin_provider_ops_anyrouter_verify_payload,
         admin_provider_ops_frontend_updated_credentials, admin_provider_ops_sub2api_verify_payload,
         admin_provider_ops_verify_headers, parse_verify_payload, ADMIN_PROVIDER_OPS_USER_AGENT,
     };
@@ -1051,55 +764,5 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("42")
         );
-    }
-
-    #[test]
-    fn cubence_verify_headers_preserve_full_cookie_header() {
-        let headers = admin_provider_ops_verify_headers(
-            "cubence",
-            &Map::new(),
-            &Map::from_iter([(
-                "token_cookie".to_string(),
-                json!("Cookie: token=abc; cf_clearance=def; Path=/; HttpOnly"),
-            )]),
-        )
-        .expect("headers should build");
-
-        assert_eq!(
-            headers.get(COOKIE).and_then(|value| value.to_str().ok()),
-            Some("token=abc; cf_clearance=def")
-        );
-        assert_eq!(
-            headers
-                .get(USER_AGENT)
-                .and_then(|value| value.to_str().ok()),
-            Some(ADMIN_PROVIDER_OPS_USER_AGENT)
-        );
-    }
-
-    #[test]
-    fn cubence_verify_payload_reads_wrapped_dashboard_overview() {
-        let payload = admin_provider_ops_cubence_verify_payload(
-            StatusCode::OK,
-            &json!({
-                "success": true,
-                "data": {
-                    "user": {
-                        "username": "AAEE86",
-                        "role": "user",
-                        "invite_code": "SCFSJ5C5"
-                    },
-                    "balance": {
-                        "total_balance_dollar": 0.6
-                    }
-                }
-            }),
-        );
-
-        assert_eq!(payload["success"], json!(true));
-        assert_eq!(payload["data"]["username"], json!("AAEE86"));
-        assert_eq!(payload["data"]["quota"], json!(0.6));
-        assert_eq!(payload["data"]["extra"]["role"], json!("user"));
-        assert_eq!(payload["data"]["extra"]["invite_code"], json!("SCFSJ5C5"));
     }
 }
