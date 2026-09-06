@@ -24,7 +24,7 @@
         </div>
         <Select
           :model-value="modelValue"
-          @update:model-value="$emit('update:modelValue', $event)"
+          @update:model-value="handleModelValueUpdate"
         >
           <SelectTrigger class="h-9 w-full">
             <SelectValue />
@@ -52,13 +52,17 @@ import { ShieldCheck } from 'lucide-vue-next'
 import { useI18n } from '@/i18n'
 import type { UserBatchQuotaMode } from './user-management-types'
 
+const emit = defineEmits<{
+  'update:modelValue': [value: UserBatchQuotaMode]
+}>()
+
 defineProps<{
   modelValue: UserBatchQuotaMode
 }>()
 
-defineEmits<{
-  'update:modelValue': [value: UserBatchQuotaMode]
-}>()
+function handleModelValueUpdate(value: string): void {
+  if (value === 'skip' || value === 'wallet' || value === 'unlimited') emit('update:modelValue', value)
+}
 
 const { legacyT } = useI18n()
 </script>

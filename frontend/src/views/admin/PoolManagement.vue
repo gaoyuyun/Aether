@@ -970,7 +970,7 @@
       v-model="showAccountBatchDialog"
       :provider-id="selectedProviderId"
       :provider-name="selectedProviderData?.name || ''"
-      :provider-type="selectedProviderData?.provider_type || selectedProviderType"
+      :provider-type="(selectedProviderData?.provider_type || selectedProviderType) as any"
       :batch-concurrency="selectedProviderConfig?.batch_concurrency"
       :selected-keys="selectedPoolKeys"
       :select-all-filtered="selectAllFilteredPoolKeys"
@@ -994,7 +994,7 @@
       v-if="selectedProviderId"
       :open="keyFormDialogOpen"
       :endpoint="null"
-      :provider-type="selectedProviderData?.provider_type || selectedProviderType"
+      :provider-type="(selectedProviderData?.provider_type || selectedProviderType) as any"
       :editing-key="editingKey"
       :provider-id="selectedProviderId"
       :available-api-formats="selectedProviderData?.api_formats || []"
@@ -2109,7 +2109,10 @@ function getPoolKeyAccountStatsMetrics(key: PoolKeyDetail): PoolStatsMetric[] {
   const display = getPoolKeyStatsDisplay(key)
   return display.kind === 'account_total'
     ? display.metrics
-    : buildPoolStatsDisplay(key, selectedProviderType.value, 'account_total').metrics
+    : (() => {
+        const fallback = buildPoolStatsDisplay(key, selectedProviderType.value, 'account_total')
+        return fallback.kind === 'account_total' ? fallback.metrics : []
+      })()
 }
 
 const quotaRefreshSupported = computed(() => {

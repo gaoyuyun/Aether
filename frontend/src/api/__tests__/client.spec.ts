@@ -4,7 +4,7 @@ import type { AxiosAdapter, AxiosInstance, InternalAxiosRequestConfig } from 'ax
 import apiClient, { AUTH_STATE_CHANGE_EVENT } from '@/api/client'
 import { cache, cachedRequest } from '@/utils/cache'
 
-type TestableApiClient = typeof apiClient & {
+type TestableApiClient = Omit<typeof apiClient, 'client'> & {
   client: AxiosInstance
 }
 
@@ -72,7 +72,7 @@ describe('apiClient auth state change event', () => {
   })
 
   it('sends auth refresh without a request body', async () => {
-    const rawClient = apiClient as TestableApiClient
+    const rawClient = apiClient as unknown as TestableApiClient
     const previousAdapter = rawClient.client.defaults.adapter
     const requests: InternalAxiosRequestConfig[] = []
 

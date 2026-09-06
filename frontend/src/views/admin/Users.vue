@@ -594,7 +594,7 @@ function entitlementLabels(items: BillingEntitlement[] | undefined): string[] {
     if (item.type === 'membership_group') {
       return legacyT('会员权益')
     }
-    return item.type
+    return ''
   })
 }
 
@@ -779,7 +779,7 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string; un
       // 更新用户
       const updateData: Record<string, unknown> = {
         username: data.username,
-        email: data.email || undefined,
+        email: data.email || '',
         role: data.role,
         group_ids: data.group_ids ?? [],
         feature_settings: data.feature_settings ?? null,
@@ -796,7 +796,7 @@ async function handleUserFormSubmit(data: UserFormData & { password?: string; un
       const newUser = await usersStore.createUser({
         username: data.username,
         password: data.password ?? '',
-        email: data.email || undefined,
+        email: data.email || '',
         initial_gift_usd: data.initial_gift_usd,
         unlimited: data.unlimited,
         role: data.role,
@@ -1145,8 +1145,10 @@ async function deleteApiKey(apiKey: ApiKey) {
   if (!confirmed) return
 
   try {
-    await usersStore.deleteApiKey(selectedUser.value.id, apiKey.id)
-    await loadUserApiKeys(selectedUser.value.id)
+    const user = selectedUser.value
+    if (!user) return
+    await usersStore.deleteApiKey(user.id, apiKey.id)
+    await loadUserApiKeys(user.id)
     success(legacyT('API Key已删除'))
   } catch (err: unknown) {
     error(localizedApiError(err, '未知错误'), legacyT('删除 API Key 失败'))

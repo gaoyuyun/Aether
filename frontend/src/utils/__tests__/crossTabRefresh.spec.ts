@@ -55,7 +55,7 @@ describe('CrossTabRefreshCoordinator', () => {
   })
 
   it('deduplicates refresh requests across tabs', async () => {
-    let resolveRefresh: ((token: string) => void) | null = null
+    let resolveRefresh: (token: string) => void = () => {}
     const firstExecutor = vi.fn(
       () =>
         new Promise<string>((resolve) => {
@@ -80,7 +80,7 @@ describe('CrossTabRefreshCoordinator', () => {
     expect(firstExecutor).toHaveBeenCalledTimes(1)
     expect(secondExecutor).not.toHaveBeenCalled()
 
-    resolveRefresh?.('access-from-first-tab')
+    resolveRefresh('access-from-first-tab')
 
     await expect(firstRun).resolves.toBe('access-from-first-tab')
     await expect(secondRun).resolves.toBe('access-from-first-tab')
@@ -91,7 +91,7 @@ describe('CrossTabRefreshCoordinator', () => {
 
   it('propagates refresh failure to waiting tabs without second refresh call', async () => {
     const refreshError = new Error('refresh failed')
-    let rejectRefresh: ((error: Error) => void) | null = null
+    let rejectRefresh: (error: Error) => void = () => {}
     const firstExecutor = vi.fn(
       () =>
         new Promise<string>((_resolve, reject) => {
@@ -113,7 +113,7 @@ describe('CrossTabRefreshCoordinator', () => {
     await Promise.resolve()
     const secondRun = second.run(secondExecutor)
 
-    rejectRefresh?.(refreshError)
+    rejectRefresh(refreshError)
 
     await expect(firstRun).rejects.toThrow('refresh failed')
     await expect(secondRun).rejects.toThrow('failed in another tab')

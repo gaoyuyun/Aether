@@ -28,7 +28,7 @@ router.beforeEach(async (to, from, next) => {
 
     // 首页重定向
     const homeRedirect = resolveHomeRedirect(to, from, authStore)
-    if (homeRedirect !== null) return next(homeRedirect === '' ? undefined : homeRedirect)
+    if (homeRedirect !== null) return homeRedirect === '' ? next() : next(homeRedirect)
 
     // 需要认证但未认证
     const requiresAuth = to.matched.some(record => record.meta.requiresAuth !== false)

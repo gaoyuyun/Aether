@@ -853,7 +853,7 @@ async function handleSave() {
 
     const latestProvider = await getProvider(providerId)
     if (!props.modelValue || props.providerId !== providerId || dialogRevision !== revision) return
-    const latestAdvanced = (latestProvider as Record<string, unknown>).pool_advanced
+    const latestAdvanced = latestProvider.pool_advanced
     const mergedAdvanced = mergePoolAdvancedPatch(latestAdvanced, {
       scheduling_presets: schedulingPresets,
     })

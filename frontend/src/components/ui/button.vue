@@ -17,7 +17,8 @@ interface Props {
   variant?: 'default' | 'destructive' | 'outline' | 'secondary' | 'ghost' | 'link'
   size?: 'default' | 'sm' | 'lg' | 'icon'
   disabled?: boolean
-  class?: string
+  /** Tailwind/Vue class binding accepts strings, arrays, and objects. */
+  class?: any
   type?: 'button' | 'submit' | 'reset'
 }
 

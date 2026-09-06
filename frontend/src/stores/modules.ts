@@ -30,7 +30,8 @@ export const useModuleStore = defineStore('modules', () => {
     loading.value = true
     error.value = null
     const requestGeneration = storeGeneration
-    const request = (async () => {
+    let request!: Promise<Record<string, ModuleStatus>>
+    request = (async () => {
       try {
         const statuses = await modulesApi.getRuntimeStatus()
         if (requestGeneration !== storeGeneration) return modules.value
@@ -85,7 +86,8 @@ export const useModuleStore = defineStore('modules', () => {
     error.value = null
 
     const requestGeneration = storeGeneration
-    const request = (async () => {
+    let request!: Promise<Record<string, ModuleStatus>>
+    request = (async () => {
       try {
         const nextModules = await modulesApi.getAllStatus()
         if (requestGeneration !== storeGeneration) return modules.value

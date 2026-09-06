@@ -1459,7 +1459,7 @@ function entitlementBadges(plan: BillingPlan): string[] {
       const groups = entitlement.grant_user_groups.map(groupName).join(', ')
       return `会员组 ${groups}`
     }
-    return entitlement.type
+    return ''
   })
 }
 

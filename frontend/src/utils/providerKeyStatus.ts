@@ -1,4 +1,9 @@
-import type { ProviderKeyStatusSnapshot } from '@/api/endpoints/types/statusSnapshot'
+import type {
+  AccountStatusSnapshot,
+  OAuthStatusSnapshot,
+  ProviderKeyStatusSnapshot,
+  QuotaStatusSnapshot,
+} from '@/api/endpoints/types/statusSnapshot'
 import { getOAuthExpiresCountdown, type OAuthStatusInfo } from '@/composables/useCountdownTimer'
 import {
   classifyAccountBlockLabel,
@@ -19,7 +24,14 @@ export interface ProviderKeyStatusCarrier extends ProviderKeyAuthCarrier {
   account_status_label?: string | null  // compatibility only
   account_status_reason?: string | null  // compatibility only
   account_status_blocked?: boolean | null  // compatibility only
-  status_snapshot?: ProviderKeyStatusSnapshot | null
+  status_snapshot?: ProviderKeyStatusSnapshotLike | null
+}
+
+/** The API returns complete snapshots, while older keys and fixtures may carry only part of one. */
+export type ProviderKeyStatusSnapshotLike = {
+  oauth?: (Omit<Partial<OAuthStatusSnapshot>, 'code'> & { code?: string }) | null
+  account?: Partial<AccountStatusSnapshot> | null
+  quota?: QuotaStatusSnapshot | null
 }
 
 export interface AccountStatusDisplay {

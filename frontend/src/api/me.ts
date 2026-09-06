@@ -5,6 +5,7 @@ import { cachedRequest, buildCacheKey } from '@/utils/cache'
 import type { BillingSummary } from './auth'
 import type { UserSession } from '@/types/session'
 import type { FeatureSettingsMap } from '@/utils/featureSettings'
+import type { ImageProgress } from './requestTrace'
 
 const ACTIVITY_HEATMAP_CACHE_TTL_MS = 30 * 60 * 1000
 
@@ -249,13 +250,13 @@ export const meApi = {
     username?: string
     feature_settings?: FeatureSettingsMap | null
   }): Promise<{ message: string }> {
-    const response = await apiClient.put('/api/users/me', data)
+    const response = await apiClient.put<{ message: string }>('/api/users/me', data)
     return response.data
   },
 
   // 修改密码
   async changePassword(data: ChangePasswordRequest): Promise<{ message: string }> {
-    const response = await apiClient.patch('/api/users/me/password', data)
+    const response = await apiClient.patch<{ message: string }>('/api/users/me/password', data)
     return response.data
   },
 
@@ -272,12 +273,12 @@ export const meApi = {
   },
 
   async revokeSession(sessionId: string): Promise<{ message: string }> {
-    const response = await apiClient.delete(`/api/users/me/sessions/${sessionId}`)
+    const response = await apiClient.delete<{ message: string }>(`/api/users/me/sessions/${sessionId}`)
     return response.data
   },
 
   async revokeOtherSessions(): Promise<{ message: string; revoked_count: number }> {
-    const response = await apiClient.delete('/api/users/me/sessions/others')
+    const response = await apiClient.delete<{ message: string; revoked_count: number }>('/api/users/me/sessions/others')
     return response.data
   },
 
@@ -323,7 +324,7 @@ export const meApi = {
   },
 
   async deleteApiKey(keyId: string): Promise<{ message: string }> {
-    const response = await apiClient.delete(`/api/users/me/api-keys/${keyId}`)
+    const response = await apiClient.delete<{ message: string }>(`/api/users/me/api-keys/${keyId}`)
     return response.data
   },
 
@@ -426,10 +427,51 @@ export const meApi = {
       reasoning_effort?: string | null
       service_tier?: string | null
       actual_service_tier?: string | null
+      image_progress?: ImageProgress | null
     }>
   }> {
     const params = ids ? { ids } : {}
-    const response = await apiClient.get('/api/users/me/usage/active', { params })
+    const response = await apiClient.get<{
+    provider_visibility_enabled?: boolean
+    requests: Array<{
+      id: string
+      status: 'pending' | 'streaming' | 'completed' | 'failed' | 'cancelled'
+      input_tokens: number
+      effective_input_tokens?: number | null
+      output_tokens: number
+      cache_creation_input_tokens?: number | null
+      cache_creation_ephemeral_5m_input_tokens?: number | null
+      cache_creation_ephemeral_1h_input_tokens?: number | null
+      cache_read_input_tokens?: number | null
+      cost: number
+      actual_cost?: number | null
+      rate_multiplier?: number | null
+      response_time_ms: number | null
+      first_byte_time_ms: number | null
+      end_to_end_time_ms?: number | null
+      end_to_end_first_byte_time_ms?: number | null
+      updated_at?: string | null
+      response_time_updated_at?: string | null
+      status_code?: number | null
+      error_message?: string | null
+      api_format?: string | null
+      endpoint_api_format?: string | null
+      is_stream?: boolean | null
+      is_websocket?: boolean | null
+      upstream_is_stream?: boolean | null
+      client_requested_stream?: boolean | null
+      client_is_stream?: boolean | null
+      has_format_conversion?: boolean | null
+      has_fallback?: boolean | null
+      provider?: string | null
+      target_model?: string | null
+      request_type?: string | null
+      requested_reasoning_effort?: string | null
+      reasoning_effort?: string | null
+      service_tier?: string | null
+      actual_service_tier?: string | null
+    }>
+  }>('/api/users/me/usage/active', { params })
     return response.data
   },
 
@@ -464,7 +506,21 @@ export const meApi = {
     }>
     total: number
   }> {
-    const response = await apiClient.get('/api/users/me/available-models', { params })
+    const response = await apiClient.get<{
+    models: Array<{
+      id: string
+      name: string
+      display_name: string | null
+      is_active: boolean
+      default_price_per_request: number | null
+      default_tiered_pricing: TieredPricingConfig | null
+      supported_capabilities: string[] | null
+      supports_embedding?: boolean | null
+      config: Record<string, unknown> | null
+      usage_count: number
+    }>
+    total: number
+  }>('/api/users/me/available-models', { params })
     return response.data
   },
 
@@ -472,7 +528,10 @@ export const meApi = {
     models: Array<{ id: string; name: string }>
     total: number
   }> {
-    const response = await apiClient.get('/api/users/me/available-models', {
+    const response = await apiClient.get<{
+    models: Array<{ id: string; name: string }>
+    total: number
+  }>('/api/users/me/available-models', {
       params: { view: 'options', limit: params?.limit ?? 1000 },
     })
     return response.data
@@ -480,18 +539,18 @@ export const meApi = {
 
   // 获取端点状态（不包含敏感信息）
   async getEndpointStatus(): Promise<Array<Record<string, unknown>>> {
-    const response = await apiClient.get('/api/users/me/endpoint-status')
+    const response = await apiClient.get<Array<Record<string, unknown>>>('/api/users/me/endpoint-status')
     return response.data
   },
 
   // 偏好设置
   async getPreferences(): Promise<UserPreferences> {
-    const response = await apiClient.get('/api/users/me/preferences')
+    const response = await apiClient.get<UserPreferences>('/api/users/me/preferences')
     return response.data
   },
 
   async updatePreferences(data: Partial<UserPreferences>): Promise<{ message: string }> {
-    const response = await apiClient.put('/api/users/me/preferences', data)
+    const response = await apiClient.put<{ message: string }>('/api/users/me/preferences', data)
     return response.data
   },
 
@@ -502,7 +561,7 @@ export const meApi = {
     allowed_providers?: string[] | null
     providers?: string[]
   }): Promise<{ message: string; allowed_providers?: string[] | null }> {
-    const response = await apiClient.put(`/api/users/me/api-keys/${keyId}/providers`, data)
+    const response = await apiClient.put<{ message: string; allowed_providers?: string[] | null }>(`/api/users/me/api-keys/${keyId}/providers`, data)
     return response.data
   },
 
@@ -510,7 +569,7 @@ export const meApi = {
   async updateApiKeyCapabilities(keyId: string, data: {
     force_capabilities?: Record<string, boolean> | null
   }): Promise<{ message: string; force_capabilities?: Record<string, boolean> | null }> {
-    const response = await apiClient.put(`/api/users/me/api-keys/${keyId}/capabilities`, data)
+    const response = await apiClient.put<{ message: string; force_capabilities?: Record<string, boolean> | null }>(`/api/users/me/api-keys/${keyId}/capabilities`, data)
     return response.data
   },
 
@@ -518,7 +577,9 @@ export const meApi = {
   async getModelCapabilitySettings(): Promise<{
     model_capability_settings: Record<string, Record<string, boolean>>
   }> {
-    const response = await apiClient.get('/api/users/me/model-capabilities')
+    const response = await apiClient.get<{
+    model_capability_settings: Record<string, Record<string, boolean>>
+  }>('/api/users/me/model-capabilities')
     return response.data
   },
 
@@ -528,7 +589,10 @@ export const meApi = {
     message: string
     model_capability_settings: Record<string, Record<string, boolean>> | null
   }> {
-    const response = await apiClient.put('/api/users/me/model-capabilities', data)
+    const response = await apiClient.put<{
+    message: string
+    model_capability_settings: Record<string, Record<string, boolean>> | null
+  }>('/api/users/me/model-capabilities', data)
     return response.data
   },
 
@@ -546,7 +610,7 @@ export const meApi = {
     return cachedRequest(
       cacheKey,
       async () => {
-        const response = await apiClient.get('/api/users/me/usage/interval-timeline', { params })
+        const response = await apiClient.get<{ analysis_period_hours: number; total_points: number; points: Array<{ x: string; y: number; model?: string }>; models?: string[] }>('/api/users/me/usage/interval-timeline', { params })
         return response.data
       },
       30000

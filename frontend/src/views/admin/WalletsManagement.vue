@@ -588,7 +588,7 @@
                         </Badge>
                       </TableCell>
                       <TableCell>
-                        <Badge :variant="callbackStatusBadge(callback.status)">
+                        <Badge :variant="callbackStatusBadge(callback.status) as any">
                           {{ callbackStatusLabel(callback.status) }}
                         </Badge>
                       </TableCell>

@@ -7,6 +7,7 @@ type UsageTokenLike = {
   cache_read_input_tokens?: number | null
   api_format?: string | null
   endpoint_api_format?: string | null
+  output_tokens?: number | null
 }
 
 function toNonNegativeNumber(value: number | null | undefined): number {

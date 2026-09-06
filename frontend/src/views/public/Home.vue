@@ -469,16 +469,17 @@ const dashboardPath = computed(() =>
   authStore.canAccessAdmin ? '/admin/dashboard' : '/dashboard'
 )
 const baseUrl = computed(() => window.location.origin)
+const translate = (key: string) => t(key as Parameters<typeof t>[0])
 
 const resolvedSections = computed(() => sections.map(section => ({
   ...section,
-  name: t(section.nameKey)
+  name: translate(section.nameKey)
 })))
 
 const resolvedFeatureCards = computed(() => featureCards.map(card => ({
   ...card,
-  title: t(card.titleKey),
-  desc: t(card.descKey),
+  title: translate(card.titleKey),
+  desc: translate(card.descKey),
 })))
 
 // Scroll state

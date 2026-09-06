@@ -1,14 +1,11 @@
-import type {
-  ProviderKeyStatusSnapshot,
-  QuotaStatusSnapshot,
-  QuotaWindowSnapshot,
-} from '@/api/endpoints/types/statusSnapshot'
+import type { QuotaStatusSnapshot, QuotaWindowSnapshot } from '@/api/endpoints/types/statusSnapshot'
+import type { ProviderKeyStatusSnapshotLike } from './providerKeyStatus'
 import type { UpstreamMetadata } from '@/api/endpoints/types/provider'
 import { getCodexQuotaWindowPresentation } from '@/utils/codexQuotaWindow'
 
 export interface ProviderKeyQuotaCarrier {
   account_quota?: string | null
-  status_snapshot?: ProviderKeyStatusSnapshot | null
+  status_snapshot?: ProviderKeyStatusSnapshotLike | null
   upstream_metadata?: UpstreamMetadata | null
 }
 

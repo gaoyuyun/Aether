@@ -673,8 +673,8 @@
                       :show-scheduling-mode="false"
                       :subtitle="`仅作用于 ${activePerModelPolicy.model}`"
                       @update:config="updateEditingConfig"
-                      @update:priority-mode="mode => updateModelPriorityMode(activePerModelPolicy.model, mode)"
-                      @update:scheduling-mode="mode => updateModelSchedulingMode(activePerModelPolicy.model, mode)"
+                      @update:priority-mode="updateActivePerModelPriorityMode"
+                      @update:scheduling-mode="updateActivePerModelSchedulingMode"
                     />
                   </div>
                 </div>
@@ -862,6 +862,16 @@ const activePerModelPolicy = computed(() => {
   if (existing) return existing
   return createEmptyModelPolicy(selectedPerModelName.value)
 })
+
+function updateActivePerModelPriorityMode(mode: RoutingPriorityMode) {
+  const model = activePerModelPolicy.value?.model
+  if (model) updateModelPriorityMode(model, mode)
+}
+
+function updateActivePerModelSchedulingMode(mode: RoutingSchedulingMode) {
+  const model = activePerModelPolicy.value?.model
+  if (model) updateModelSchedulingMode(model, mode)
+}
 const firstStepPriorityMode = computed<RoutingPriorityMode>(() => {
   if (sortingScope.value === 'per_model' && activePerModelPolicy.value) {
     return modelPriorityMode(activePerModelPolicy.value.model)
@@ -1422,9 +1432,14 @@ async function saveDraft(): Promise<void> {
       is_system_default: draft.value.is_system_default,
       config_json: config,
     }
-    const saved = wasCreating
-      ? await createRoutingGroup(payload)
-      : await updateRoutingGroup(draft.value.id, payload)
+    let saved
+    if (wasCreating) {
+      saved = await createRoutingGroup(payload)
+    } else if (targetGroupId) {
+      saved = await updateRoutingGroup(targetGroupId, payload)
+    } else {
+      return
+    }
 
     const sameDraftGeneration = draftGeneration === submittedGeneration
     const stillEditingSubmittedDraft = wasCreating

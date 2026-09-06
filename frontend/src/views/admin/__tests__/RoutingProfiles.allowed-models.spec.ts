@@ -200,8 +200,8 @@ function routingGroup(
       rules: [],
     },
     version: 1,
-    created_at: 1,
-    updated_at: 1,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
     published_at: null,
     ...overrides,
   }
@@ -228,7 +228,7 @@ async function mountPage(
         ...group,
         ...payload,
         config_json: payload.config_json ?? group.config_json,
-        updated_at: 2,
+        updated_at: '2026-01-01T00:00:02Z',
       }
     },
   )
@@ -335,7 +335,8 @@ describe('RoutingProfiles model allowlist', () => {
       ...group,
       ...submittedPayload,
       config_json: submittedPayload.config_json ?? group.config_json,
-      updated_at: 2,
+      published_at: null,
+      updated_at: '2026-01-01T00:00:02Z',
     })
     await flushPromises()
 
@@ -389,7 +390,8 @@ describe('RoutingProfiles model allowlist', () => {
       ...firstGroup,
       ...submittedPayload,
       config_json: submittedPayload.config_json ?? firstGroup.config_json,
-      updated_at: 2,
+      published_at: null,
+      updated_at: '2026-01-01T00:00:02Z',
     })
     await flushPromises()
 
@@ -439,7 +441,8 @@ describe('RoutingProfiles model allowlist', () => {
       ...group,
       ...submittedPayload,
       config_json: submittedPayload.config_json ?? group.config_json,
-      updated_at: 2,
+      published_at: null,
+      updated_at: '2026-01-01T00:00:02Z',
     })
     await flushPromises()
 

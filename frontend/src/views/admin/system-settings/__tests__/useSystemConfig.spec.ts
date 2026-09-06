@@ -41,7 +41,7 @@ describe('useSystemConfig', () => {
   })
 
   it('loads config keys in one request and keeps change detection disabled until the baseline is ready', async () => {
-    let resolveConfigs: ((value: Array<{ key: string, value: unknown, is_set?: boolean }>) => void) | null = null
+    let resolveConfigs: (value: Array<{ key: string, value: unknown, is_set?: boolean }>) => void = () => {}
     getAllSystemConfigsMock.mockImplementation(() => new Promise((resolve) => {
       resolveConfigs = resolve
     }))
@@ -56,7 +56,7 @@ describe('useSystemConfig', () => {
     expect(state.systemConfigLoading.value).toBe(true)
     expect(state.hasLogConfigChanges.value).toBe(false)
 
-    resolveConfigs?.([
+    resolveConfigs([
       { key: 'request_record_level', value: 'basic' },
       { key: 'proxy_node_metrics_cleanup_batch_size', value: 5000 },
       { key: 'enable_standard_text_sync_heartbeat', value: false },

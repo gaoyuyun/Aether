@@ -71,7 +71,8 @@ const emit = defineEmits<{
 
 interface Props {
   modelValue?: string | number
-  class?: string
+  /** Tailwind/Vue class binding accepts strings, arrays, and objects. */
+  class?: any
   autocomplete?: string
   /**
    * 输入框尺寸

@@ -672,12 +672,17 @@ const KNOWN_PROCESSING_TIERS = [
   { key: 'flex', label: 'Flex' },
   { key: 'batch', label: 'Batch' },
 ] as const
-const COMPACT_PROCESSING_TIERS = [
+const COMPACT_PROCESSING_TIERS: ReadonlyArray<{
+  key: string
+  label: string
+  detail?: string
+  group?: string
+}> = [
   { key: 'priority', label: 'OpenAI', detail: 'Chat / Responses', group: 'Fast' },
   { key: 'fast', label: 'Claude', detail: 'Messages', group: 'Fast' },
   { key: 'flex', label: 'Flex' },
   { key: 'batch', label: 'Batch' },
-] as const
+]
 
 // 本地状态
 const basePricingConfig = ref<Record<string, unknown>>({})
@@ -728,8 +733,8 @@ const activeProcessingTierUsesMultiplier = computed(() => (
 const compactProcessingTierOptions = computed<CompactProcessingTierOption[]>(() => (
   COMPACT_PROCESSING_TIERS.map(option => ({
     ...option,
-    accessibleLabel: [option.group, option.label, 'detail' in option ? option.detail : null]
-      .filter((part): part is string => Boolean(part))
+    accessibleLabel: [option.group, option.label, option.detail]
+      .filter((part): part is string => typeof part === 'string' && part.length > 0)
       .join(' · '),
     ...(processingTierMultiplierDrafts[option.key] ?? {
       enabled: false,
@@ -1332,10 +1337,10 @@ function processingTierDisplayLabel(key: string): string {
   const compactTier = COMPACT_PROCESSING_TIERS.find(tier => tier.key === key)
   if (compactTier) {
     return [
-      'group' in compactTier ? compactTier.group : null,
+      compactTier.group,
       compactTier.label,
-      'detail' in compactTier ? compactTier.detail : null,
-    ].filter((part): part is string => Boolean(part)).join(' · ')
+      compactTier.detail,
+    ].filter((part): part is string => typeof part === 'string' && part.length > 0).join(' · ')
   }
   return KNOWN_PROCESSING_TIERS.find(tier => tier.key === key)?.label ?? key
 }

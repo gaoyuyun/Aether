@@ -31,6 +31,49 @@ export interface CandidateResponseBoundary {
   body_state?: string | null
 }
 
+export interface CandidateProxyTiming {
+  connection_reused?: boolean | null
+  dns_ms?: number | null
+  connect_ms?: number | null
+  tls_ms?: number | null
+  connection_acquire_ms?: number | null
+  ttfb_ms?: number | null
+  upstream_ms?: number | null
+  upstream_processing_ms?: number | null
+  response_wait_ms?: number | null
+  body_read_ms?: number | null
+  decompress_ms?: number | null
+  wire_size?: number | null
+  body_size?: number | null
+  total_ms?: number | null
+}
+
+export interface CandidateProxyInfo {
+  node_id?: string | null
+  node_name?: string | null
+  url?: string | null
+  source?: string | null
+  ttfb_ms?: number | null
+  timing?: CandidateProxyTiming | null
+  [key: string]: unknown
+}
+
+export interface CandidatePoolSelection {
+  reason?: string
+  cost_soft_threshold?: boolean
+  cost_window_usage?: number | null
+  cost_limit?: number | null
+  [key: string]: unknown
+}
+
+export interface CandidatePoolSkip {
+  type?: string
+  cooldown_reason?: string | null
+  cooldown_ttl?: number | null
+  cost_window_usage?: number | null
+  [key: string]: unknown
+}
+
 export interface CandidateRecord {
   id: string
   request_id: string
@@ -72,6 +115,12 @@ export interface CandidateRecord {
   extra_data?: Record<string, unknown> & {
     upstream_response?: CandidateResponseBoundary
     image_progress?: ImageProgress | null
+    first_byte_time_ms?: number | null
+    needs_conversion?: boolean
+    provider_api_format?: string | null
+    proxy?: CandidateProxyInfo | null
+    pool_selection?: CandidatePoolSelection | null
+    pool_skip?: CandidatePoolSkip | null
   }
   created_at: string
   started_at?: string

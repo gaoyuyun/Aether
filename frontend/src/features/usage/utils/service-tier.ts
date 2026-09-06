@@ -4,6 +4,7 @@ export interface ServiceTierFacts {
 
 export interface ServiceTierFactSource {
   service_tier?: unknown
+  [key: string]: unknown
 }
 
 export function resolveServiceTierFacts(

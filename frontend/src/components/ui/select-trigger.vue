@@ -5,7 +5,8 @@ import { cn } from '@/lib/utils'
 import { computed } from 'vue'
 
 interface Props {
-  class?: string
+  /** Tailwind/Vue class binding accepts strings, arrays, and objects. */
+  class?: any
   disabled?: boolean
 }
 

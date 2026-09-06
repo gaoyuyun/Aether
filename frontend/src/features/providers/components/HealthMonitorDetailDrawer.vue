@@ -232,21 +232,22 @@ async function loadRelated() {
   loading.value = true
   errorMessage.value = null
   try {
+    if (!props.isAdmin && target.source.kind === 'provider') {
+      throw new Error('公开健康监控不支持 provider 详情')
+    }
+    const dimension = target.source.kind as 'provider' | 'model' | 'endpoint'
     const params = {
-      dimension: target.source.kind,
+      dimension,
       value: target.source.value,
       lookback_hours: target.lookbackHours,
       related_limit: 8,
       per_item_limit: 100
     }
-    if (!props.isAdmin && target.source.kind === 'provider') {
-      throw new Error('公开健康监控不支持 provider 详情')
-    }
     const data = props.isAdmin
       ? await getHealthRelatedMonitor(params)
       : await getPublicHealthRelatedMonitor({
           ...params,
-          dimension: target.source.kind
+          dimension: dimension as 'model' | 'endpoint'
         })
     if (seq === requestSeq) {
       related.value = data

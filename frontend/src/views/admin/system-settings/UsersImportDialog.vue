@@ -33,7 +33,7 @@
         <Select
           :model-value="usersMergeMode"
           :open="usersMergeModeSelectOpen"
-          @update:model-value="$emit('update:usersMergeMode', $event)"
+          @update:model-value="handleUsersMergeModeUpdate"
           @update:open="$emit('update:usersMergeModeSelectOpen', $event)"
         >
           <SelectTrigger>
@@ -204,11 +204,17 @@ defineProps<{
   importUsersProgress: ImportProgressState | null
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   confirm: []
   'update:importUsersDialogOpen': [value: boolean]
   'update:importUsersResultDialogOpen': [value: boolean]
   'update:usersMergeMode': [value: 'skip' | 'overwrite' | 'error']
   'update:usersMergeModeSelectOpen': [value: boolean]
 }>()
+
+function handleUsersMergeModeUpdate(value: string | number) {
+  if (value === 'skip' || value === 'overwrite' || value === 'error') {
+    emit('update:usersMergeMode', value)
+  }
+}
 </script>

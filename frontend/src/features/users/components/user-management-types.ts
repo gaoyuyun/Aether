@@ -4,7 +4,7 @@ export type UserFilterRole = 'all' | UserRole
 export type UserFilterStatus = 'all' | 'active' | 'inactive'
 export type UserSortOption = 'default' | 'created_at_desc' | 'created_at_asc'
 export type UserBatchQuotaMode = 'skip' | 'wallet' | 'unlimited'
-export type BadgeVariant = 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning' | 'dark'
+export type BadgeVariant = 'default' | 'secondary' | 'destructive' | 'outline' | 'outline-transparent' | 'success' | 'warning' | 'dark'
 
 export interface UserFilterOption<TValue extends string = string> {
   value: TValue

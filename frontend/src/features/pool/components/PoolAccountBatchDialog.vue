@@ -111,7 +111,7 @@
               class="h-9"
               placeholder="留空为自适应"
               :disabled="!settingsSelection.rpm_limit"
-              @update:model-value="settingsDraft.rpm_limit = parseNullableNumberInput($event, { min: 1, max: 10000 })"
+              @update:model-value="settingsDraft.rpm_limit = parseNullableNumberInput($event, { min: 1, max: 10000 }) ?? null"
             />
           </div>
 
@@ -130,7 +130,7 @@
               class="h-9"
               placeholder="留空为不限制"
               :disabled="!settingsSelection.concurrent_limit"
-              @update:model-value="settingsDraft.concurrent_limit = parseNullableNumberInput($event, { min: 0 })"
+              @update:model-value="settingsDraft.concurrent_limit = parseNullableNumberInput($event, { min: 0 }) ?? null"
             />
           </div>
 

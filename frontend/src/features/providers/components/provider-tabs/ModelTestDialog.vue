@@ -696,7 +696,7 @@
 
                   <TabsContent value="request-body">
                     <JsonContent
-                      :data="selectedInspectionAttempt.request_body"
+                      :data="selectedInspectionAttempt.request_body as unknown"
                       view-mode="formatted"
                       :expand-depth="inspectionExpandDepth"
                       :is-dark="isDark"
@@ -716,7 +716,7 @@
 
                   <TabsContent value="response-body">
                     <JsonContent
-                      :data="selectedInspectionAttempt.response_body"
+                      :data="selectedInspectionAttempt.response_body as unknown"
                       view-mode="formatted"
                       :expand-depth="inspectionExpandDepth"
                       :is-dark="isDark"

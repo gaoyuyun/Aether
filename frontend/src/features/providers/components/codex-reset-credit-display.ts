@@ -276,18 +276,19 @@ export function getVisibleCodexResetCreditItems(
   const credits = snapshot?.credits
   if (!snapshot || !Array.isArray(credits)) return []
 
-  return credits
-    .map((item) => {
-      if (!codexResetCreditStatusIsDisplayable(item)) return null
-      const remainingSeconds = codexResetCreditRemainingSeconds(item, snapshot, nowUnixSecs)
-      if (remainingSeconds === null || remainingSeconds <= 0) return null
-      return {
-        id: item.id,
-        expiresAt: nowUnixSecs + remainingSeconds,
-        remainingSeconds,
-      } satisfies CodexResetCreditDisplayCandidate
+  const candidates = credits.reduce<CodexResetCreditDisplayCandidate[]>((items, item) => {
+    if (!codexResetCreditStatusIsDisplayable(item)) return items
+    const remainingSeconds = codexResetCreditRemainingSeconds(item, snapshot, nowUnixSecs)
+    if (remainingSeconds === null || remainingSeconds <= 0) return items
+    items.push({
+      id: item.id,
+      expiresAt: nowUnixSecs + remainingSeconds,
+      remainingSeconds,
     })
-    .filter((item): item is CodexResetCreditDisplayCandidate => item !== null)
+    return items
+  }, [])
+
+  return candidates
     .sort((a, b) => a.remainingSeconds - b.remainingSeconds)
     .slice(0, limit)
     .map((item, index) => {

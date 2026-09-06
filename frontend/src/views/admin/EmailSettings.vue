@@ -40,7 +40,8 @@
             </Label>
             <Input
               id="smtp-host"
-              v-model="emailConfig.smtp_host"
+              :model-value="emailConfig.smtp_host ?? ''"
+              @update:model-value="emailConfig.smtp_host = String($event)"
               type="text"
               placeholder="smtp.gmail.com"
               class="mt-1"
@@ -78,7 +79,8 @@
             </Label>
             <Input
               id="smtp-user"
-              v-model="emailConfig.smtp_user"
+              :model-value="emailConfig.smtp_user ?? ''"
+              @update:model-value="emailConfig.smtp_user = String($event)"
               type="text"
               placeholder="your-email@example.com"
               class="mt-1"
@@ -102,7 +104,8 @@
             <div class="mt-1">
               <Input
                 id="smtp-password"
-                v-model="emailConfig.smtp_password"
+                :model-value="emailConfig.smtp_password ?? ''"
+                @update:model-value="emailConfig.smtp_password = String($event)"
                 masked
                 :placeholder="smtpPasswordIsSet ? '已设置（留空保持不变）' : '请输入密码'"
               />
@@ -121,7 +124,8 @@
             </Label>
             <Input
               id="smtp-from-email"
-              v-model="emailConfig.smtp_from_email"
+              :model-value="emailConfig.smtp_from_email ?? ''"
+              @update:model-value="emailConfig.smtp_from_email = String($event)"
               type="email"
               placeholder="noreply@example.com"
               class="mt-1"

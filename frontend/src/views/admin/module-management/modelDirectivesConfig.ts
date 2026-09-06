@@ -133,24 +133,25 @@ export function modelDirectiveBuiltInMappingPreview(
       : undefined
   }
 
-  const isReasoningEffort = REASONING_EFFORTS.some(effort => effort === normalizedSuffix)
+  const isReasoningEffort = REASONING_EFFORTS.includes(normalizedSuffix as ReasoningEffort)
+  const reasoningEffort = normalizedSuffix as ReasoningEffort
   const isCodexUltra = normalizedSuffix === 'ultra'
   if (!isReasoningEffort && !isCodexUltra) return undefined
 
   switch (apiFormat) {
     case 'openai:chat':
-      return { reasoning_effort: normalizedSuffix }
+      return { reasoning_effort: reasoningEffort }
     case 'openai:responses':
     case 'openai:responses:compact':
     case 'openai:search':
-      return { reasoning: { effort: normalizedSuffix } }
+      return { reasoning: { effort: reasoningEffort } }
     case 'claude:messages': {
       if (!isReasoningEffort) return undefined
       return {
-        output_config: { effort: claudeEffortValue(normalizedSuffix) },
+        output_config: { effort: claudeEffortValue(reasoningEffort) },
         thinking: {
           type: 'enabled',
-          budget_tokens: thinkingBudgetTokens(normalizedSuffix),
+          budget_tokens: thinkingBudgetTokens(reasoningEffort),
         },
       }
     }
@@ -160,7 +161,7 @@ export function modelDirectiveBuiltInMappingPreview(
         generationConfig: {
           thinkingConfig: {
             includeThoughts: true,
-            thinkingBudget: thinkingBudgetTokens(normalizedSuffix),
+            thinkingBudget: thinkingBudgetTokens(reasoningEffort),
           },
         },
       }

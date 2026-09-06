@@ -18,33 +18,45 @@ export interface ProviderBillingConfig {
   provider_priority?: number;
 }
 
+export interface ProviderStatsResponse {
+  billing_info?: {
+    monthly_used_usd?: number | null
+    pending_quota_reset_at?: string | null
+    quota_windows?: ProviderBillingConfig['quota_windows'] | null
+  } | null
+}
+
+export interface ProviderQuotaResetResponse {
+  effective_at?: string | null
+}
+
 /**
  * 更新提供商计费配置
  */
 export async function updateProviderBilling(
   providerId: string,
   config: ProviderBillingConfig
-) {
+): Promise<ProviderStatsResponse> {
   const response = await apiClient.put(`${API_BASE}/providers/${providerId}/billing`, config);
-  return response.data;
+  return response.data as ProviderStatsResponse;
 }
 
 /**
  * 获取提供商使用统计
  */
-export async function getProviderStats(providerId: string, hours: number = 24) {
+export async function getProviderStats(providerId: string, hours: number = 24): Promise<ProviderStatsResponse> {
   const response = await apiClient.get(`${API_BASE}/providers/${providerId}/stats`, {
     params: { hours }
   });
-  return response.data;
+  return response.data as ProviderStatsResponse;
 }
 
 /**
  * 重置提供商月卡额度
  */
-export async function resetProviderQuota(providerId: string) {
+export async function resetProviderQuota(providerId: string): Promise<ProviderQuotaResetResponse> {
   const response = await apiClient.post(`${API_BASE}/providers/${providerId}/quota/reset`);
-  return response.data;
+  return response.data as ProviderQuotaResetResponse;
 }
 
 /**

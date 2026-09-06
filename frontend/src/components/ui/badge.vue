@@ -1,3 +1,15 @@
+<script lang="ts">
+export type BadgeVariant =
+  | 'default'
+  | 'secondary'
+  | 'destructive'
+  | 'outline'
+  | 'outline-transparent'
+  | 'success'
+  | 'warning'
+  | 'dark'
+</script>
+
 <script setup lang="ts">
 import { cva } from 'class-variance-authority'
 import { cn } from '@/lib/utils'
@@ -36,8 +48,9 @@ const badgeVariants = cva(
 )
 
 interface Props {
-  variant?: 'default' | 'secondary' | 'destructive' | 'outline' | 'outline-transparent' | 'success' | 'warning' | 'dark'
-  class?: string
+  variant?: BadgeVariant
+  /** Tailwind/Vue class binding accepts strings, arrays, and objects. */
+  class?: any
 }
 
 const badgeClass = computed(() =>

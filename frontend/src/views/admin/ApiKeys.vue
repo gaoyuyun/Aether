@@ -1018,6 +1018,7 @@ function buildAdminWalletFromApiKey(apiKey: AdminApiKey): AdminWallet | null {
     owner_type: 'api_key',
     owner_name: apiKey.name || apiKey.key_display || null,
     created_at: apiKey.created_at || apiKey.wallet.updated_at || '',
+    updated_at: apiKey.wallet.updated_at ?? apiKey.created_at ?? '',
   }
 }
 

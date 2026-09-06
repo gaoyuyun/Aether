@@ -3,8 +3,19 @@ import type { RouteLocationNormalizedLoaded } from 'vue-router'
 
 import { buildBreadcrumbs, buildNavigation } from '@/layouts/main-layout/navigation'
 import type { MessageKey } from '@/i18n'
+import type { ModuleStatus } from '@/api/modules'
 
 const translate = (key: MessageKey) => `tx:${key}`
+
+function moduleStatus(overrides: Partial<ModuleStatus>): ModuleStatus {
+  return {
+    name: 'test', available: true, enabled: true, active: false,
+    config_validated: true, config_error: null, display_name: 'Test module',
+    description: '', category: 'integration', kind: 'builtin', group: 'management',
+    depends_on: [], admin_route: null, admin_menu_icon: null, admin_menu_group: null,
+    admin_menu_order: 0, health: 'healthy', ...overrides,
+  }
+}
 
 function route(path: string, name?: string, meta: Record<string, unknown> = {}): RouteLocationNormalizedLoaded {
   return {
@@ -57,22 +68,22 @@ describe('main layout navigation builder', () => {
     const navigation = buildNavigation({
       canAccessAdmin: true,
       modules: {
-        first: {
+        first: moduleStatus({
           active: true,
           admin_route: '/admin/first',
           admin_menu_group: 'management',
           admin_menu_order: 2,
           admin_menu_icon: 'Gift',
           display_name: 'First module',
-        },
-        second: {
+        }),
+        second: moduleStatus({
           active: true,
           admin_route: '/admin/second',
           admin_menu_group: 'management',
           admin_menu_order: 1,
           admin_menu_icon: 'Key',
           display_name: 'Second module',
-        },
+        }),
       },
       isModuleActive: () => false,
       t: translate,
@@ -88,14 +99,14 @@ describe('main layout navigation builder', () => {
   })
 
   it('shows the standalone keys entry only while its built-in module is active', () => {
-    const standaloneModule = {
+    const standaloneModule = moduleStatus({
       active: true,
       admin_route: '/admin/keys',
       admin_menu_group: 'management',
       admin_menu_order: 60,
       admin_menu_icon: 'KeyRound',
       display_name: '独立密钥',
-    }
+    })
     const activeNavigation = buildNavigation({
       canAccessAdmin: true,
       modules: { standalone_keys: standaloneModule },
@@ -144,7 +155,7 @@ describe('main layout navigation builder', () => {
       route: route('/dashboard/wallet', 'WalletCenter', { module: 'wallet' }),
       navigation,
       modules: {
-        wallet: { display_name: '钱包管理' },
+        wallet: moduleStatus({ display_name: '钱包管理' }),
       },
       isNavActive: () => false,
       t: translate,

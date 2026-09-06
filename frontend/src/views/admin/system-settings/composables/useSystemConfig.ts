@@ -325,7 +325,7 @@ export function useSystemConfig() {
             continue
           }
           if (response.value !== null && response.value !== undefined) {
-            ; (nextConfig as Record<string, unknown>)[key] = response.value
+            ; (nextConfig as unknown as Record<string, unknown>)[key] = response.value
           }
         } catch {
           // 单个配置项加载失败时忽略，使用默认值

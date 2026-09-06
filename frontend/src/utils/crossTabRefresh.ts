@@ -167,7 +167,7 @@ export class CrossTabRefreshCoordinator {
   }
 
   private waitForRefreshResult(requestId: string, executor: () => Promise<string>, retryCount: number): Promise<string> {
-    return new Promise((resolve, reject) => {
+    return new Promise<string>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         this.waiters.delete(requestId)
         reject(new CrossTabRefreshTimeoutError(requestId))

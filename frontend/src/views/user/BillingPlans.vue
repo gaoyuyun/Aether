@@ -459,7 +459,7 @@ function entitlementLabels(items: BillingEntitlement[]): string[] {
     if (item.type === 'membership_group') {
       return `会员组 ${item.grant_user_groups.join(', ')}`
     }
-    return item.type
+    return ''
   })
 }
 

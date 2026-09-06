@@ -117,7 +117,7 @@
         <div
           class="space-y-4 transition-opacity duration-150"
           :class="mode === 'oauth' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
-          :inert="mode !== 'oauth' ? '' : undefined"
+          :inert="mode !== 'oauth' || undefined"
           :aria-hidden="mode !== 'oauth'"
         >
           <!-- Windsurf: 浏览器 session/poll 授权 -->
@@ -612,7 +612,7 @@
           v-if="isClaudeCodeProvider"
           class="flex flex-col gap-3 justify-center transition-opacity duration-150"
           :class="mode === 'cookie' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
-          :inert="mode !== 'cookie' ? '' : undefined"
+          :inert="mode !== 'cookie' || undefined"
           :aria-hidden="mode !== 'cookie'"
         >
           <label
@@ -648,7 +648,7 @@
         <div
           class="flex flex-col gap-3 justify-center transition-opacity duration-150"
           :class="mode === 'import' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
-          :inert="mode !== 'import' ? '' : undefined"
+          :inert="mode !== 'import' || undefined"
           :aria-hidden="mode !== 'import'"
         >
           <div
@@ -780,7 +780,7 @@
           v-if="isCodexProvider"
           class="flex flex-col gap-3 justify-center transition-opacity duration-150"
           :class="mode === 'agent_identity' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
-          :inert="mode !== 'agent_identity' ? '' : undefined"
+          :inert="mode !== 'agent_identity' || undefined"
           :aria-hidden="mode !== 'agent_identity'"
         >
           <Textarea

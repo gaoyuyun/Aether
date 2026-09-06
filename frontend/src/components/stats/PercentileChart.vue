@@ -32,6 +32,7 @@ import { computed } from 'vue'
 import LineChart from '@/components/charts/LineChart.vue'
 import { LoadingState } from '@/components/common'
 import type { PercentileItem } from '@/api/admin'
+import type { ChartOptions } from 'chart.js'
 
 interface Props {
   title: string
@@ -87,11 +88,11 @@ const chartData = computed(() => {
   }
 })
 
-const chartOptions = computed(() => ({
+const chartOptions = computed<ChartOptions<'line'>>(() => ({
   scales: {
     y: {
       ticks: {
-        callback: (value: number) => `${value}s`
+        callback: (value: string | number) => `${value}s`
       }
     }
   }

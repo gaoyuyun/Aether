@@ -906,7 +906,8 @@ describe('PoolManagement Codex cycle stats mode', () => {
             },
           ],
         },
-      },
+      } as unknown as NonNullable<PoolKeyDetail['status_snapshot']>,
+
     })
     endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
     endpointMocks.listPoolKeys
@@ -998,7 +999,7 @@ describe('PoolManagement Codex cycle stats mode', () => {
       status_snapshot: {
         ...createPoolKey('codex').status_snapshot,
         oauth: { code: 'expired', expires_at: 1 },
-      },
+      } as unknown as NonNullable<PoolKeyDetail['status_snapshot']>,
     })
     endpointMocks.getPoolOverview.mockResolvedValue({ items: [createOverview('codex')] })
     endpointMocks.listPoolKeys
