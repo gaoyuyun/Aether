@@ -440,6 +440,87 @@ type = "unix_seconds"
 name = "uq_stats_hourly_provider"
 columns = ["hour_utc", "provider_name"]
 
+[table.stats_hourly_model_provider]
+domain = "stats"
+order = 55
+primary_key = ["id"]
+
+[[table.stats_hourly_model_provider.columns]]
+name = "id"
+type = "text_id"
+length = 64
+
+[[table.stats_hourly_model_provider.columns]]
+name = "hour_utc"
+type = "unix_seconds"
+
+[[table.stats_hourly_model_provider.columns]]
+name = "model"
+type = "text"
+length = 255
+
+[[table.stats_hourly_model_provider.columns]]
+name = "provider_name"
+type = "text"
+length = 255
+
+[[table.stats_hourly_model_provider.columns]]
+name = "total_requests"
+type = "int64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "input_tokens"
+type = "int64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "output_tokens"
+type = "int64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "cache_creation_tokens"
+type = "int64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "cache_read_tokens"
+type = "int64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "total_cost"
+type = "float64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "settled_total_cost"
+type = "float64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "response_time_sum_ms"
+type = "float64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "response_time_samples"
+type = "int64"
+default = 0
+
+[[table.stats_hourly_model_provider.columns]]
+name = "created_at"
+type = "unix_seconds"
+
+[[table.stats_hourly_model_provider.columns]]
+name = "updated_at"
+type = "unix_seconds"
+
+[[table.stats_hourly_model_provider.uniques]]
+name = "uq_stats_hourly_model_provider"
+columns = ["hour_utc", "model", "provider_name"]
+
 [table.stats_daily]
 domain = "stats"
 order = 60

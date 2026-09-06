@@ -260,6 +260,7 @@
             <Label class="text-xs">{{ legacyT('总额周期 (天，1=日卡)') }}</Label>
             <Input
               :model-value="form.quota_reset_day ?? ''"
+              :disabled="isEditMode && provider?.billing_type === 'monthly_quota'"
               type="number"
               min="1"
               max="30"
@@ -322,16 +323,17 @@
           </div>
           <div class="space-y-1.5">
             <Label class="text-xs">
-              {{ legacyT('周期开始时间（精确到分）') }} <span class="text-red-500">*</span>
+              {{ legacyT('订阅开始时间（精确到分）') }} <span class="text-red-500">*</span>
             </Label>
             <Input
-              v-model="form.quota_last_reset_at"
+              v-model="form.quota_subscription_started_at"
               type="datetime-local"
               step="60"
             />
           </div>
+          <p class="text-xs text-muted-foreground">{{ legacyT('订阅开始时间是固定的开通记录。调整周期长度和当前起点，请使用详情中的“调整周期”。') }}</p>
           <div class="space-y-1.5">
-            <Label class="text-xs">{{ legacyT('过期时间') }}</Label>
+            <Label class="text-xs">{{ legacyT('订阅到期时间') }}</Label>
             <Input
               id="quota-expires-at"
               v-model="form.quota_expires_at"
@@ -540,7 +542,7 @@ const form = ref({
   billing_type: 'pay_as_you_go' as 'monthly_quota' | 'pay_as_you_go' | 'free_tier',
   monthly_quota_usd: undefined as number | undefined,
   quota_reset_day: 30,
-  quota_last_reset_at: '',  // 周期开始时间
+  quota_subscription_started_at: '',  // 订阅开始时间
   quota_expires_at: '',
   quota_windows: [] as ProviderQuotaWindow[],
   provider_priority: 100,
@@ -578,7 +580,7 @@ function resetForm() {
     billing_type: 'pay_as_you_go',
     monthly_quota_usd: undefined,
     quota_reset_day: 30,
-    quota_last_reset_at: '',
+    quota_subscription_started_at: '',
     quota_expires_at: '',
     quota_windows: [],
     provider_priority: defaultPriority.value,
@@ -615,9 +617,9 @@ function loadProviderData() {
     description: props.provider.description || '',
     website: props.provider.website || '',
     billing_type: (props.provider.billing_type as 'monthly_quota' | 'pay_as_you_go' | 'free_tier') || 'pay_as_you_go',
-    monthly_quota_usd: props.provider.monthly_quota_usd || undefined,
+    monthly_quota_usd: props.provider.monthly_quota_usd ?? undefined,
     quota_reset_day: props.provider.quota_reset_day || 30,
-    quota_last_reset_at: formatDateTimeLocalInput(props.provider.quota_last_reset_at),
+    quota_subscription_started_at: formatDateTimeLocalInput(props.provider.quota_subscription_started_at ?? props.provider.quota_last_reset_at),
     quota_expires_at: formatDateTimeLocalInput(props.provider.quota_expires_at),
     quota_windows: (props.provider.quota_windows ?? []).map(window => ({ ...window })),
     provider_priority: props.provider.provider_priority || 999,
@@ -641,7 +643,7 @@ function loadProviderData() {
     // Responses WebSocket 配置
     responses_websocket_enabled: props.provider.responses_websocket_enabled ?? false,
   }
-  initialQuotaLastResetAt.value = dateTimeLocalToRfc3339(form.value.quota_last_reset_at)
+  initialQuotaLastResetAt.value = dateTimeLocalToRfc3339(form.value.quota_subscription_started_at)
 }
 
 function addQuotaWindow() {
@@ -687,15 +689,15 @@ watch(() => form.value.provider_type, () => {
 
 // 提交表单
 const handleSubmit = async () => {
-  // 月卡类型必须设置周期开始时间
-  if (form.value.billing_type === 'monthly_quota' && !form.value.quota_last_reset_at) {
-    showError(legacyT('月卡类型必须设置周期开始时间'), legacyT('验证失败'))
+  // 月卡类型必须设置订阅开始时间
+  if (form.value.billing_type === 'monthly_quota' && !form.value.quota_subscription_started_at) {
+    showError(legacyT('月卡类型必须设置订阅开始时间'), legacyT('验证失败'))
     return
   }
 
-  const quotaLastResetAt = dateTimeLocalToRfc3339(form.value.quota_last_reset_at)
+  const quotaLastResetAt = dateTimeLocalToRfc3339(form.value.quota_subscription_started_at)
   if (form.value.billing_type === 'monthly_quota' && !quotaLastResetAt) {
-    showError(legacyT('周期开始时间必须是合法时间'), legacyT('验证失败'))
+    showError(legacyT('订阅开始时间必须是合法时间'), legacyT('验证失败'))
     return
   }
   const quotaExpiresAt = dateTimeLocalToRfc3339(form.value.quota_expires_at)
@@ -717,7 +719,7 @@ const handleSubmit = async () => {
       billing_type: form.value.billing_type,
       monthly_quota_usd: form.value.monthly_quota_usd,
       quota_reset_day: form.value.quota_reset_day,
-      ...(quotaLastResetAtChanged ? { quota_last_reset_at: quotaLastResetAt } : {}),
+      ...(quotaLastResetAtChanged ? { quota_subscription_started_at: quotaLastResetAt } : {}),
       // 编辑时清空过期时间需显式发送 null，后端只有收到 null 才会清除已保存的值
       quota_expires_at: quotaExpiresAt ?? (isEditMode.value ? null : undefined),
       // Leave the saved window policy intact while a provider is temporarily pay-as-you-go;

@@ -30,6 +30,191 @@ fn normalize_newlines(value: &str) -> String {
 }
 
 #[tokio::test]
+#[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL migrations"]
+async fn live_dashboard_hourly_coverage_preserves_history_scopes_and_local_boundaries() {
+    let pool = sqlx::PgPool::connect(&std::env::var("AETHER_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    crate::run_migrations(&pool).await.unwrap();
+    let repository = SqlxUsageReadRepository::new(pool.clone());
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..12];
+    let model = format!("dashboard-{suffix}");
+    let user_ids = [
+        format!("dashboard-a-{suffix}"),
+        format!("dashboard-b-{suffix}"),
+    ];
+    for user_id in &user_ids {
+        sqlx::query("INSERT INTO users (id, username, email_verified, created_at, updated_at) VALUES ($1, $1, false, NOW(), NOW())")
+            .bind(user_id).execute(&pool).await.unwrap();
+    }
+    let day = 1_767_225_600_i64;
+    let mut timestamps = (0..7)
+        .map(|index| day + index * 86_400 + 12 * 3600)
+        .collect::<Vec<_>>();
+    for tz in [330, 345, -210, -225] {
+        let midnight = day + 3 * 86_400 - tz * 60;
+        timestamps.extend([midnight - 60, midnight + 60]);
+    }
+    for (index, timestamp) in timestamps.into_iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO usage (id, request_id, user_id, model, provider_name, input_tokens, output_tokens, total_tokens, total_cost_usd, response_time_ms, status, billing_status, created_at) VALUES ($1, $1, $2, $3, $3, 10, 5, 15, 0.25, 100, 'completed', 'settled', TO_TIMESTAMP($4::double precision))",
+        ).bind(format!("{suffix}-{index}")).bind(&user_ids[index % 2]).bind(&model)
+            .bind(timestamp as f64).execute(&pool).await.unwrap();
+    }
+    let cutoff_id = format!("dashboard-cutoff-{suffix}");
+    sqlx::query("INSERT INTO stats_hourly (id, hour_utc, total_requests, success_requests, error_requests, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, total_cost, actual_total_cost, avg_response_time_ms, is_complete, created_at, updated_at) VALUES ($1, TO_TIMESTAMP($2::double precision), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true, NOW(), NOW()) ON CONFLICT (hour_utc) DO NOTHING")
+        .bind(&cutoff_id).bind((day + 7 * 86_400) as f64).execute(&pool).await.unwrap();
+    let query = UsageDashboardDailyBreakdownQuery {
+        created_from_unix_secs: (day - 8 * 3600) as u64,
+        created_until_unix_secs: (day + 7 * 86_400 - 8 * 3600) as u64,
+        tz_offset_minutes: 480,
+        user_id: None,
+    };
+    let only_fixture = |rows: Vec<super::StoredUsageDashboardDailyBreakdownRow>| {
+        rows.into_iter()
+            .filter(|row| row.model == model)
+            .collect::<Vec<_>>()
+    };
+    let expected = only_fixture(
+        repository
+            .list_dashboard_daily_breakdown_raw(&query)
+            .await
+            .unwrap(),
+    );
+    assert!(!expected.is_empty());
+    assert_eq!(
+        only_fixture(
+            repository
+                .list_dashboard_daily_breakdown(&query)
+                .await
+                .unwrap()
+        ),
+        expected
+    );
+
+    // Seed the newer rollup only for some of the historical hours.
+    sqlx::query(
+        r#"
+INSERT INTO stats_hourly_model_provider (
+    id, hour_utc, model, provider_name, total_requests, input_tokens,
+    total_cost, response_time_sum_ms, response_time_samples, created_at, updated_at
+)
+SELECT md5($1 || EXTRACT(EPOCH FROM date_trunc('hour', created_at))::TEXT),
+    EXTRACT(EPOCH FROM date_trunc('hour', created_at))::BIGINT, model, provider_name,
+    COUNT(*), SUM(total_tokens), SUM(total_cost_usd), SUM(response_time_ms), COUNT(*), 1, 1
+FROM usage
+WHERE model = $1 AND created_at >= TO_TIMESTAMP($2::double precision)
+    AND created_at < TO_TIMESTAMP($3::double precision)
+GROUP BY date_trunc('hour', created_at), model, provider_name
+"#,
+    )
+    .bind(&model)
+    .bind((day + 2 * 86_400) as f64)
+    .bind((day + 6 * 86_400) as f64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM stats_hourly_model_provider WHERE model = $1 AND hour_utc = $2")
+        .bind(&model)
+        .bind(day + 4 * 86_400 + 12 * 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for tz in [60, 480, -300, 330, 345, -210, -225] {
+        for user_id in [
+            None,
+            Some(user_ids[0].clone()),
+            Some(user_ids[1].clone()),
+            Some(format!("absent-{suffix}")),
+        ] {
+            let query = UsageDashboardDailyBreakdownQuery {
+                created_from_unix_secs: (day - i64::from(tz) * 60) as u64,
+                created_until_unix_secs: (day + 7 * 86_400 - i64::from(tz) * 60) as u64,
+                tz_offset_minutes: tz,
+                user_id,
+            };
+            let expected = only_fixture(
+                repository
+                    .list_dashboard_daily_breakdown_raw(&query)
+                    .await
+                    .unwrap(),
+            );
+            let actual = only_fixture(
+                repository
+                    .list_dashboard_daily_breakdown(&query)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(actual, expected, "timezone {tz}, user {:?}", query.user_id);
+        }
+    }
+    for (from, until) in [
+        (day + 5 * 86_400 - 8 * 3600, day + 6 * 86_400 - 8 * 3600),
+        (
+            day + 2 * 86_400 + 12 * 3600 + 60,
+            day + 2 * 86_400 + 12 * 3600 + 120,
+        ),
+    ] {
+        let query = UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: from as u64,
+            created_until_unix_secs: until as u64,
+            ..query.clone()
+        };
+        assert_eq!(
+            only_fixture(
+                repository
+                    .list_dashboard_daily_breakdown(&query)
+                    .await
+                    .unwrap()
+            ),
+            only_fixture(
+                repository
+                    .list_dashboard_daily_breakdown_raw(&query)
+                    .await
+                    .unwrap()
+            )
+        );
+    }
+
+    // Covered hours must remain readable after their raw requests expire.
+    sqlx::query("DELETE FROM usage u WHERE model = $1 AND EXISTS (SELECT 1 FROM stats_hourly_model_provider h WHERE h.model = u.model AND h.hour_utc = EXTRACT(EPOCH FROM date_trunc('hour', u.created_at))::BIGINT)")
+        .bind(&model).execute(&pool).await.unwrap();
+    assert_eq!(
+        only_fixture(
+            repository
+                .list_dashboard_daily_breakdown(&query)
+                .await
+                .unwrap()
+        ),
+        expected
+    );
+    sqlx::query("DELETE FROM usage WHERE model = $1")
+        .bind(&model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stats_hourly_model_provider WHERE model = $1")
+        .bind(&model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stats_hourly WHERE id = $1")
+        .bind(&cutoff_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for user_id in user_ids {
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn postgres_provider_quota_backfill_resumes_and_rebuilds_when_url_is_set() {
     let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
         .ok()

@@ -244,7 +244,7 @@ describe('ProviderFormDialog quota cycle updates', () => {
     expect(payload).not.toHaveProperty('quota_last_reset_at')
   })
 
-  it('submits the cycle start when the administrator edits it', async () => {
+  it('edits the historical subscription start without resetting the cycle', async () => {
     mountDialog(makeProvider({
       billing_type: 'monthly_quota',
       monthly_quota_usd: 10,
@@ -260,7 +260,7 @@ describe('ProviderFormDialog quota cycle updates', () => {
     expect(endpointMocks.updateProvider).toHaveBeenCalledWith(
       'provider-1',
       expect.objectContaining({
-        quota_last_reset_at: dateTimeLocalToRfc3339('2026-08-19T00:00'),
+        quota_subscription_started_at: dateTimeLocalToRfc3339('2026-08-19T00:00'),
       }),
     )
   })

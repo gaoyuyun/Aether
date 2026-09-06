@@ -66,7 +66,8 @@ pub(crate) async fn build_admin_create_provider_record(
         None => Some(30),
     };
     let mut quota_last_reset_at_unix_secs = payload
-        .quota_last_reset_at
+        .quota_subscription_started_at
+        .or(payload.quota_last_reset_at)
         .as_deref()
         .map(|value| parse_optional_rfc3339_unix_secs(value, "quota_last_reset_at"))
         .transpose()?;
@@ -201,11 +202,6 @@ pub(crate) async fn build_admin_create_provider_record(
     if let Some(enabled) = payload.responses_websocket_enabled {
         set_responses_websocket_enabled(&mut config_map, enabled)?;
     }
-    validate_responses_websocket_config(&config_map)?;
-    let config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
-    crate::provider_transport::validate_anthropic_compatibility_profile_config(config.as_ref())
-        .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
-
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -214,6 +210,10 @@ pub(crate) async fn build_admin_create_provider_record(
     if billing_type == "monthly_quota" && quota_last_reset_at_unix_secs.is_none() {
         quota_last_reset_at_unix_secs = Some(now_unix_secs / 60 * 60);
     }
+    validate_responses_websocket_config(&config_map)?;
+    let config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
+    crate::provider_transport::validate_anthropic_compatibility_profile_config(config.as_ref())
+        .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
 
     let record = StoredProviderCatalogProvider::new(
         Uuid::new_v4().to_string(),
@@ -236,6 +236,7 @@ pub(crate) async fn build_admin_create_provider_record(
         quota_last_reset_at_unix_secs,
         quota_expires_at_unix_secs,
     )
+    .with_quota_schedule(quota_last_reset_at_unix_secs, quota_last_reset_at_unix_secs)
     .with_routing_fields(provider_priority)
     .with_transport_fields(
         is_active,

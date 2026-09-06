@@ -888,7 +888,10 @@ export interface ProviderWithEndpointsSummary {
   monthly_quota_usd?: number
   monthly_used_usd?: number
   quota_reset_day?: number
-  quota_last_reset_at?: string  // 当前周期开始时间
+  quota_last_reset_at?: string  // 当前记账起点
+  quota_subscription_started_at?: string
+  quota_cycle_start_at?: string
+  quota_next_reset_at?: string
   quota_expires_at?: string
   quota_windows?: ProviderQuotaWindow[]
   // 请求配置（从 Endpoint 迁移）

@@ -160,6 +160,27 @@ CREATE TABLE IF NOT EXISTS public.stats_hourly_provider (
 ALTER TABLE ONLY public.stats_hourly_provider ADD CONSTRAINT stats_hourly_provider_pkey PRIMARY KEY (id);
 ALTER TABLE ONLY public.stats_hourly_provider ADD CONSTRAINT uq_stats_hourly_provider UNIQUE (hour_utc, provider_name);
 
+CREATE TABLE IF NOT EXISTS public.stats_hourly_model_provider (
+    id character varying(64) NOT NULL,
+    hour_utc bigint NOT NULL,
+    model character varying(255) NOT NULL,
+    provider_name character varying(255) NOT NULL,
+    total_requests bigint DEFAULT 0 NOT NULL,
+    input_tokens bigint DEFAULT 0 NOT NULL,
+    output_tokens bigint DEFAULT 0 NOT NULL,
+    cache_creation_tokens bigint DEFAULT 0 NOT NULL,
+    cache_read_tokens bigint DEFAULT 0 NOT NULL,
+    total_cost double precision DEFAULT 0 NOT NULL,
+    settled_total_cost double precision DEFAULT 0 NOT NULL,
+    response_time_sum_ms double precision DEFAULT 0 NOT NULL,
+    response_time_samples bigint DEFAULT 0 NOT NULL,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.stats_hourly_model_provider ADD CONSTRAINT stats_hourly_model_provider_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.stats_hourly_model_provider ADD CONSTRAINT uq_stats_hourly_model_provider UNIQUE (hour_utc, model, provider_name);
+
 CREATE TABLE IF NOT EXISTS public.stats_daily (
     id character varying(64) NOT NULL,
     date bigint NOT NULL,

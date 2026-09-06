@@ -227,6 +227,14 @@ ON DUPLICATE KEY UPDATE
         aggregated_at_unix_secs,
     )
     .await?;
+    upsert_mysql_stats_hourly_model_provider_rows(
+        &mut tx,
+        hour_utc_unix_secs,
+        start_unix_secs,
+        end_unix_secs,
+        aggregated_at_unix_secs,
+    )
+    .await?;
     advanced::refresh_hourly(&mut tx, hour_utc_unix_secs, start_unix_secs, end_unix_secs).await?;
     tx.commit().await.map_sql_err()?;
 
@@ -529,6 +537,82 @@ GROUP BY provider_name
 ON DUPLICATE KEY UPDATE
   total_requests = VALUES(total_requests), input_tokens = VALUES(input_tokens),
   output_tokens = VALUES(output_tokens), total_cost = VALUES(total_cost),
+  updated_at = VALUES(updated_at)
+"#,
+    )
+    .bind(hour_utc)
+    .bind(now_unix_secs)
+    .bind(now_unix_secs)
+    .bind(start_unix_secs)
+    .bind(end_unix_secs)
+    .execute(&mut **tx)
+    .await
+    .map_sql_err()?;
+    Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
+}
+
+async fn upsert_mysql_stats_hourly_model_provider_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    hour_utc: i64,
+    start_unix_secs: i64,
+    end_unix_secs: i64,
+    now_unix_secs: i64,
+) -> Result<usize, DataLayerError> {
+    // Token columns follow the local usage-fused convention (recorded total
+    // when present, component fallback otherwise) so the four-column sum
+    // matches the daily model-provider rollup on MySQL.
+    let result = sqlx::query(
+        r#"
+INSERT INTO stats_hourly_model_provider (
+  id, hour_utc, model, provider_name, total_requests,
+  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+  total_cost, settled_total_cost, response_time_sum_ms, response_time_samples,
+  created_at, updated_at
+)
+SELECT SHA2(UUID(), 256), ?, model, provider_name, COUNT(*),
+  COALESCE(SUM(CASE WHEN COALESCE(`usage`.total_tokens, 0) > 0 THEN GREATEST(COALESCE(`usage`.total_tokens, 0), 0) ELSE 0 END), 0)
+    + COALESCE(SUM(CASE WHEN COALESCE(`usage`.total_tokens, 0) <= 0 THEN (
+      CASE
+        WHEN (
+          LOWER(COALESCE(`usage`.endpoint_api_format, `usage`.api_format, '')) IN ('openai', 'gemini', 'google')
+          OR LOWER(COALESCE(`usage`.endpoint_api_format, `usage`.api_format, '')) LIKE 'openai:%'
+          OR LOWER(COALESCE(`usage`.endpoint_api_format, `usage`.api_format, '')) LIKE 'gemini:%'
+          OR LOWER(COALESCE(`usage`.endpoint_api_format, `usage`.api_format, '')) LIKE 'google:%'
+        ) AND COALESCE(`usage`.input_tokens, 0) > 0 AND COALESCE(`usage`.cache_read_input_tokens, 0) > 0
+        THEN GREATEST(COALESCE(`usage`.input_tokens, 0) - COALESCE(`usage`.cache_read_input_tokens, 0), 0)
+        ELSE GREATEST(COALESCE(`usage`.input_tokens, 0), 0)
+      END
+    ) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(`usage`.total_tokens, 0) <= 0 THEN GREATEST(COALESCE(`usage`.output_tokens, 0), 0) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(`usage`.total_tokens, 0) <= 0 THEN (
+    CASE WHEN COALESCE(`usage`.cache_creation_input_tokens, 0) = 0
+      AND (COALESCE(`usage`.cache_creation_ephemeral_5m_input_tokens, 0)
+         + COALESCE(`usage`.cache_creation_ephemeral_1h_input_tokens, 0)) > 0
+    THEN COALESCE(`usage`.cache_creation_ephemeral_5m_input_tokens, 0)
+       + COALESCE(`usage`.cache_creation_ephemeral_1h_input_tokens, 0)
+    ELSE GREATEST(COALESCE(`usage`.cache_creation_input_tokens, 0), 0) END
+  ) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(`usage`.total_tokens, 0) <= 0 THEN GREATEST(COALESCE(`usage`.cache_read_input_tokens, 0), 0) ELSE 0 END), 0),
+  COALESCE(SUM(`usage`.total_cost_usd), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(`usage`.billing_status, 'settled') = 'settled' THEN COALESCE(`usage`.total_cost_usd, 0) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN `usage`.response_time_ms IS NOT NULL THEN GREATEST(COALESCE(`usage`.response_time_ms, 0), 0) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN `usage`.response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0), ?, ?
+FROM `usage`
+WHERE created_at_unix_ms >= ? AND created_at_unix_ms < ?
+  AND model IS NOT NULL AND model <> ''
+  AND status NOT IN ('pending', 'streaming')
+  AND provider_name NOT IN ('unknown', 'pending')
+GROUP BY model, provider_name
+ON DUPLICATE KEY UPDATE
+  total_requests = VALUES(total_requests),
+  input_tokens = VALUES(input_tokens),
+  output_tokens = VALUES(output_tokens),
+  cache_creation_tokens = VALUES(cache_creation_tokens),
+  cache_read_tokens = VALUES(cache_read_tokens),
+  total_cost = VALUES(total_cost),
+  settled_total_cost = VALUES(settled_total_cost),
+  response_time_sum_ms = VALUES(response_time_sum_ms),
+  response_time_samples = VALUES(response_time_samples),
   updated_at = VALUES(updated_at)
 "#,
     )

@@ -955,6 +955,27 @@ ON CONFLICT (id) DO UPDATE SET
     .await
     .map_postgres_err()?;
     reconcile_settled_provider_quota_attempt(tx, &delta_id, candidate).await?;
+    if matches!(
+        candidate.status,
+        RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
+    ) {
+        let actual = candidate
+            .extra_data
+            .as_ref()
+            .and_then(|v| v.pointer("/provider_quota_attempt_accounting/cost_usd"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(cost)
+            .max(cost);
+        // Unknown consumption uses the approved provisional minimum, while the immutable
+        // dispatch snapshot and candidate accounting annotation preserve the uncertainty.
+        crate::settlement::reconcile_provider_monthly_attempt_postgres(
+            tx,
+            &candidate.id,
+            actual,
+            true,
+        )
+        .await?;
+    }
     Ok(())
 }
 

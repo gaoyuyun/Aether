@@ -7,7 +7,8 @@ use super::{
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };
 use crate::DataLayerError;
-use aether_wallet::{ProviderBillingType, ProviderQuotaSnapshot};
+use aether_data_contracts::repository::quota::ProviderQuotaAdjustment;
+use aether_wallet::ProviderBillingType;
 
 #[derive(Debug, Default)]
 pub struct InMemoryProviderQuotaRepository {
@@ -61,33 +62,24 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
         let mut count = 0usize;
         let mut quotas = self.by_provider_id.write().expect("quota repository lock");
         for quota in quotas.values_mut() {
-            let snapshot = ProviderQuotaSnapshot {
-                provider_id: quota.provider_id.clone(),
-                billing_type: ProviderBillingType::parse(&quota.billing_type),
-                monthly_quota_usd: quota.monthly_quota_usd,
-                monthly_used_usd: quota.monthly_used_usd,
-                quota_reset_day: quota.quota_reset_day,
-                quota_last_reset_at_unix_secs: quota.quota_last_reset_at_unix_secs,
-                quota_expires_at_unix_secs: quota.quota_expires_at_unix_secs,
-                is_active: quota.is_active,
-            };
-            let pending_due = quota
-                .pending_quota_reset_at_unix_secs
-                .is_some_and(|effective_at| effective_at <= now_unix_secs);
-            if pending_due
-                || (quota.quota_reset_day.is_some_and(|days| days <= 30)
-                    && snapshot.should_reset(now_unix_secs))
-            {
-                quota.monthly_used_usd = 0.0;
-                quota.quota_last_reset_at_unix_secs = Some(
-                    quota
-                        .pending_quota_reset_at_unix_secs
-                        .filter(|effective_at| *effective_at <= now_unix_secs)
-                        .unwrap_or(now_unix_secs)
-                        / 60
-                        * 60,
-                );
-                quota.pending_quota_reset_at_unix_secs = None;
+            if !quota.is_active {
+                continue;
+            }
+            if let Some(change) = quota.due_transition(now_unix_secs) {
+                quota.quota_subscription_started_at_unix_secs = quota
+                    .quota_subscription_started_at_unix_secs
+                    .or(quota.quota_last_reset_at_unix_secs)
+                    .or(Some(change.cycle_start));
+                quota.quota_cycle_start_at_unix_secs = Some(change.cycle_start);
+                quota.quota_last_reset_at_unix_secs = Some(change.epoch_start);
+                quota.quota_reset_day = Some(change.cycle_days);
+                if change.reset_usage {
+                    quota.monthly_used_usd = 0.0;
+                }
+                if change.applied_pending {
+                    quota.pending_adjustment = None;
+                    quota.pending_quota_reset_at_unix_secs = None;
+                }
                 count += 1;
             }
         }
@@ -99,6 +91,19 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
         provider_id: &str,
         effective_at_unix_secs: u64,
     ) -> Result<bool, DataLayerError> {
+        self.request_adjustment(
+            provider_id,
+            &ProviderQuotaAdjustment::cycle(effective_at_unix_secs),
+        )
+        .await
+    }
+
+    async fn request_adjustment(
+        &self,
+        provider_id: &str,
+        adjustment: &ProviderQuotaAdjustment,
+    ) -> Result<bool, DataLayerError> {
+        adjustment.validate()?;
         let mut quotas = self.by_provider_id.write().expect("quota repository lock");
         let Some(quota) = quotas.get_mut(provider_id) else {
             return Ok(false);
@@ -106,7 +111,8 @@ impl ProviderQuotaWriteRepository for InMemoryProviderQuotaRepository {
         if ProviderBillingType::parse(&quota.billing_type) != ProviderBillingType::MonthlyQuota {
             return Ok(false);
         }
-        quota.pending_quota_reset_at_unix_secs = Some(effective_at_unix_secs / 60 * 60);
+        quota.pending_quota_reset_at_unix_secs = Some(adjustment.effective_at_unix_secs);
+        quota.pending_adjustment = Some(adjustment.clone());
         Ok(true)
     }
 }

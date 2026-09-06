@@ -230,7 +230,7 @@ async fn enqueue_provider_monthly_usage_delta_mysql(
     Ok(())
 }
 
-async fn reconcile_provider_monthly_attempt_mysql(
+pub(crate) async fn reconcile_provider_monthly_attempt_mysql(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     candidate_id: &str,
     actual_cost_usd: f64,
@@ -262,11 +262,7 @@ async fn reconcile_provider_monthly_attempt_mysql(
     let processed_at = row
         .try_get::<Option<i64>, _>("processed_at")
         .map_sql_err()?;
-    let reconciled_cost = if base_status.as_deref() == Some("ready") {
-        actual_cost_usd.max(base_cost)
-    } else {
-        actual_cost_usd
-    };
+    let reconciled_cost = actual_cost_usd.max(base_cost);
     if !reconciled_cost.is_finite() || reconciled_cost < 0.0 {
         return Err(DataLayerError::InvalidInput(
             "provider quota attempt settlement cost is invalid".to_string(),
@@ -295,13 +291,19 @@ async fn reconcile_provider_monthly_attempt_mysql(
         .map_sql_err()?;
         return Ok(true);
     }
-    let adjustment = reconciled_cost - base_cost;
+    let applied: f64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(provider_quota_cost_usd), 0) AS DOUBLE) FROM usage_counter_deltas WHERE kind = 'provider_monthly' AND request_id = ? AND id <> ?")
+        .bind(candidate_id).bind(&delta_id).fetch_one(&mut **tx).await.map_sql_err()?;
+    let adjustment = (reconciled_cost - base_cost - applied).max(0.0);
     if adjustment.abs() <= SETTLEMENT_EPSILON_USD {
         return Ok(true);
     }
     let adjustment_id = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_OID,
-        format!("provider-quota-attempt-actual:{}", candidate_id).as_bytes(),
+        format!(
+            "provider-quota-attempt-actual:{}:{:.12}",
+            candidate_id, reconciled_cost
+        )
+        .as_bytes(),
     )
     .to_string();
     let pricing_snapshot: Option<String> = row

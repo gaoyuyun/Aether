@@ -2,8 +2,9 @@ use super::{usage_columns, SqliteUsageReadRepository, SqliteUsageWriteRepository
 use crate::run_migrations;
 use aether_data_contracts::repository::usage::{
     ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest, UpsertUsageRecord,
-    UsageAuditAggregationGroupBy, UsageAuditAggregationQuery, UsageAuditDimensionsAggregationQuery,
-    UsageAuditListQuery, UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBreakdownGroupBy,
+    StoredUsageDashboardDailyBreakdownRow, UsageAuditAggregationGroupBy,
+    UsageAuditAggregationQuery, UsageAuditDimensionsAggregationQuery, UsageAuditListQuery,
+    UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBreakdownGroupBy,
     UsageBreakdownSummaryQuery, UsageCacheAffinityIntervalGroupBy, UsageCacheAffinityIntervalQuery,
     UsageCleanupExecutionMode, UsageCleanupTargets, UsageCleanupWindow,
     UsageCostSavingsSummaryQuery, UsageDailyHeatmapQuery, UsageDashboardDailyBreakdownQuery,
@@ -2812,5 +2813,535 @@ fn cleanup_window(
         compressed_cutoff: timestamp(compressed_cutoff),
         header_cutoff: timestamp(header_cutoff),
         log_cutoff: timestamp(log_cutoff),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hourly model × provider fast path (timezone-aware daily breakdown)
+// ---------------------------------------------------------------------------
+
+async fn hourly_fast_path_pool() -> sqlx::SqlitePool {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    pool
+}
+
+/// Inserts one usage row at `created_unix_secs` with the given usage shape.
+async fn insert_hourly_usage_row(
+    pool: &sqlx::SqlitePool,
+    request_id: &str,
+    created_unix_secs: i64,
+    model: &str,
+    provider: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    total_cost_usd: f64,
+    response_time_ms: Option<i64>,
+    billing_status: &str,
+) {
+    sqlx::query(
+        r#"
+INSERT INTO "usage" (
+  request_id, id, user_id, provider_name, model, input_tokens, output_tokens,
+  total_tokens, cache_read_input_tokens, total_cost_usd, response_time_ms,
+  status, billing_status, created_at_unix_ms, updated_at_unix_secs
+) VALUES (?, ?, 'user-1', ?, ?, ?, ?, 0, ?, ?, ?, 'completed', ?, ?, 1)
+"#,
+    )
+    .bind(request_id)
+    .bind(format!("{request_id}-id"))
+    .bind(provider)
+    .bind(model)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(cache_read_tokens)
+    .bind(total_cost_usd)
+    .bind(response_time_ms)
+    .bind(billing_status)
+    .bind(created_unix_secs)
+    .execute(pool)
+    .await
+    .expect("usage row should insert");
+}
+
+/// Runs the hourly aggregation worker over `hour_start..hour_end` (UTC secs).
+async fn run_hourly_aggregation_for_hours(
+    pool: &sqlx::SqlitePool,
+    hour_start: i64,
+    hour_end: i64,
+) {
+    let url = format!("sqlite://{}?mode=rw", ":memory:"); // placeholder, replaced below
+    let _ = url;
+    for hour in (hour_start..hour_end).step_by(3600) {
+        // Direct SQL mirroring the worker branch, exercised through the same
+        // statements aether-data would issue.
+        let sql = r#"
+INSERT INTO stats_hourly_model_provider (
+  id, hour_utc, model, provider_name, total_requests,
+  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+  total_cost, settled_total_cost, response_time_sum_ms, response_time_samples,
+  created_at, updated_at
+)
+SELECT
+  lower(hex(randomblob(32))), ?, model, provider_name, COUNT(*),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) > 0 THEN MAX(COALESCE("usage".total_tokens, 0), 0) ELSE 0 END), 0)
+    + COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN (
+      CASE
+        WHEN (
+          LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) IN ('openai', 'gemini', 'google')
+          OR LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) LIKE 'openai:%'
+          OR LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) LIKE 'gemini:%'
+          OR LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) LIKE 'google:%'
+        ) AND COALESCE("usage".input_tokens, 0) > 0 AND COALESCE("usage".cache_read_input_tokens, 0) > 0
+        THEN MAX(COALESCE("usage".input_tokens, 0) - COALESCE("usage".cache_read_input_tokens, 0), 0)
+        ELSE MAX(COALESCE("usage".input_tokens, 0), 0)
+      END
+    ) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN MAX(COALESCE("usage".output_tokens, 0), 0) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN (
+    CASE WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
+      AND (COALESCE("usage".cache_creation_ephemeral_5m_input_tokens, 0)
+         + COALESCE("usage".cache_creation_ephemeral_1h_input_tokens, 0)) > 0
+    THEN COALESCE("usage".cache_creation_ephemeral_5m_input_tokens, 0)
+       + COALESCE("usage".cache_creation_ephemeral_1h_input_tokens, 0)
+    ELSE MAX(COALESCE("usage".cache_creation_input_tokens, 0), 0) END
+  ) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN MAX(COALESCE("usage".cache_read_input_tokens, 0), 0) ELSE 0 END), 0),
+  CAST(COALESCE(SUM(COALESCE(settlement.billing_total_cost_usd, "usage".total_cost_usd, 0)), 0) AS REAL),
+  CAST(COALESCE(SUM(CASE WHEN COALESCE(settlement.billing_status, "usage".billing_status) = 'settled' THEN COALESCE(settlement.billing_total_cost_usd, "usage".total_cost_usd, 0) ELSE 0 END), 0) AS REAL),
+  COALESCE(SUM(CASE WHEN "usage".response_time_ms IS NOT NULL THEN MAX(COALESCE("usage".response_time_ms, 0), 0) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN "usage".response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0), 1, 1
+FROM "usage"
+LEFT JOIN usage_settlement_snapshots AS settlement
+  ON settlement.request_id = "usage".request_id
+WHERE created_at_unix_ms >= ? AND created_at_unix_ms < ?
+  AND model IS NOT NULL AND model <> ''
+  AND status NOT IN ('pending', 'streaming')
+  AND provider_name NOT IN ('unknown', 'pending')
+GROUP BY model, provider_name
+ON CONFLICT (hour_utc, model, provider_name) DO UPDATE SET
+  total_requests = excluded.total_requests,
+  total_cost = excluded.total_cost,
+  settled_total_cost = excluded.settled_total_cost,
+  updated_at = excluded.updated_at
+"#;
+        sqlx::query(sql)
+            .bind(hour)
+            .bind(hour)
+            .bind(hour + 3600)
+            .execute(pool)
+            .await
+            .expect("hourly aggregation should run");
+    }
+}
+
+fn assert_daily_breakdown_rows_equal(
+    left: &[StoredUsageDashboardDailyBreakdownRow],
+    right: &[StoredUsageDashboardDailyBreakdownRow],
+    context: &str,
+) {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "{context}: row count mismatch\n left: {left:#?}\n right: {right:#?}"
+    );
+    for (l, r) in left.iter().zip(right.iter()) {
+        assert_eq!(l.date, r.date, "{context}: date mismatch");
+        assert_eq!(l.model, r.model, "{context}: model mismatch for {}", l.date);
+        assert_eq!(l.provider, r.provider, "{context}: provider mismatch for {}", l.date);
+        assert_eq!(l.requests, r.requests, "{context}: requests mismatch for {} {}", l.date, l.model);
+        assert_eq!(l.total_tokens, r.total_tokens, "{context}: tokens mismatch for {} {}", l.date, l.model);
+        assert!(
+            (l.total_cost_usd - r.total_cost_usd).abs() < 1e-6,
+            "{context}: cost mismatch for {} {} ({} vs {})",
+            l.date,
+            l.model,
+            l.total_cost_usd,
+            r.total_cost_usd
+        );
+        assert_eq!(
+            l.response_time_samples, r.response_time_samples,
+            "{context}: response samples"
+        );
+        assert!(
+            (l.response_time_sum_ms - r.response_time_sum_ms).abs() < 1e-6,
+            "{context}: response time"
+        );
+    }
+}
+
+/// Seeds a three-day dataset spanning local-day boundaries under all timezone
+/// variants, aggregates hours, then asserts fast-path == raw equality for the
+/// full tz matrix {0, 60, 480, -300, 330}.
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_hourly_fast_path_matches_raw_across_timezones() {
+    for tz in [0, 60, 480, -300, 330] {
+        let pool = hourly_fast_path_pool().await;
+
+        // Day 1 (2026-01-01 UTC) and day 2 (2026-01-02): covered by hourly rows.
+        // Day 3 (2026-01-03): left un-aggregated as the live tail.
+        let day1 = 1_767_225_600_i64; // 2026-01-01 00:00:00 UTC
+        let day2 = day1 + 86_400;
+        let day3 = day1 + 2 * 86_400;
+
+        // Rows crafted to sit near local-day boundaries for tz=480:
+        // local day = [00:00-08:00, next 00:00-08:00) UTC.
+        insert_hourly_usage_row(&pool, "r1", day1, "m1", "p1", 100, 50, 20, 0.15, Some(120), "settled").await;
+        insert_hourly_usage_row(&pool, "r2", day2 - 400, "m1", "p2", 10, 5, 0, 0.02, Some(80), "settled").await;
+        insert_hourly_usage_row(&pool, "r3", day2 + 400, "m2", "p1", 40, 20, 10, 0.40, None, "settled").await;
+        insert_hourly_usage_row(&pool, "r4", day2 + 5000, "m1", "p1", 7, 3, 2, 0.07, Some(33), "pending").await;
+        insert_hourly_usage_row(&pool, "r5", day3 + 100, "m3", "p3", 15, 6, 0, 0.06, Some(15), "settled").await;
+        insert_hourly_usage_row(&pool, "r6", day3 + 7200, "m1", "p1", 8, 2, 1, 0.08, Some(9), "settled").await;
+
+        // Aggregate days 1-2 only; day 3 stays raw (un-aggregated tail).
+        run_hourly_aggregation_for_hours(&pool, day1, day3).await;
+
+        let reader = SqliteUsageReadRepository::new(pool.clone());
+        let query = UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: (day1 - 43_200) as u64,
+            created_until_unix_secs: (day3 + 86_400) as u64,
+            tz_offset_minutes: tz,
+            user_id: None,
+        };
+        let fast_rows = reader
+            .list_dashboard_daily_breakdown(&query)
+            .await
+            .expect("fast-path breakdown should load");
+        let raw_rows = reader
+            .list_dashboard_daily_breakdown_raw(&query)
+            .await
+            .expect("raw breakdown should load");
+        assert_daily_breakdown_rows_equal(&fast_rows, &raw_rows, &format!("tz {tz}"));
+    }
+}
+
+/// Missing hourly coverage must degrade to the historical raw behavior.
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_hourly_gap_falls_back_to_raw() {
+    let pool = hourly_fast_path_pool().await;
+    let day1 = 1_767_225_600_i64;
+    insert_hourly_usage_row(&pool, "r1", day1, "m1", "p1", 100, 50, 20, 0.15, Some(120), "settled").await;
+    // No rows in stats_hourly_model_provider at all.
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let query = UsageDashboardDailyBreakdownQuery {
+        created_from_unix_secs: day1 as u64,
+        created_until_unix_secs: (day1 + 86_400) as u64,
+        tz_offset_minutes: 480,
+        user_id: None,
+    };
+    let fallback_rows = reader
+        .list_dashboard_daily_breakdown(&query)
+        .await
+        .expect("fallback breakdown should load");
+    let raw_rows = reader
+        .list_dashboard_daily_breakdown_raw(&query)
+        .await
+        .expect("raw breakdown should load");
+    assert_daily_breakdown_rows_equal(&fallback_rows, &raw_rows, "hourly gap fallback");
+}
+
+/// The un-aggregated tail (today) must merge live raw rows correctly.
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_merges_unaggregated_tail() {
+    let pool = hourly_fast_path_pool().await;
+    let day1 = 1_767_225_600_i64;
+    let day3 = day1 + 2 * 86_400;
+    // Hourly aggregation covers hours [day1, day3): under tz=480 that fully
+    // covers local days 01-01 and 01-02; local day 01-03 (the r2/r4 hours) is
+    // the not-yet-aggregated tail served from raw.
+    insert_hourly_usage_row(&pool, "r1", day1, "m1", "p1", 100, 50, 20, 0.15, Some(120), "settled").await;
+    insert_hourly_usage_row(&pool, "r2", day3 + 100, "m1", "p1", 5, 2, 1, 0.05, Some(50), "settled").await;
+    insert_hourly_usage_row(&pool, "r3", day3 + 7200, "m1", "p1", 8, 1, 0, 0.08, Some(9), "settled").await;
+    run_hourly_aggregation_for_hours(&pool, day1, day3).await;
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let query = UsageDashboardDailyBreakdownQuery {
+        created_from_unix_secs: day1 as u64,
+        created_until_unix_secs: (day3 + 86_400) as u64,
+        tz_offset_minutes: 480,
+        user_id: None,
+    };
+    let merged = reader
+        .list_dashboard_daily_breakdown(&query)
+        .await
+        .expect("merged breakdown should load");
+    let raw_rows = reader
+        .list_dashboard_daily_breakdown_raw(&query)
+        .await
+        .expect("raw breakdown should load");
+    assert_daily_breakdown_rows_equal(&merged, &raw_rows, "unaggregated tail merge");
+
+    // Local days 01-01/01-02 come from hourly rows and local day 01-03 from
+    // raw; no (date, model, provider) may ever appear twice.
+    let keys = merged
+        .iter()
+        .map(|row| (row.date.clone(), row.model.clone(), row.provider.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys.len(), merged.len(), "no duplicate (date, model, provider)");
+
+    let day_three_total: u64 = merged
+        .iter()
+        .filter(|row| row.date.ends_with("01-03"))
+        .map(|row| row.requests)
+        .sum();
+    assert_eq!(day_three_total, 2, "both tail rows must appear exactly once");
+}
+
+/// Sub-hour timezone offsets (India +05:30) must regroup correctly.
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_supports_half_hour_offsets() {
+    let pool = hourly_fast_path_pool().await;
+    let day1 = 1_767_225_600_i64;
+    // 05:30 local = 00:00 UTC, so day1 is exactly the local day start.
+    insert_hourly_usage_row(&pool, "r1", day1, "m1", "p1", 100, 50, 20, 0.15, Some(120), "settled").await;
+    insert_hourly_usage_row(&pool, "r2", day1 + 86_400 - 1800, "m1", "p1", 10, 5, 0, 0.05, None, "settled").await;
+    run_hourly_aggregation_for_hours(&pool, day1, day1 + 86_400).await;
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let query = UsageDashboardDailyBreakdownQuery {
+        created_from_unix_secs: day1 as u64,
+        created_until_unix_secs: (day1 + 2 * 86_400) as u64,
+        tz_offset_minutes: 330,
+        user_id: None,
+    };
+    let rows = reader
+        .list_dashboard_daily_breakdown(&query)
+        .await
+        .expect("half-hour offset breakdown should load");
+    let raw_rows = reader
+        .list_dashboard_daily_breakdown_raw(&query)
+        .await
+        .expect("raw half-hour breakdown should load");
+    assert_daily_breakdown_rows_equal(&rows, &raw_rows, "tz 330");
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_preserves_history_before_hourly_backfill() {
+    let pool = hourly_fast_path_pool().await;
+    let day = 1_767_225_600_i64;
+    for index in 0..7 {
+        insert_hourly_usage_row(
+            &pool,
+            &format!("history-{index}"),
+            day + index * 86_400 + 12 * 3600,
+            "model",
+            "provider",
+            100,
+            50,
+            20,
+            0.25,
+            Some(100),
+            "settled",
+        )
+        .await;
+    }
+    // An upgraded database has old raw history but only recent hourly rollups.
+    run_hourly_aggregation_for_hours(&pool, day + 6 * 86_400, day + 7 * 86_400).await;
+    let reader = SqliteUsageReadRepository::new(pool);
+    for (first_day, last_day) in [(5, 6), (0, 7)] {
+        let query = UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: (day + first_day * 86_400 - 8 * 3600) as u64,
+            created_until_unix_secs: (day + last_day * 86_400 - 8 * 3600) as u64,
+            tz_offset_minutes: 480,
+            user_id: None,
+        };
+        let expected = reader
+            .list_dashboard_daily_breakdown_raw(&query)
+            .await
+            .unwrap();
+        assert_eq!(expected.len(), (last_day - first_day) as usize);
+        let actual = reader.list_dashboard_daily_breakdown(&query).await.unwrap();
+        assert_daily_breakdown_rows_equal(&actual, &expected, "history before hourly backfill");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_merges_hourly_holes_without_requiring_covered_raw() {
+    let pool = hourly_fast_path_pool().await;
+    let day = 1_767_225_600_i64;
+    for hour in [0, 1, 2, 24, 48] {
+        insert_hourly_usage_row(
+            &pool,
+            &format!("hour-{hour}"),
+            day + hour * 3600 + 60,
+            "model",
+            "provider",
+            100,
+            50,
+            20,
+            0.25,
+            Some(100),
+            "settled",
+        )
+        .await;
+    }
+    run_hourly_aggregation_for_hours(&pool, day, day + 49 * 3600).await;
+    let reader = SqliteUsageReadRepository::new(pool.clone());
+    let query = UsageDashboardDailyBreakdownQuery {
+        created_from_unix_secs: (day - 8 * 3600) as u64,
+        created_until_unix_secs: (day + 3 * 86_400 - 8 * 3600) as u64,
+        tz_offset_minutes: 480,
+        user_id: None,
+    };
+    let expected = reader
+        .list_dashboard_daily_breakdown_raw(&query)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stats_hourly_model_provider WHERE hour_utc = ?")
+        .bind(day + 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Keep raw data only in the gap: valid rollups must still be used.
+    sqlx::query("DELETE FROM \"usage\" WHERE request_id <> 'hour-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let actual = reader.list_dashboard_daily_breakdown(&query).await.unwrap();
+    assert_daily_breakdown_rows_equal(&actual, &expected, "hourly hole and retained rollups");
+    assert_eq!(actual.iter().map(|row| row.requests).sum::<u64>(), 5);
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_keeps_imported_history_with_recent_hourly_rows() {
+    let pool = hourly_fast_path_pool().await;
+    let day = 1_767_225_600_i64;
+    sqlx::query(
+        "INSERT INTO stats_daily (id, \"date\", total_requests, input_tokens, output_tokens, total_cost, is_complete, created_at, updated_at) VALUES ('imported', ?, 9, 90, 45, 1.5, 1, 1, 1)",
+    ).bind(day).execute(&pool).await.unwrap();
+    insert_hourly_usage_row(
+        &pool,
+        "recent",
+        day + 2 * 86_400 + 12 * 3600,
+        "model",
+        "provider",
+        100,
+        50,
+        20,
+        0.25,
+        Some(100),
+        "settled",
+    )
+    .await;
+    run_hourly_aggregation_for_hours(&pool, day + 2 * 86_400, day + 3 * 86_400).await;
+    let rows = SqliteUsageReadRepository::new(pool)
+        .list_dashboard_daily_breakdown(&UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: (day - 8 * 3600) as u64,
+            created_until_unix_secs: (day + 3 * 86_400 - 8 * 3600) as u64,
+            tz_offset_minutes: 480,
+            user_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (
+            rows[0].date.as_str(),
+            rows[0].requests,
+            rows[0].total_tokens
+        ),
+        ("2026-01-01", 9, 135)
+    );
+    assert_eq!((rows[1].date.as_str(), rows[1].requests), ("2026-01-03", 1));
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_never_uses_global_hourly_rows_for_a_user() {
+    let pool = hourly_fast_path_pool().await;
+    let day = 1_767_225_600_i64;
+    for (request_id, hour) in [("own", 0), ("other", 1), ("tail", 48)] {
+        insert_hourly_usage_row(
+            &pool,
+            request_id,
+            day + hour * 3600 + 60,
+            "model",
+            "provider",
+            100,
+            50,
+            20,
+            0.25,
+            Some(100),
+            "settled",
+        )
+        .await;
+    }
+    sqlx::query("UPDATE \"usage\" SET user_id = 'user-2' WHERE request_id = 'other'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    run_hourly_aggregation_for_hours(&pool, day, day + 49 * 3600).await;
+    let reader = SqliteUsageReadRepository::new(pool);
+    for user_id in ["user-1", "user-2", "no-usage"] {
+        let query = UsageDashboardDailyBreakdownQuery {
+            created_from_unix_secs: (day - 8 * 3600) as u64,
+            created_until_unix_secs: (day + 3 * 86_400 - 8 * 3600) as u64,
+            tz_offset_minutes: 480,
+            user_id: Some(user_id.to_string()),
+        };
+        let expected = reader
+            .list_dashboard_daily_breakdown_raw(&query)
+            .await
+            .unwrap();
+        let actual = reader.list_dashboard_daily_breakdown(&query).await.unwrap();
+        assert_daily_breakdown_rows_equal(&actual, &expected, user_id);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_dashboard_daily_breakdown_splits_hours_at_fractional_local_midnight() {
+    for tz in [330, 345, -210, -225] {
+        let pool = hourly_fast_path_pool().await;
+        let day = 1_767_225_600_i64;
+        let local_midnight = day + 86_400 - i64::from(tz) * 60;
+        for (index, timestamp) in [local_midnight - 60, local_midnight + 60, day + 3 * 86_400]
+            .into_iter()
+            .enumerate()
+        {
+            insert_hourly_usage_row(
+                &pool,
+                &format!("boundary-{index}"),
+                timestamp,
+                "model",
+                "provider",
+                100,
+                50,
+                20,
+                0.25,
+                Some(100),
+                "settled",
+            )
+            .await;
+        }
+        run_hourly_aggregation_for_hours(&pool, day, day + 4 * 86_400).await;
+        let reader = SqliteUsageReadRepository::new(pool);
+        for (from, until) in [
+            (local_midnight - 86_400, local_midnight + 86_400),
+            (local_midnight - 30, local_midnight + 120),
+        ] {
+            let query = UsageDashboardDailyBreakdownQuery {
+                created_from_unix_secs: from as u64,
+                created_until_unix_secs: until as u64,
+                tz_offset_minutes: tz,
+                user_id: None,
+            };
+            let expected = reader
+                .list_dashboard_daily_breakdown_raw(&query)
+                .await
+                .unwrap();
+            let actual = reader.list_dashboard_daily_breakdown(&query).await.unwrap();
+            assert_daily_breakdown_rows_equal(
+                &actual,
+                &expected,
+                &format!("local midnight at tz {tz}"),
+            );
+        }
     }
 }

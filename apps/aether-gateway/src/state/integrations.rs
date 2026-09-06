@@ -596,12 +596,81 @@ impl RequestCandidateRuntimeWriter for AppState {
         AppState::upsert_request_candidate(self, candidate).await
     }
 
+    async fn persist_monthly_quota_terminal(
+        &self,
+        record: &UpsertRequestCandidateRecord,
+    ) -> Result<bool, GatewayError> {
+        let existing = self
+            .data
+            .list_request_candidates_by_request_id(&record.request_id)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let Some(stored) = existing.iter().find(|c| c.id == record.id) else {
+            return Ok(false);
+        };
+        let Some(snapshot) =
+            aether_data_contracts::repository::candidates::provider_quota_dispatch_snapshot(
+                stored.extra_data.as_ref(),
+            )
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .filter(|s| s.is_monthly_quota())
+        else {
+            return Ok(false);
+        };
+        let mut record = record.clone();
+        if matches!(
+            record.status,
+            aether_data_contracts::repository::candidates::RequestCandidateStatus::Failed
+                | aether_data_contracts::repository::candidates::RequestCandidateStatus::Cancelled
+        ) && record
+            .extra_data
+            .as_ref()
+            .and_then(|v| v.get("provider_quota_attempt_accounting"))
+            .is_none()
+            && stored
+                .extra_data
+                .as_ref()
+                .and_then(|v| v.get("provider_quota_attempt_accounting"))
+                .is_none()
+        {
+            let mut extra = record
+                .extra_data
+                .take()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            extra.insert("provider_quota_attempt_accounting".to_string(), serde_json::json!({
+                "status": if snapshot.provider_quota_cost_usd.is_some() { "dispatch_minimum" } else { "provisional_unknown" },
+                "policy": "availability_first", "cost_usd": snapshot.provider_quota_cost_usd.unwrap_or(0.0),
+            }));
+            record.extra_data = Some(Value::Object(extra));
+        }
+        self.data
+            .upsert_request_candidate(record)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .ok_or_else(|| {
+                GatewayError::Internal("monthly quota candidate writer unavailable".to_string())
+            })?;
+        self.provider_quota_snapshot_cache.clear();
+        self.provider_quota_window_usage_cache.clear();
+        Ok(true)
+    }
+
     async fn prepare_provider_quota_dispatch(
         &self,
         context: &ProviderQuotaDispatchContext,
         candidate: &mut UpsertRequestCandidateRecord,
     ) -> Result<(), GatewayError> {
-        let quota = AppState::read_provider_quota_snapshot(self, &context.provider_id).await?;
+        let loaded = self
+            .data
+            .find_provider_quotas_by_provider_ids(std::slice::from_ref(&context.provider_id))
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let quota = self
+            .ensure_due_provider_quota_resets(std::slice::from_ref(&context.provider_id), loaded)
+            .await?
+            .into_iter()
+            .next();
         let billing_context = match context.model_id.as_deref() {
             Some(model_id) => self
                 .data
@@ -631,18 +700,13 @@ impl RequestCandidateRuntimeWriter for AppState {
             .and_then(|value| value.provider_billing_type.clone())
             .or_else(|| quota.as_ref().map(|value| value.billing_type.clone()))
             .unwrap_or_else(|| "pay_as_you_go".to_string());
-        let quota_epoch = billing_context
-            .as_ref()
-            .and_then(|value| value.provider_quota_epoch_start_unix_secs)
-            .or_else(|| {
-                quota
-                    .as_ref()
-                    .and_then(|value| value.quota_last_reset_at_unix_secs)
-            });
+        let quota_epoch = quota.as_ref().and_then(|q| q.quota_last_reset_at_unix_secs);
         if billing_type.eq_ignore_ascii_case("monthly_quota")
             && (billing_context.is_none()
                 || quota_epoch.is_none()
-                || quota.as_ref().is_none_or(|value| !value.is_active))
+                || quota.as_ref().is_none_or(|value| {
+                    aether_scheduler_core::should_skip_provider_quota(value, current_unix_secs())
+                }))
         {
             return Err(GatewayError::Internal(format!(
                 "monthly provider quota dispatch is unavailable or fail-closed for provider {}",

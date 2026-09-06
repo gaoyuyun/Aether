@@ -3,6 +3,7 @@
  */
 
 import apiClient from './client';
+import type { ProviderQuotaWindow } from './endpoints';
 
 const API_BASE = '/api/admin/provider-strategy';
 
@@ -18,16 +19,29 @@ export interface ProviderBillingConfig {
   provider_priority?: number;
 }
 
-export interface ProviderStatsResponse {
-  billing_info?: {
-    monthly_used_usd?: number | null
-    pending_quota_reset_at?: string | null
-    quota_windows?: ProviderBillingConfig['quota_windows'] | null
-  } | null
+export interface ProviderQuotaBillingInfo {
+  monthly_used_usd?: number | null
+  monthly_quota_usd?: number | null
+  pending_quota_reset_at?: string | null
+  quota_windows?: ProviderQuotaWindow[] | null
+  quota_subscription_started_at?: string | null
+  quota_cycle_start_at?: string | null
+  quota_last_reset_at?: string | null
+  quota_next_reset_at?: string | null
+  quota_expires_at?: string | null
+  quota_reset_day?: number | null
+  status?: 'active' | 'expired' | 'not_started' | 'disabled' | 'exhausted' | 'accounting_pending'
 }
-
+export interface ProviderStatsResponse { billing_info?: ProviderQuotaBillingInfo | null }
+export interface ProviderQuotaResetRequest {
+  mode: 'cycle' | 'usage_only'
+  effective_at?: string
+  cycle_days?: number
+  reset_usage?: boolean
+}
 export interface ProviderQuotaResetResponse {
   effective_at?: string | null
+  pending?: boolean
 }
 
 /**
@@ -54,8 +68,8 @@ export async function getProviderStats(providerId: string, hours: number = 24): 
 /**
  * 重置提供商月卡额度
  */
-export async function resetProviderQuota(providerId: string): Promise<ProviderQuotaResetResponse> {
-  const response = await apiClient.post(`${API_BASE}/providers/${providerId}/quota/reset`);
+export async function resetProviderQuota(providerId: string, operation: ProviderQuotaResetRequest = { mode: 'cycle' }): Promise<ProviderQuotaResetResponse> {
+  const response = await apiClient.post(`${API_BASE}/providers/${providerId}/quota/reset`, operation);
   return response.data as ProviderQuotaResetResponse;
 }
 

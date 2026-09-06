@@ -121,7 +121,8 @@ export async function updateProvider(
     billing_type: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
     monthly_quota_usd: number
     quota_reset_day: number
-    quota_last_reset_at: string  // 周期开始时间
+    quota_last_reset_at?: string  // 兼容旧客户端
+    quota_subscription_started_at?: string
     quota_expires_at: string | null
     quota_windows: Array<{ duration_secs: number; limit_usd: number }>
     rpm_limit: number | null
@@ -160,6 +161,7 @@ export async function createProvider(
     monthly_quota_usd?: number
     quota_reset_day?: number
     quota_last_reset_at?: string
+    quota_subscription_started_at?: string
     quota_expires_at?: string | null
     quota_windows?: Array<{ duration_secs: number; limit_usd: number }>
     provider_priority?: number

@@ -374,6 +374,9 @@ async fn upsert_provider_quota_attempt_delta(
         .transpose()
         .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
     let cost = snapshot.provider_quota_cost_usd.unwrap_or(0.0);
+    // An unresolved attempt is fail-closed only while it may still settle. Once
+    // the candidate is terminally failed/cancelled, it consumed no known quota
+    // and must not keep the provider unavailable for the rest of the epoch.
     sqlx::query(
         r#"
 INSERT INTO usage_counter_deltas (
@@ -417,6 +420,31 @@ ON CONFLICT (id) DO UPDATE SET
     .await
     .map_sql_err()?;
     reconcile_settled_provider_quota_attempt(tx, &delta_id, candidate).await?;
+    if matches!(
+        candidate.status,
+        RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
+    ) {
+        let actual = candidate
+            .extra_data
+            .as_ref()
+            .and_then(|v| v.pointer("/provider_quota_attempt_accounting/cost_usd"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(cost)
+            .max(cost);
+        // Unknown consumption uses the approved provisional minimum, while the immutable
+        // dispatch snapshot and candidate accounting annotation preserve the uncertainty.
+        crate::settlement::reconcile_provider_monthly_attempt_sqlite(
+            tx,
+            &candidate.id,
+            actual,
+            true,
+            (candidate
+                .finished_at_unix_ms
+                .unwrap_or(candidate.created_at_unix_ms)
+                / 1000) as i64,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1063,6 +1091,200 @@ mod tests {
         PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY, PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
     };
     use serde_json::json;
+
+    #[tokio::test]
+    async fn sqlite_failed_monthly_candidate_recovers_and_keeps_late_cost_in_dispatch_epoch() {
+        use crate::quota::SqliteProviderQuotaRepository;
+        use aether_data_contracts::repository::quota::{
+            ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
+        };
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, is_active, created_at, updated_at) VALUES ('provider-1', 'monthly', 'custom', 'monthly_quota', 20, 5, 7, 960, 1, 1, 1)").execute(&pool).await.unwrap();
+        let candidates = SqliteRequestCandidateRepository::new(pool.clone());
+        let quotas = SqliteProviderQuotaRepository::new(pool.clone());
+        let snapshot = ProviderQuotaDispatchSnapshot {
+            schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
+            provider_billing_type_at_usage: "monthly_quota".to_string(),
+            quota_epoch_start_at_usage: Some(960),
+            provider_dispatch_at_unix_secs: 1020,
+            pricing_rule_version_at_usage: Some("dispatch-v1".to_string()),
+            provider_pricing_snapshot_at_usage: Some(json!({"provider_id": "provider-1"})),
+            provider_quota_cost_usd: None,
+            quota_accounting_status: "pending".to_string(),
+        };
+        let mut a = sample_upsert(
+            "monthly-a",
+            RequestCandidateStatus::Pending,
+            Some(json!({PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY: snapshot})),
+            1_020_000,
+        );
+        a.started_at_unix_ms = Some(1_020_000);
+        candidates.upsert(a.clone()).await.unwrap();
+        assert!(
+            !quotas
+                .find_by_provider_id("provider-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        a.status = RequestCandidateStatus::Failed;
+        a.finished_at_unix_ms = Some(1_030_000);
+        a.extra_data = None;
+        candidates.upsert(a.clone()).await.unwrap();
+        // B may own the response; closing A must not create terminal client usage.
+        let mut b = sample_upsert(
+            "fallback-b",
+            RequestCandidateStatus::Success,
+            None,
+            1_030_000,
+        );
+        b.candidate_index = a.candidate_index + 1;
+        b.provider_id = Some("provider-2".to_string());
+        candidates.upsert(b).await.unwrap();
+        assert!(
+            quotas
+                .find_by_provider_id("provider-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_count, 0);
+        // Retain positive partial consumption. An old pending replay cannot regress accounting.
+        a.extra_data = Some(
+            json!({"provider_quota_attempt_accounting": {"cost_usd": 2.0, "status": "known_usage"}}),
+        );
+        candidates.upsert(a.clone()).await.unwrap();
+        let mut replay = a.clone();
+        replay.status = RequestCandidateStatus::Pending;
+        replay.extra_data = None;
+        candidates.upsert(replay).await.unwrap();
+        sqlx::query(
+            "UPDATE usage_counter_deltas SET processed_at = 1031 WHERE request_id = 'monthly-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        quotas.request_reset("provider-1", 1080).await.unwrap();
+        quotas.reset_due(1080).await.unwrap();
+        a.extra_data = Some(
+            json!({"provider_quota_attempt_accounting": {"cost_usd": 3.0, "status": "known_usage"}}),
+        );
+        for _ in 0..2 {
+            candidates.upsert(a.clone()).await.unwrap();
+        }
+        a.extra_data = Some(
+            json!({"provider_quota_attempt_accounting": {"cost_usd": 4.0, "status": "known_usage"}}),
+        );
+        for _ in 0..2 {
+            candidates.upsert(a.clone()).await.unwrap();
+        }
+        let total: f64 = sqlx::query_scalar("SELECT SUM(provider_quota_cost_usd) FROM usage_counter_deltas WHERE request_id = 'monthly-a'").fetch_one(&pool).await.unwrap();
+        assert_eq!(total, 4.0);
+        let wrong_epoch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_counter_deltas WHERE request_id = 'monthly-a' AND quota_epoch_start_at_usage <> 960").fetch_one(&pool).await.unwrap();
+        assert_eq!(wrong_epoch, 0);
+        assert_eq!(
+            quotas
+                .find_by_provider_id("provider-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .monthly_used_usd,
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_monthly_recovery_is_bounded_audited_and_does_not_release_active_attempts() {
+        use crate::quota::SqliteProviderQuotaRepository;
+        use aether_data_contracts::repository::quota::{
+            ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
+        };
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, is_active, created_at, updated_at) VALUES ('provider-1', 'monthly', 'custom', 'monthly_quota', 20, 5, 7, 960, 1, 1, 1)").execute(&pool).await.unwrap();
+        let candidates = SqliteRequestCandidateRepository::new(pool.clone());
+        let quotas = SqliteProviderQuotaRepository::new(pool.clone());
+        for (index, id, status) in [
+            (0, "legacy-failed", RequestCandidateStatus::Failed),
+            (1, "active-long", RequestCandidateStatus::Pending),
+        ] {
+            let snapshot = ProviderQuotaDispatchSnapshot {
+                schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
+                provider_billing_type_at_usage: "monthly_quota".to_string(),
+                quota_epoch_start_at_usage: Some(960),
+                provider_dispatch_at_unix_secs: 1020,
+                pricing_rule_version_at_usage: Some("dispatch-v1".to_string()),
+                provider_pricing_snapshot_at_usage: Some(json!({"provider_id": "provider-1"})),
+                provider_quota_cost_usd: Some(0.5),
+                quota_accounting_status: "ready".to_string(),
+            };
+            let mut candidate = sample_upsert(
+                id,
+                status,
+                Some(json!({PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY: snapshot})),
+                1_020_000,
+            );
+            candidate.candidate_index = index;
+            candidates.upsert(candidate).await.unwrap();
+        }
+        // Simulate legacy rows and an interrupted accounting write.
+        sqlx::query("UPDATE usage_counter_deltas SET quota_accounting_status = 'pending'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let preview = quotas
+            .recover_attempts(Some("provider-1"), 1, 1_000_000, true)
+            .await
+            .unwrap();
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].candidate_id, "legacy-failed");
+        assert!(!preview[0].applied);
+        assert_eq!(preview[0].known_cost_usd, 0.5);
+        assert!(
+            !quotas
+                .find_by_provider_id("provider-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
+        assert_eq!(
+            quotas
+                .recover_attempts(Some("provider-1"), 1, 1_000_000, false)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(quotas
+            .recover_attempts(Some("provider-1"), 100, 1_000_000, false)
+            .await
+            .unwrap()
+            .is_empty());
+        let active_status: String = sqlx::query_scalar("SELECT quota_accounting_status FROM usage_counter_deltas WHERE request_id = 'active-long'").fetch_one(&pool).await.unwrap();
+        assert_eq!(active_status, "pending");
+        let restored = candidates.list_by_request_id("request-1").await.unwrap();
+        assert!(restored.iter().any(|c| c.id == "legacy-failed"
+            && c.extra_data
+                .as_ref()
+                .and_then(|e| e.get("provider_quota_recovery"))
+                .is_some()));
+    }
 
     #[tokio::test]
     async fn sqlite_repository_writes_and_reads_request_candidates() {

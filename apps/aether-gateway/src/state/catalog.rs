@@ -713,6 +713,22 @@ impl AppState {
         Ok(requested)
     }
 
+    pub(crate) async fn request_provider_quota_adjustment(
+        &self,
+        provider_id: &str,
+        adjustment: &aether_data_contracts::repository::quota::ProviderQuotaAdjustment,
+    ) -> Result<bool, GatewayError> {
+        let requested = self
+            .data
+            .request_provider_quota_adjustment(provider_id, adjustment)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if requested {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(requested)
+    }
+
     pub(crate) async fn delete_provider_catalog_provider(
         &self,
         provider_id: &str,

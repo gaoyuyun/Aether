@@ -33,6 +33,7 @@ impl SqlitePoolFactory {
     pub fn connect_options(&self) -> Result<SqliteConnectOptions, DataLayerError> {
         ensure_sqlite_parent_dir(self.config.url.trim())?;
         let is_memory = is_sqlite_memory_url(self.config.url.trim());
+        let cache_mb = self.config.sqlite_cache_mb();
         SqliteConnectOptions::from_str(self.config.url.trim())
             .map(|options| {
                 let options = options
@@ -42,7 +43,15 @@ impl SqlitePoolFactory {
                 if is_memory {
                     options
                 } else {
-                    options.journal_mode(SqliteJournalMode::Wal)
+                    options
+                        .journal_mode(SqliteJournalMode::Wal)
+                        // 64MB page cache by default (sqlx defaults to ~2MB) plus a 256MB
+                        // read mmap; both keep hot pages resident for raw fallback paths.
+                        .pragma("cache_size", format!("-{}", cache_mb * 1024))
+                        .pragma("mmap_size", "268435456")
+                        // Safe with WAL: at most the durability of the last committed
+                        // transaction is lost on a crash, never integrity.
+                        .pragma("synchronous", "NORMAL")
                 }
             })
             .map_err(|err| {
@@ -109,7 +118,7 @@ fn ensure_sqlite_parent_dir(url: &str) -> Result<(), DataLayerError> {
 #[cfg(test)]
 mod tests {
     use super::SqlitePoolFactory;
-    use crate::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
+    use crate::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_CACHE_MB};
     use std::path::PathBuf;
 
     #[tokio::test]
@@ -125,11 +134,60 @@ mod tests {
                 max_lifetime_ms: 30_000,
                 statement_cache_capacity: 64,
                 require_ssl: false,
+                sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
             },
         };
 
         let factory = SqlitePoolFactory::new(config).expect("factory should build");
         let _pool = factory.connect_lazy().expect("lazy pool should build");
+    }
+
+    #[tokio::test]
+    async fn file_database_connection_applies_tuning_pragmas() {
+        let db_path = unique_temp_db_path();
+        let config = SqlDatabaseConfig {
+            driver: DatabaseDriver::Sqlite,
+            url: format!("sqlite://{}", db_path.display()),
+            pool: SqlPoolConfig::default(),
+        };
+        let factory = SqlitePoolFactory::new(config).expect("factory should build");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(
+                factory
+                    .connect_options()
+                    .expect("options should build"),
+            );
+        let (cache_size,): (i64,) = sqlx::query_as("PRAGMA cache_size;")
+            .fetch_one(&pool)
+            .await
+            .expect("cache_size should read back");
+        let (mmap_size,): (i64,) = sqlx::query_as("PRAGMA mmap_size;")
+            .fetch_one(&pool)
+            .await
+            .expect("mmap_size should read back");
+        let (synchronous,): (i64,) = sqlx::query_as("PRAGMA synchronous;")
+            .fetch_one(&pool)
+            .await
+            .expect("synchronous should read back");
+        assert_eq!(cache_size, -(i64::from(DEFAULT_SQLITE_CACHE_MB)) * 1024);
+        assert_eq!(mmap_size, 268_435_456);
+        assert_eq!(synchronous, 1, "NORMAL maps to 1");
+        let _ = std::fs::remove_dir_all(db_path.parent().expect("temp db path should have parent"));
+    }
+
+    #[tokio::test]
+    async fn memory_database_skips_pragma_tuning() {
+        let config = SqlDatabaseConfig {
+            driver: DatabaseDriver::Sqlite,
+            url: "sqlite::memory:".to_string(),
+            pool: SqlPoolConfig::default(),
+        };
+        let factory = SqlitePoolFactory::new(config).expect("factory should build");
+        let options = factory.connect_options().expect("options should build");
+        // Only file-backed databases get the page-cache/mmap/synchronous tuning.
+        let options_debug = format!("{options:?}");
+        assert!(!options_debug.contains("cache_size"));
     }
 
     #[tokio::test]

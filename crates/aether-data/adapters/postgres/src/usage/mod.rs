@@ -361,8 +361,24 @@ fn decode_dashboard_summary_row(
 }
 
 fn finalize_dashboard_daily_breakdown_rows(
-    mut items: Vec<StoredUsageDashboardDailyBreakdownRow>,
+    items: Vec<StoredUsageDashboardDailyBreakdownRow>,
 ) -> Vec<StoredUsageDashboardDailyBreakdownRow> {
+    let mut by_dimension = BTreeMap::<_, StoredUsageDashboardDailyBreakdownRow>::new();
+    for item in items {
+        let key = (item.date.clone(), item.model.clone(), item.provider.clone());
+        if let Some(total) = by_dimension.get_mut(&key) {
+            total.requests = total.requests.saturating_add(item.requests);
+            total.total_tokens = total.total_tokens.saturating_add(item.total_tokens);
+            total.total_cost_usd += item.total_cost_usd;
+            total.response_time_sum_ms += item.response_time_sum_ms;
+            total.response_time_samples = total
+                .response_time_samples
+                .saturating_add(item.response_time_samples);
+        } else {
+            by_dimension.insert(key, item);
+        }
+    }
+    let mut items = by_dimension.into_values().collect::<Vec<_>>();
     items.sort_by(|left, right| {
         left.date
             .cmp(&right.date)
@@ -2354,6 +2370,73 @@ WHERE is_complete IS TRUE
             .try_get::<Option<DateTime<Utc>>, _>("latest_hour")
             .map_postgres_err()?;
         Ok(latest_hour.map(|value| value + chrono::Duration::hours(1)))
+    }
+
+    /// Merge only the UTC hours actually present in the model/provider table.
+    /// Existing stats_hourly history does not imply that this newer rollup has
+    /// been backfilled. Read every uncovered interval from raw usage.
+    async fn list_dashboard_daily_breakdown_with_hourly_model_provider(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        if query.user_id.is_some() {
+            return self.list_dashboard_daily_breakdown_raw(query).await;
+        }
+        let rows = sqlx::query(
+            r#"
+SELECT
+  hour_utc,
+  TO_CHAR((TO_TIMESTAMP(hour_utc::DOUBLE PRECISION) AT TIME ZONE 'UTC') + ($1::integer * INTERVAL '1 minute'), 'YYYY-MM-DD') AS date,
+  model,
+  provider_name AS provider,
+  total_requests::BIGINT AS requests,
+  (input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens)::BIGINT AS total_tokens,
+  total_cost::DOUBLE PRECISION AS total_cost_usd,
+  response_time_sum_ms::DOUBLE PRECISION AS response_time_sum_ms,
+  response_time_samples::BIGINT AS response_time_samples
+FROM stats_hourly_model_provider
+WHERE hour_utc >= $2 AND hour_utc < $3
+ORDER BY hour_utc ASC
+"#,
+        )
+        .bind(query.tz_offset_minutes)
+        .bind(query.created_from_unix_secs.div_ceil(3600).saturating_mul(3600) as i64)
+        .bind((query.created_until_unix_secs / 3600 * 3600) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_postgres_err()?;
+
+        let mut items = Vec::new();
+        let mut raw_ranges = Vec::new();
+        let mut cursor = query.created_from_unix_secs;
+        let offset_secs = i64::from(query.tz_offset_minutes) * 60;
+        for row in rows {
+            let hour = row.try_get::<i64, _>("hour_utc").map_postgres_err()?.max(0) as u64;
+            // Fractional timezone offsets split the midnight hour across dates.
+            // Leave that entire hour to raw usage, as well as partial request bounds.
+            if (hour as i64 + offset_secs).rem_euclid(86_400) > 86_400 - 3600 {
+                continue;
+            }
+            if cursor < hour {
+                raw_ranges.push((cursor, hour));
+            }
+            cursor = cursor.max(hour.saturating_add(3600));
+            items.push(decode_dashboard_daily_breakdown_row(&row)?);
+        }
+        if cursor < query.created_until_unix_secs {
+            raw_ranges.push((cursor, query.created_until_unix_secs));
+        }
+        for (from, until) in raw_ranges {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&UsageDashboardDailyBreakdownQuery {
+                    created_from_unix_secs: from,
+                    created_until_unix_secs: until,
+                    ..query.clone()
+                })
+                .await?,
+            );
+        }
+        Ok(finalize_dashboard_daily_breakdown_rows(items))
     }
 
     async fn summarize_dashboard_usage_from_daily_aggregates(
@@ -5060,8 +5143,20 @@ ORDER BY date ASC, total_cost_usd DESC, "usage".model ASC, "usage".provider_name
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
     ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        if query.created_from_unix_secs >= query.created_until_unix_secs {
+            return Ok(Vec::new());
+        }
         if query.tz_offset_minutes != 0 {
-            return self.list_dashboard_daily_breakdown_raw(query).await;
+            return match self
+                .list_dashboard_daily_breakdown_with_hourly_model_provider(query)
+                .await
+            {
+                Ok(items) => Ok(items),
+                Err(err) if dashboard_should_fallback_to_raw_on_aggregate_error(&err) => {
+                    self.list_dashboard_daily_breakdown_raw(query).await
+                }
+                Err(err) => Err(err),
+            };
         }
 
         let cutoff_utc = match self.read_stats_daily_cutoff_date().await {

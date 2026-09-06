@@ -122,6 +122,7 @@ async fn perform_stats_hourly_aggregation_for_hour(
         upsert_stats_hourly_model_rows(&mut tx, hour_utc, hour_end, aggregated_at).await?;
     let provider_rows =
         upsert_stats_hourly_provider_rows(&mut tx, hour_utc, hour_end, aggregated_at).await?;
+    upsert_stats_hourly_model_provider_rows(&mut tx, hour_utc, hour_end, aggregated_at).await?;
     tx.commit().await?;
 
     Ok(StatsHourlyAggregationSummary {
@@ -200,4 +201,54 @@ async fn upsert_stats_hourly_provider_rows(
         .rows_affected();
 
     Ok(usize::try_from(rows_affected).unwrap_or(usize::MAX))
+}
+
+async fn upsert_stats_hourly_model_provider_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    hour_utc: DateTime<Utc>,
+    hour_end: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+) -> Result<usize, sqlx::Error> {
+    let rows_affected = sqlx::query(UPSERT_STATS_HOURLY_MODEL_PROVIDER_SQL)
+        .bind(hour_utc)
+        .bind(hour_end)
+        .bind(now_utc)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+
+    Ok(usize::try_from(rows_affected).unwrap_or(usize::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL migrations"]
+    async fn live_hourly_model_provider_stores_epoch_timestamps() {
+        let pool = sqlx::PgPool::connect(&std::env::var("AETHER_TEST_DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        aether_data_postgres::run_migrations(&pool).await.unwrap();
+        let hour = DateTime::from_timestamp(1_767_225_600, 0).unwrap();
+        let until = hour + chrono::Duration::hours(1);
+        let now = until + chrono::Duration::minutes(1);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage (id, request_id, provider_name, model, input_tokens, output_tokens, total_tokens, total_cost_usd, status, billing_status, created_at) VALUES ($1, $1, $1, $1, 10, 5, 15, 0.25, 'completed', 'settled', $2)",
+        ).bind(&request_id).bind(hour).execute(&mut *tx).await.unwrap();
+        upsert_stats_hourly_model_provider_rows(&mut tx, hour, until, now)
+            .await
+            .unwrap();
+        let row: (i64, i64, i64, i64, f64) = sqlx::query_as(
+            "SELECT hour_utc, created_at, updated_at, total_requests, total_cost FROM stats_hourly_model_provider WHERE model = $1",
+        ).bind(&request_id).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(
+            row,
+            (hour.timestamp(), now.timestamp(), now.timestamp(), 1, 0.25)
+        );
+        tx.rollback().await.unwrap();
+    }
 }

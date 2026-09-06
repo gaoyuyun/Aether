@@ -28,7 +28,9 @@ pub use backend::{
     DataWriteRepositories,
 };
 pub use config::DataLayerConfig;
-pub use database::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_DATABASE_URL};
+pub use database::{
+    DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_CACHE_MB, DEFAULT_SQLITE_DATABASE_URL,
+};
 pub use error::DataLayerError;
 pub use maintenance::{
     DatabaseMaintenanceSummary, DatabasePoolSummary, DatabasePostgresActivityGroup,

@@ -76,6 +76,7 @@
         :format-reset-countdown="formatResetCountdown"
         :get-quota-used-color-class="getQuotaUsedColorClass"
       />
+      <button v-if="provider.billing_type === 'monthly_quota'" type="button" class="mt-1 text-xs text-primary hover:underline" @click.stop="$emit('rowClick', $event, provider.id)">{{ legacyT('配额详情') }}</button>
     </TableCell>
     <TableCell class="py-3.5 text-center">
       <div class="inline-grid grid-cols-[1.75rem_1.75rem_1.75rem] gap-x-0.5 gap-y-0.5 text-xs text-left">

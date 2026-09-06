@@ -250,6 +250,13 @@ pub(crate) trait RequestCandidateRuntimeWriter: Sync {
         candidate: UpsertRequestCandidateRecord,
     ) -> Result<Option<StoredRequestCandidate>, GatewayError>;
 
+    async fn persist_monthly_quota_terminal(
+        &self,
+        _record: &UpsertRequestCandidateRecord,
+    ) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+
     async fn prepare_provider_quota_dispatch(
         &self,
         _context: &ProviderQuotaDispatchContext,
@@ -533,6 +540,20 @@ pub(crate) async fn persist_local_request_candidate_status_record(
     let retry_index = record.retry_index;
     let status = record.status;
 
+    if matches!(
+        status,
+        RequestCandidateStatus::Success
+            | RequestCandidateStatus::Failed
+            | RequestCandidateStatus::Cancelled
+    ) {
+        match state.persist_monthly_quota_terminal(&record).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(candidate_id = %candidate_id, error = ?err, "monthly candidate terminal write failed; durable recovery will retry")
+            }
+        }
+    }
     if !should_persist_request_candidate_status(status) {
         debug!(
             event_name = "request_candidate_status_persistence_skipped",
@@ -715,6 +736,14 @@ pub(crate) fn try_enqueue_local_request_candidate_status_snapshot(
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) -> Result<(), UpsertRequestCandidateRecord> {
     let record = build_local_request_candidate_status_snapshot_record(snapshot, status_update);
+    if matches!(
+        record.status,
+        RequestCandidateStatus::Success
+            | RequestCandidateStatus::Failed
+            | RequestCandidateStatus::Cancelled
+    ) {
+        return Err(record);
+    }
     if !should_persist_request_candidate_status(record.status) {
         return Ok(());
     }
@@ -749,12 +778,6 @@ pub(crate) async fn record_report_request_candidate_status(
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) {
-    if matches!(
-        request_candidate_persistence_mode(),
-        RequestCandidatePersistenceMode::None
-    ) {
-        return;
-    }
     let Some(slot) = resolve_report_request_candidate_slot(state, report_context).await else {
         return;
     };
@@ -771,6 +794,20 @@ pub(crate) async fn record_report_request_candidate_status(
     let candidate_id = record.id.clone();
     let status = record.status;
 
+    if matches!(
+        status,
+        RequestCandidateStatus::Success
+            | RequestCandidateStatus::Failed
+            | RequestCandidateStatus::Cancelled
+    ) {
+        match state.persist_monthly_quota_terminal(&record).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(candidate_id = %candidate_id, error = ?err, "monthly report terminal write failed; durable recovery will retry")
+            }
+        }
+    }
     if !should_persist_request_candidate_status(status) {
         debug!(
             event_name = "request_candidate_report_status_persistence_skipped",
@@ -1895,5 +1932,75 @@ mod tests {
             stored[0].required_capabilities,
             sample_minimal_candidate().key_capabilities
         );
+    }
+}
+
+/// Compute known candidate consumption with the immutable dispatch price. This never writes
+/// a request-level usage event: the fallback candidate still owns the client response.
+pub(crate) async fn record_failed_monthly_candidate_usage(
+    state: &crate::AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    payload: &crate::usage::GatewaySyncReportRequest,
+) {
+    let result: Result<(), aether_data_contracts::DataLayerError> = async {
+        let mut event =
+            aether_usage_runtime::build_sync_terminal_usage_event(plan, report_context, payload)?;
+        let Some(candidate_id) = event.data.candidate_id.as_deref() else {
+            return Ok(());
+        };
+        let rows = state
+            .data
+            .list_request_candidates_by_request_id(&event.request_id)
+            .await?;
+        let Some(candidate) = rows.iter().find(|c| c.id == candidate_id) else {
+            return Ok(());
+        };
+        if !provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())?
+            .is_some_and(|s| s.is_monthly_quota())
+        {
+            return Ok(());
+        }
+        // Missing usage is audited as unknown by the terminal writer, rather than inferred from
+        // a timeout/HTTP status. Known partial tokens remain billable at the original price.
+        let has_usage = event.data.input_tokens.unwrap_or(0) > 0
+            || event.data.output_tokens.unwrap_or(0) > 0
+            || event.data.cache_read_input_tokens.unwrap_or(0) > 0
+            || event.data.cache_creation_input_tokens.unwrap_or(0) > 0;
+        if !has_usage {
+            return Ok(());
+        }
+        aether_billing::enrich_usage_event_with_billing(state.data.as_ref(), &mut event).await?;
+        if let Some(settlement) = event
+            .data
+            .request_metadata
+            .as_ref()
+            .and_then(|m| m.get("settlement_snapshot"))
+        {
+            if settlement.get("status").and_then(Value::as_str) == Some("complete") {
+                if let Some(cost) = settlement
+                    .get("provider_quota_cost_usd")
+                    .and_then(Value::as_f64)
+                {
+                    record_local_request_candidate_extra_data(
+                        state,
+                        plan,
+                        report_context,
+                        RequestCandidateStatus::Failed,
+                        Some(payload.status_code),
+                        None,
+                        serde_json::json!({ "provider_quota_attempt_accounting": {
+                            "status": "known_usage", "cost_usd": cost, "settlement": settlement,
+                        }}),
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        warn!(candidate_id = ?plan.candidate_id, error = %err, "candidate quota consumption reconciliation failed");
     }
 }

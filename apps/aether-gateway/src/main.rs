@@ -21,7 +21,9 @@ use aether_data::lifecycle::export::{
     copy_database_records, export_database_jsonl, import_database_jsonl, DataCopyOptions,
     ExportDomain,
 };
-use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_DATABASE_URL};
+use aether_data::{
+    DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_CACHE_MB, DEFAULT_SQLITE_DATABASE_URL,
+};
 use aether_gateway::{
     attach_static_frontend, build_router_with_state,
     prewarm_direct_h2c_sender_cache_from_env_for_startup, set_gateway_frontdoor_app_port, AppState,
@@ -533,6 +535,7 @@ fn automatic_sql_pool_config_for_parallelism(
         max_lifetime_ms: DEFAULT_SQL_POOL_MAX_LIFETIME_MS,
         statement_cache_capacity: DEFAULT_SQL_POOL_STATEMENT_CACHE_CAPACITY,
         require_ssl: false,
+        sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
     }
 }
 
@@ -669,6 +672,7 @@ impl GatewayDataArgs {
                 .postgres_statement_cache_capacity
                 .unwrap_or(auto.statement_cache_capacity),
             require_ssl: driver != DatabaseDriver::Sqlite && self.postgres_require_ssl,
+            sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
         }
     }
 

@@ -1373,6 +1373,40 @@ fn sqlite_usage_local_date_expr(tz_offset_minutes: i32) -> String {
     format!("date(created_at_unix_ms + ({offset}), 'unixepoch')")
 }
 
+fn sqlite_merge_dashboard_daily_breakdown_rows(
+    items: Vec<StoredUsageDashboardDailyBreakdownRow>,
+) -> Vec<StoredUsageDashboardDailyBreakdownRow> {
+    let mut by_dimension = BTreeMap::<_, StoredUsageDashboardDailyBreakdownRow>::new();
+    for item in items {
+        let key = (item.date.clone(), item.model.clone(), item.provider.clone());
+        if let Some(total) = by_dimension.get_mut(&key) {
+            total.requests = total.requests.saturating_add(item.requests);
+            total.total_tokens = total.total_tokens.saturating_add(item.total_tokens);
+            total.total_cost_usd += item.total_cost_usd;
+            total.response_time_sum_ms += item.response_time_sum_ms;
+            total.response_time_samples = total
+                .response_time_samples
+                .saturating_add(item.response_time_samples);
+        } else {
+            by_dimension.insert(key, item);
+        }
+    }
+    let mut items = by_dimension.into_values().collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.date
+            .cmp(&right.date)
+            .then_with(|| {
+                right
+                    .total_cost_usd
+                    .partial_cmp(&left.total_cost_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.provider.cmp(&right.provider))
+    });
+    items
+}
+
 fn sqlite_usage_breakdown_group_expr(group_by: UsageBreakdownGroupBy) -> &'static str {
     match group_by {
         UsageBreakdownGroupBy::Model => "COALESCE(NULLIF(model, ''), 'unknown')",
@@ -2534,6 +2568,92 @@ FROM (
             .transpose()
     }
 
+    /// Read only complete UTC hours wholly inside the request and one local day.
+    /// The rows themselves describe coverage: MAX(hour_utc) cannot prove that
+    /// older hours have been backfilled, or that there are no holes in between.
+    async fn list_dashboard_daily_breakdown_with_hourly_aggregates(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+    ) -> Result<Vec<StoredUsageDashboardDailyBreakdownRow>, DataLayerError> {
+        // Model/provider rollups are global and cannot satisfy a user filter.
+        if query.user_id.is_some() {
+            return self.list_dashboard_daily_breakdown_raw(query).await;
+        }
+        let offset_secs = i64::from(query.tz_offset_minutes) * 60;
+        let date_expr = sqlite_usage_local_date_expr(query.tz_offset_minutes)
+            .replace("created_at_unix_ms", "hour_utc");
+        let rows = sqlx::query(&format!(
+            r#"
+SELECT
+  hour_utc,
+  {date_expr} AS date,
+  model,
+  provider_name AS provider,
+  total_requests AS requests,
+  input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens AS total_tokens,
+  total_cost AS total_cost_usd,
+  response_time_sum_ms,
+  response_time_samples
+FROM stats_hourly_model_provider
+WHERE hour_utc >= ?
+  AND hour_utc < ?
+ORDER BY hour_utc ASC
+"#
+        ))
+        .bind(
+            query
+                .created_from_unix_secs
+                .div_ceil(3600)
+                .saturating_mul(3600) as i64,
+        )
+        .bind((query.created_until_unix_secs / 3600 * 3600) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+
+        let mut items = Vec::new();
+        let mut raw_ranges = Vec::new();
+        let mut cursor = query.created_from_unix_secs;
+        for row in rows {
+            let hour = row_u64(&row, "hour_utc")?;
+            // At offsets such as +05:30/+05:45, the midnight hour belongs to
+            // two local dates. Read that hour from raw usage to split it exactly.
+            if (hour as i64 + offset_secs).rem_euclid(86_400) > 86_400 - 3600 {
+                continue;
+            }
+            if cursor < hour {
+                raw_ranges.push((cursor, hour));
+            }
+            cursor = cursor.max(hour.saturating_add(3600));
+            items.push(StoredUsageDashboardDailyBreakdownRow {
+                date: row.try_get("date").map_sql_err()?,
+                model: row.try_get("model").map_sql_err()?,
+                provider: row.try_get("provider").map_sql_err()?,
+                requests: sqlite_aggregate_u64(&row, "requests")?,
+                total_tokens: sqlite_aggregate_u64(&row, "total_tokens")?,
+                total_cost_usd: sqlite_real(&row, "total_cost_usd")?,
+                response_time_sum_ms: sqlite_real(&row, "response_time_sum_ms")?,
+                response_time_samples: sqlite_aggregate_u64(&row, "response_time_samples")?,
+            });
+        }
+        if cursor < query.created_until_unix_secs {
+            raw_ranges.push((cursor, query.created_until_unix_secs));
+        }
+        // Each source owns disjoint time ranges, including leading history,
+        // internal gaps, partial hours and the live tail.
+        for (from, until) in raw_ranges {
+            items.extend(
+                self.list_dashboard_daily_breakdown_raw(&UsageDashboardDailyBreakdownQuery {
+                    created_from_unix_secs: from,
+                    created_until_unix_secs: until,
+                    ..query.clone()
+                })
+                .await?,
+            );
+        }
+        Ok(sqlite_merge_dashboard_daily_breakdown_rows(items))
+    }
+
     async fn list_dashboard_daily_breakdown_from_daily_totals(
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
@@ -3408,31 +3528,23 @@ LEFT JOIN usage_settlement_snapshots AS settlement
         }
 
         if query.tz_offset_minutes != 0 {
-            let raw_rows = self.list_dashboard_daily_breakdown_raw(query).await?;
-            let raw_dates = raw_rows
+            let mut items = self
+                .list_dashboard_daily_breakdown_with_hourly_aggregates(query)
+                .await?;
+            let covered_dates = items
                 .iter()
                 .map(|item| item.date.clone())
                 .collect::<BTreeSet<_>>();
-            let mut items = self
-                .list_dashboard_daily_breakdown_from_daily_aggregates(query)
-                .await?
-                .into_iter()
-                .filter(|item| !raw_dates.contains(&item.date))
-                .collect::<Vec<_>>();
-            items.extend(raw_rows);
-            items.sort_by(|left, right| {
-                left.date
-                    .cmp(&right.date)
-                    .then_with(|| {
-                        right
-                            .total_cost_usd
-                            .partial_cmp(&left.total_cost_usd)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| left.model.cmp(&right.model))
-                    .then_with(|| left.provider.cmp(&right.provider))
-            });
-            return Ok(items);
+            // Retain imported history whose raw requests are no longer present.
+            // Never add a whole UTC daily rollup to a date already reconstructed
+            // from hourly/raw usage in the requested timezone.
+            items.extend(
+                self.list_dashboard_daily_breakdown_from_daily_aggregates(query)
+                    .await?
+                    .into_iter()
+                    .filter(|item| !covered_dates.contains(&item.date)),
+            );
+            return Ok(sqlite_merge_dashboard_daily_breakdown_rows(items));
         }
 
         let Some(cutoff) = self.read_dashboard_daily_cutoff_unix_secs().await? else {
