@@ -186,6 +186,10 @@ pub struct StoredProviderCatalogProvider {
     pub monthly_used_usd: Option<f64>,
     pub quota_reset_day: Option<u64>,
     pub quota_last_reset_at_unix_secs: Option<u64>,
+    #[serde(default)]
+    pub quota_subscription_started_at_unix_secs: Option<u64>,
+    #[serde(default)]
+    pub quota_cycle_start_at_unix_secs: Option<u64>,
     pub quota_expires_at_unix_secs: Option<u64>,
     pub provider_priority: i32,
     pub is_active: bool,
@@ -287,6 +291,8 @@ impl StoredProviderCatalogProvider {
             monthly_used_usd: None,
             quota_reset_day: None,
             quota_last_reset_at_unix_secs: None,
+            quota_subscription_started_at_unix_secs: None,
+            quota_cycle_start_at_unix_secs: None,
             quota_expires_at_unix_secs: None,
             provider_priority: 0,
             is_active: true,
@@ -301,6 +307,16 @@ impl StoredProviderCatalogProvider {
             created_at_unix_ms: None,
             updated_at_unix_secs: None,
         })
+    }
+
+    pub fn with_quota_schedule(
+        mut self,
+        subscription_start: Option<u64>,
+        cycle_start: Option<u64>,
+    ) -> Self {
+        self.quota_subscription_started_at_unix_secs = subscription_start;
+        self.quota_cycle_start_at_unix_secs = cycle_start;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]

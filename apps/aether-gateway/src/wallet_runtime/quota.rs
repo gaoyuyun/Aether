@@ -23,8 +23,11 @@ pub(crate) async fn reset_due_provider_quotas_once(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    data.reset_due_provider_quotas(now_unix_secs / 60 * 60)
-        .await
+    let recovered = data.recover_provider_quota_attempts(now_unix_secs).await?;
+    let reset = data
+        .reset_due_provider_quotas(now_unix_secs / 60 * 60)
+        .await?;
+    Ok(recovered + reset)
 }
 
 pub(crate) fn spawn_provider_quota_reset_worker(

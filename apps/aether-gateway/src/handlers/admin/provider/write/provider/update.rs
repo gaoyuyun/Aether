@@ -132,28 +132,53 @@ pub(crate) async fn build_admin_update_provider_record(
         }
     }
 
+    if existing.billing_type.as_deref() == Some("monthly_quota")
+        && existing.quota_last_reset_at_unix_secs.is_some()
+        && updated.quota_reset_day != existing.quota_reset_day
+    {
+        return Err(
+            "请通过订阅配额中的调整周期操作修改周期长度，并选择生效时间和是否清零用量".to_string(),
+        );
+    }
     if fields.contains("quota_last_reset_at") {
-        if fields.is_null("quota_last_reset_at") {
-            updated.quota_last_reset_at_unix_secs = None;
-        } else {
-            let Some(raw) = payload.quota_last_reset_at.as_deref() else {
-                return Err("quota_last_reset_at 必须是字符串".to_string());
-            };
-            updated.quota_last_reset_at_unix_secs = Some(parse_optional_rfc3339_unix_secs(
-                raw,
-                "quota_last_reset_at",
-            )?);
+        let value = payload
+            .quota_last_reset_at
+            .as_deref()
+            .map(|v| parse_optional_rfc3339_unix_secs(v, "quota_last_reset_at"))
+            .transpose()?;
+        if existing.quota_last_reset_at_unix_secs.is_some()
+            && value.map(|v| v / 60) != existing.quota_last_reset_at_unix_secs.map(|v| v / 60)
+        {
+            return Err("请通过订阅配额中的调整周期操作修改当前周期起点".to_string());
+        }
+        if existing.quota_last_reset_at_unix_secs.is_none() {
+            updated.quota_last_reset_at_unix_secs = value;
         }
     }
-    if fields.contains("quota_last_reset_at")
-        && existing
-            .quota_last_reset_at_unix_secs
-            .zip(updated.quota_last_reset_at_unix_secs)
-            .is_some_and(|(existing, updated)| existing / 60 == updated / 60)
+    if fields.contains("quota_subscription_started_at") {
+        let raw = payload
+            .quota_subscription_started_at
+            .as_deref()
+            .ok_or("订阅开始时间不能为空")?;
+        updated.quota_subscription_started_at_unix_secs =
+            Some(parse_optional_rfc3339_unix_secs(raw, "quota_subscription_started_at")? / 60 * 60);
+    }
+    if updated.billing_type.as_deref() == Some("monthly_quota")
+        && updated.quota_last_reset_at_unix_secs.is_none()
     {
-        // The UI intentionally edits only to minute precision. Preserve legacy seconds when the
-        // displayed minute did not change so an unrelated provider edit cannot reset the quota.
-        updated.quota_last_reset_at_unix_secs = existing.quota_last_reset_at_unix_secs;
+        let start = updated
+            .quota_subscription_started_at_unix_secs
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    / 60
+                    * 60
+            });
+        updated.quota_last_reset_at_unix_secs = Some(start);
+        updated.quota_subscription_started_at_unix_secs = Some(start);
+        updated.quota_cycle_start_at_unix_secs = Some(start);
     }
 
     if fields.contains("quota_expires_at") {
@@ -388,13 +413,6 @@ pub(crate) async fn build_admin_update_provider_record(
     )
     .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
 
-    // Billing mode changes preserve the current quota epoch. Only an explicit epoch edit/reset
-    // can start a new cycle.
-    let quota_start_changed = fields.contains("quota_last_reset_at")
-        && existing.quota_last_reset_at_unix_secs != updated.quota_last_reset_at_unix_secs;
-    if quota_start_changed {
-        updated.monthly_used_usd = Some(0.0);
-    }
     updated.updated_at_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()

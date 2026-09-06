@@ -8,7 +8,8 @@ use crate::handlers::admin::provider::{
         builders::{
             build_provider_strategy_list_response, build_provider_strategy_reset_quota_response,
             build_provider_strategy_stats_response,
-            build_provider_strategy_update_billing_response, AdminProviderStrategyBillingRequest,
+            build_provider_strategy_update_billing_response, AdminProviderQuotaResetRequest,
+            AdminProviderStrategyBillingRequest,
         },
         responses::{
             admin_provider_strategy_data_unavailable_response,
@@ -135,8 +136,24 @@ impl<'a> AdminAppState<'a> {
                 return Ok(Some(admin_provider_strategy_provider_not_found_response()));
             };
 
+            let payload = match request_body
+                .filter(|body| !body.is_empty())
+                .map(|body| serde_json::from_slice::<AdminProviderQuotaResetRequest>(body))
+                .transpose()
+            {
+                Ok(value) => value.unwrap_or_default(),
+                Err(_) => {
+                    return Ok(Some(
+                        (
+                            http::StatusCode::BAD_REQUEST,
+                            Json(json!({ "detail": "无效的额度调整请求" })),
+                        )
+                            .into_response(),
+                    ))
+                }
+            };
             return Ok(Some(
-                build_provider_strategy_reset_quota_response(self, provider_id).await?,
+                build_provider_strategy_reset_quota_response(self, provider_id, payload).await?,
             ));
         }
 

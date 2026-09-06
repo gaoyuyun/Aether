@@ -7,6 +7,7 @@ use aether_data::repository::auth::CreateStandaloneApiKeyRecord;
 use aether_data::repository::wallet::WalletLookupKey;
 use aether_data::{
     DataBackends, DataLayerConfig, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig,
+    DEFAULT_SQLITE_CACHE_MB,
 };
 use aether_data_contracts::repository::global_models::{
     CreateAdminGlobalModelRecord, UpdateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
@@ -208,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_lifetime_ms: 300_000,
             statement_cache_capacity: 128,
             require_ssl: false,
+                    sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
         },
     }))?;
 

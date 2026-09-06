@@ -2,16 +2,13 @@ use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite};
 
 use aether_data_contracts::repository::quota::{
-    ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
+    ProviderQuotaAdjustment, ProviderQuotaReadRepository, ProviderQuotaRecovery,
+    ProviderQuotaResetMode, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };
 use aether_data_query::{DialectSql, SelectColumn, SelectQuery, SqlDialect};
 
 use crate::error::SqlResultExt;
 use crate::{sqlite_optional_real, sqlite_real, DataLayerError, SqlitePool};
-
-fn current_unix_secs() -> i64 {
-    chrono::Utc::now().timestamp()
-}
 
 fn quota_snapshot_select() -> SelectQuery<'static> {
     SelectQuery::new("providers").select_columns([
@@ -31,6 +28,11 @@ fn quota_snapshot_select() -> SelectQuery<'static> {
         ))
         .alias("monthly_used_usd"),
         SelectColumn::expr("quota_reset_day"),
+        SelectColumn::expr("quota_subscription_started_at"),
+        SelectColumn::expr("quota_cycle_start_at"),
+        SelectColumn::expr("pending_quota_reset_mode"),
+        SelectColumn::expr("pending_quota_reset_days"),
+        SelectColumn::expr("pending_quota_reset_usage"),
         SelectColumn::expr(DialectSql::dialect(
             "CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT)",
             "quota_last_reset_at",
@@ -103,61 +105,60 @@ impl ProviderQuotaReadRepository for SqliteProviderQuotaRepository {
 #[async_trait]
 impl ProviderQuotaWriteRepository for SqliteProviderQuotaRepository {
     async fn reset_due(&self, now_unix_secs: u64) -> Result<usize, DataLayerError> {
-        let now = i64::try_from(now_unix_secs).map_err(|_| {
-            DataLayerError::InvalidInput("provider quota reset timestamp overflow".to_string())
-        })?;
+        let now = i64::try_from(now_unix_secs / 60 * 60)
+            .map_err(|_| DataLayerError::InvalidInput("quota timestamp overflow".to_string()))?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
         sqlx::query("UPDATE providers SET updated_at = updated_at WHERE 0")
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
-        let due = sqlx::query(
-            r#"
-SELECT id, pending_quota_reset_at
-FROM providers
-WHERE is_active = 1
-  AND (
-    (pending_quota_reset_at IS NOT NULL AND pending_quota_reset_at <= ?)
-    OR (
-      billing_type = 'monthly_quota'
-      AND quota_reset_day BETWEEN 1 AND 30
-      AND (
-        quota_last_reset_at IS NULL
-        OR (? - quota_last_reset_at) >= (quota_reset_day * 86400)
-      )
-    )
-  )
-"#,
-        )
-        .bind(now)
-        .bind(now)
-        .fetch_all(&mut *tx)
-        .await
-        .map_sql_err()?;
-        for row in &due {
-            let provider_id: String = row.try_get("id").map_sql_err()?;
-            let effective_at = row
-                .try_get::<Option<i64>, _>("pending_quota_reset_at")
-                .map_sql_err()?
-                .filter(|value| *value <= now)
-                .unwrap_or(now);
+        let mut statement = quota_snapshot_select().statement::<Sqlite>(SqlDialect::Sqlite);
+        statement.where_raw(&format!("is_active = 1 AND billing_type = 'monthly_quota' AND quota_reset_day BETWEEN 1 AND 30 AND ((pending_quota_reset_at IS NOT NULL AND pending_quota_reset_at <= {now}) OR quota_last_reset_at IS NULL OR ({now} - ((COALESCE(quota_cycle_start_at, quota_last_reset_at) / 60) * 60)) >= quota_reset_day * 86400)"));
+        let mut query = statement.finish();
+        let due = query.build().fetch_all(&mut *tx).await.map_sql_err()?;
+        let mut count = 0;
+        for row in due {
+            let snapshot = map_row(&row)?;
+            let Some(change) = snapshot.due_transition(now as u64) else {
+                continue;
+            };
             sqlx::query(
-                "UPDATE providers SET monthly_used_usd = 0, quota_last_reset_at = ?, pending_quota_reset_at = NULL, updated_at = ? WHERE id = ?",
+                r#"UPDATE providers SET
+  quota_subscription_started_at = COALESCE(quota_subscription_started_at, quota_last_reset_at, ?),
+  quota_cycle_start_at = ?, quota_reset_day = ?,
+  monthly_used_usd = CASE WHEN ? THEN 0 ELSE monthly_used_usd END,
+  quota_last_reset_at = ?,
+  pending_quota_reset_at = CASE WHEN ? THEN NULL ELSE pending_quota_reset_at END,
+  pending_quota_reset_mode = CASE WHEN ? THEN NULL ELSE pending_quota_reset_mode END,
+  pending_quota_reset_days = CASE WHEN ? THEN NULL ELSE pending_quota_reset_days END,
+  pending_quota_reset_usage = CASE WHEN ? THEN NULL ELSE pending_quota_reset_usage END,
+  updated_at = ? WHERE id = ?"#,
             )
-            .bind(effective_at / 60 * 60)
+            .bind(change.cycle_start as i64)
+            .bind(change.cycle_start as i64)
+            .bind(change.cycle_days as i32)
+            .bind(change.reset_usage)
+            .bind(change.epoch_start as i64)
+            .bind(change.applied_pending)
+            .bind(change.applied_pending)
+            .bind(change.applied_pending)
+            .bind(change.applied_pending)
             .bind(now)
-            .bind(&provider_id)
+            .bind(&snapshot.provider_id)
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
-            sqlx::query("DELETE FROM provider_quota_window_counters WHERE provider_id = ?")
-                .bind(&provider_id)
-                .execute(&mut *tx)
-                .await
-                .map_sql_err()?;
+            if change.reset_usage {
+                sqlx::query("DELETE FROM provider_quota_window_counters WHERE provider_id = ?")
+                    .bind(&snapshot.provider_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_sql_err()?;
+            }
+            count += 1;
         }
         tx.commit().await.map_sql_err()?;
-        Ok(due.len())
+        Ok(count)
     }
 
     async fn request_reset(
@@ -165,19 +166,136 @@ WHERE is_active = 1
         provider_id: &str,
         effective_at_unix_secs: u64,
     ) -> Result<bool, DataLayerError> {
-        let effective_at = i64::try_from(effective_at_unix_secs / 60 * 60).map_err(|_| {
-            DataLayerError::InvalidInput("provider quota reset timestamp overflow".to_string())
-        })?;
-        let result = sqlx::query(
-            "UPDATE providers SET pending_quota_reset_at = ?, updated_at = ? WHERE id = ? AND billing_type = 'monthly_quota'",
+        self.request_adjustment(
+            provider_id,
+            &ProviderQuotaAdjustment::cycle(effective_at_unix_secs),
         )
-        .bind(effective_at)
-        .bind(current_unix_secs())
+        .await
+    }
+
+    async fn request_adjustment(
+        &self,
+        provider_id: &str,
+        adjustment: &ProviderQuotaAdjustment,
+    ) -> Result<bool, DataLayerError> {
+        adjustment.validate()?;
+        let effective = i64::try_from(adjustment.effective_at_unix_secs)
+            .map_err(|_| DataLayerError::InvalidInput("quota timestamp overflow".to_string()))?;
+        let result = sqlx::query(
+            r#"UPDATE providers SET pending_quota_reset_at = ?,
+  pending_quota_reset_mode = ?, pending_quota_reset_days = ?, pending_quota_reset_usage = ?,
+  updated_at = ? WHERE id = ? AND billing_type = 'monthly_quota' "#,
+        )
+        .bind(effective)
+        .bind(match adjustment.mode {
+            ProviderQuotaResetMode::Cycle => "cycle",
+            ProviderQuotaResetMode::UsageOnly => "usage_only",
+        })
+        .bind(adjustment.cycle_days.map(|v| v as i32))
+        .bind(adjustment.reset_usage)
+        .bind(chrono::Utc::now().timestamp())
         .bind(provider_id)
         .execute(&self.pool)
         .await
         .map_sql_err()?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn recover_attempts(
+        &self,
+        provider_id: Option<&str>,
+        limit: usize,
+        now_unix_secs: u64,
+        dry_run: bool,
+    ) -> Result<Vec<ProviderQuotaRecovery>, DataLayerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        sqlx::query("UPDATE providers SET updated_at = updated_at WHERE 0")
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        // A timeout alone is not proof of termination. Active candidates are recovered only
+        // after durable request finalization, with five minutes for terminal queue settlement.
+        let rows = sqlx::query(r#"SELECT delta.id AS delta_id, delta.request_id AS candidate_id, delta.target_id AS provider_id,
+  delta.quota_epoch_start_at_usage AS epoch, delta.provider_quota_cost_usd AS cost,
+  c.extra_data, c.status AS candidate_status,
+  (SELECT CAST(json_extract(ss.settlement_snapshot, '$.provider_quota_cost_usd') AS REAL) FROM usage_settlement_snapshots ss
+    JOIN usage_routing_snapshots routing ON routing.request_id = ss.request_id
+    WHERE routing.candidate_id = c.id AND ss.finalized_at IS NOT NULL LIMIT 1) AS settled_cost
+FROM usage_counter_deltas delta
+JOIN request_candidates c ON c.id = delta.request_id AND c.provider_id = delta.target_id
+JOIN providers p ON p.id = delta.target_id
+WHERE delta.kind = 'provider_monthly' AND delta.quota_epoch_start_at_usage = (p.quota_last_reset_at / 60) * 60
+  AND delta.quota_accounting_status IN ('pending', 'failed')
+  AND (? IS NULL OR delta.target_id = ?)
+  AND (c.status IN ('failed', 'cancelled') OR EXISTS (
+    SELECT 1 FROM "usage" u WHERE u.request_id = c.request_id
+      AND u.finalized_at IS NOT NULL AND u.finalized_at <= ?))
+ORDER BY delta.created_at, delta.id LIMIT ?"#)
+            .bind(provider_id).bind(provider_id).bind(now_unix_secs.saturating_sub(300) as i64)
+            .bind(limit.min(1000) as i64).fetch_all(&mut *tx).await.map_sql_err()?;
+        let mut recovered = Vec::new();
+        for row in rows {
+            let extra = row
+                .try_get::<Option<String>, _>("extra_data")
+                .map_sql_err()?
+                .map(|v| serde_json::from_str::<serde_json::Value>(&v))
+                .transpose()
+                .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+            let Some(snapshot) =
+                aether_data_contracts::repository::candidates::provider_quota_dispatch_snapshot(
+                    extra.as_ref(),
+                )?
+                .filter(|s| s.is_monthly_quota())
+            else {
+                continue;
+            };
+            let delta_id: String = row.try_get("delta_id").map_sql_err()?;
+            let candidate_id: String = row.try_get("candidate_id").map_sql_err()?;
+            let known = extra
+                .as_ref()
+                .and_then(|v| v.pointer("/provider_quota_attempt_accounting/cost_usd"))
+                .and_then(serde_json::Value::as_f64);
+            let settled: Option<f64> = row.try_get("settled_cost").map_sql_err()?;
+            let cost = row
+                .try_get::<Option<f64>, _>("cost")
+                .map_sql_err()?
+                .unwrap_or(0.0)
+                .max(snapshot.provider_quota_cost_usd.unwrap_or(0.0))
+                .max(known.unwrap_or(0.0))
+                .max(settled.unwrap_or(0.0));
+            let reason = if known.is_some() || settled.is_some() {
+                "known_usage"
+            } else {
+                "availability_first_provisional_unknown"
+            };
+            if !dry_run {
+                crate::settlement::reconcile_provider_monthly_attempt_sqlite(
+                    &mut tx,
+                    &candidate_id,
+                    cost,
+                    true,
+                    now_unix_secs as i64,
+                )
+                .await?;
+                let audit = serde_json::json!({ "delta_id": delta_id, "reason": reason, "cost_usd": cost, "recovered_at_unix_secs": now_unix_secs });
+                sqlx::query("UPDATE request_candidates SET extra_data = json_set(COALESCE(extra_data, '{}'), '$.provider_quota_recovery', json(?)) WHERE id = ?")
+                    .bind(audit.to_string()).bind(&candidate_id).execute(&mut *tx).await.map_sql_err()?;
+            }
+            recovered.push(ProviderQuotaRecovery {
+                provider_id: row.try_get("provider_id").map_sql_err()?,
+                candidate_id,
+                delta_id,
+                quota_epoch_start: row.try_get::<i64, _>("epoch").map_sql_err()? as u64,
+                known_cost_usd: cost,
+                reason: reason.to_string(),
+                applied: !dry_run,
+            });
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(recovered)
     }
 
     async fn clear_window_counters(&self, provider_id: &str) -> Result<(), DataLayerError> {
@@ -210,6 +328,39 @@ fn map_row(row: &SqliteRow) -> Result<StoredProviderQuotaSnapshot, DataLayerErro
         .try_get::<Option<i64>, _>("pending_quota_reset_at_unix_secs")
         .map_sql_err()?
         .map(|value| value.max(0) as u64);
+    snapshot.quota_subscription_started_at_unix_secs = row
+        .try_get::<Option<i64>, _>("quota_subscription_started_at")
+        .map_sql_err()?
+        .map(|v| v.max(0) as u64)
+        .or(snapshot.quota_last_reset_at_unix_secs);
+    snapshot.quota_cycle_start_at_unix_secs = row
+        .try_get::<Option<i64>, _>("quota_cycle_start_at")
+        .map_sql_err()?
+        .map(|v| v.max(0) as u64)
+        .or(snapshot.quota_last_reset_at_unix_secs);
+    if let Some(effective) = snapshot.pending_quota_reset_at_unix_secs {
+        snapshot.pending_adjustment = Some(ProviderQuotaAdjustment {
+            effective_at_unix_secs: effective,
+            mode: if row
+                .try_get::<Option<String>, _>("pending_quota_reset_mode")
+                .map_sql_err()?
+                .as_deref()
+                == Some("usage_only")
+            {
+                ProviderQuotaResetMode::UsageOnly
+            } else {
+                ProviderQuotaResetMode::Cycle
+            },
+            reset_usage: row
+                .try_get::<Option<bool>, _>("pending_quota_reset_usage")
+                .map_sql_err()?
+                .unwrap_or(true),
+            cycle_days: row
+                .try_get::<Option<i32>, _>("pending_quota_reset_days")
+                .map_sql_err()?
+                .map(|v| v as u64),
+        });
+    }
     Ok(snapshot)
 }
 
@@ -412,6 +563,90 @@ INSERT INTO provider_quota_maintenance_state (
             .expect("quota should exist");
         assert_eq!(quota.quota_last_reset_at_unix_secs, Some(1_080));
         assert!(quota.is_active, "reset must start a clean quota epoch");
+    }
+
+    #[tokio::test]
+    async fn sqlite_quota_reset_modes_preserve_history_expiry_and_natural_grid() {
+        use aether_data_contracts::repository::quota::{
+            ProviderQuotaAdjustment, ProviderQuotaResetMode,
+        };
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        seed_provider_quotas(&pool).await;
+        sqlx::query("UPDATE providers SET quota_last_reset_at=960, quota_cycle_start_at=960, quota_subscription_started_at=960, quota_expires_at=9999999 WHERE id='provider-1'").execute(&pool).await.unwrap();
+        let repository = SqliteProviderQuotaRepository::new(pool.clone());
+        repository
+            .request_adjustment(
+                "provider-1",
+                &ProviderQuotaAdjustment {
+                    effective_at_unix_secs: 1200,
+                    mode: ProviderQuotaResetMode::UsageOnly,
+                    reset_usage: true,
+                    cycle_days: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(repository.reset_due(1199).await.unwrap(), 0);
+        repository.reset_due(1200).await.unwrap();
+        let row = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.quota_cycle_start_at_unix_secs, Some(960));
+        assert_eq!(row.quota_last_reset_at_unix_secs, Some(1200));
+        assert_eq!(row.monthly_used_usd, 0.0);
+        // Worker delay across several periods cannot move the natural time grid.
+        repository
+            .reset_due(960 + 3 * 7 * 86400 + 180)
+            .await
+            .unwrap();
+        let row = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.quota_cycle_start_at_unix_secs,
+            Some(960 + 3 * 7 * 86400)
+        );
+        assert_eq!(row.quota_subscription_started_at_unix_secs, Some(960));
+        assert_eq!(row.quota_expires_at_unix_secs, Some(9999999));
+        sqlx::query("UPDATE providers SET monthly_used_usd=4 WHERE id='provider-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let effective = 960 + 3 * 7 * 86400 + 360;
+        repository
+            .request_adjustment(
+                "provider-1",
+                &ProviderQuotaAdjustment {
+                    effective_at_unix_secs: effective,
+                    mode: ProviderQuotaResetMode::Cycle,
+                    reset_usage: false,
+                    cycle_days: Some(2),
+                },
+            )
+            .await
+            .unwrap();
+        repository.reset_due(effective).await.unwrap();
+        let row = repository
+            .find_by_provider_id("provider-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.monthly_used_usd, 4.0);
+        assert_eq!(row.quota_cycle_start_at_unix_secs, Some(effective));
+        assert_eq!(row.quota_last_reset_at_unix_secs, Some(960 + 3 * 7 * 86400));
+        assert_eq!(row.quota_reset_day, Some(2));
+        assert_eq!(row.quota_subscription_started_at_unix_secs, Some(960));
+        assert_eq!(row.quota_expires_at_unix_secs, Some(9999999));
+        assert_eq!(repository.reset_due(effective).await.unwrap(), 0);
     }
 
     async fn seed_provider_quotas(pool: &sqlx::SqlitePool) {

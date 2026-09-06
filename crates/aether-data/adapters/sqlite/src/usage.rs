@@ -1373,6 +1373,7 @@ fn sqlite_usage_local_date_expr(tz_offset_minutes: i32) -> String {
     format!("date(created_at_unix_ms + ({offset}), 'unixepoch')")
 }
 
+
 fn sqlite_usage_breakdown_group_expr(group_by: UsageBreakdownGroupBy) -> &'static str {
     match group_by {
         UsageBreakdownGroupBy::Model => "COALESCE(NULLIF(model, ''), 'unknown')",
@@ -2534,6 +2535,144 @@ FROM (
             .transpose()
     }
 
+    /// Returns the exclusive upper bound of hours covered by complete
+    /// `stats_hourly_model_provider` rows: the end of the last aggregatable usage hour.
+    async fn read_hourly_model_provider_cutoff_unix_secs(
+        &self,
+    ) -> Result<Option<u64>, DataLayerError> {
+        let latest_hour: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(hour_utc) FROM stats_hourly_model_provider",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_sql_err()?;
+        latest_hour
+            .map(|value| {
+                u64::try_from(value)
+                    .map(|value| value.saturating_add(3600))
+                    .map_err(|_| {
+                        DataLayerError::UnexpectedValue(
+                            "stats hourly model-provider cutoff must not be negative".to_string(),
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    /// Reassembles local-day rows from complete UTC hours in
+    /// `stats_hourly_model_provider`.
+    ///
+    /// A local day `[D, D+1)` maps to the UTC hour range
+    /// `[D - tz_secs, D+1 - tz_secs)`, so any fixed UTC offset (minutes included,
+    /// e.g. India +05:30) recomposes exactly from stored hourly buckets.
+    ///
+    /// Returns the rows for local days whose full hour range lies in
+    /// `[hourly_from, hourly_until)` plus the `[covered_from, covered_until)`
+    /// local-day window that produced them, so callers know exactly which days
+    /// still need the raw path.
+    #[allow(clippy::type_complexity)]
+    async fn list_dashboard_daily_breakdown_from_hourly_aggregates(
+        &self,
+        query: &UsageDashboardDailyBreakdownQuery,
+        hourly_from: u64,
+        hourly_until: u64,
+    ) -> Result<
+        (
+            Vec<StoredUsageDashboardDailyBreakdownRow>,
+            Option<(u64, u64)>,
+        ),
+        DataLayerError,
+    > {
+        // Align both bounds outwards to hour boundaries: the hourly rows we
+        // select cover the local days whose full UTC-hour range lies inside.
+        let aligned_from = query.created_from_unix_secs / 3600 * 3600;
+        let aligned_until = query.created_until_unix_secs.div_ceil(3600) * 3600;
+        let scan_from = aligned_from.max(hourly_from);
+        let scan_until = aligned_until.min(hourly_until);
+        if scan_from >= scan_until {
+            return Ok((Vec::new(), None));
+        }
+        let offset_secs = i64::from(query.tz_offset_minutes) * 60;
+        // A local day is fully covered iff its UTC-hour range lies inside
+        // [scan_from, scan_until). Local midnights occur at `n*86400 - offset`
+        // in UTC, so the first fully covered day starts at the first local
+        // midnight at or after scan_from, and coverage ends at the local
+        // midnight of scan_until (exclusive).
+        let local_floor = |unix_secs: i64| {
+            unix_secs
+                .saturating_add(offset_secs)
+                .div_euclid(86_400)
+                .saturating_mul(86_400)
+                .saturating_sub(offset_secs)
+                .max(0)
+        };
+        // The first fully covered local day starts at the first local midnight
+        // at or after scan_from; coverage ends at the local midnight of
+        // scan_until (exclusive), so partial boundary days stay excluded.
+        let scan_from_i64 = i64::try_from(scan_from).unwrap_or(i64::MAX);
+        let first_full_local_day_start = (local_floor(scan_from_i64)
+            + if local_floor(scan_from_i64) >= scan_from_i64 {
+                0
+            } else {
+                86_400
+            })
+        .max(0) as u64;
+        let last_local_day_covered_end =
+            local_floor(i64::try_from(scan_until).unwrap_or(0)).max(0) as u64;
+        if first_full_local_day_start >= last_local_day_covered_end {
+            return Ok((Vec::new(), None));
+        }
+        let date_expr = format!(
+            "date((hour_utc / 3600 + ({offset_secs}) / 3600) * 3600, 'unixepoch')"
+        );
+        let rows = sqlx::query(&format!(
+            r#"
+SELECT
+  {date_expr} AS date,
+  model,
+  provider_name AS provider,
+  SUM(total_requests) AS requests,
+  SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) AS total_tokens,
+  SUM(total_cost) AS total_cost_usd,
+  SUM(response_time_sum_ms) AS response_time_sum_ms,
+  SUM(response_time_samples) AS response_time_samples
+FROM stats_hourly_model_provider
+WHERE hour_utc >= ?
+  AND hour_utc < ?
+GROUP BY date, model, provider_name
+ORDER BY date ASC, total_cost_usd DESC, model ASC, provider_name ASC
+"#
+        ))
+        .bind(first_full_local_day_start as i64)
+        .bind(last_local_day_covered_end as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
+
+        let rows = rows
+            .iter()
+            .map(|row| {
+                Ok(StoredUsageDashboardDailyBreakdownRow {
+                    date: row.try_get("date").map_sql_err()?,
+                    model: row.try_get("model").map_sql_err()?,
+                    provider: row.try_get("provider").map_sql_err()?,
+                    requests: sqlite_aggregate_u64(row, "requests")?,
+                    total_tokens: sqlite_aggregate_u64(row, "total_tokens")?,
+                    total_cost_usd: sqlite_real(row, "total_cost_usd")?,
+                    response_time_sum_ms: sqlite_real(row, "response_time_sum_ms")?,
+                    response_time_samples: sqlite_aggregate_u64(row, "response_time_samples")?,
+                })
+            })
+            .collect::<Result<Vec<_>, DataLayerError>>()?;
+        Ok((
+            rows,
+            Some((
+                first_full_local_day_start,
+                last_local_day_covered_end,
+            )),
+        ))
+    }
+
     async fn list_dashboard_daily_breakdown_from_daily_totals(
         &self,
         query: &UsageDashboardDailyBreakdownQuery,
@@ -3407,7 +3546,91 @@ LEFT JOIN usage_settlement_snapshots AS settlement
             return Ok(Vec::new());
         }
 
+        // Any fixed-offset timezone: local days recompose exactly from complete
+        // UTC hours (a local day is a contiguous UTC hour range), so serve them
+        // from stats_hourly_model_provider and only scan raw usage for the
+        // not-yet-aggregated tail local days.
+        //
+        // Hourly coverage hole (fresh deployment before backfill): fall back to
+        // the historical raw + imported-daily merge, never worse than before.
         if query.tz_offset_minutes != 0 {
+            if let Some(hourly_cutoff) = self
+                .read_hourly_model_provider_cutoff_unix_secs()
+                .await?
+            {
+                let aligned_from = query.created_from_unix_secs / 3600 * 3600;
+                let aligned_until = query.created_until_unix_secs.div_ceil(3600) * 3600;
+                if hourly_cutoff > aligned_from {
+                    let (hourly_rows, covered) = self
+                        .list_dashboard_daily_breakdown_from_hourly_aggregates(
+                            query,
+                            aligned_from,
+                            hourly_cutoff.min(aligned_until),
+                        )
+                        .await?;
+                    if let Some((covered_from, covered_until)) = covered {
+                        let mut items = hourly_rows;
+                        let covered_dates = items
+                            .iter()
+                            .map(|item| item.date.clone())
+                            .collect::<BTreeSet<_>>();
+                        // Raw rebuilds every local day the hourly segment left
+                        // out — boundary days at the window edges and the
+                        // not-yet-aggregated tail — so each day comes from
+                        // exactly one source.
+                        if covered_from > query.created_from_unix_secs {
+                            for row in self
+                                .list_dashboard_daily_breakdown_raw(
+                                    &UsageDashboardDailyBreakdownQuery {
+                                        created_from_unix_secs: query.created_from_unix_secs,
+                                        created_until_unix_secs: covered_from,
+                                        tz_offset_minutes: query.tz_offset_minutes,
+                                        user_id: query.user_id.clone(),
+                                    },
+                                )
+                                .await?
+                            {
+                                if !covered_dates.contains(&row.date) {
+                                    items.push(row);
+                                }
+                            }
+                        }
+                        if covered_until < query.created_until_unix_secs {
+                            for row in self
+                                .list_dashboard_daily_breakdown_raw(
+                                    &UsageDashboardDailyBreakdownQuery {
+                                        created_from_unix_secs: covered_until,
+                                        created_until_unix_secs: query.created_until_unix_secs,
+                                        tz_offset_minutes: query.tz_offset_minutes,
+                                        user_id: query.user_id.clone(),
+                                    },
+                                )
+                                .await?
+                            {
+                                if !covered_dates.contains(&row.date) {
+                                    items.push(row);
+                                }
+                            }
+                        }
+                        items.sort_by(|left, right| {
+                            left.date
+                                .cmp(&right.date)
+                                .then_with(|| {
+                                    right
+                                        .total_cost_usd
+                                        .partial_cmp(&left.total_cost_usd)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .then_with(|| left.model.cmp(&right.model))
+                                .then_with(|| left.provider.cmp(&right.provider))
+                        });
+                        return Ok(items);
+                    }
+                }
+            }
+
+            // Historical fallback when hourly coverage is missing: keep the
+            // pre-existing raw + imported-daily merge semantics.
             let raw_rows = self.list_dashboard_daily_breakdown_raw(query).await?;
             let raw_dates = raw_rows
                 .iter()

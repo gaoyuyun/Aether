@@ -447,6 +447,15 @@ async fn record_stream_sync_failure(
     );
     let concludes_request =
         !matches!(handling, StreamFailureHandling::HonorLocalFailover) || !retrying_next_candidate;
+    if !concludes_request {
+        crate::request_candidate_runtime::record_failed_monthly_candidate_usage(
+            state,
+            plan,
+            report_context,
+            payload,
+        )
+        .await;
+    }
     if concludes_request {
         crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
         let report_context_with_diagnostics =
@@ -738,6 +747,15 @@ async fn handle_prefetch_transport_stream_failure(
     .await;
     let retrying_next_candidate = retry_scope_out.is_some()
         && matches!(analysis.decision, LocalFailoverDecision::RetryNextCandidate);
+    if retrying_next_candidate {
+        crate::request_candidate_runtime::record_failed_monthly_candidate_usage(
+            state,
+            plan,
+            payload.report_context.as_ref(),
+            &payload,
+        )
+        .await;
+    }
     if !retrying_next_candidate {
         crate::execution_runtime::mark_stream_candidate_watchdog_terminal_started();
         let report_context_with_diagnostics =

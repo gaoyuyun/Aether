@@ -5,6 +5,7 @@ use crate::handlers::admin::provider::shared::support::{
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use crate::GatewayError;
+use aether_data_contracts::repository::quota::{ProviderQuotaAdjustment, ProviderQuotaResetMode};
 use axum::{
     body::Body,
     http,
@@ -25,14 +26,30 @@ pub(crate) struct AdminProviderStrategyBillingRequest {
     pub(super) quota_reset_day: u64,
     #[serde(default)]
     pub(super) quota_last_reset_at: Option<String>,
-    #[serde(default)]
-    pub(super) quota_expires_at: Option<String>,
+    #[serde(default, deserialize_with = "present_json_value")]
+    pub(super) quota_expires_at: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) quota_windows: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) rpm_limit: Option<i32>,
     #[serde(default = "default_provider_strategy_provider_priority")]
     pub(super) provider_priority: i32,
+}
+
+fn present_json_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminProviderQuotaResetRequest {
+    #[serde(default)]
+    pub(crate) mode: ProviderQuotaResetMode,
+    pub(crate) effective_at: Option<String>,
+    pub(crate) cycle_days: Option<u64>,
+    pub(crate) reset_usage: Option<bool>,
 }
 
 fn default_provider_strategy_quota_reset_day() -> u64 {
@@ -120,8 +137,20 @@ pub(crate) async fn build_provider_strategy_update_billing_response(
         },
         None => existing.quota_last_reset_at_unix_secs,
     };
-    let quota_expires_at_unix_secs = match payload.quota_expires_at.as_deref() {
-        Some(value) => match parse_optional_rfc3339_unix_secs(value, "quota_expires_at") {
+    if billing_type == "monthly_quota" && quota_last_reset_at_unix_secs.is_none() {
+        let now_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        quota_last_reset_at_unix_secs = Some(now_unix_secs / 60 * 60);
+    }
+    let quota_expires_at_unix_secs = match payload.quota_expires_at.as_ref() {
+        Some(serde_json::Value::Null) => None,
+        Some(value) => match value
+            .as_str()
+            .ok_or_else(|| "quota_expires_at 必须是字符串或 null".to_string())
+            .and_then(|v| parse_optional_rfc3339_unix_secs(v, "quota_expires_at"))
+        {
             Ok(value) => Some(value),
             Err(message) => {
                 return Ok((
@@ -140,8 +169,16 @@ pub(crate) async fn build_provider_strategy_update_billing_response(
     {
         quota_last_reset_at_unix_secs = existing.quota_last_reset_at_unix_secs;
     }
-    let quota_start_changed =
-        existing.quota_last_reset_at_unix_secs != quota_last_reset_at_unix_secs;
+    if existing.quota_last_reset_at_unix_secs.is_some()
+        && (existing.quota_last_reset_at_unix_secs != quota_last_reset_at_unix_secs
+            || existing.quota_reset_day != Some(payload.quota_reset_day))
+    {
+        return Ok((
+            http::StatusCode::BAD_REQUEST,
+            Json(json!({ "detail": "请通过订阅配额中的调整周期操作指定生效时间和是否清零用量" })),
+        )
+            .into_response());
+    }
 
     let mut config_map = existing
         .config
@@ -166,13 +203,24 @@ pub(crate) async fn build_provider_strategy_update_billing_response(
         }
     }
 
-    let synced_monthly_used_usd = if quota_start_changed {
-        Some(0.0)
-    } else {
-        existing.monthly_used_usd
-    };
+    let synced_monthly_used_usd = existing.monthly_used_usd;
 
     let _ignored_rpm_limit = payload.rpm_limit;
+    let quota_schedule = if billing_type == "monthly_quota" {
+        (
+            existing
+                .quota_subscription_started_at_unix_secs
+                .or(quota_last_reset_at_unix_secs),
+            existing
+                .quota_cycle_start_at_unix_secs
+                .or(quota_last_reset_at_unix_secs),
+        )
+    } else {
+        (
+            existing.quota_subscription_started_at_unix_secs,
+            existing.quota_cycle_start_at_unix_secs,
+        )
+    };
     let updated = existing
         .clone()
         .with_billing_fields(
@@ -183,6 +231,7 @@ pub(crate) async fn build_provider_strategy_update_billing_response(
             quota_last_reset_at_unix_secs,
             quota_expires_at_unix_secs,
         )
+        .with_quota_schedule(quota_schedule.0, quota_schedule.1)
         .with_routing_fields(payload.provider_priority);
     let mut updated = updated;
     updated.config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
@@ -193,12 +242,6 @@ pub(crate) async fn build_provider_strategy_update_billing_response(
     else {
         return Ok(admin_provider_strategy_provider_not_found_response());
     };
-    if quota_start_changed {
-        state
-            .app()
-            .clear_provider_quota_window_counters(&provider_id)
-            .await?;
-    }
 
     Ok(Json(json!({
         "message": "Provider billing config updated successfully",
@@ -241,7 +284,16 @@ pub(crate) async fn build_provider_strategy_stats_response(
         .app()
         .summarize_provider_actual_usage_since(&provider_id, since_unix_secs)
         .await?;
-    let monthly_used_usd = provider.monthly_used_usd.unwrap_or(0.0);
+    let quota = state
+        .app()
+        .read_provider_quota_snapshots(std::slice::from_ref(&provider_id))
+        .await?
+        .into_iter()
+        .next();
+    let monthly_used_usd = quota
+        .as_ref()
+        .map(|q| q.monthly_used_usd)
+        .unwrap_or_else(|| provider.monthly_used_usd.unwrap_or(0.0));
     let quota_remaining_usd = provider
         .monthly_quota_usd
         .map(|value| value - monthly_used_usd);
@@ -251,8 +303,10 @@ pub(crate) async fn build_provider_strategy_stats_response(
         0.0
     };
     let configured_windows = aether_wallet::quota_windows_from_config(provider.config.as_ref());
-    let quota_epoch = provider
-        .quota_last_reset_at_unix_secs
+    let quota_epoch = quota
+        .as_ref()
+        .and_then(|q| q.quota_last_reset_at_unix_secs)
+        .or(provider.quota_last_reset_at_unix_secs)
         .map(aether_wallet::quota_clock_minute);
     let window_requests = quota_epoch
         .map(|quota_epoch_start_unix_secs| {
@@ -294,12 +348,40 @@ pub(crate) async fn build_provider_strategy_stats_response(
             })
         })
         .collect::<Vec<_>>();
-    let pending_reset = state
-        .app()
-        .read_provider_quota_snapshot(&provider_id)
-        .await?
-        .and_then(|quota| quota.pending_quota_reset_at_unix_secs)
+    let pending_reset = quota
+        .as_ref()
+        .and_then(|q| q.pending_quota_reset_at_unix_secs)
         .and_then(unix_secs_to_rfc3339);
+    let cycle_start = quota
+        .as_ref()
+        .and_then(|q| q.quota_cycle_start_at_unix_secs)
+        .or(provider.quota_cycle_start_at_unix_secs)
+        .or(quota_epoch);
+    let cycle_days = quota
+        .as_ref()
+        .and_then(|q| q.quota_reset_day)
+        .or(provider.quota_reset_day);
+    let subscription_start = provider
+        .quota_subscription_started_at_unix_secs
+        .or(provider.quota_last_reset_at_unix_secs);
+    let status = if provider
+        .quota_expires_at_unix_secs
+        .is_some_and(|end| end <= now_unix_secs)
+    {
+        "expired"
+    } else if subscription_start.is_some_and(|start| start > now_unix_secs)
+        || quota_epoch.is_some_and(|start| start > now_unix_secs)
+    {
+        "not_started"
+    } else if !provider.is_active {
+        "disabled"
+    } else if quota_remaining_usd.is_some_and(|remaining| remaining <= 0.0) {
+        "exhausted"
+    } else if quota.as_ref().is_some_and(|q| !q.is_active) {
+        "accounting_pending"
+    } else {
+        "active"
+    };
 
     Ok(Json(json!({
         "provider_id": provider_id,
@@ -312,6 +394,12 @@ pub(crate) async fn build_provider_strategy_stats_response(
             "quota_remaining_usd": quota_remaining_usd,
             "quota_windows": quota_windows,
             "pending_quota_reset_at": pending_reset,
+            "quota_subscription_started_at": subscription_start.and_then(unix_secs_to_rfc3339),
+            "quota_cycle_start_at": cycle_start.and_then(unix_secs_to_rfc3339),
+            "quota_last_reset_at": quota_epoch.and_then(unix_secs_to_rfc3339),
+            "quota_next_reset_at": cycle_start.zip(cycle_days).map(|(s,d)| s + d * 86_400).and_then(unix_secs_to_rfc3339),
+            "quota_reset_day": cycle_days,
+            "status": status,
             "quota_expires_at": provider.quota_expires_at_unix_secs.and_then(unix_secs_to_rfc3339),
         },
         "usage_stats": {
@@ -330,6 +418,7 @@ pub(crate) async fn build_provider_strategy_stats_response(
 pub(crate) async fn build_provider_strategy_reset_quota_response(
     state: &AdminAppState<'_>,
     provider_id: String,
+    payload: AdminProviderQuotaResetRequest,
 ) -> Result<Response<Body>, GatewayError> {
     let Some(provider) = state
         .app()
@@ -354,7 +443,31 @@ pub(crate) async fn build_provider_strategy_reset_quota_response(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let effective_at = (now_unix_secs / 60 + 1) * 60;
+    let earliest = (now_unix_secs / 60 + 1) * 60;
+    let effective_at = match payload
+        .effective_at
+        .as_deref()
+        .map(|v| parse_optional_rfc3339_unix_secs(v, "effective_at"))
+        .transpose()
+    {
+        Ok(value) => value.unwrap_or(earliest),
+        Err(detail) => {
+            return Ok((
+                http::StatusCode::BAD_REQUEST,
+                Json(json!({ "detail": detail })),
+            )
+                .into_response())
+        }
+    };
+    let adjustment = ProviderQuotaAdjustment {
+        effective_at_unix_secs: effective_at,
+        mode: payload.mode,
+        reset_usage: payload.reset_usage.unwrap_or(true),
+        cycle_days: payload.cycle_days,
+    };
+    if effective_at < earliest || adjustment.validate().is_err() {
+        return Ok((http::StatusCode::BAD_REQUEST, Json(json!({ "detail": "请选择下一整分钟或更晚的生效时间，以及有效的重置模式和周期长度" }))).into_response());
+    }
     if !state.app().has_provider_quota_data_writer() {
         return Ok((
             http::StatusCode::SERVICE_UNAVAILABLE,
@@ -364,14 +477,17 @@ pub(crate) async fn build_provider_strategy_reset_quota_response(
     }
     let requested = state
         .app()
-        .request_provider_quota_reset(&provider_id, effective_at)
+        .request_provider_quota_adjustment(&provider_id, &adjustment)
         .await?;
     if !requested {
         return Ok(admin_provider_strategy_provider_not_found_response());
     }
 
     Ok(Json(json!({
-        "message": "Provider quota reset scheduled",
+        "message": "Provider quota adjustment scheduled",
+        "mode": payload.mode,
+        "reset_usage": adjustment.reset_usage,
+        "cycle_days": adjustment.cycle_days,
         "provider_name": provider.name,
         "previous_used": previous_used,
         "current_used": previous_used,

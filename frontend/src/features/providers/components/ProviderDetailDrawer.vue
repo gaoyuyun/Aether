@@ -50,12 +50,17 @@
             <div class="space-y-6 p-4 sm:p-6">
               <!-- 配额使用情况 -->
               <ProviderMonthlyQuotaCard
-                v-if="provider.billing_type === 'monthly_quota' && provider.monthly_quota_usd"
+                v-if="provider.billing_type === 'monthly_quota'"
                 :used="provider.monthly_used_usd"
                 :quota="provider.monthly_quota_usd"
                 :reset-day="provider.quota_reset_day"
                 :provider-id="provider.id"
                 :windows="provider.quota_windows"
+                :active="open"
+                :subscription-start="provider.quota_subscription_started_at"
+                :cycle-start="provider.quota_cycle_start_at"
+                :next-reset-at="provider.quota_next_reset_at"
+                :expires-at="provider.quota_expires_at"
               />
 
               <!-- 密钥管理 -->

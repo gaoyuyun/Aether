@@ -202,6 +202,31 @@ type = "unix_seconds"
 nullable = true
 
 [[table.providers.columns]]
+name = "quota_subscription_started_at"
+type = "unix_seconds"
+nullable = true
+
+[[table.providers.columns]]
+name = "quota_cycle_start_at"
+type = "unix_seconds"
+nullable = true
+
+[[table.providers.columns]]
+name = "pending_quota_reset_mode"
+type = "text"
+nullable = true
+
+[[table.providers.columns]]
+name = "pending_quota_reset_days"
+type = "int32"
+nullable = true
+
+[[table.providers.columns]]
+name = "pending_quota_reset_usage"
+type = "bool"
+nullable = true
+
+[[table.providers.columns]]
 name = "quota_expires_at"
 type = "unix_seconds"
 nullable = true

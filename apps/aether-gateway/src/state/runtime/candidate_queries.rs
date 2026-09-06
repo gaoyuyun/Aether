@@ -162,7 +162,7 @@ impl AppState {
             .await
     }
 
-    async fn ensure_due_provider_quota_resets(
+    pub(crate) async fn ensure_due_provider_quota_resets(
         &self,
         provider_ids: &[String],
         snapshots: Vec<quota::StoredProviderQuotaSnapshot>,
@@ -173,21 +173,9 @@ impl AppState {
             .as_secs()
             / 60
             * 60;
-        let reset_is_due = snapshots.iter().any(|snapshot| {
-            snapshot
-                .pending_quota_reset_at_unix_secs
-                .is_some_and(|effective_at| effective_at <= now)
-                || (snapshot.billing_type == "monthly_quota"
-                    && snapshot
-                        .quota_reset_day
-                        .is_some_and(|days| (1..=30).contains(&days))
-                    && snapshot
-                        .quota_last_reset_at_unix_secs
-                        .map_or(true, |epoch| {
-                            now.saturating_sub(epoch)
-                                >= snapshot.quota_reset_day.unwrap_or(30) * 86_400
-                        }))
-        });
+        let reset_is_due = snapshots
+            .iter()
+            .any(|snapshot| snapshot.due_transition(now).is_some());
         if !reset_is_due {
             return Ok(snapshots);
         }
@@ -368,6 +356,16 @@ impl AppState {
         &self,
         candidate: candidates::UpsertRequestCandidateRecord,
     ) -> Result<Option<candidates::StoredRequestCandidate>, GatewayError> {
+        if candidates::provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .is_some_and(|snapshot| snapshot.is_monthly_quota())
+        {
+            return self
+                .data
+                .upsert_request_candidate(candidate)
+                .await
+                .map_err(|err| GatewayError::Internal(err.to_string()));
+        }
         if let Some(queue) = self.request_candidate_queue.as_ref() {
             let stored = stored_request_candidate_from_upsert(&candidate)?;
             queue

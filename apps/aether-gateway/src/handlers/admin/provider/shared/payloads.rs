@@ -169,6 +169,8 @@ pub(crate) struct AdminProviderCreateRequest {
     #[serde(default)]
     pub(crate) quota_last_reset_at: Option<String>,
     #[serde(default)]
+    pub(crate) quota_subscription_started_at: Option<String>,
+    #[serde(default)]
     pub(crate) quota_expires_at: Option<String>,
     #[serde(default)]
     pub(crate) quota_windows: Option<Vec<AdminProviderQuotaWindowRequest>>,
@@ -233,6 +235,8 @@ pub(crate) struct AdminProviderUpdateRequest {
     pub(crate) quota_reset_day: Option<u64>,
     #[serde(default)]
     pub(crate) quota_last_reset_at: Option<String>,
+    #[serde(default)]
+    pub(crate) quota_subscription_started_at: Option<String>,
     #[serde(default)]
     pub(crate) quota_expires_at: Option<String>,
     #[serde(default)]

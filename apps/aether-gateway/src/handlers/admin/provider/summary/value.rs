@@ -176,6 +176,14 @@ pub(crate) fn build_admin_provider_summary_value(
         .and_then(|quota| quota.quota_expires_at_unix_secs)
         .or(provider.quota_expires_at_unix_secs)
         .and_then(unix_secs_to_rfc3339);
+    let quota_subscription_started_at = provider
+        .quota_subscription_started_at_unix_secs
+        .or(provider.quota_last_reset_at_unix_secs)
+        .and_then(unix_secs_to_rfc3339);
+    let cycle_start = quota_snapshot
+        .and_then(|q| q.quota_cycle_start_at_unix_secs)
+        .or(provider.quota_cycle_start_at_unix_secs)
+        .or(provider.quota_last_reset_at_unix_secs);
 
     json!({
         "id": provider.id.clone(),
@@ -192,6 +200,9 @@ pub(crate) fn build_admin_provider_summary_value(
         "monthly_used_usd": monthly_used_usd,
         "quota_reset_day": quota_reset_day,
         "quota_last_reset_at": quota_last_reset_at,
+        "quota_subscription_started_at": quota_subscription_started_at,
+        "quota_cycle_start_at": cycle_start.and_then(unix_secs_to_rfc3339),
+        "quota_next_reset_at": cycle_start.zip(quota_reset_day).map(|(start, days)| start + days * 86_400).and_then(unix_secs_to_rfc3339),
         "quota_expires_at": quota_expires_at,
         "quota_windows": config.and_then(|cfg| cfg.get("quota_windows")).cloned(),
         "max_retries": provider.max_retries,

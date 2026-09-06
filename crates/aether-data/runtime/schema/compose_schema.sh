@@ -225,6 +225,17 @@ targets=(
   "sqlite/baseline"
 )
 
+compose_incremental() {
+  local driver source dest
+  for driver in postgres mysql sqlite; do
+    for source in "${driver_schema_root}/${driver}/incremental/"*.sql; do
+      [[ -f "${source}" ]] || continue
+      dest="${adapters_root}/${driver}/migrations/$(basename "${source}")"
+      if [[ "$1" == "check" ]]; then diff -u "${source}" "${dest}"; else cp "${source}" "${dest}"; fi
+    done
+  done
+}
+
 cmd="${1:-}"
 case "${cmd}" in
   split)
@@ -236,11 +247,13 @@ case "${cmd}" in
     generate_logical_schema
     ;;
   compose)
+    compose_incremental compose
     for target in "${targets[@]}"; do
       compose_target "${target}"
     done
     ;;
   check)
+    compose_incremental check
     check_logical_generated
     check_bootstrap_sources
     for target in "${targets[@]}"; do

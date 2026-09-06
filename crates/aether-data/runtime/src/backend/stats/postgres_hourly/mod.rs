@@ -122,6 +122,7 @@ async fn perform_stats_hourly_aggregation_for_hour(
         upsert_stats_hourly_model_rows(&mut tx, hour_utc, hour_end, aggregated_at).await?;
     let provider_rows =
         upsert_stats_hourly_provider_rows(&mut tx, hour_utc, hour_end, aggregated_at).await?;
+    upsert_stats_hourly_model_provider_rows(&mut tx, hour_utc, hour_end, aggregated_at).await?;
     tx.commit().await?;
 
     Ok(StatsHourlyAggregationSummary {
@@ -192,6 +193,23 @@ async fn upsert_stats_hourly_provider_rows(
     now_utc: DateTime<Utc>,
 ) -> Result<usize, sqlx::Error> {
     let rows_affected = sqlx::query(UPSERT_STATS_HOURLY_PROVIDER_SQL)
+        .bind(hour_utc)
+        .bind(hour_end)
+        .bind(now_utc)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+
+    Ok(usize::try_from(rows_affected).unwrap_or(usize::MAX))
+}
+
+async fn upsert_stats_hourly_model_provider_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    hour_utc: DateTime<Utc>,
+    hour_end: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+) -> Result<usize, sqlx::Error> {
+    let rows_affected = sqlx::query(UPSERT_STATS_HOURLY_MODEL_PROVIDER_SQL)
         .bind(hour_utc)
         .bind(hour_end)
         .bind(now_utc)

@@ -39,6 +39,8 @@ SELECT
   CAST(monthly_quota_usd AS DOUBLE PRECISION) AS monthly_quota_usd,
   CAST(monthly_used_usd AS DOUBLE PRECISION) AS monthly_used_usd,
   quota_reset_day,
+  quota_subscription_started_at,
+  quota_cycle_start_at,
   CAST(EXTRACT(EPOCH FROM quota_last_reset_at) AS BIGINT) AS quota_last_reset_at_unix_secs,
   CAST(EXTRACT(EPOCH FROM quota_expires_at) AS BIGINT) AS quota_expires_at_unix_secs,
   provider_priority,
@@ -1281,7 +1283,9 @@ INSERT INTO providers (
   stream_first_byte_timeout,
   config,
   created_at,
-  updated_at
+  updated_at,
+  quota_subscription_started_at,
+  quota_cycle_start_at
 ) VALUES (
   $1,
   $2,
@@ -1317,7 +1321,9 @@ INSERT INTO providers (
   CASE
     WHEN $23::double precision IS NULL THEN NOW()
     ELSE TO_TIMESTAMP($23::double precision)
-  END
+  END,
+  $24,
+  $25
 )
 "#,
         )
@@ -1357,6 +1363,18 @@ INSERT INTO providers (
         .bind(&provider.config)
         .bind(provider.created_at_unix_ms.map(|value| value as f64))
         .bind(provider.updated_at_unix_secs.map(|value| value as f64))
+        .bind(
+            provider
+                .quota_subscription_started_at_unix_secs
+                .or(provider.quota_last_reset_at_unix_secs)
+                .map(|v| v as i64),
+        )
+        .bind(
+            provider
+                .quota_cycle_start_at_unix_secs
+                .or(provider.quota_last_reset_at_unix_secs)
+                .map(|v| v as i64),
+        )
         .execute(&mut *tx)
         .await
         .map_postgres_err()?;
@@ -1415,29 +1433,26 @@ SET
   provider_type = $5,
   billing_type = CAST($6 AS providerbillingtype),
   monthly_quota_usd = $7,
-  monthly_used_usd = COALESCE($8, monthly_used_usd),
-  quota_reset_day = $9,
-  quota_last_reset_at = CASE
+  quota_reset_day = COALESCE(quota_reset_day, $8),
+  quota_last_reset_at = COALESCE(quota_last_reset_at, TO_TIMESTAMP($9::double precision)),
+  quota_expires_at = CASE
     WHEN $10::double precision IS NULL THEN NULL
     ELSE TO_TIMESTAMP($10::double precision)
   END,
-  quota_expires_at = CASE
-    WHEN $11::double precision IS NULL THEN NULL
-    ELSE TO_TIMESTAMP($11::double precision)
-  END,
-  provider_priority = $12,
-  is_active = $13,
-  keep_priority_on_conversion = $14,
-  enable_format_conversion = $15,
-  concurrent_limit = $16,
-  max_retries = $17,
-  proxy = $18,
-  request_timeout = $19,
-  stream_first_byte_timeout = $20,
-  config = $21,
+  provider_priority = $11,
+  is_active = $12,
+  keep_priority_on_conversion = $13,
+  enable_format_conversion = $14,
+  concurrent_limit = $15,
+  max_retries = $16,
+  proxy = $17,
+  request_timeout = $18,
+  stream_first_byte_timeout = $19,
+  config = $20,
+  quota_subscription_started_at = $22,
   updated_at = CASE
-    WHEN $22::double precision IS NULL THEN NOW()
-    ELSE TO_TIMESTAMP($22::double precision)
+    WHEN $21::double precision IS NULL THEN NOW()
+    ELSE TO_TIMESTAMP($21::double precision)
   END
 WHERE id = $1
 "#,
@@ -1454,7 +1469,6 @@ WHERE id = $1
                 .unwrap_or_else(|| "pay_as_you_go".to_string()),
         )
         .bind(provider.monthly_quota_usd)
-        .bind(provider.monthly_used_usd)
         .bind(provider.quota_reset_day.map(|value| value as i32))
         .bind(
             provider
@@ -1477,6 +1491,12 @@ WHERE id = $1
         .bind(provider.stream_first_byte_timeout_secs)
         .bind(&provider.config)
         .bind(provider.updated_at_unix_secs.map(|value| value as f64))
+        .bind(
+            provider
+                .quota_subscription_started_at_unix_secs
+                .or(provider.quota_last_reset_at_unix_secs)
+                .map(|v| v as i64),
+        )
         .execute(&self.pool)
         .await
         .map_postgres_err()?
@@ -3265,6 +3285,10 @@ fn map_provider_row(row: &PgRow) -> Result<StoredProviderCatalogProvider, DataLa
         quota_reset_day,
         row_get::<Option<i64>>(row, "quota_last_reset_at_unix_secs")?.map(|value| value as u64),
         row_get::<Option<i64>>(row, "quota_expires_at_unix_secs")?.map(|value| value as u64),
+    )
+    .with_quota_schedule(
+        row_get::<Option<i64>>(row, "quota_subscription_started_at")?.map(|v| v as u64),
+        row_get::<Option<i64>>(row, "quota_cycle_start_at")?.map(|v| v as u64),
     )
     .with_routing_fields(row_get(row, "provider_priority")?)
     .with_transport_fields(

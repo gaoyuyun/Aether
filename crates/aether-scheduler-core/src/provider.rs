@@ -27,6 +27,12 @@ pub fn should_skip_provider_quota(
             !quota.is_active
                 || quota.quota_last_reset_at_unix_secs.is_none()
                 || quota
+                    .quota_subscription_started_at_unix_secs
+                    .is_some_and(|start| start > _now_unix_secs)
+                || quota
+                    .quota_last_reset_at_unix_secs
+                    .is_some_and(|start_at| start_at > _now_unix_secs)
+                || quota
                     .quota_reset_day
                     .is_some_and(|days| days == 0 || days > 30)
                 || quota
@@ -53,6 +59,9 @@ pub fn should_skip_provider_quota_with_windows(
     let billing_type = ProviderBillingType::parse(&quota.billing_type);
     if billing_type != ProviderBillingType::MonthlyQuota {
         return false;
+    }
+    if should_skip_provider_quota(quota, _now_unix_secs) {
+        return true;
     }
     let snapshot = ProviderQuotaSnapshot {
         provider_id: quota.provider_id.clone(),
@@ -188,6 +197,25 @@ mod tests {
         )
         .expect("quota should build");
         assert!(!should_skip_provider_quota(&free, 2_000));
+    }
+
+    #[test]
+    fn skips_monthly_quota_before_subscription_start() {
+        let mut future = StoredProviderQuotaSnapshot::new(
+            "provider-future".to_string(),
+            "monthly_quota".to_string(),
+            Some(10.0),
+            0.0,
+            Some(30),
+            Some(3_000),
+            None,
+            true,
+        )
+        .expect("quota should build");
+        future.quota_subscription_started_at_unix_secs = Some(3_000);
+        future.quota_cycle_start_at_unix_secs = Some(3_000);
+        assert!(should_skip_provider_quota(&future, 2_000));
+        assert!(!should_skip_provider_quota(&future, 3_000));
     }
 
     #[test]

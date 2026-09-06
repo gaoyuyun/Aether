@@ -92,6 +92,7 @@ mod tests {
                 max_lifetime_ms: 30_000,
                 statement_cache_capacity: 64,
                 require_ssl: false,
+                ..SqlPoolConfig::default()
             },
         };
 

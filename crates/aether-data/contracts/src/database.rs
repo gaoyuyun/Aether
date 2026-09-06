@@ -113,7 +113,12 @@ pub struct SqlPoolConfig {
     pub max_lifetime_ms: u64,
     pub statement_cache_capacity: usize,
     pub require_ssl: bool,
+    /// SQLite page cache, in MiB. Other drivers ignore this value.
+    pub sqlite_cache_mb: u32,
 }
+
+pub const DEFAULT_SQLITE_CACHE_MB: u32 = 64;
+pub const SQLITE_CACHE_MB_ENV_VAR: &str = "AETHER_GATEWAY_SQLITE_CACHE_MB";
 
 impl Default for SqlPoolConfig {
     fn default() -> Self {
@@ -125,6 +130,7 @@ impl Default for SqlPoolConfig {
             max_lifetime_ms: 30 * 60_000,
             statement_cache_capacity: 100,
             require_ssl: false,
+            sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
         }
     }
 }
@@ -198,6 +204,28 @@ impl SqlDatabaseConfig {
         self.pool.validate(self.driver)
     }
 
+    /// SQLite page cache size in MiB for file-backed databases.
+    ///
+    /// Resolves in this order:
+    /// 1. The `SqlPoolConfig::sqlite_cache_mb` value when it was customized.
+    /// 2. The `AETHER_GATEWAY_SQLITE_CACHE_MB` environment variable.
+    /// 3. `DEFAULT_SQLITE_CACHE_MB`.
+    ///
+    /// Tests construct configs with `SqlPoolConfig::default()` everywhere, so an explicit
+    /// environment override beats the untouched default, and explicit configs beat the
+    /// environment.
+    pub fn sqlite_cache_mb(&self) -> u32 {
+        let configured = self.pool.sqlite_cache_mb;
+        if configured != DEFAULT_SQLITE_CACHE_MB {
+            return configured;
+        }
+        std::env::var(SQLITE_CACHE_MB_ENV_VAR)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0 && *value <= 4_096)
+            .unwrap_or(DEFAULT_SQLITE_CACHE_MB)
+    }
+
     pub fn from_postgres_config(postgres: PostgresPoolConfig) -> Self {
         Self {
             driver: DatabaseDriver::Postgres,
@@ -210,6 +238,7 @@ impl SqlDatabaseConfig {
                 max_lifetime_ms: postgres.max_lifetime_ms,
                 statement_cache_capacity: postgres.statement_cache_capacity,
                 require_ssl: postgres.require_ssl,
+                sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
             },
         }
     }

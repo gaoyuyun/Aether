@@ -39,6 +39,8 @@ SELECT
   CAST(monthly_quota_usd AS REAL) AS monthly_quota_usd,
   CAST(monthly_used_usd AS REAL) AS monthly_used_usd,
   quota_reset_day,
+  quota_subscription_started_at,
+  quota_cycle_start_at,
   quota_last_reset_at AS quota_last_reset_at_unix_secs,
   quota_expires_at AS quota_expires_at_unix_secs,
   provider_priority,
@@ -635,9 +637,9 @@ INSERT INTO providers (
   quota_last_reset_at, quota_expires_at, provider_priority,
   is_active, keep_priority_on_conversion, enable_format_conversion,
   concurrent_limit, max_retries, proxy, request_timeout,
-  stream_first_byte_timeout, config, created_at, updated_at
+  stream_first_byte_timeout, config, created_at, updated_at, quota_subscription_started_at, quota_cycle_start_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&provider.id)
@@ -680,6 +682,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         )?)
         .bind(created_at)
         .bind(updated_at)
+        .bind(provider.quota_subscription_started_at_unix_secs.or(provider.quota_last_reset_at_unix_secs).map(|v| v as i64))
+        .bind(provider.quota_cycle_start_at_unix_secs.or(provider.quota_last_reset_at_unix_secs).map(|v| v as i64))
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
@@ -706,9 +710,8 @@ SET
   provider_type = ?,
   billing_type = ?,
   monthly_quota_usd = ?,
-  monthly_used_usd = ?,
-  quota_reset_day = ?,
-  quota_last_reset_at = ?,
+  quota_reset_day = COALESCE(quota_reset_day, ?),
+  quota_last_reset_at = COALESCE(quota_last_reset_at, ?),
   quota_expires_at = ?,
   provider_priority = ?,
   is_active = ?,
@@ -720,7 +723,8 @@ SET
   request_timeout = ?,
   stream_first_byte_timeout = ?,
   config = ?,
-  updated_at = ?
+  updated_at = ?,
+  quota_subscription_started_at = ?
 WHERE id = ?
 "#,
         )
@@ -735,7 +739,6 @@ WHERE id = ?
                 .unwrap_or_else(|| "pay_as_you_go".to_string()),
         )
         .bind(provider.monthly_quota_usd)
-        .bind(provider.monthly_used_usd)
         .bind(optional_i64_from_u64(
             provider.quota_reset_day,
             "providers.quota_reset_day",
@@ -762,6 +765,12 @@ WHERE id = ?
             "providers.config",
         )?)
         .bind(updated_at)
+        .bind(
+            provider
+                .quota_subscription_started_at_unix_secs
+                .or(provider.quota_last_reset_at_unix_secs)
+                .map(|v| v as i64),
+        )
         .bind(&provider.id)
         .execute(&self.pool)
         .await
@@ -3155,6 +3164,14 @@ fn map_provider_row(row: &SqliteRow) -> Result<StoredProviderCatalogProvider, Da
             row.try_get("quota_expires_at_unix_secs").map_sql_err()?,
             "providers.quota_expires_at",
         )?,
+    )
+    .with_quota_schedule(
+        row.try_get::<Option<i64>, _>("quota_subscription_started_at")
+            .map_sql_err()?
+            .map(|v| v as u64),
+        row.try_get::<Option<i64>, _>("quota_cycle_start_at")
+            .map_sql_err()?
+            .map(|v| v as u64),
     )
     .with_routing_fields(row.try_get("provider_priority").map_sql_err()?)
     .with_transport_fields(

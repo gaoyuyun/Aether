@@ -232,6 +232,14 @@ ON CONFLICT (hour_utc) DO UPDATE SET
         aggregated_at_unix_secs,
     )
     .await?;
+    upsert_sqlite_stats_hourly_model_provider_rows(
+        &mut tx,
+        hour_utc_unix_secs,
+        start_unix_secs,
+        end_unix_secs,
+        aggregated_at_unix_secs,
+    )
+    .await?;
     advanced::refresh_hourly(&mut tx, hour_utc_unix_secs, start_unix_secs, end_unix_secs).await?;
     tx.commit().await.map_sql_err()?;
 
@@ -546,6 +554,89 @@ ON CONFLICT (hour_utc, provider_name) DO UPDATE SET
   input_tokens = excluded.input_tokens,
   output_tokens = excluded.output_tokens,
   total_cost = excluded.total_cost,
+  updated_at = excluded.updated_at
+"#,
+    )
+    .bind(hour_utc)
+    .bind(now_unix_secs)
+    .bind(now_unix_secs)
+    .bind(start_unix_secs)
+    .bind(end_unix_secs)
+    .execute(&mut **tx)
+    .await
+    .map_sql_err()?;
+    Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
+}
+
+async fn upsert_sqlite_stats_hourly_model_provider_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hour_utc: i64,
+    start_unix_secs: i64,
+    end_unix_secs: i64,
+    now_unix_secs: i64,
+) -> Result<usize, DataLayerError> {
+    // Column shares mirror stats_daily_model_provider semantics: the four token
+    // columns sum to the same usage-fused total as the daily model-provider
+    // rollup (recorded total_tokens when present, otherwise the four-way
+    // component fallback), and both cost columns hold the settlement-preferred
+    // cost so hourly rows recompose the exact numbers the daily fast path
+    // serves today.
+    let result = sqlx::query(
+        r#"
+INSERT INTO stats_hourly_model_provider (
+  id, hour_utc, model, provider_name, total_requests,
+  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+  total_cost, settled_total_cost, response_time_sum_ms, response_time_samples,
+  created_at, updated_at
+)
+SELECT
+  lower(hex(randomblob(32))), ?, model, provider_name, COUNT(*),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) > 0 THEN MAX(COALESCE("usage".total_tokens, 0), 0)
+    ELSE 0 END), 0)
+    + COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN (
+      CASE
+        WHEN (
+          LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) IN ('openai', 'gemini', 'google')
+          OR LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) LIKE 'openai:%'
+          OR LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) LIKE 'gemini:%'
+          OR LOWER(COALESCE("usage".endpoint_api_format, "usage".api_format, '')) LIKE 'google:%'
+        ) AND COALESCE("usage".input_tokens, 0) > 0 AND COALESCE("usage".cache_read_input_tokens, 0) > 0
+        THEN MAX(COALESCE("usage".input_tokens, 0) - COALESCE("usage".cache_read_input_tokens, 0), 0)
+        ELSE MAX(COALESCE("usage".input_tokens, 0), 0)
+      END
+    ) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN MAX(COALESCE("usage".output_tokens, 0), 0) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN (
+    CASE WHEN COALESCE("usage".cache_creation_input_tokens, 0) = 0
+      AND (COALESCE("usage".cache_creation_ephemeral_5m_input_tokens, 0)
+         + COALESCE("usage".cache_creation_ephemeral_1h_input_tokens, 0)) > 0
+    THEN COALESCE("usage".cache_creation_ephemeral_5m_input_tokens, 0)
+       + COALESCE("usage".cache_creation_ephemeral_1h_input_tokens, 0)
+    ELSE MAX(COALESCE("usage".cache_creation_input_tokens, 0), 0) END
+  ) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE("usage".total_tokens, 0) <= 0 THEN MAX(COALESCE("usage".cache_read_input_tokens, 0), 0) ELSE 0 END), 0),
+  CAST(COALESCE(SUM(COALESCE(settlement.billing_total_cost_usd, "usage".total_cost_usd, 0)), 0) AS REAL),
+  CAST(COALESCE(SUM(CASE WHEN COALESCE(settlement.billing_status, "usage".billing_status) = 'settled' THEN COALESCE(settlement.billing_total_cost_usd, "usage".total_cost_usd, 0) ELSE 0 END), 0) AS REAL),
+  COALESCE(SUM(CASE WHEN "usage".response_time_ms IS NOT NULL THEN MAX(COALESCE("usage".response_time_ms, 0), 0) ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN "usage".response_time_ms IS NOT NULL THEN 1 ELSE 0 END), 0), ?, ?
+FROM "usage"
+LEFT JOIN usage_settlement_snapshots AS settlement
+  ON settlement.request_id = "usage".request_id
+WHERE created_at_unix_ms >= ? AND created_at_unix_ms < ?
+  AND model IS NOT NULL AND model <> ''
+  AND status NOT IN ('pending', 'streaming')
+  AND provider_name NOT IN ('unknown', 'pending')
+GROUP BY model, provider_name
+ON CONFLICT (hour_utc, model, provider_name) DO UPDATE SET
+  total_requests = excluded.total_requests,
+  input_tokens = excluded.input_tokens,
+  output_tokens = excluded.output_tokens,
+  cache_creation_tokens = excluded.cache_creation_tokens,
+  cache_read_tokens = excluded.cache_read_tokens,
+  total_cost = excluded.total_cost,
+  settled_total_cost = excluded.settled_total_cost,
+  response_time_sum_ms = excluded.response_time_sum_ms,
+  response_time_samples = excluded.response_time_samples,
   updated_at = excluded.updated_at
 "#,
     )

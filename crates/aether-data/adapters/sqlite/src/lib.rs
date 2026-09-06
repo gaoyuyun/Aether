@@ -26,7 +26,10 @@ mod users;
 mod video_tasks;
 mod wallet;
 
-pub use aether_data_contracts::{DataLayerError, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
+pub use aether_data_contracts::{
+    DataLayerError, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig,
+    DEFAULT_SQLITE_CACHE_MB,
+};
 pub use announcements::SqliteAnnouncementRepository;
 pub use audit::SqliteAuditLogReadRepository;
 pub use auth::SqliteAuthApiKeyReadRepository;

@@ -1194,6 +1194,22 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn recover_provider_quota_attempts(
+        &self,
+        now: u64,
+    ) -> Result<usize, DataLayerError> {
+        let Some(repository) = &self.provider_quota_writer else {
+            return Ok(0);
+        };
+        let recovered = repository.recover_attempts(None, 100, now, false).await?;
+        for record in &recovered {
+            tracing::info!(provider_id = %record.provider_id, candidate_id = %record.candidate_id,
+                quota_epoch = record.quota_epoch_start, known_cost_usd = record.known_cost_usd,
+                reason = %record.reason, "recovered monthly quota attempt");
+        }
+        Ok(recovered.len())
+    }
+
     pub(crate) async fn reset_due_provider_quotas(
         &self,
         now_unix_secs: u64,
@@ -1215,6 +1231,17 @@ impl GatewayDataState {
                     .request_reset(provider_id, effective_at_unix_secs)
                     .await
             }
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn request_provider_quota_adjustment(
+        &self,
+        provider_id: &str,
+        adjustment: &aether_data_contracts::repository::quota::ProviderQuotaAdjustment,
+    ) -> Result<bool, DataLayerError> {
+        match &self.provider_quota_writer {
+            Some(repository) => repository.request_adjustment(provider_id, adjustment).await,
             None => Ok(false),
         }
     }

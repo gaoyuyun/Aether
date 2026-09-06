@@ -1,6 +1,7 @@
 mod types;
 
 pub use types::{
-    ProviderQuotaReadRepository, ProviderQuotaRepository, ProviderQuotaWriteRepository,
-    StoredProviderQuotaSnapshot,
+    ProviderQuotaAdjustment, ProviderQuotaReadRepository, ProviderQuotaRecovery,
+    ProviderQuotaRepository, ProviderQuotaResetMode, ProviderQuotaTransition,
+    ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
 };

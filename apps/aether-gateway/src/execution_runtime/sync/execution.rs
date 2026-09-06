@@ -2834,6 +2834,11 @@ async fn execute_execution_runtime_sync_impl(
             local_failover_response_text.as_deref(),
             local_failover_analysis,
         );
+        crate::request_candidate_runtime::record_failed_monthly_candidate_usage(
+            state, &plan, report_context.as_ref(), &build_sync_report_payload(trace_id,
+                "error".to_string(), report_context.clone(), result.status_code, headers.clone(),
+                body_json.clone(), body_base64.clone(), result.telemetry.clone()),
+        ).await;
         record_local_request_candidate_status(
             state,
             &plan,
@@ -2917,6 +2922,11 @@ async fn execute_execution_runtime_sync_impl(
             local_failover_response_text.as_deref(),
             local_failover_analysis,
         );
+        crate::request_candidate_runtime::record_failed_monthly_candidate_usage(
+            state, &plan, report_context.as_ref(), &build_sync_report_payload(trace_id,
+                "error".to_string(), report_context.clone(), result.status_code, headers.clone(),
+                body_json.clone(), body_base64.clone(), result.telemetry.clone()),
+        ).await;
         record_local_request_candidate_status(
             state,
             &plan,
