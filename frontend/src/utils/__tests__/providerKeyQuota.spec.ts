@@ -87,6 +87,7 @@ describe('providerKeyQuota', () => {
           exhausted: false,
           windows: [
             {
+              code: 'account',
               scope: 'account',
               used_value: 2,
               limit_value: 10,

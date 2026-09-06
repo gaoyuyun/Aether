@@ -59,7 +59,7 @@ describe('module runtime store', () => {
   })
 
   it('does not let a request from the previous identity repopulate the store', async () => {
-    let resolveOld: ((value: ReturnType<typeof runtimeStatus>) => void) | null = null
+    let resolveOld: (value: ReturnType<typeof runtimeStatus>) => void = () => {}
     getRuntimeStatusMock.mockImplementationOnce(
       () => new Promise(resolve => { resolveOld = resolve })
     )
@@ -68,7 +68,7 @@ describe('module runtime store', () => {
     store.reset()
     getRuntimeStatusMock.mockResolvedValueOnce(runtimeStatus(false))
     await store.fetchRuntimeModules()
-    resolveOld?.(runtimeStatus(true))
+    resolveOld(runtimeStatus(true))
     await oldRequest
 
     expect(store.isActive('wallet')).toBe(false)

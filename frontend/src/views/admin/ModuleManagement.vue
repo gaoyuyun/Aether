@@ -96,7 +96,7 @@
                 <Switch
                   :model-value="tool.module.enabled"
                   :disabled="!tool.module.available || toggling[tool.module.name]"
-                  @update:model-value="(val: boolean) => toggleModule(tool.module.name, val)"
+                  @update:model-value="(val: boolean) => tool.module && toggleModule(tool.module.name, val)"
                 />
                 <span
                   class="text-sm"

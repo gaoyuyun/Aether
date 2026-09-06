@@ -102,10 +102,11 @@ export const PROXY_FIELD_GROUP: AuthTemplateFieldGroup = {
  * @returns 代理配置对象，展开到 connector.config 中
  */
 export function buildProxyConfig(formData: Record<string, unknown>): { proxy_node_id?: string } {
-  if (!formData.proxy_enabled || !formData.proxy_node_id) {
+  const proxyNodeId = formData.proxy_node_id
+  if (!formData.proxy_enabled || typeof proxyNodeId !== 'string' || !proxyNodeId) {
     return {}
   }
-  return { proxy_node_id: formData.proxy_node_id }
+  return { proxy_node_id: proxyNodeId }
 }
 
 /**

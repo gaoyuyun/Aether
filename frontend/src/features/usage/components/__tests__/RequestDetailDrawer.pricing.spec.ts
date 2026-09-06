@@ -399,7 +399,7 @@ describe('RequestDetailDrawer settlement pricing', () => {
       status: 'failed',
       status_code: 400,
       error_message: 'execution runtime stream returned non-success status 400',
-      response_body: null,
+      response_body: undefined,
     })
     await vi.waitFor(() => {
       expect(document.body.querySelector('[data-request-detail-model-badge="cyber"]')?.textContent)

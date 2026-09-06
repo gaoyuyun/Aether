@@ -1520,7 +1520,7 @@ function validateJsonCondition(rule: Record<string, unknown>, label: string, ind
   if (!isJsonObject(raw)) return formatJsonRuleError(label, index, 'condition 必须是对象')
   const shapeError = validateJsonConditionShape(raw, formatJsonRuleFieldLabel(label, index, 'condition'))
   if (shapeError) return shapeError
-  const editable = conditionToEditable(raw as BodyRule['condition'])
+  const editable = conditionToEditable(raw as unknown as BodyRule['condition'])
   const err = validateEditableCondition(editable)
   return err ? formatJsonRuleError(label, index, err) : null
 }

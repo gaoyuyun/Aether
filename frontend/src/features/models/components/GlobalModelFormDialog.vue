@@ -1084,6 +1084,7 @@ const VIDEO_RESOLUTION_PRICE_PRESETS: Record<
 }
 
 const embeddingApiFormats = [...EMBEDDING_API_FORMATS]
+const embeddingApiFormatSet = new Set<string>(embeddingApiFormats)
 
 interface FormData {
   name: string
@@ -1177,7 +1178,7 @@ function setEmbeddingEnabled(enabled: boolean) {
     setConfigField('embedding', undefined)
     if (form.value.config?.model_type === 'embedding') setConfigField('model_type', undefined)
     if (Array.isArray(form.value.config?.api_formats)
-      && form.value.config.api_formats.every((format) => embeddingApiFormats.includes(String(format)))) {
+      && form.value.config.api_formats.every((format) => embeddingApiFormatSet.has(String(format)))) {
       setConfigField('api_formats', undefined)
     }
   }

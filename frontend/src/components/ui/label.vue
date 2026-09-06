@@ -9,7 +9,8 @@ import { computed } from 'vue'
 import { cn } from '@/lib/utils'
 
 interface Props {
-  class?: string
+  /** Tailwind/Vue class binding accepts strings, arrays, and objects. */
+  class?: any
 }
 
 const props = defineProps<Props>()

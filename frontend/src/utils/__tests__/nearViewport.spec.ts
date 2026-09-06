@@ -58,10 +58,10 @@ describe('observeNearViewportOnce', () => {
     expect(onNearViewport).not.toHaveBeenCalled()
 
     observer?.callback([
-      { isIntersecting: true, target } as IntersectionObserverEntry,
+      { isIntersecting: true, target } as unknown as IntersectionObserverEntry,
     ], observer as unknown as IntersectionObserver)
     observer?.callback([
-      { isIntersecting: true, target } as IntersectionObserverEntry,
+      { isIntersecting: true, target } as unknown as IntersectionObserverEntry,
     ], observer as unknown as IntersectionObserver)
 
     expect(onNearViewport).toHaveBeenCalledTimes(1)
@@ -77,7 +77,7 @@ describe('observeNearViewportOnce', () => {
 
     stop()
     observer?.callback([
-      { isIntersecting: true, target } as IntersectionObserverEntry,
+      { isIntersecting: true, target } as unknown as IntersectionObserverEntry,
     ], observer as unknown as IntersectionObserver)
 
     expect(observer?.disconnect).toHaveBeenCalledTimes(1)

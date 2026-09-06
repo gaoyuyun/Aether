@@ -190,7 +190,7 @@ const hideUnknownRecords = useLocalStorage('usage-hide-unknown-records', false)
 const analyticsReady = ref(false)
 let analyticsLoadStarted = false
 let analyticsIdleHandle: number | null = null
-let analyticsFallbackTimer: ReturnType<typeof setTimeout> | null = null
+let analyticsFallbackTimer: number | null = null
 
 type IdleWindow = Window & {
   requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number

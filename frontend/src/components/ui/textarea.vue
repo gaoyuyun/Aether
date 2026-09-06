@@ -13,7 +13,8 @@ import { cn } from '@/lib/utils'
 
 interface Props {
   modelValue?: string
-  class?: string
+  /** Tailwind/Vue class binding accepts strings, arrays, and objects. */
+  class?: any
 }
 
 const props = defineProps<Props>()

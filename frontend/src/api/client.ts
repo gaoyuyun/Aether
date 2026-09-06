@@ -181,7 +181,7 @@ class ApiClient {
   /**
    * 处理响应错误
    */
-  private async handleResponseError(error: unknown): Promise<never> {
+  private async handleResponseError(error: unknown): Promise<AxiosResponse> {
     // 请求被取消
     if (axios.isCancel(error)) {
       return Promise.reject(error)

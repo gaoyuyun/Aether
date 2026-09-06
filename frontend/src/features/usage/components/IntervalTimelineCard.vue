@@ -186,7 +186,7 @@ function formatModelName(model: string): string {
 }
 
 // 构建图表数据
-const chartData = computed<ChartData<'scatter'>>(() => {
+const chartData = computed<ChartData<'scatter', Array<{ x: string; y: number }>>>(() => {
   if (!timelineData.value?.points) {
     return { datasets: [] }
   }

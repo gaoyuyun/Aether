@@ -154,7 +154,7 @@
                       </div>
                       <ProviderKeyActionCluster
                         :api-key="key"
-                        :provider-type="provider.provider_type"
+                        :provider-type="provider.provider_type ?? undefined"
                         :recoverable="isKeyRecoverable(key)"
                         :recover-title="getRecoverKeyTitle(key)"
                         :circuit-breaker-title="getKeyCircuitBreakerTitle(key)"
@@ -162,7 +162,7 @@
                         :health-score-bar-class="getHealthScoreBarColor(key.health_score || 0)"
                         :health-score-text-class="getHealthScoreColor(key.health_score || 0)"
                         :proxy-popover-open="proxyPopoverOpenKeyId === key.id"
-                        :proxy-node-name="getKeyProxyNodeName(key)"
+                        :proxy-node-name="getKeyProxyNodeName(key) ?? undefined"
                         :saving-proxy="savingProxyKeyId === key.id"
                         :toggling="togglingKeyId === key.id"
                         @recover="handleRecoverKey(key)"
@@ -855,7 +855,7 @@
     v-if="open && oauthAccountDialogOpen && provider"
     :open="oauthAccountDialogOpen"
     :provider-id="provider.id"
-    :provider-type="provider.provider_type"
+    :provider-type="provider.provider_type ?? null"
     @close="oauthAccountDialogOpen = false"
     @saved="handleKeyChanged"
   />
@@ -918,10 +918,10 @@
   <AntigravityQuotaDialog
     v-if="antigravityQuotaDialogKey"
     :open="antigravityQuotaDialogOpen"
-    :metadata="antigravityQuotaDialogKey.upstream_metadata"
+    :metadata="antigravityQuotaDialogKey.upstream_metadata ?? null"
     :quota-snapshot="antigravityQuotaDialogKey.status_snapshot?.quota ?? null"
     :key-name="antigravityQuotaDialogKey.name || legacyT('未命名密钥')"
-    :provider-id="providerId"
+    :provider-id="providerId ?? undefined"
     :key-id="antigravityQuotaDialogKey.id"
     @update:open="antigravityQuotaDialogOpen = $event"
   />
@@ -1049,6 +1049,7 @@ import {
 } from '@/utils/providerKeyStatus'
 import { getGeminiCliAccountCreditsText } from '@/utils/providerKeyQuota'
 import {
+  clearPendingCodexResetCreditIdempotencyKey,
   clearPendingCodexResetCreditIdempotencyKeyForOutcome,
   createCodexResetCreditIdempotencyKey,
   formatCodexResetCreditCount as formatCodexResetCreditCountLabel,
@@ -1548,7 +1549,8 @@ async function downloadRefreshToken(key: EndpointAPIKey) {
   try {
     const data = await exportKey(key.id)
     const providerType = provider.value?.provider_type || 'unknown'
-    const safeName = (data.email || key.name || key.id.slice(0, 8)).replace(/[^a-zA-Z0-9_\-@.]/g, '_')
+    const rawName = typeof data.email === 'string' ? data.email : (key.name || key.id.slice(0, 8))
+    const safeName = rawName.replace(/[^a-zA-Z0-9_\-@.]/g, '_')
 
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
@@ -1687,7 +1689,7 @@ async function handleClearOAuthInvalid(key: EndpointAPIKey) {
     title: legacyT('清除账号异常标记'),
     message: formatClearOAuthInvalidConfirmMessage(key),
     confirmText: legacyT('确认清除'),
-    variant: 'default',
+    variant: 'info',
   })
   if (!confirmed) return
 
@@ -2510,7 +2512,7 @@ function formatKiroUsage(value: number | undefined): string {
 }
 
 // 格式化 Kiro 重置时间
-function formatKiroResetTime(timestamp: number | undefined): string {
+function formatKiroResetTime(timestamp: number | null | undefined): string {
   if (!timestamp) return ''
   // timestamp 可能是毫秒或秒，需要判断
   const ts = timestamp > 1e12 ? timestamp : timestamp * 1000
@@ -2883,7 +2885,9 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
     if (refreshingQuota.value) return
     refreshingQuota.value = true
     try {
-      const result = await refreshProviderQuota(props.providerId)
+      const providerId = props.providerId
+      if (!providerId) return
+      const result = await refreshProviderQuota(providerId)
       applyQuotaResults(result.results)
       // 更新弹窗引用的 key 数据
       const updated = allKeys.value.find(({ key: k }) => k.id === key.id)
@@ -3327,7 +3331,8 @@ function getKeyRateMultiplier(key: EndpointAPIKey, format: string): number {
 }
 
 // OAuth 订阅类型格式化
-function formatOAuthPlanType(planType: string): string {
+function formatOAuthPlanType(planType: string | null | undefined): string {
+  if (!planType) return ''
   const labels: Record<string, string> = {
     plus: 'Plus',
     pro: 'Pro',

@@ -129,7 +129,8 @@ export const useAuthStore = defineStore('auth', () => {
 
     fetchCurrentUserToken = requestToken
     const requestAuthStateVersion = authStateVersion
-    const request = (async () => {
+    let request!: Promise<User | null>
+    request = (async () => {
       try {
         const userInfo = await authApi.getCurrentUser()
         if (requestAuthStateVersion !== authStateVersion || !token.value) {

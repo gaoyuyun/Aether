@@ -733,8 +733,9 @@ import {
 } from '@/api/global-models'
 import { log } from '@/utils/logger'
 import { formatUsageCount } from '@/utils/format'
-import { getProvidersSummary, type ProviderWithEndpointsSummary } from '@/api/endpoints/providers'
+import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getModelsDevList, type ModelsDevModelItem } from '@/api/models-dev'
+import type { ProviderWithEndpointsSummary } from '@/api/endpoints/types'
 import {
   buildGlobalModelPriceSyncPlan,
   cloneTieredPricingConfig,
@@ -763,6 +764,11 @@ interface ModelProviderDisplay {
   supports_extended_thinking?: boolean | null
   supports_embedding?: boolean | null
 }
+
+type ModelProviderActionTarget = Pick<
+  ModelProviderDisplay,
+  'id' | 'model_id' | 'name' | 'is_active'
+>
 
 const { success, error: showError } = useToast()
 const { copyToClipboard } = useClipboard()
@@ -871,7 +877,7 @@ function hasTieredPricing(model: GlobalModelResponse): boolean {
 // 检测是否有视频分辨率计费配置
 function hasVideoPricing(model: GlobalModelResponse): boolean {
   const priceByResolution = model.config?.billing?.video?.price_per_second_by_resolution
-  return priceByResolution && typeof priceByResolution === 'object' && Object.keys(priceByResolution).length > 0
+  return Boolean(priceByResolution && typeof priceByResolution === 'object' && Object.keys(priceByResolution).length > 0)
 }
 
 // 获取视频分辨率计费的数量
@@ -1731,8 +1737,15 @@ function handleDrawerOpenChange(value: boolean) {
 }
 
 // 编辑提供商模型
-function openEditProviderImplementation(provider: ModelProviderDisplay) {
-  editingProvider.value = provider
+function openEditProviderImplementation(provider: ModelProviderActionTarget) {
+  const fullProvider = selectedModelProviders.value.find(item => (
+    item.id === provider.id && item.model_id === provider.model_id
+  ))
+  if (!fullProvider) {
+    showError('未找到提供商模型详情，请刷新后重试')
+    return
+  }
+  editingProvider.value = fullProvider
   editProviderDialogOpen.value = true
 }
 
@@ -1752,7 +1765,7 @@ async function handleEditProviderSaved() {
 }
 
 // 切换关联提供商状态
-async function toggleProviderStatus(provider: ModelProviderDisplay) {
+async function toggleProviderStatus(provider: ModelProviderActionTarget) {
   if (!provider.model_id) {
     showError('缺少模型 ID')
     return
@@ -1772,7 +1785,7 @@ async function toggleProviderStatus(provider: ModelProviderDisplay) {
 }
 
 // 删除关联提供商
-async function confirmDeleteProviderImplementation(provider: ModelProviderDisplay) {
+async function confirmDeleteProviderImplementation(provider: ModelProviderActionTarget) {
   if (!provider.model_id) {
     showError('缺少模型 ID')
     return

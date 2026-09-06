@@ -1,4 +1,6 @@
-<template>
+  const requestId = props.requestId
+  if (!requestId || props.traceData) return
+  if (traceLoadInFlight) return traceLoadInFlight<template>
   <div class="minimal-request-timeline">
     <!-- Loading State -->
     <div
@@ -551,7 +553,7 @@ import Badge from '@/components/ui/badge.vue'
 import Skeleton from '@/components/ui/skeleton.vue'
 import JsonContentPanel from './JsonContentPanel.vue'
 import { ChevronLeft, ChevronRight, ExternalLink } from 'lucide-vue-next'
-import { requestTraceApi, type RequestTrace, type CandidateRecord, type ImageProgress } from '@/api/requestTrace'
+import { requestTraceApi, type RequestTrace, type CandidateRecord, type CandidateProxyInfo, type ImageProgress } from '@/api/requestTrace'
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
 import { formatTokens } from '@/utils/format'
@@ -708,8 +710,8 @@ const formatSize = (bytes: number): string => {
 }
 
 // 代理 timing 分阶段展示
-const proxyTimingBreakdown = (proxy: Record<string, unknown>): string => {
-  const t = proxy.timing as Record<string, number | null | undefined> | undefined
+const proxyTimingBreakdown = (proxy: CandidateProxyInfo): string => {
+  const t = proxy.timing
   if (!t) return ''
 
   const parts: string[] = []
@@ -921,7 +923,7 @@ const buildProviderGroups = (items: CandidateRecord[]): NodeGroup[] => {
       return
     }
 
-    currentGroup = {
+    const group: NodeGroup = {
       id: providerKey,
       providerName: getProviderDisplayName(candidate),
       primary: candidate,
@@ -935,7 +937,8 @@ const buildProviderGroups = (items: CandidateRecord[]): NodeGroup[] => {
       providerApiFormat: candidate.extra_data?.provider_api_format || null,
       isPoolGroup: false,
     }
-    groups.push(currentGroup)
+    currentGroup = group
+    groups.push(group)
   })
 
   return groups
@@ -1890,7 +1893,8 @@ const formatAuthTypeWithPlan = (authType: string, planType?: string): string => 
   return typeName
 }
 
-const poolSelectionLabel = (reason: string): string => {
+const poolSelectionLabel = (reason: string | undefined): string => {
+  if (!reason) return ""
   const labels: Record<string, string> = {
     sticky: '粘性会话',
     lru: 'LRU',
@@ -1900,7 +1904,8 @@ const poolSelectionLabel = (reason: string): string => {
   return labels[reason] || reason
 }
 
-const poolSkipLabel = (type: string): string => {
+const poolSkipLabel = (type: string | undefined): string => {
+  if (!type) return ""
   const labels: Record<string, string> = {
     cooldown: '冷却中',
     cost_exhausted: '额度耗尽',
@@ -2094,7 +2099,8 @@ const navigateAttempt = (direction: number) => {
 // 加载请求追踪数据
 const isSilentRefresh = ref(false)
 const loadTrace = async (silent = false) => {
-  if (!props.requestId || props.traceData) return
+  const requestId = props.requestId
+  if (!requestId || props.traceData) return
   if (traceLoadInFlight) return traceLoadInFlight
 
   traceLoadInFlight = (async () => {
@@ -2107,7 +2113,7 @@ const loadTrace = async (silent = false) => {
     error.value = null
 
     try {
-      internalTrace.value = await requestTraceApi.getRequestTrace(props.requestId, { attemptedOnly: true })
+      internalTrace.value = await requestTraceApi.getRequestTrace(requestId, { attemptedOnly: true })
     } catch (err: unknown) {
       if (isAxiosError(err) && err.response?.status === 404) {
         internalTrace.value = null

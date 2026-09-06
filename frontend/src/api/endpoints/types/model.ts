@@ -67,13 +67,30 @@ export interface ProviderTieredPricingConfig {
   [key: string]: unknown
 }
 
+export interface ModelVideoBillingConfig {
+  price_per_second_by_resolution?: Record<string, number>
+  [key: string]: unknown
+}
+
+export interface ModelBillingConfig {
+  video?: ModelVideoBillingConfig
+  [key: string]: unknown
+}
+
+export interface ModelConfig {
+  billing?: ModelBillingConfig
+  [key: string]: unknown
+}
+
 export interface Model {
   id: string
   provider_id: string
   global_model_id: string  // 关联的 GlobalModel ID
   provider_model_name: string  // Provider 侧的主模型名称
   provider_model_mappings?: ProviderModelMapping[] | null  // 模型名称映射列表（带优先级）
-  config?: Record<string, unknown> | null  // 额外配置（如 billing/video 等）
+  config?: ModelConfig | null  // 额外配置（如 billing/video 等）
+  api_format?: string | null
+  effective_api_format?: string | null
   // 原始配置值（可能为空，为空时使用 GlobalModel 默认值）
   price_per_request?: number | null  // 按次计费价格
   tiered_pricing?: ProviderTieredPricingConfig | null  // Provider 原始覆盖，可仅包含 processing_tiers
@@ -102,7 +119,7 @@ export interface Model {
   global_model_name?: string
   global_model_display_name?: string
   // 有效配置（合并 Model 和 GlobalModel 的 config）
-  effective_config?: Record<string, unknown> | null
+  effective_config?: ModelConfig | null
   model_test_capabilities?: ModelTestCapabilities | null
 }
 
@@ -264,6 +281,7 @@ export interface GlobalModelResponse {
   id: string
   name: string
   display_name: string
+  description?: string | null
   is_active: boolean
   // 按次计费配置
   default_price_per_request?: number
@@ -273,7 +291,7 @@ export interface GlobalModelResponse {
   supported_capabilities?: string[] | null
   supports_embedding?: boolean | null
   // 模型配置（JSON格式）
-  config?: Record<string, unknown> | null
+  config?: ModelConfig | null
   // 统计数据
   provider_count?: number
   active_provider_count?: number

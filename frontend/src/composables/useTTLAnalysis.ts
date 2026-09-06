@@ -162,7 +162,7 @@ export function useTTLAnalysis() {
   }
 
   // 用户时间线散点图数据
-  const userTimelineChartData = computed<ChartData<'scatter'>>(() => {
+  const userTimelineChartData = computed<ChartData<'scatter', Array<{ x: string; y: number }>>>(() => {
     if (!userTimelineData.value || userTimelineData.value.points.length === 0) {
       return { datasets: [] }
     }

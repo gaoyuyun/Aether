@@ -326,6 +326,7 @@ import {
 
 interface ProviderPriorityRow {
   id: string
+  kind: 'provider' | 'pool'
   name: string
   is_active: boolean
   api_formats: string[]
@@ -444,6 +445,7 @@ const providerRows = computed<ProviderPriorityRow[]>(() => {
   return providers.value
     .map(provider => ({
       id: provider.id,
+      kind: poolProviderIds.value.has(provider.id) ? 'pool' as const : 'provider' as const,
       name: provider.name,
       is_active: provider.is_active,
       api_formats: provider.api_formats ?? [],

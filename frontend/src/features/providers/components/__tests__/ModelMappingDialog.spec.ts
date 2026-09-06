@@ -136,7 +136,7 @@ describe('ModelMappingDialog', () => {
       id: 'model-1',
       provider_model_name: 'provider-model-1',
       provider_model_mappings: [],
-    } as Model
+    } as unknown as Model
     const root = document.createElement('div')
     document.body.appendChild(root)
     const app = createApp(defineComponent({
@@ -174,7 +174,7 @@ describe('ModelMappingDialog', () => {
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
       provider_model_mappings: [],
-    } as Model
+    } as unknown as Model
     const open = ref(false)
     const root = document.createElement('div')
     document.body.appendChild(root)

@@ -93,8 +93,8 @@
                 <span class="text-sm font-medium text-foreground">{{ group.title }}</span>
                 <div class="flex items-center gap-2">
                   <span class="text-xs text-muted-foreground">启用代理</span>
-                  <Switch
-                    :model-value="formData[group.toggleKey] || false"
+:model-value="(typeof formData[group.toggleKey] === 'boolean' ? formData[group.toggleKey] : false) as boolean"
+                    :model-value="typeof formData[group.toggleKey] === 'boolean' ? formData[group.toggleKey] : false"
                     @update:model-value="handleProxyToggle(group.toggleKey, $event)"
                   />
                 </div>
@@ -107,7 +107,7 @@
               >
                 <ProxyNodeSelect
                   ref="proxyNodeSelectRef"
-                  :model-value="formData.proxy_node_id || ''"
+                  :model-value="typeof formData.proxy_node_id === 'string' ? formData.proxy_node_id : ''"
                   trigger-class="h-8"
                   @update:model-value="(v: string) => { formData.proxy_node_id = v; handleFieldChange('proxy_node_id', v) }"
                 />
@@ -146,7 +146,8 @@
                   <!-- 文本输入 -->
                   <Input
                     v-if="field.type === 'text'"
-                    v-model="formData[field.key]"
+                    :model-value="formData[field.key] as string | number | undefined"
+                    @update:model-value="formData[field.key] = $event"
                     :placeholder="field.sensitive ? (sensitivePlaceholders[field.key] || field.placeholder) : field.placeholder"
                     :masked="field.sensitive"
                     disable-autofill
@@ -156,7 +157,8 @@
                   <!-- 密码/敏感输入 -->
                   <Input
                     v-else-if="field.type === 'password'"
-                    v-model="formData[field.key]"
+                    :model-value="formData[field.key] as string | number | undefined"
+                    @update:model-value="formData[field.key] = $event"
                     :placeholder="sensitivePlaceholders[field.key] || field.placeholder"
                     masked
                     @update:model-value="handleFieldChange(field.key, $event)"
@@ -182,7 +184,8 @@
                   <!-- 文本输入 -->
                   <Input
                     v-if="field.type === 'text'"
-                    v-model="formData[field.key]"
+                    :model-value="formData[field.key] as string | number | undefined"
+                    @update:model-value="formData[field.key] = $event"
                     :placeholder="field.sensitive ? (sensitivePlaceholders[field.key] || field.placeholder) : field.placeholder"
                     :masked="field.sensitive"
                     disable-autofill
@@ -192,7 +195,8 @@
                   <!-- 密码/敏感输入 -->
                   <Input
                     v-else-if="field.type === 'password'"
-                    v-model="formData[field.key]"
+                    :model-value="formData[field.key] as string | number | undefined"
+                    @update:model-value="formData[field.key] = $event"
                     :placeholder="sensitivePlaceholders[field.key] || field.placeholder"
                     masked
                     @update:model-value="handleFieldChange(field.key, $event)"
@@ -201,7 +205,8 @@
                   <!-- 下拉选择 -->
                   <Select
                     v-else-if="field.type === 'select'"
-                    v-model="formData[field.key]"
+                    :model-value="formData[field.key] as string | undefined"
+                    @update:model-value="formData[field.key] = $event; handleFieldChange(field.key, $event)"
                     @update:model-value="handleFieldChange(field.key, $event)"
                   >
                     <SelectTrigger>
@@ -221,7 +226,8 @@
                   <!-- 多行文本 -->
                   <Textarea
                     v-else-if="field.type === 'textarea'"
-                    v-model="formData[field.key]"
+                    :model-value="formData[field.key] as string | undefined"
+                    @update:model-value="formData[field.key] = $event"
                     :placeholder="field.placeholder"
                     rows="3"
                     @update:model-value="handleFieldChange(field.key, $event)"
@@ -346,6 +352,7 @@ import {
   getProviderOpsConfig,
   deleteProviderOpsConfig,
   type ArchitectureInfo,
+  type VerifyAuthRequest,
   type QuotaAlertConfig,
 } from '@/api/providerOps'
 import { parseApiError } from '@/utils/errorParser'
@@ -464,7 +471,9 @@ const canVerify = computed(() => {
   const error = validateFromSchema(schema, dataToValidate)
   if (error) return false
 
-  const effectiveBaseUrl = formData.value.base_url || props.providerWebsite
+  const effectiveBaseUrl = typeof formData.value.base_url === 'string' && formData.value.base_url
+      ? formData.value.base_url
+      : props.providerWebsite
   return !!effectiveBaseUrl
 })
 
@@ -533,7 +542,7 @@ function resetFormData() {
   // 初始化表单数据
   const data: Record<string, unknown> = {}
   for (const [key, prop] of Object.entries(schema.properties)) {
-    data[key] = (prop as Record<string, unknown>)['x-default-value'] ?? ''
+    data[key] = (prop as { 'x-default-value'?: string })['x-default-value'] ?? ''
   }
   // 代理相关默认值
   data.proxy_enabled = false
@@ -575,7 +584,9 @@ async function handleVerify() {
     return
   }
 
-  const effectiveBaseUrl = formData.value.base_url || props.providerWebsite
+  const effectiveBaseUrl = typeof formData.value.base_url === 'string' && formData.value.base_url
+      ? formData.value.base_url
+      : props.providerWebsite
   if (!effectiveBaseUrl) {
     showError('请填写 API 地址')
     return
@@ -590,9 +601,9 @@ async function handleVerify() {
       formData.value,
       props.providerWebsite,
     )
-    const verifyRequest = {
+    const verifyRequest: VerifyAuthRequest = {
       ...request,
-      base_url: request.base_url || effectiveBaseUrl,
+      base_url: request.base_url || effectiveBaseUrl || '',
     }
     const result = await verifyProviderAuth(props.providerId, verifyRequest)
 
@@ -672,7 +683,9 @@ async function handleSave() {
     return
   }
 
-  const effectiveBaseUrl = formData.value.base_url || props.providerWebsite
+  const effectiveBaseUrl = typeof formData.value.base_url === 'string' && formData.value.base_url
+      ? formData.value.base_url
+      : props.providerWebsite
   if (!effectiveBaseUrl) {
     showError('请填写 API 地址')
     return

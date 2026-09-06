@@ -115,10 +115,8 @@ interface DisplayLine extends JsonLine {
 }
 
 /** JSON data can be any serializable value: object, array, string, number, boolean, null */
-type JsonValue = Record<string, unknown> | unknown[] | string | number | boolean | null | undefined
-
 const props = defineProps<{
-  data: JsonValue
+  data: unknown
   viewMode: 'formatted' | 'raw' | 'compare'
   expandDepth: number
   isDark: boolean

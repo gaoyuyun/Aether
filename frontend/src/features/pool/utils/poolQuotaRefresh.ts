@@ -20,7 +20,8 @@ export function mergePoolKeyQuotaSnapshots(
       ...key,
       quota_updated_at: quotaSnapshot.updated_at ?? quotaSnapshot.observed_at ?? key.quota_updated_at ?? null,
       status_snapshot: {
-        ...(key.status_snapshot ?? {}),
+        oauth: key.status_snapshot?.oauth ?? { code: 'none' },
+        account: key.status_snapshot?.account ?? { code: 'ok', blocked: false },
         quota: quotaSnapshot,
       },
     }

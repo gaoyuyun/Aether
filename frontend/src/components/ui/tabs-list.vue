@@ -17,7 +17,7 @@ import { computed, ref, watch, onMounted, onUnmounted, nextTick, inject, type Re
 import { cn } from '@/lib/utils'
 
 interface Props {
-  class?: string
+  class?: any
 }
 
 const props = defineProps<Props>()

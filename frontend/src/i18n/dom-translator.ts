@@ -102,7 +102,10 @@ function translateDom(root: ParentNode, locale: Locale): void {
 function scheduleDomTranslation(locale: Ref<Locale>): void {
   if (scheduled) return
   scheduled = true
-  requestAnimationFrame(() => {
+  const schedule = typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function'
+    ? window.requestAnimationFrame.bind(window)
+    : (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 16)
+  schedule(() => {
     scheduled = false
     if (document.body) {
       translateDom(document.body, locale.value)

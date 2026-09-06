@@ -42,8 +42,8 @@
                     <span class="shrink-0">·</span>
                     <span
                       class="text-xs truncate"
-                      :title="model.config?.description"
-                    >{{ model.config?.description }}</span>
+                      :title="typeof model.config?.description === 'string' ? model.config.description : '' "
+                    >{{ typeof model.config?.description === 'string' ? model.config.description : '' }}</span>
                   </template>
                 </div>
               </div>
@@ -516,7 +516,7 @@
                 ref="modelMappingsTabRef"
                 :global-model-id="model.id"
                 :model-name="model.name"
-                :mappings="model.config?.model_mappings || []"
+                :mappings="Array.isArray(model.config?.model_mappings) ? model.config.model_mappings : []"
                 :routing-data="routingData"
                 :loading-preview="routingLoading"
                 @update="handleMappingsUpdate"
@@ -577,9 +577,9 @@ const emit = defineEmits<{
   'editModel': [model: GlobalModelResponse]
   'toggleModelStatus': [model: GlobalModelResponse]
   'addProvider': []
-  'editProvider': [provider: Record<string, unknown>]
-  'deleteProvider': [provider: Record<string, unknown>]
-  'toggleProviderStatus': [provider: Record<string, unknown>]
+  'editProvider': [provider: { id: string; model_id?: string | null; name: string; is_active: boolean }]
+  'deleteProvider': [provider: { id: string; model_id?: string | null; name: string; is_active: boolean }]
+  'toggleProviderStatus': [provider: { id: string; model_id?: string | null; name: string; is_active: boolean }]
   'refreshModel': []
   'linkProvider': [providerId: string]
   'linkProviders': [providerIds: string[]]
@@ -662,7 +662,11 @@ defineExpose({
 
 // 检测是否有视频分辨率计费配置
 const hasVideoPricing = computed(() => {
-  const priceByResolution = props.model?.config?.billing?.video?.price_per_second_by_resolution
+  const billing = props.model?.config?.billing
+  if (!billing || typeof billing !== 'object') return false
+  const video = (billing as Record<string, unknown>).video
+  if (!video || typeof video !== 'object') return false
+  const priceByResolution = (video as Record<string, unknown>).price_per_second_by_resolution
   return priceByResolution && typeof priceByResolution === 'object' && Object.keys(priceByResolution).length > 0
 })
 

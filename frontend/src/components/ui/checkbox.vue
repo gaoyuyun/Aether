@@ -18,7 +18,8 @@ interface Props {
   modelValue?: boolean
   checked?: boolean
   indeterminate?: boolean
-  class?: string
+  /** Tailwind/Vue class binding accepts strings, arrays, and objects. */
+  class?: any
 }
 
 const props = defineProps<Props>()

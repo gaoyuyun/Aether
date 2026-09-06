@@ -445,7 +445,7 @@ export const MOCK_ADMIN_API_KEYS: AdminApiKeysResponse = {
 
 // ========== Provider 数据 ==========
 
-export const MOCK_PROVIDERS: ProviderWithEndpointsSummary[] = [
+export const MOCK_PROVIDERS = [
   {
     id: 'provider-001',
     name: 'DuckCodingFree',
@@ -621,7 +621,7 @@ export const MOCK_PROVIDERS: ProviderWithEndpointsSummary[] = [
     created_at: '2024-12-07T23:00:42.559105+08:00',
     updated_at: new Date().toISOString()
   }
-]
+] as unknown as ProviderWithEndpointsSummary[]
 
 // ========== GlobalModel 数据 ==========
 

@@ -55,7 +55,7 @@
         <Select
           :model-value="aggregateMergeMode"
           :open="aggregateMergeModeSelectOpen"
-          @update:model-value="$emit('update:aggregateMergeMode', $event)"
+          @update:model-value="handleAggregateMergeModeUpdate"
           @update:open="$emit('update:aggregateMergeModeSelectOpen', $event)"
         >
           <SelectTrigger>
@@ -209,13 +209,19 @@ const props = defineProps<{
   importAggregateProgress: ImportProgressState | null
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   confirm: []
   'update:aggregateImportDialogOpen': [value: boolean]
   'update:aggregateImportResultDialogOpen': [value: boolean]
   'update:aggregateMergeMode': [value: 'skip' | 'overwrite' | 'error']
   'update:aggregateMergeModeSelectOpen': [value: boolean]
 }>()
+
+function handleAggregateMergeModeUpdate(value: string | number) {
+  if (value === 'skip' || value === 'overwrite' || value === 'error') {
+    emit('update:aggregateMergeMode', value)
+  }
+}
 
 const warningMessages = computed(() => {
   if (!props.aggregateImportResult) return []

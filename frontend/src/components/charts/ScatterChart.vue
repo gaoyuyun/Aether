@@ -82,7 +82,8 @@ ChartJS.register(
 )
 
 interface Props {
-  data: ChartData<'scatter'>
+  // Time scales accept ISO string x values although Chart.js' Point type is numeric.
+  data: ChartData<'scatter', any>
   options?: ChartOptions<'scatter'>
   height?: number
   compressGaps?: boolean
@@ -114,13 +115,13 @@ interface GapInfo {
 }
 
 const chartRef = ref<HTMLCanvasElement>()
-let chart: ChartJS<'scatter'> | null = null
+let chart: ChartJS<'scatter', any> | null = null
 
 const crosshairY = ref<number | null>(null)
 const gapInfoList = ref<GapInfo[]>([])
 
 interface PreparedRenderData {
-  chartData: ChartData<'scatter'>
+  chartData: ChartData<'scatter', any>
   gaps: GapInfo[]
 }
 
@@ -202,8 +203,8 @@ function toRealValue(displayValue: number): number {
 }
 
 // 压缩时间间隙的数据转换
-function compressTimeGaps(data: ChartData<'scatter'>): {
-  data: ChartData<'scatter'>
+function compressTimeGaps(data: ChartData<'scatter', any>): {
+  data: ChartData<'scatter', any>
   gaps: GapInfo[]
   timeMapping: Map<number, number> // 原始时间 -> 压缩后时间
 } {
@@ -265,7 +266,7 @@ function compressTimeGaps(data: ChartData<'scatter'>): {
   }
 
   // 转换数据
-  const compressedData: ChartData<'scatter'> = {
+  const compressedData: ChartData<'scatter', any> = {
     ...data,
     datasets: data.datasets.map(dataset => ({
       ...dataset,
@@ -285,7 +286,7 @@ function compressTimeGaps(data: ChartData<'scatter'>): {
 }
 
 // 转换数据点的 Y 值
-function transformData(data: ChartData<'scatter'>): ChartData<'scatter'> {
+function transformData(data: ChartData<'scatter', any>): ChartData<'scatter', any> {
   return {
     ...data,
     datasets: data.datasets.map(dataset => ({

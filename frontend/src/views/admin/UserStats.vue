@@ -160,7 +160,7 @@ const timeRange = ref<DateRangeParams>(getDateRangeFromPeriod('last7days'))
 const metric = ref<'requests' | 'tokens' | 'cost'>('requests')
 
 const users = ref<User[]>([])
-const selectedUserId = ref<string | null>(null)
+const selectedUserId = ref<string>('')
 const compareUserId = ref<string>('__none__')
 
 const leaderboard = ref<LeaderboardItem[]>([])
@@ -176,6 +176,13 @@ interface UsageSummary {
 interface TimeSeriesItem {
   date: string
   total_cost: number
+}
+
+function normalizeTimeSeries(items: Array<Record<string, unknown>>): TimeSeriesItem[] {
+  return items.map((item) => ({
+    date: typeof item.date === 'string' ? item.date : '',
+    total_cost: typeof item.total_cost === 'number' ? item.total_cost : 0,
+  }))
 }
 
 const userSummary = ref<UsageSummary | null>(null)
@@ -253,7 +260,12 @@ async function loadSummary() {
       user_id: selectedUserId.value
     })
     if (requestId !== summaryRequestId) return
-    userSummary.value = summary
+    userSummary.value = {
+      total_requests: summary.total_requests ?? 0,
+      total_tokens: summary.total_tokens ?? 0,
+      total_cost: summary.total_cost ?? 0,
+      error_rate: summary.error_rate ?? 0,
+    }
   } finally {
     if (requestId === summaryRequestId) {
       summaryLoading.value = false
@@ -275,11 +287,11 @@ async function loadSeries() {
       ? adminApi.getTimeSeries({
         ...buildTimeRangeParams(),
         user_id: compareUserId.value
-      })
+      }).then(normalizeTimeSeries)
       : Promise.resolve([])
 
     const [primarySeries, compareSeries] = await Promise.all([
-      adminApi.getTimeSeries(baseParams),
+      adminApi.getTimeSeries(baseParams).then(normalizeTimeSeries),
       comparePromise
     ])
 

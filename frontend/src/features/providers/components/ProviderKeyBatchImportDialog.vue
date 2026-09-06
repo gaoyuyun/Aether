@@ -459,7 +459,7 @@ function buildSettingsPayload(
     cache_ttl_minutes: source.cache_ttl_minutes,
     max_probe_interval_minutes: source.max_probe_interval_minutes,
     is_active: source.is_active,
-    note: source.note.trim() || null,
+    note: source.note?.trim() || null,
     ...((source.proxy_node_id || includeEmptyProxy)
       ? { proxy_node_id: source.proxy_node_id || null }
       : {}),

@@ -343,7 +343,7 @@ export interface PoolBatchAction {
     | 'clear_proxy'
     | 'set_proxy'
     | 'update_settings'
-  payload?: Record<string, unknown> | null
+  payload?: Record<string, unknown> | PoolKeySettingsPatch | null
 }
 
 export interface PoolKeySharedSettingsPatch {
@@ -507,7 +507,7 @@ export async function batchActionPoolKeys(
   providerId: string,
   body: PoolBatchAction,
 ): Promise<{ affected: number; message: string; task_id?: string }> {
-  const response = await client.post(
+  const response = await client.post<{ affected: number; message: string; task_id?: string }>(
     `/api/admin/pool/${providerId}/keys/batch-action`,
     body,
     { timeout: POOL_BATCH_ACTION_TIMEOUT_MS },
@@ -560,7 +560,7 @@ export async function getPoolBatchDeleteTask(
 export async function cleanupBannedPoolKeys(
   providerId: string,
 ): Promise<{ affected: number; message: string }> {
-  const response = await client.post(
+  const response = await client.post<{ affected: number; message: string }>(
     `/api/admin/pool/${providerId}/keys/cleanup-banned`,
     undefined,
     { timeout: POOL_BATCH_ACTION_TIMEOUT_MS },

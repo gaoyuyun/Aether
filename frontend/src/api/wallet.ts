@@ -224,7 +224,10 @@ export const walletApi = {
     order: PaymentOrder
     payment_instructions: Record<string, unknown>
   }> {
-    const response = await apiClient.post('/api/wallet/recharge', payload)
+    const response = await apiClient.post<{
+    order: PaymentOrder
+    payment_instructions: Record<string, unknown>
+  }>('/api/wallet/recharge', payload)
     return response.data
   },
 
@@ -239,12 +242,17 @@ export const walletApi = {
     limit: number
     offset: number
   }> {
-    const response = await apiClient.get('/api/wallet/recharge', { params })
+    const response = await apiClient.get<{
+    items: PaymentOrder[]
+    total: number
+    limit: number
+    offset: number
+  }>('/api/wallet/recharge', { params })
     return response.data
   },
 
   async getRechargeOrder(orderId: string): Promise<{ order: PaymentOrder }> {
-    const response = await apiClient.get(`/api/wallet/recharge/${orderId}`)
+    const response = await apiClient.get<{ order: PaymentOrder }>(`/api/wallet/recharge/${orderId}`)
     return response.data
   },
 
@@ -254,7 +262,12 @@ export const walletApi = {
     limit: number
     offset: number
   }> {
-    const response = await apiClient.get('/api/wallet/refunds', { params })
+    const response = await apiClient.get<{
+    items: RefundRequest[]
+    total: number
+    limit: number
+    offset: number
+  }>('/api/wallet/refunds', { params })
     return response.data
   },
 
