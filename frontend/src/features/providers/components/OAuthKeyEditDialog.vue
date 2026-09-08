@@ -390,9 +390,9 @@ async function handleSave() {
       model_exclude_patterns: parsePatternText(form.value.model_exclude_patterns_text)
     }
 
-    const updated = await updateProviderKey(props.editingKey.id, updateData)
+    const updatedKey = await updateProviderKey(props.editingKey.id, updateData)
     success('账号已更新', '成功')
-    emit('saved', updated)
+    emit('saved', updatedKey)
     emit('close')
   } catch (err: unknown) {
     const errorMessage = parseApiError(err, '保存失败')

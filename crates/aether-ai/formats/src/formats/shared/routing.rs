@@ -4,13 +4,14 @@ use url::form_urlencoded;
 use crate::contracts::{
     ClientSurface, CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CHAT_SYNC_PLAN_KIND,
     CLAUDE_CLI_STREAM_PLAN_KIND, CLAUDE_CLI_SYNC_PLAN_KIND, CLAUDE_COUNT_TOKENS_SYNC_PLAN_KIND,
-    GEMINI_CHAT_STREAM_PLAN_KIND, GEMINI_CHAT_SYNC_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND,
-    GEMINI_CLI_SYNC_PLAN_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND, GEMINI_FILES_DELETE_PLAN_KIND,
-    GEMINI_FILES_DOWNLOAD_PLAN_KIND, GEMINI_FILES_GET_PLAN_KIND, GEMINI_FILES_LIST_PLAN_KIND,
-    GEMINI_FILES_UPLOAD_PLAN_KIND, GEMINI_INTERACTIONS_STREAM_PLAN_KIND,
-    GEMINI_INTERACTIONS_SYNC_PLAN_KIND, GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND,
-    GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND,
-    OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND,
+    CODEX_LIVE_STREAM_PLAN_KIND, GEMINI_CHAT_STREAM_PLAN_KIND, GEMINI_CHAT_SYNC_PLAN_KIND,
+    GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND,
+    GEMINI_FILES_DELETE_PLAN_KIND, GEMINI_FILES_DOWNLOAD_PLAN_KIND, GEMINI_FILES_GET_PLAN_KIND,
+    GEMINI_FILES_LIST_PLAN_KIND, GEMINI_FILES_UPLOAD_PLAN_KIND,
+    GEMINI_INTERACTIONS_STREAM_PLAN_KIND, GEMINI_INTERACTIONS_SYNC_PLAN_KIND,
+    GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND, GEMINI_VIDEO_CREATE_SYNC_PLAN_KIND,
+    OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND, OPENAI_EMBEDDING_SYNC_PLAN_KIND,
+    OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND, OPENAI_REALTIME_STREAM_PLAN_KIND,
     OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND,
     OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND, OPENAI_RESPONSES_STREAM_PLAN_KIND,
     OPENAI_RESPONSES_SYNC_PLAN_KIND, OPENAI_SEARCH_SYNC_PLAN_KIND,
@@ -114,6 +115,23 @@ pub fn resolve_execution_runtime_stream_plan_kind_with_client_surface(
         && path == "/v1/responses"
     {
         return Some(OPENAI_RESPONSES_STREAM_PLAN_KIND);
+    }
+
+    if route_family == Some("openai")
+        && route_kind == Some("realtime")
+        && *method == Method::GET
+        && path == "/v1/realtime"
+    {
+        return Some(OPENAI_REALTIME_STREAM_PLAN_KIND);
+    }
+
+    if route_family == Some("codex")
+        && route_kind == Some("live")
+        && ((*method == Method::GET
+            && (path == "/v1/live" || path.starts_with("/v1/live/") || path == "/v1/realtime"))
+            || (*method == Method::POST && matches!(path, "/v1/live" | "/v1/realtime/calls")))
+    {
+        return Some(CODEX_LIVE_STREAM_PLAN_KIND);
     }
 
     if route_family == Some("openai")
@@ -411,7 +429,31 @@ pub fn sanitize_request_path(path: &str) -> Option<String> {
         .map(|(path, _)| path)
         .unwrap_or_else(|| path.trim())
         .trim();
-    (!path.is_empty()).then(|| path.to_string())
+    if path.is_empty() {
+        return None;
+    }
+    if path
+        .strip_prefix("/v1/live/")
+        .is_some_and(|call_id| !call_id.is_empty())
+    {
+        // A Live call id identifies an in-progress WebRTC session. Keep this
+        // bearer-like capability out of logs and persisted request metadata,
+        // including for malformed routes that will later be rejected.
+        return Some("/v1/live/{call_id}".to_string());
+    }
+    Some(sanitize_sensitive_request_path(path))
+}
+
+fn sanitize_sensitive_request_path(path: &str) -> String {
+    for prefix in ["/install-tunnel/", "/install/", "/i/"] {
+        if path
+            .strip_prefix(prefix)
+            .is_some_and(|secret| !secret.is_empty())
+        {
+            return format!("{prefix}[redacted]");
+        }
+    }
+    path.to_string()
 }
 
 pub fn sanitize_request_query_string(query: &str) -> Option<String> {
@@ -440,19 +482,48 @@ pub fn sanitize_request_path_and_query(path: &str, query: Option<&str>) -> Optio
         return None;
     }
 
+    let sanitized_path = sanitize_request_path(path)?;
     let sanitized_query = query
-        .and_then(sanitize_request_query_string)
-        .or_else(|| embedded_query.and_then(sanitize_request_query_string));
+        .and_then(|query| sanitize_request_query_string_for_path(path, query))
+        .or_else(|| {
+            embedded_query.and_then(|query| sanitize_request_query_string_for_path(path, query))
+        });
     Some(match sanitized_query {
-        Some(query) => format!("{path}?{query}"),
-        None => path.to_string(),
+        Some(query) => format!("{sanitized_path}?{query}"),
+        None => sanitized_path,
     })
+}
+
+fn sanitize_request_query_string_for_path(path: &str, query: &str) -> Option<String> {
+    if path != "/v1/realtime" {
+        return sanitize_request_query_string(query);
+    }
+
+    let query = query.trim().trim_start_matches('?').trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    let mut redacted_call_id = false;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key.eq_ignore_ascii_case("call_id") {
+            if !value.trim().is_empty() && !redacted_call_id {
+                serializer.append_pair("call_id", "{call_id}");
+                redacted_call_id = true;
+            }
+        } else if request_query_key_is_safe_to_trace(key.as_ref()) {
+            serializer.append_pair(key.as_ref(), value.as_ref());
+        }
+    }
+    let sanitized = serializer.finish();
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 fn request_query_key_is_safe_to_trace(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
-        "alt" | "view" | "pagesize" | "page_size" | "limit" | "offset"
+        "alt" | "view" | "pagesize" | "page_size" | "limit" | "offset" | "model"
     )
 }
 
@@ -528,6 +599,8 @@ pub fn supports_stream_execution_decision_kind(plan_kind: &str) -> bool {
     matches!(
         plan_kind,
         OPENAI_CHAT_STREAM_PLAN_KIND
+            | CODEX_LIVE_STREAM_PLAN_KIND
+            | OPENAI_REALTIME_STREAM_PLAN_KIND
             | CLAUDE_CHAT_STREAM_PLAN_KIND
             | GEMINI_CHAT_STREAM_PLAN_KIND
             | OPENAI_RESPONSES_STREAM_PLAN_KIND
@@ -554,14 +627,15 @@ mod tests {
     };
     use crate::contracts::{
         CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CHAT_SYNC_PLAN_KIND, CLAUDE_CLI_STREAM_PLAN_KIND,
-        CLAUDE_CLI_SYNC_PLAN_KIND, GEMINI_CHAT_STREAM_PLAN_KIND, GEMINI_CHAT_SYNC_PLAN_KIND,
-        GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND,
-        GEMINI_INTERACTIONS_STREAM_PLAN_KIND, GEMINI_INTERACTIONS_SYNC_PLAN_KIND,
-        OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_CHAT_SYNC_PLAN_KIND, OPENAI_EMBEDDING_SYNC_PLAN_KIND,
-        OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND, OPENAI_RERANK_SYNC_PLAN_KIND,
-        OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND, OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND,
-        OPENAI_RESPONSES_STREAM_PLAN_KIND, OPENAI_RESPONSES_SYNC_PLAN_KIND,
-        OPENAI_SEARCH_SYNC_PLAN_KIND,
+        CLAUDE_CLI_SYNC_PLAN_KIND, CODEX_LIVE_STREAM_PLAN_KIND, GEMINI_CHAT_STREAM_PLAN_KIND,
+        GEMINI_CHAT_SYNC_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND,
+        GEMINI_EMBEDDING_SYNC_PLAN_KIND, GEMINI_INTERACTIONS_STREAM_PLAN_KIND,
+        GEMINI_INTERACTIONS_SYNC_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND,
+        OPENAI_CHAT_SYNC_PLAN_KIND, OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND,
+        OPENAI_IMAGE_SYNC_PLAN_KIND, OPENAI_REALTIME_STREAM_PLAN_KIND,
+        OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND,
+        OPENAI_RESPONSES_COMPACT_SYNC_PLAN_KIND, OPENAI_RESPONSES_STREAM_PLAN_KIND,
+        OPENAI_RESPONSES_SYNC_PLAN_KIND, OPENAI_SEARCH_SYNC_PLAN_KIND,
     };
 
     #[test]
@@ -630,6 +704,61 @@ mod tests {
         ));
         assert!(supports_stream_execution_decision_kind(
             OPENAI_RESPONSES_STREAM_PLAN_KIND
+        ));
+    }
+
+    #[test]
+    fn resolves_openai_realtime_as_websocket_stream_only() {
+        assert_eq!(
+            resolve_execution_runtime_stream_plan_kind(
+                Some("ai_public"),
+                Some("openai"),
+                Some("realtime"),
+                None,
+                &Method::GET,
+                "/v1/realtime",
+            ),
+            Some(OPENAI_REALTIME_STREAM_PLAN_KIND)
+        );
+        assert_eq!(
+            resolve_execution_runtime_sync_plan_kind(
+                Some("ai_public"),
+                Some("openai"),
+                Some("realtime"),
+                None,
+                &Method::GET,
+                "/v1/realtime",
+            ),
+            None
+        );
+        assert!(supports_stream_execution_decision_kind(
+            OPENAI_REALTIME_STREAM_PLAN_KIND
+        ));
+    }
+
+    #[test]
+    fn resolves_codex_live_call_create_and_websocket_routes() {
+        for (method, path) in [
+            (Method::POST, "/v1/live"),
+            (Method::POST, "/v1/realtime/calls"),
+            (Method::GET, "/v1/live"),
+            (Method::GET, "/v1/live/rtc_opaque"),
+            (Method::GET, "/v1/realtime"),
+        ] {
+            assert_eq!(
+                resolve_execution_runtime_stream_plan_kind(
+                    Some("ai_public"),
+                    Some("codex"),
+                    Some("live"),
+                    None,
+                    &method,
+                    path,
+                ),
+                Some(CODEX_LIVE_STREAM_PLAN_KIND)
+            );
+        }
+        assert!(supports_stream_execution_decision_kind(
+            CODEX_LIVE_STREAM_PLAN_KIND
         ));
     }
 
@@ -870,6 +999,61 @@ mod tests {
             )
             .as_deref(),
             Some("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse")
+        );
+        assert_eq!(
+            sanitize_request_path_and_query(
+                "/v1/live/rtc_secret_opaque?alt=sse&token=hidden",
+                None
+            )
+            .as_deref(),
+            Some("/v1/live/{call_id}?alt=sse")
+        );
+        assert_eq!(
+            sanitize_request_path_and_query(
+                "/v1/realtime?model=gpt-realtime-2.1&api_key=secret&token=hidden",
+                None
+            )
+            .as_deref(),
+            Some("/v1/realtime?model=gpt-realtime-2.1")
+        );
+        assert_eq!(
+            sanitize_request_path_and_query(
+                "/v1/realtime?intent=quicksilver&call_id=rtc_secret_opaque&model=gpt-realtime-1.5&api_key=secret",
+                None
+            )
+            .as_deref(),
+            Some("/v1/realtime?call_id=%7Bcall_id%7D&model=gpt-realtime-1.5")
+        );
+        assert_eq!(
+            sanitize_request_path_and_query(
+                "/v1/realtime?c%61ll_id=rtc_secret_encoded&call_id=rtc_duplicate",
+                None
+            )
+            .as_deref(),
+            Some("/v1/realtime?call_id=%7Bcall_id%7D")
+        );
+    }
+
+    #[test]
+    fn request_path_metadata_sanitizer_redacts_install_session_codes() {
+        for (raw, expected) in [
+            ("/install/secret-code", "/install/[redacted]"),
+            ("/install/secret-code.ps1", "/install/[redacted]"),
+            ("/i/secret-code", "/i/[redacted]"),
+            (
+                "/install-tunnel/secret-code.ps1?token=also-secret",
+                "/install-tunnel/[redacted]",
+            ),
+        ] {
+            assert_eq!(sanitize_request_path(raw).as_deref(), Some(expected));
+            assert_eq!(
+                sanitize_request_path_and_query(raw, None).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            sanitize_request_path("/install/").as_deref(),
+            Some("/install/")
         );
     }
 

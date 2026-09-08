@@ -1,4 +1,14 @@
 use super::{StoredRequestUsageAudit, UpsertUsageRecord};
+use serde_json::{Map, Value};
+
+const MAX_USAGE_CANDIDATE_INDEX: u64 = i32::MAX as u64;
+const MAX_USAGE_CANDIDATE_ID_LEN: usize = 128;
+const MAX_USAGE_KEY_NAME_LEN: usize = 255;
+const MAX_USAGE_PLANNER_KIND_LEN: usize = 64;
+const MAX_USAGE_ROUTE_FAMILY_LEN: usize = 80;
+const MAX_USAGE_ROUTE_KIND_LEN: usize = 80;
+const MAX_USAGE_EXECUTION_PATH_LEN: usize = 80;
+const MAX_USAGE_RUNTIME_MISS_REASON_LEN: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ApiKeyUsageContribution {
@@ -201,10 +211,287 @@ pub fn usage_can_recover_terminal_failure(
         && incoming_usage_can_recover_terminal_failure(incoming_status, incoming_billing_status)
 }
 
+/// Decide whether an incoming lifecycle event may replace an existing usage revision.
+///
+/// `updated_at_unix_secs` is authoritative. `finalized_at_unix_secs` breaks ties when writers
+/// observe multiple transitions in the same second. Equal pending revisions may still progress to
+/// streaming or terminal states, while every terminal replay requires a strictly newer revision.
+/// The explicit void-failure recovery remains available at an equal revision, but never for an
+/// older event.
+#[allow(clippy::too_many_arguments)]
+pub fn usage_lifecycle_update_allowed(
+    existing_status: &str,
+    existing_billing_status: &str,
+    existing_updated_at_unix_secs: u64,
+    existing_finalized_at_unix_secs: Option<u64>,
+    incoming_status: &str,
+    incoming_billing_status: &str,
+    incoming_updated_at_unix_secs: u64,
+    incoming_finalized_at_unix_secs: Option<u64>,
+) -> bool {
+    let existing_revision = (
+        existing_updated_at_unix_secs,
+        existing_finalized_at_unix_secs.unwrap_or_default(),
+    );
+    let incoming_revision = (
+        incoming_updated_at_unix_secs,
+        incoming_finalized_at_unix_secs.unwrap_or_default(),
+    );
+    if incoming_revision < existing_revision {
+        return false;
+    }
+
+    let can_recover = usage_can_recover_terminal_failure(
+        existing_status,
+        existing_billing_status,
+        incoming_status,
+        incoming_billing_status,
+    );
+    let existing_is_terminal = matches!(existing_status, "completed" | "failed" | "cancelled");
+    let incoming_is_terminal = matches!(incoming_status, "completed" | "failed" | "cancelled");
+    if existing_is_terminal && !incoming_is_terminal {
+        return false;
+    }
+    if existing_status == "streaming" && incoming_status == "pending" {
+        return false;
+    }
+    if incoming_revision == existing_revision && existing_is_terminal && incoming_is_terminal {
+        return can_recover;
+    }
+
+    true
+}
+
 pub fn strip_deprecated_usage_display_fields(mut usage: UpsertUsageRecord) -> UpsertUsageRecord {
     usage.username = None;
     usage.api_key_name = None;
     usage
+}
+
+pub fn sanitize_usage_for_persistence(mut usage: UpsertUsageRecord) -> UpsertUsageRecord {
+    usage = strip_deprecated_usage_display_fields(usage);
+    sanitize_usage_routing_fields(&mut usage, None);
+    usage.error_message = None;
+    usage.error_category = sanitize_usage_error_category(usage.error_category);
+    if usage.error_category.is_none() && usage.status == "failed" {
+        usage.error_category = usage
+            .status_code
+            .map(usage_error_category_for_status_code)
+            .map(str::to_string);
+    }
+    usage.request_metadata = super::sanitize_usage_request_metadata(usage.request_metadata);
+    usage.request_headers = None;
+    usage.request_body = None;
+    usage.request_body_ref = None;
+    usage.request_body_state = None;
+    usage.provider_request_headers = None;
+    usage.provider_request_body = None;
+    usage.provider_request_body_ref = None;
+    usage.provider_request_body_state = None;
+    usage.response_headers = None;
+    usage.response_body = None;
+    usage.response_body_ref = None;
+    usage.response_body_state = None;
+    usage.client_response_headers = None;
+    usage.client_response_body = None;
+    usage.client_response_body_ref = None;
+    usage.client_response_body_state = None;
+    usage
+}
+
+/// Project an event onto the non-content controls accepted by auxiliary usage storage.
+///
+/// Explicit `none` states are retained only as tombstones for removing historical captures.
+/// Every header, body, reference, and non-clear capture state is discarded.
+pub fn sanitize_usage_capture_controls_for_persistence(
+    mut usage: UpsertUsageRecord,
+) -> UpsertUsageRecord {
+    // Routing facts are allowed in the transient event metadata for compatibility with older
+    // writers. Project only the known scalar fields into typed slots before the general metadata
+    // sanitizer drops unknown keys. This keeps snapshots useful without re-persisting arbitrary
+    // metadata (or any body/header material).
+    let metadata = usage
+        .request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned();
+    sanitize_usage_routing_fields(&mut usage, metadata.as_ref());
+    let clear_request_body = usage.request_body_state == Some(super::UsageBodyCaptureState::None);
+    let clear_provider_request_body =
+        usage.provider_request_body_state == Some(super::UsageBodyCaptureState::None);
+    let clear_response_body = usage.response_body_state == Some(super::UsageBodyCaptureState::None);
+    let clear_client_response_body =
+        usage.client_response_body_state == Some(super::UsageBodyCaptureState::None);
+
+    let mut usage = sanitize_usage_for_persistence(usage);
+    usage.request_body_state = clear_request_body.then_some(super::UsageBodyCaptureState::None);
+    usage.provider_request_body_state =
+        clear_provider_request_body.then_some(super::UsageBodyCaptureState::None);
+    usage.response_body_state = clear_response_body.then_some(super::UsageBodyCaptureState::None);
+    usage.client_response_body_state =
+        clear_client_response_body.then_some(super::UsageBodyCaptureState::None);
+    usage
+}
+
+fn sanitize_usage_routing_fields(
+    usage: &mut UpsertUsageRecord,
+    metadata: Option<&Map<String, Value>>,
+) {
+    usage.candidate_id = sanitize_usage_routing_string_with_metadata(
+        usage.candidate_id.take(),
+        metadata,
+        "candidate_id",
+        MAX_USAGE_CANDIDATE_ID_LEN,
+        false,
+    );
+    usage.candidate_index =
+        sanitize_usage_routing_index_with_metadata(usage.candidate_index.take(), metadata);
+    usage.key_name = sanitize_usage_routing_string_with_metadata(
+        usage.key_name.take(),
+        metadata,
+        "key_name",
+        MAX_USAGE_KEY_NAME_LEN,
+        true,
+    );
+    usage.planner_kind = sanitize_usage_routing_string_with_metadata(
+        usage.planner_kind.take(),
+        metadata,
+        "planner_kind",
+        MAX_USAGE_PLANNER_KIND_LEN,
+        false,
+    );
+    usage.route_family = sanitize_usage_routing_string_with_metadata(
+        usage.route_family.take(),
+        metadata,
+        "route_family",
+        MAX_USAGE_ROUTE_FAMILY_LEN,
+        false,
+    );
+    usage.route_kind = sanitize_usage_routing_string_with_metadata(
+        usage.route_kind.take(),
+        metadata,
+        "route_kind",
+        MAX_USAGE_ROUTE_KIND_LEN,
+        false,
+    );
+    usage.execution_path = sanitize_usage_routing_string_with_metadata(
+        usage.execution_path.take(),
+        metadata,
+        "execution_path",
+        MAX_USAGE_EXECUTION_PATH_LEN,
+        false,
+    );
+    usage.local_execution_runtime_miss_reason = sanitize_usage_routing_string_with_metadata(
+        usage.local_execution_runtime_miss_reason.take(),
+        metadata,
+        "local_execution_runtime_miss_reason",
+        MAX_USAGE_RUNTIME_MISS_REASON_LEN,
+        false,
+    );
+}
+
+fn sanitize_usage_routing_string_with_metadata(
+    typed: Option<String>,
+    metadata: Option<&Map<String, Value>>,
+    key: &str,
+    max_len: usize,
+    allow_spaces: bool,
+) -> Option<String> {
+    match typed {
+        Some(value) => sanitize_usage_routing_string(Some(value), max_len, allow_spaces),
+        None => metadata_routing_string(metadata, key, max_len, allow_spaces),
+    }
+}
+
+fn sanitize_usage_routing_index_with_metadata(
+    typed: Option<u64>,
+    metadata: Option<&Map<String, Value>>,
+) -> Option<u64> {
+    match typed {
+        Some(value) => sanitize_usage_routing_index(Some(value)),
+        None => metadata
+            .and_then(|object| object.get("candidate_index"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                    .filter(|value| *value <= MAX_USAGE_CANDIDATE_INDEX)
+            }),
+    }
+}
+
+fn metadata_routing_string(
+    metadata: Option<&Map<String, Value>>,
+    key: &str,
+    max_len: usize,
+    allow_spaces: bool,
+) -> Option<String> {
+    metadata
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_str)
+        .and_then(|value| {
+            sanitize_usage_routing_string(Some(value.to_string()), max_len, allow_spaces)
+        })
+}
+
+fn sanitize_usage_routing_index(value: Option<u64>) -> Option<u64> {
+    value.filter(|value| *value <= MAX_USAGE_CANDIDATE_INDEX)
+}
+
+fn sanitize_usage_routing_string(
+    value: Option<String>,
+    max_len: usize,
+    allow_spaces: bool,
+) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() || value.len() > max_len {
+        return None;
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || b"._:/@+-".contains(&byte) || (allow_spaces && byte == b' ')
+    }) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+pub(crate) fn sanitize_usage_error_category(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_ascii_lowercase();
+    let category = match value.as_str() {
+        "auth"
+        | "cancelled"
+        | "client_error"
+        | "http_error"
+        | "non_success_status"
+        | "provider_error"
+        | "rate_limit"
+        | "redirect"
+        | "server_error"
+        | "stream_missing_terminal_event"
+        | "stream_terminal_error"
+        | "upstream_error" => value,
+        "" => return None,
+        _ => "other_error".to_string(),
+    };
+    Some(category)
+}
+
+/// Return the bounded error category represented by an HTTP status code.
+///
+/// Stale-request cleanup may have only a candidate status code available.  Do
+/// not persist provider-supplied diagnostic text in that case; derive one of
+/// the same fixed categories used by the usage writer instead.
+pub fn usage_error_category_for_status_code(status_code: u16) -> &'static str {
+    if status_code >= 500 {
+        "server_error"
+    } else if status_code >= 400 {
+        "client_error"
+    } else if status_code >= 300 {
+        "redirect"
+    } else {
+        "non_success_status"
+    }
 }
 
 pub fn provider_api_key_usage_is_success(
@@ -254,12 +541,15 @@ pub fn provider_api_key_usage_contribution(
         request_count: 1,
         success_count: i64::from(is_success),
         error_count: i64::from(is_error),
-        total_tokens: if is_in_flight {
+        total_tokens: if is_in_flight || !usage.usage_available() {
             0
         } else {
             i64::try_from(usage.total_tokens).unwrap_or(i64::MAX)
         },
-        total_cost_usd: if is_in_flight {
+        total_cost_usd: if is_in_flight
+            || !usage.usage_available()
+            || !usage.usage_pricing_available()
+        {
             0.0
         } else if usage.total_cost_usd.is_finite() {
             usage.total_cost_usd.max(0.0)
@@ -308,8 +598,14 @@ pub fn api_key_usage_contribution(
     Some(ApiKeyUsageContribution {
         api_key_id,
         total_requests: 1,
-        total_tokens: i64::try_from(usage.total_tokens).unwrap_or(i64::MAX),
-        total_cost_usd: if usage.total_cost_usd.is_finite() {
+        total_tokens: if usage.usage_available() {
+            i64::try_from(usage.total_tokens).unwrap_or(i64::MAX)
+        } else {
+            0
+        },
+        total_cost_usd: if !usage.usage_available() || !usage.usage_pricing_available() {
+            0.0
+        } else if usage.total_cost_usd.is_finite() {
             usage.total_cost_usd.max(0.0)
         } else {
             0.0
@@ -323,5 +619,437 @@ fn newer_last_used_at(before: Option<u64>, after: Option<u64>) -> Option<u64> {
         (Some(before), Some(after)) if after > before => Some(after),
         (None, Some(after)) => Some(after),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        sanitize_usage_capture_controls_for_persistence, sanitize_usage_error_category,
+        sanitize_usage_for_persistence, usage_error_category_for_status_code,
+        usage_lifecycle_update_allowed,
+    };
+    use crate::repository::usage::{UpsertUsageRecord, UsageBodyCaptureState};
+
+    fn usage_with_http_capture() -> UpsertUsageRecord {
+        UpsertUsageRecord {
+            request_id: "req-sensitive-capture".to_string(),
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("key-1".to_string()),
+            username: Some("alice".to_string()),
+            api_key_name: Some("primary".to_string()),
+            provider_name: "OpenAI".to_string(),
+            model: "gpt-5".to_string(),
+            target_model: None,
+            provider_id: Some("provider-1".to_string()),
+            provider_endpoint_id: None,
+            provider_api_key_id: None,
+            request_type: Some("chat".to_string()),
+            api_format: Some("openai:chat".to_string()),
+            api_family: Some("openai".to_string()),
+            endpoint_kind: Some("chat".to_string()),
+            endpoint_api_format: Some("openai:chat".to_string()),
+            provider_api_family: Some("openai".to_string()),
+            provider_endpoint_kind: Some("chat".to_string()),
+            has_format_conversion: Some(false),
+            is_stream: Some(false),
+            input_tokens: Some(1),
+            output_tokens: Some(2),
+            total_tokens: Some(3),
+            cache_creation_input_tokens: None,
+            cache_creation_ephemeral_5m_input_tokens: None,
+            cache_creation_ephemeral_1h_input_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_cost_usd: None,
+            cache_read_cost_usd: None,
+            output_price_per_1m: None,
+            total_cost_usd: Some(0.01),
+            actual_total_cost_usd: Some(0.01),
+            status_code: Some(200),
+            error_message: Some("Bearer secret".to_string()),
+            error_category: Some("provider_error".to_string()),
+            response_time_ms: Some(10),
+            first_byte_time_ms: Some(5),
+            status: "completed".to_string(),
+            billing_status: "settled".to_string(),
+            request_headers: Some(json!({"authorization": "Bearer secret"})),
+            request_body: Some(json!({"prompt": "private"})),
+            request_body_ref: Some("usage://request/body".to_string()),
+            request_body_state: Some(UsageBodyCaptureState::Reference),
+            provider_request_headers: Some(json!({"x-api-key": "secret"})),
+            provider_request_body: Some(json!({"prompt": "private"})),
+            provider_request_body_ref: Some("usage://provider/body".to_string()),
+            provider_request_body_state: Some(UsageBodyCaptureState::Inline),
+            response_headers: Some(json!({"set-cookie": "secret"})),
+            response_body: Some(json!({"output": "private"})),
+            response_body_ref: Some("usage://response/body".to_string()),
+            response_body_state: Some(UsageBodyCaptureState::Truncated),
+            client_response_headers: Some(json!({"x-private": "secret"})),
+            client_response_body: Some(json!({"output": "private"})),
+            client_response_body_ref: Some("usage://client/body".to_string()),
+            client_response_body_state: Some(UsageBodyCaptureState::Disabled),
+            candidate_id: Some("candidate-1".to_string()),
+            candidate_index: Some(0),
+            key_name: None,
+            planner_kind: None,
+            route_family: None,
+            route_kind: None,
+            execution_path: None,
+            local_execution_runtime_miss_reason: None,
+            request_metadata: Some(json!({"client_ip": "203.0.113.8"})),
+            finalized_at_unix_secs: Some(2),
+            created_at_unix_ms: Some(1_000),
+            updated_at_unix_secs: 2,
+        }
+    }
+
+    #[test]
+    fn usage_error_categories_are_bounded_to_controlled_values() {
+        assert_eq!(
+            sanitize_usage_error_category(Some(" Server_Error ".to_string())).as_deref(),
+            Some("server_error")
+        );
+        assert_eq!(
+            sanitize_usage_error_category(Some("Authorization: Bearer secret".to_string()))
+                .as_deref(),
+            Some("other_error")
+        );
+        assert_eq!(sanitize_usage_error_category(Some("  ".to_string())), None);
+    }
+
+    #[test]
+    fn status_codes_map_to_bounded_error_categories() {
+        assert_eq!(usage_error_category_for_status_code(599), "server_error");
+        assert_eq!(usage_error_category_for_status_code(400), "client_error");
+        assert_eq!(usage_error_category_for_status_code(302), "redirect");
+        assert_eq!(
+            usage_error_category_for_status_code(200),
+            "non_success_status"
+        );
+    }
+
+    #[test]
+    fn persistence_derives_missing_failed_category_from_status_code() {
+        let mut usage = usage_with_http_capture();
+        usage.status = "failed".to_string();
+        usage.status_code = Some(429);
+        usage.error_category = None;
+
+        let usage = sanitize_usage_for_persistence(usage);
+        assert_eq!(usage.error_category.as_deref(), Some("client_error"));
+    }
+
+    #[test]
+    fn persistence_boundary_drops_all_http_capture_material() {
+        let usage = sanitize_usage_for_persistence(usage_with_http_capture());
+
+        assert!(usage.username.is_none());
+        assert!(usage.api_key_name.is_none());
+        assert!(usage.error_message.is_none());
+        assert!(usage.request_headers.is_none());
+        assert!(usage.request_body.is_none());
+        assert!(usage.request_body_ref.is_none());
+        assert!(usage.request_body_state.is_none());
+        assert!(usage.provider_request_headers.is_none());
+        assert!(usage.provider_request_body.is_none());
+        assert!(usage.provider_request_body_ref.is_none());
+        assert!(usage.provider_request_body_state.is_none());
+        assert!(usage.response_headers.is_none());
+        assert!(usage.response_body.is_none());
+        assert!(usage.response_body_ref.is_none());
+        assert!(usage.response_body_state.is_none());
+        assert!(usage.client_response_headers.is_none());
+        assert!(usage.client_response_body.is_none());
+        assert!(usage.client_response_body_ref.is_none());
+        assert!(usage.client_response_body_state.is_none());
+        assert_eq!(usage.error_category.as_deref(), Some("provider_error"));
+        assert_eq!(usage.candidate_id.as_deref(), Some("candidate-1"));
+        assert_eq!(
+            usage.request_metadata,
+            Some(json!({"client_ip": "203.0.113.8"}))
+        );
+    }
+
+    #[test]
+    fn auxiliary_capture_projection_keeps_only_explicit_clear_tombstones() {
+        let mut input = usage_with_http_capture();
+        input.request_body_state = Some(UsageBodyCaptureState::None);
+        input.response_body_state = Some(UsageBodyCaptureState::Disabled);
+
+        let usage = sanitize_usage_capture_controls_for_persistence(input);
+
+        assert!(usage.request_headers.is_none());
+        assert!(usage.request_body.is_none());
+        assert!(usage.request_body_ref.is_none());
+        assert_eq!(usage.request_body_state, Some(UsageBodyCaptureState::None));
+        assert!(usage.provider_request_body_state.is_none());
+        assert!(usage.response_body_state.is_none());
+        assert!(usage.client_response_body_state.is_none());
+    }
+
+    #[test]
+    fn auxiliary_projection_promotes_only_bounded_routing_metadata() {
+        let mut input = usage_with_http_capture();
+        input.candidate_id = None;
+        input.candidate_index = None;
+        input.key_name = None;
+        input.planner_kind = None;
+        input.route_family = None;
+        input.route_kind = None;
+        input.execution_path = None;
+        input.local_execution_runtime_miss_reason = None;
+        input.request_metadata = Some(json!({
+            "trace_id": "trace",
+            "candidate_id": "candidate-from-metadata",
+            "candidate_index": 7,
+            "key_name": "primary key",
+            "planner_kind": "fallback",
+            "route_family": "chat",
+            "route_kind": "remote",
+            "execution_path": "execution_runtime_stream",
+            "local_execution_runtime_miss_reason": "runtime_busy",
+            "authorization": "Bearer should-not-persist",
+        }));
+
+        let usage = sanitize_usage_capture_controls_for_persistence(input);
+
+        assert_eq!(
+            usage.candidate_id.as_deref(),
+            Some("candidate-from-metadata")
+        );
+        assert_eq!(usage.candidate_index, Some(7));
+        assert_eq!(usage.key_name.as_deref(), Some("primary key"));
+        assert_eq!(usage.planner_kind.as_deref(), Some("fallback"));
+        assert_eq!(usage.route_family.as_deref(), Some("chat"));
+        assert_eq!(usage.route_kind.as_deref(), Some("remote"));
+        assert_eq!(
+            usage.execution_path.as_deref(),
+            Some("execution_runtime_stream")
+        );
+        assert_eq!(
+            usage.local_execution_runtime_miss_reason.as_deref(),
+            Some("runtime_busy")
+        );
+        assert_eq!(usage.request_metadata, Some(json!({"trace_id": "trace"})));
+    }
+
+    #[test]
+    fn routing_projection_rejects_unbounded_or_control_character_values() {
+        let mut input = usage_with_http_capture();
+        input.candidate_id = Some("candidate\nforged".to_string());
+        input.candidate_index = Some(u64::MAX);
+        input.key_name = Some("key\0name".to_string());
+        input.planner_kind = Some("p".repeat(65));
+        input.route_family = Some("route\tname".to_string());
+        input.route_kind = Some("route-kind".to_string());
+        input.execution_path = Some("execution-path".to_string());
+        input.local_execution_runtime_miss_reason = Some("m".repeat(121));
+
+        let usage = sanitize_usage_for_persistence(input);
+
+        assert!(usage.candidate_id.is_none());
+        assert!(usage.candidate_index.is_none());
+        assert!(usage.key_name.is_none());
+        assert!(usage.planner_kind.is_none());
+        assert!(usage.route_family.is_none());
+        assert_eq!(usage.route_kind.as_deref(), Some("route-kind"));
+        assert_eq!(usage.execution_path.as_deref(), Some("execution-path"));
+        assert!(usage.local_execution_runtime_miss_reason.is_none());
+    }
+
+    #[test]
+    fn invalid_typed_routing_values_do_not_fall_back_to_metadata() {
+        let mut input = usage_with_http_capture();
+        input.candidate_id = Some("candidate\nforged".to_string());
+        input.candidate_index = Some(u64::MAX);
+        input.key_name = Some("key\0name".to_string());
+        input.planner_kind = Some("p".repeat(65));
+        input.route_family = Some("route\tname".to_string());
+        input.route_kind = Some("route\nkind".to_string());
+        input.execution_path = Some("execution\npath".to_string());
+        input.local_execution_runtime_miss_reason = Some("m".repeat(121));
+        input.request_metadata = Some(json!({
+            "candidate_id": "metadata-candidate",
+            "candidate_index": 7,
+            "key_name": "metadata key",
+            "planner_kind": "metadata-planner",
+            "route_family": "metadata-family",
+            "route_kind": "metadata-kind",
+            "execution_path": "metadata-path",
+            "local_execution_runtime_miss_reason": "metadata-reason",
+        }));
+
+        let usage = sanitize_usage_capture_controls_for_persistence(input);
+
+        assert!(usage.candidate_id.is_none());
+        assert!(usage.candidate_index.is_none());
+        assert!(usage.key_name.is_none());
+        assert!(usage.planner_kind.is_none());
+        assert!(usage.route_family.is_none());
+        assert!(usage.route_kind.is_none());
+        assert!(usage.execution_path.is_none());
+        assert!(usage.local_execution_runtime_miss_reason.is_none());
+    }
+
+    #[test]
+    fn lifecycle_order_rejects_stale_and_equal_conflicting_terminal_events() {
+        assert!(!usage_lifecycle_update_allowed(
+            "completed",
+            "pending",
+            20,
+            Some(20),
+            "failed",
+            "void",
+            19,
+            Some(19),
+        ));
+        assert!(!usage_lifecycle_update_allowed(
+            "completed",
+            "pending",
+            20,
+            Some(20),
+            "failed",
+            "void",
+            20,
+            Some(20),
+        ));
+        assert!(!usage_lifecycle_update_allowed(
+            "completed",
+            "pending",
+            20,
+            Some(20),
+            "completed",
+            "settled",
+            20,
+            Some(20),
+        ));
+        assert!(usage_lifecycle_update_allowed(
+            "completed",
+            "pending",
+            20,
+            Some(20),
+            "failed",
+            "void",
+            21,
+            Some(21),
+        ));
+    }
+
+    #[test]
+    fn lifecycle_order_allows_same_second_progress_and_fresh_void_recovery() {
+        assert!(usage_lifecycle_update_allowed(
+            "pending",
+            "pending",
+            20,
+            None,
+            "streaming",
+            "pending",
+            20,
+            None,
+        ));
+        assert!(usage_lifecycle_update_allowed(
+            "streaming",
+            "pending",
+            20,
+            None,
+            "completed",
+            "pending",
+            20,
+            Some(20),
+        ));
+        assert!(usage_lifecycle_update_allowed(
+            "failed",
+            "void",
+            20,
+            Some(20),
+            "completed",
+            "pending",
+            20,
+            Some(20),
+        ));
+        assert!(!usage_lifecycle_update_allowed(
+            "failed",
+            "void",
+            20,
+            Some(21),
+            "completed",
+            "pending",
+            20,
+            Some(20),
+        ));
+    }
+
+    use super::{api_key_usage_contribution, provider_api_key_usage_contribution};
+    use crate::repository::usage::StoredRequestUsageAudit;
+
+    fn authoritative_unpriced_usage() -> StoredRequestUsageAudit {
+        let mut usage = StoredRequestUsageAudit::new(
+            "usage-realtime".to_string(),
+            "request-realtime".to_string(),
+            None,
+            Some("downstream-key".to_string()),
+            None,
+            None,
+            "OpenAI".to_string(),
+            "gpt-realtime".to_string(),
+            None,
+            Some("provider-realtime".to_string()),
+            Some("endpoint-realtime".to_string()),
+            Some("provider-key-realtime".to_string()),
+            Some("realtime".to_string()),
+            Some("openai:realtime".to_string()),
+            Some("openai".to_string()),
+            Some("realtime".to_string()),
+            Some("openai:realtime".to_string()),
+            Some("openai".to_string()),
+            Some("realtime".to_string()),
+            false,
+            true,
+            120,
+            40,
+            160,
+            9.75,
+            11.25,
+            Some(200),
+            None,
+            None,
+            Some(250),
+            Some(30),
+            "completed".to_string(),
+            "void".to_string(),
+            100,
+            101,
+            Some(102),
+        )
+        .expect("usage should build");
+        usage.request_metadata = Some(json!({
+            "usage_available": true,
+            "usage_pricing_available": false,
+            "realtime_session": {
+                "input_audio_tokens": 20,
+                "output_audio_tokens": 10,
+            }
+        }));
+        usage
+    }
+
+    #[test]
+    fn authoritative_unpriced_usage_contributes_tokens_but_never_cost() {
+        let usage = authoritative_unpriced_usage();
+
+        let provider = provider_api_key_usage_contribution(&usage)
+            .expect("provider key contribution should exist");
+        assert_eq!(provider.request_count, 1);
+        assert_eq!(provider.success_count, 1);
+        assert_eq!(provider.total_tokens, 160);
+        assert_eq!(provider.total_cost_usd, 0.0);
+
+        let downstream =
+            api_key_usage_contribution(&usage).expect("API key contribution should exist");
+        assert_eq!(downstream.total_requests, 1);
+        assert_eq!(downstream.total_tokens, 160);
+        assert_eq!(downstream.total_cost_usd, 0.0);
     }
 }

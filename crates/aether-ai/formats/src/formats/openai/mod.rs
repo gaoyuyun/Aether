@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod embedding;
 pub mod image;
+pub(crate) mod namespace;
 pub mod prompt_cache;
 pub mod reasoning;
 pub mod request_contract;

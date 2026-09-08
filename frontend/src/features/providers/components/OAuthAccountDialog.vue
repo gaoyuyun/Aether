@@ -868,6 +868,7 @@ import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
 import { useTotp } from '@/composables/useTotp'
 import { parseApiError } from '@/utils/errorParser'
+import { safeExternalHttpsUrl } from '@/utils/navigationSecurity'
 import { useI18n } from '@/i18n'
 import {
   startProviderLevelOAuth,
@@ -1550,7 +1551,12 @@ function handleClose() {
 function openAuthorizationUrl() {
   const url = oauth.value.authorization_url
   if (!url) return
-  window.open(url, '_blank', 'noopener,noreferrer')
+  const safeUrl = safeExternalHttpsUrl(url)
+  if (!safeUrl) {
+    showError(legacyT('OAuth 服务返回了不安全的授权地址'))
+    return
+  }
+  window.open(safeUrl, '_blank', 'noopener,noreferrer')
 }
 
 async function initOAuth() {
@@ -2324,7 +2330,13 @@ async function handleCreateAgentIdentity() {
 
 function openDeviceVerificationUrl() {
   const url = device.value.verification_uri_complete || device.value.verification_uri
-  if (url) window.open(url, '_blank', 'noopener,noreferrer')
+  if (!url) return
+  const safeUrl = safeExternalHttpsUrl(url)
+  if (!safeUrl) {
+    showError(legacyT('OAuth 服务返回了不安全的设备验证地址'))
+    return
+  }
+  window.open(safeUrl, '_blank', 'noopener,noreferrer')
 }
 
 function startCountdown() {

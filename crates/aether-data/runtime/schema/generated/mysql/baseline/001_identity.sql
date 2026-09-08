@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS users (
     `email_verified` TINYINT(1) NOT NULL DEFAULT 0,
     `is_active` TINYINT(1) NOT NULL DEFAULT 1,
     `is_deleted` TINYINT(1) NOT NULL DEFAULT 0,
+    `security_version` BIGINT NOT NULL DEFAULT 0,
     `allowed_models` JSON,
     `allowed_models_mode` VARCHAR(32) NOT NULL DEFAULT 'unrestricted',
     `allowed_providers` JSON,
@@ -193,6 +194,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
 CREATE TABLE IF NOT EXISTS user_sessions (
     `id` VARCHAR(64) NOT NULL,
     `user_id` VARCHAR(64) NOT NULL,
+    `security_version` BIGINT NOT NULL DEFAULT 0,
     `client_device_id` VARCHAR(128) NOT NULL,
     `device_label` VARCHAR(120),
     `device_type` VARCHAR(20) NOT NULL DEFAULT 'unknown',

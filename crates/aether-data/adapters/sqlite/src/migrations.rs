@@ -131,6 +131,54 @@ fn validate_applied_migrations(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn legacy_proxy_node_inserts_receive_non_empty_tunnel_generations() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        // Simulate an older writer that does not know about tunnel_generation.
+        sqlx::query(
+            "INSERT INTO proxy_nodes (id, name, ip, port, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("legacy-node-a")
+        .bind("legacy node a")
+        .bind("127.0.0.1")
+        .bind(18080_i32)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("legacy proxy node insert should succeed");
+        sqlx::query(
+            "INSERT INTO proxy_nodes (id, name, ip, port, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("legacy-node-b")
+        .bind("legacy node b")
+        .bind("127.0.0.2")
+        .bind(18081_i32)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("second legacy proxy node insert should succeed");
+
+        let generations = sqlx::query_scalar::<_, String>(
+            "SELECT tunnel_generation FROM proxy_nodes ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("proxy node generations should load");
+        assert_eq!(generations.len(), 2);
+        assert!(generations.iter().all(|generation| !generation.is_empty()));
+        assert_ne!(generations[0], generations[1]);
+    }
+
     use std::borrow::Cow;
 
     use super::{
@@ -792,6 +840,237 @@ ORDER BY id
                 "manual-event".to_string(),
                 "ownerless-event".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ldap_singleton_migration_keeps_legacy_min_id_and_enforces_one_fixed_row() {
+        const LDAP_SINGLETON_VERSION: i64 = 20260831000000;
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version < LDAP_SINGLETON_VERSION)
+        {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("migration {} should run: {err}", migration.version));
+        }
+
+        sqlx::query(
+            r#"
+INSERT INTO ldap_configs (
+  server_url, bind_dn, bind_password_encrypted, base_dn, created_at, updated_at
+) VALUES
+  ('ldaps://first.example.com', 'cn=first', 'first-ciphertext', 'dc=first', 1, 1),
+  ('ldaps://second.example.com', 'cn=second', 'second-ciphertext', 'dc=second', 2, 2)
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy duplicate LDAP rows should seed");
+
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == LDAP_SINGLETON_VERSION)
+            .expect("LDAP singleton migration should be embedded");
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("LDAP singleton migration should run");
+
+        let surviving = sqlx::query_as::<_, (String, Option<String>, i64)>(
+            "SELECT server_url, bind_password_encrypted, singleton_key FROM ldap_configs",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("singleton LDAP row should load");
+        assert_eq!(
+            surviving,
+            vec![(
+                "ldaps://first.example.com".to_string(),
+                Some("first-ciphertext".to_string()),
+                1,
+            )]
+        );
+
+        let duplicate = sqlx::query(
+            r#"
+INSERT INTO ldap_configs (
+  server_url, bind_dn, bind_password_encrypted, base_dn, created_at, updated_at
+) VALUES ('ldaps://third.example.com', 'cn=third', 'third-ciphertext', 'dc=third', 3, 3)
+"#,
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "a second singleton row must be rejected"
+        );
+
+        let invalid_key = sqlx::query("UPDATE ldap_configs SET singleton_key = 2")
+            .execute(&pool)
+            .await;
+        assert!(
+            invalid_key.is_err(),
+            "the singleton discriminator must remain fixed at one"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_live_permission_migration_is_scoped_and_idempotent() {
+        const MIGRATION_VERSION: i64 = 20260821000000;
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        run_migrations(&pool).await.expect("run sqlite migrations");
+
+        sqlx::raw_sql(
+            r#"
+INSERT INTO users (
+  id, username, allowed_api_formats, allowed_api_formats_mode, created_at, updated_at
+) VALUES
+  ('user-specific', 'user-specific', '["openai:responses"]', 'specific', 1, 1),
+  ('user-unrestricted', 'user-unrestricted', '["openai:responses"]', 'unrestricted', 1, 1);
+
+INSERT INTO api_keys (
+  id, user_id, key_hash, allowed_api_formats, created_at, updated_at
+) VALUES (
+  'api-key-specific', 'user-specific', 'api-key-specific-hash',
+  '["openai:responses"]', 1, 1
+);
+
+INSERT INTO user_groups (
+  id, name, normalized_name, allowed_api_formats, allowed_api_formats_mode,
+  created_at, updated_at
+) VALUES (
+  'group-specific', 'Specific', 'specific', '["openai:responses"]', 'specific', 1, 1
+);
+
+INSERT INTO providers (id, name, provider_type, created_at, updated_at) VALUES
+  ('provider-codex', 'Codex migration fixture', 'codex', 1, 1),
+  ('provider-openai', 'OpenAI migration fixture', 'openai', 1, 1);
+
+INSERT INTO provider_api_keys (
+  id, provider_id, name, api_formats, auth_type_by_format,
+  allow_auth_channel_mismatch_formats, rate_multipliers,
+  global_priority_by_format, created_at, updated_at
+) VALUES
+  (
+    'provider-key-codex', 'provider-codex', 'Codex key',
+    '["openai:responses"]', '{"openai:responses":"oauth"}',
+    '["openai:responses"]', '{"openai:responses":1.25}',
+    '{"openai:responses":17}', 1, 1
+  ),
+  (
+    'provider-key-openai', 'provider-openai', 'OpenAI key',
+    '["openai:responses"]', '{"openai:responses":"api_key"}',
+    '["openai:responses"]', '{"openai:responses":2.0}',
+    '{"openai:responses":23}', 1, 1
+  );
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy Codex Live fixtures should insert");
+
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == MIGRATION_VERSION)
+            .expect("Codex Live permission migration should be embedded");
+        for _ in 0..2 {
+            sqlx::raw_sql(migration.sql.as_ref())
+                .execute(&pool)
+                .await
+                .expect("Codex Live permission migration should run idempotently");
+        }
+
+        let user_specific: String =
+            sqlx::query_scalar("SELECT allowed_api_formats FROM users WHERE id = 'user-specific'")
+                .fetch_one(&pool)
+                .await
+                .expect("specific user formats should load");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&user_specific).unwrap(),
+            serde_json::json!(["openai:responses", "codex:live"])
+        );
+
+        let user_unrestricted: String = sqlx::query_scalar(
+            "SELECT allowed_api_formats FROM users WHERE id = 'user-unrestricted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("unrestricted user formats should load");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&user_unrestricted).unwrap(),
+            serde_json::json!(["openai:responses"])
+        );
+
+        for (table, id_column, id) in [
+            ("api_keys", "id", "api-key-specific"),
+            ("user_groups", "id", "group-specific"),
+        ] {
+            let sql = format!("SELECT allowed_api_formats FROM {table} WHERE {id_column} = ?");
+            let formats: String = sqlx::query_scalar(sql.as_str())
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("migrated downstream formats should load");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&formats).unwrap(),
+                serde_json::json!(["openai:responses", "codex:live"])
+            );
+        }
+
+        let codex_key = sqlx::query_as::<_, (String, String, String, String, String)>(
+            r#"
+SELECT api_formats, auth_type_by_format, allow_auth_channel_mismatch_formats,
+       rate_multipliers, global_priority_by_format
+FROM provider_api_keys
+WHERE id = 'provider-key-codex'
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("migrated Codex key should load");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&codex_key.0).unwrap(),
+            serde_json::json!(["openai:responses", "codex:live"])
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&codex_key.1).unwrap(),
+            serde_json::json!({"openai:responses": "oauth", "codex:live": "oauth"})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&codex_key.2).unwrap(),
+            serde_json::json!(["openai:responses", "codex:live"])
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&codex_key.3).unwrap(),
+            serde_json::json!({"openai:responses": 1.25, "codex:live": 1.25})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&codex_key.4).unwrap(),
+            serde_json::json!({"openai:responses": 17, "codex:live": 17})
+        );
+
+        let openai_formats: String = sqlx::query_scalar(
+            "SELECT api_formats FROM provider_api_keys WHERE id = 'provider-key-openai'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("non-Codex key formats should load");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&openai_formats).unwrap(),
+            serde_json::json!(["openai:responses"])
         );
     }
 

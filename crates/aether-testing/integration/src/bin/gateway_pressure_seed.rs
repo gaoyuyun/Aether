@@ -1,7 +1,11 @@
 // Gateway-backed benchmark scenarios live outside the reusable testkit.
 use std::env;
+#[cfg(unix)]
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+#[cfg(unix)]
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use aether_data::repository::auth::CreateStandaloneApiKeyRecord;
 use aether_data::repository::wallet::WalletLookupKey;
@@ -209,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_lifetime_ms: 300_000,
             statement_cache_capacity: 128,
             require_ssl: false,
-                    sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
+            sqlite_cache_mb: DEFAULT_SQLITE_CACHE_MB,
         },
     }))?;
 
@@ -524,7 +528,11 @@ async fn seed_api_key(
             .update_standalone_api_key_basic(
                 aether_data::repository::auth::UpdateStandaloneApiKeyBasicRecord {
                     api_key_id: api_key_id.clone(),
+                    key_encrypted: None,
+                    key_encrypted_present: false,
                     name: Some(format!("Local pressure API key {}", key_index + 1)),
+                    name_present: true,
+                    force_capabilities: None,
                     rate_limit_present: true,
                     rate_limit: Some(0),
                     concurrent_limit_present: true,
@@ -657,22 +665,18 @@ async fn verify_candidate_selection(
 }
 
 fn write_outputs(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = config.output_env_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = config.output_key_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = config.output_key_list_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::write(&config.output_key_path, format!("{}\n", config.api_key))?;
+    write_private_output(
+        &config.output_key_path,
+        format!("{}\n", config.api_key).as_bytes(),
+    )?;
     let key_list = (0..config.api_key_count)
         .map(|index| pressure_api_key_value(config, index))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(&config.output_key_list_path, format!("{key_list}\n"))?;
+    write_private_output(
+        &config.output_key_list_path,
+        format!("{key_list}\n").as_bytes(),
+    )?;
     let env_content = format!(
         concat!(
             "export AETHER_API_KEY_FILE={key_path}\n",
@@ -691,8 +695,107 @@ fn write_outputs(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         model = shell_escape(&config.model),
         mock_upstream_base_url = shell_escape(&config.mock_upstream_base_url),
     );
-    fs::write(&config.output_env_path, env_content)?;
+    write_private_output(&config.output_env_path, env_content.as_bytes())?;
 
+    Ok(())
+}
+
+fn write_private_output(path: &Path, contents: &[u8]) -> io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (path, contents);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private benchmark credential outputs currently require Unix filesystem checks",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private output path must name a file",
+            )
+        })?;
+        let input_parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = fs::canonicalize(input_parent)?;
+        let parent_metadata = fs::symlink_metadata(&parent)?;
+        if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+            return Err(io::Error::other(
+                "private output parent must be a real directory",
+            ));
+        }
+
+        let target = parent.join(file_name);
+        let temporary = parent.join(format!(
+            ".aether-pressure-output-{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+
+        let result = (|| -> io::Result<()> {
+            let owner_uid = file.metadata()?.uid();
+            validate_private_output_directory(&parent, owner_uid)?;
+            match fs::symlink_metadata(&target) {
+                Ok(metadata)
+                    if metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.uid() == owner_uid
+                        && metadata.nlink() == 1 => {}
+                Ok(_) => {
+                    return Err(io::Error::other(
+                        "refusing to replace a symlink, special file, hard link, or foreign-owned private output",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, &target)?;
+            fs::File::open(&parent)?.sync_all()
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+#[cfg(unix)]
+fn validate_private_output_directory(directory: &Path, owner_uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut ancestor = Some(directory);
+    while let Some(path) = ancestor {
+        let metadata = fs::symlink_metadata(path)?;
+        let mode = metadata.mode();
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (metadata.uid() != owner_uid && metadata.uid() != 0)
+            || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+        {
+            return Err(io::Error::other(format!(
+                "private output directory '{}' has unsafe ownership or permissions",
+                path.display()
+            )));
+        }
+        ancestor = path.parent();
+    }
     Ok(())
 }
 
@@ -791,7 +894,7 @@ Options:\n\
 mod tests {
     use serde_json::json;
 
-    use super::pressure_provider_transport_config;
+    use super::{pressure_provider_transport_config, write_private_output};
 
     #[test]
     fn pressure_provider_transport_config_enables_h2c_prior_knowledge() {
@@ -812,5 +915,39 @@ mod tests {
     #[test]
     fn pressure_provider_transport_config_is_absent_by_default() {
         assert_eq!(pressure_provider_transport_config(false), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_outputs_are_atomic_private_and_refuse_link_targets() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "aether-pressure-private-output-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let output = root.join("api-key");
+        write_private_output(&output, b"secret\n").unwrap();
+        let metadata = std::fs::symlink_metadata(&output).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"secret\n");
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"known-good").unwrap();
+        std::fs::remove_file(&output).unwrap();
+        symlink(&victim, &output).unwrap();
+        assert!(write_private_output(&output, b"replacement\n").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"known-good");
+
+        std::fs::remove_file(&output).unwrap();
+        std::fs::hard_link(&victim, &output).unwrap();
+        assert!(write_private_output(&output, b"replacement\n").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"known-good");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

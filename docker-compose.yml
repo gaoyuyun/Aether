@@ -3,13 +3,14 @@
 
 services:
   postgres:
-    image: postgres:15
+    # OCI index digest for the official multi-architecture postgres:15.19 image.
+    image: postgres:15.19@sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111
     container_name: aether-postgres
     shm_size: ${POSTGRES_SHM_SIZE:-512mb}
     environment:
       POSTGRES_DB: aether
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be configured}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
       TZ: Asia/Shanghai
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -41,20 +42,22 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    # OCI index digest for the official multi-architecture redis:7.4.11-alpine image.
+    image: redis:7.4.11-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     container_name: aether-redis
-    command: redis-server --dir /tmp --appendonly no --save "" --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be configured} --maxclients ${REDIS_MAXCLIENTS:-10000}
+    command: redis-server --dir /tmp --appendonly no --save "" --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env} --maxclients ${REDIS_MAXCLIENTS:-10000}
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
-      test: [ "CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD}\" ping | grep -q PONG" ]
+      test: [ "CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}\" ping | grep -q PONG" ]
       interval: 5s
       timeout: 3s
       retries: 5
     restart: unless-stopped
 
   mysql:
-    image: mysql:8.0
+    # OCI index digest for the official multi-architecture mysql:8.0.46 image.
+    image: mysql:8.0.46@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
     container_name: aether-mysql
     profiles:
       - mysql
@@ -80,12 +83,19 @@ services:
   app:
     image: ${APP_IMAGE:-ghcr.io/fawney19/aether:latest}
     container_name: aether-app
-    user: "0:0"
+    user: "${AETHER_CONTAINER_UID:-65532}:${AETHER_CONTAINER_GID:-65532}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777
     env_file:
       - ${AETHER_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:?DB_PASSWORD must be configured}@postgres:5432/aether
-      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be configured}@redis:6379/0
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD:?set DB_PASSWORD in .env}@postgres:5432/aether
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
       ENVIRONMENT: ${ENVIRONMENT:-production}
       TZ: Asia/Shanghai
       AETHER_BASE_DIR: /opt/aether

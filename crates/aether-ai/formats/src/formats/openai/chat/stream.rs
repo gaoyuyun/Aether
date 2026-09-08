@@ -2,11 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
+use crate::formats::openai::namespace::NamespaceToolAliases;
 use crate::formats::openai::responses::{
+    encode_gemini_tool_signature_carrier_with_direction, openai_responses_message_item_id,
     openai_responses_synthetic_reasoning_item_id,
     response::{
         ensure_modern_openai_responses_response_fields, openai_responses_current_timestamp,
     },
+    GeminiToolSignatureCarrierDirection,
 };
 use crate::formats::shared::response::build_generated_tool_call_id;
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
@@ -683,6 +686,52 @@ impl OpenAIResponsesProviderState {
         }
     }
 
+    fn resolve_function_call_chat_name(
+        report_context: &Value,
+        namespace: Option<&Value>,
+        incoming_name: Option<&str>,
+        existing_chat_name: Option<&str>,
+    ) -> Result<Option<String>, ()> {
+        let incoming_name = incoming_name.map(str::trim).filter(|name| !name.is_empty());
+        let existing_chat_name = existing_chat_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let aliases = NamespaceToolAliases::from_report_context(report_context);
+
+        match namespace {
+            Some(Value::String(namespace)) if !namespace.trim().is_empty() => {
+                if let Some(child_name) = incoming_name {
+                    return aliases
+                        .chat_name(namespace.trim(), child_name)
+                        .map(|chat_name| Some(chat_name.to_string()))
+                        .ok_or(());
+                }
+                existing_chat_name
+                    .filter(|chat_name| {
+                        aliases
+                            .responses_name(chat_name)
+                            .is_some_and(|(existing_namespace, _)| {
+                                existing_namespace == namespace.trim()
+                            })
+                    })
+                    .map(|chat_name| Some(chat_name.to_string()))
+                    .ok_or(())
+            }
+            Some(_) => Err(()),
+            None => {
+                if let (Some(child_name), Some(chat_name)) = (incoming_name, existing_chat_name) {
+                    if aliases
+                        .responses_name(chat_name)
+                        .is_some_and(|(_, existing_child_name)| existing_child_name == child_name)
+                    {
+                        return Ok(Some(chat_name.to_string()));
+                    }
+                }
+                Ok(incoming_name.or(existing_chat_name).map(ToOwned::to_owned))
+            }
+        }
+    }
+
     fn emit_tool_call_item(
         &mut self,
         report_context: &Value,
@@ -698,7 +747,15 @@ impl OpenAIResponsesProviderState {
         // sync Responses aggregator retains the original item verbatim. Treat these
         // sidecars as recognized while continuing to fail closed for semantic fields
         // (for example `caller`) that the canonical tool-call events cannot represent.
-        const EXECUTION_FIELDS: &[&str] = &["type", "id", "call_id", "status", "name", "arguments"];
+        const EXECUTION_FIELDS: &[&str] = &[
+            "type",
+            "id",
+            "call_id",
+            "status",
+            "namespace",
+            "name",
+            "arguments",
+        ];
         let has_chat_metadata_passthrough =
             item.contains_key("internal_chat_message_metadata_passthrough");
         let chat_metadata_target_supported = report_context
@@ -727,17 +784,28 @@ impl OpenAIResponsesProviderState {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let index = self.tool_index_for_key(key, output_index);
+        let existing_chat_name = self.tool_calls.get(&index).map(|state| state.name.as_str());
+        let incoming_chat_name = match Self::resolve_function_call_chat_name(
+            report_context,
+            item.get("namespace"),
+            item.get("name").and_then(Value::as_str),
+            existing_chat_name,
+        ) {
+            Ok(name) => name,
+            Err(()) => {
+                out.push(self.unknown_frame(report_context, Value::Object(item.clone())));
+                return;
+            }
+        };
         let state = self.tool_calls.entry(index).or_default();
         state.call_id = item
             .get("call_id")
             .and_then(Value::as_str)
             .unwrap_or(state.call_id.as_str())
             .to_string();
-        state.name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(state.name.as_str())
-            .to_string();
+        if let Some(name) = incoming_chat_name {
+            state.name = name;
+        }
         let completed_arguments = item
             .get("arguments")
             .and_then(Value::as_str)
@@ -1590,13 +1658,12 @@ impl OpenAIResponsesProviderState {
                 self.emit_ready_function_call(report_context, &mut out, index);
             }
             "response.function_call_arguments.done" => {
+                let nested_item = value.get("item").and_then(Value::as_object);
                 let arguments = value
                     .get("arguments")
                     .and_then(Value::as_str)
                     .or_else(|| {
-                        value
-                            .get("item")
-                            .and_then(Value::as_object)
+                        nested_item
                             .and_then(|item| item.get("arguments"))
                             .and_then(Value::as_str)
                     })
@@ -1609,9 +1676,7 @@ impl OpenAIResponsesProviderState {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
                     .or_else(|| {
-                        value
-                            .get("item")
-                            .and_then(Value::as_object)
+                        nested_item
                             .and_then(|item| item.get("call_id").or_else(|| item.get("id")))
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned)
@@ -1621,31 +1686,42 @@ impl OpenAIResponsesProviderState {
                     .and_then(Value::as_u64)
                     .map(|value| value as usize);
                 let index = self.tool_index_for_key(key, output_index);
+                let incoming_name = value.get("name").and_then(Value::as_str).or_else(|| {
+                    nested_item
+                        .and_then(|item| item.get("name"))
+                        .and_then(Value::as_str)
+                });
+                let namespace = value
+                    .get("namespace")
+                    .or_else(|| nested_item.and_then(|item| item.get("namespace")));
+                let existing_chat_name =
+                    self.tool_calls.get(&index).map(|state| state.name.as_str());
+                let incoming_chat_name = match Self::resolve_function_call_chat_name(
+                    report_context,
+                    namespace,
+                    incoming_name,
+                    existing_chat_name,
+                ) {
+                    Ok(name) => name,
+                    Err(()) => {
+                        out.push(self.unknown_frame(report_context, value.clone()));
+                        return Ok(out);
+                    }
+                };
                 let state = self.tool_calls.entry(index).or_default();
                 state.call_id = value
                     .get("call_id")
                     .and_then(Value::as_str)
                     .or_else(|| {
-                        value
-                            .get("item")
-                            .and_then(Value::as_object)
+                        nested_item
                             .and_then(|item| item.get("call_id"))
                             .and_then(Value::as_str)
                     })
                     .unwrap_or(state.call_id.as_str())
                     .to_string();
-                state.name = value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        value
-                            .get("item")
-                            .and_then(Value::as_object)
-                            .and_then(|item| item.get("name"))
-                            .and_then(Value::as_str)
-                    })
-                    .unwrap_or(state.name.as_str())
-                    .to_string();
+                if let Some(name) = incoming_chat_name {
+                    state.name = name;
+                }
                 Self::merge_tool_call_arguments(state, arguments);
                 self.emit_ready_function_call(report_context, &mut out, index);
             }
@@ -1764,7 +1840,7 @@ impl OpenAIResponsesProviderState {
                 });
                 self.finished = true;
             }
-            "keepalive" => {}
+            "keepalive" | "ping" => {}
             event_type if openai_responses_stream_event_is_known_noop(event_type) => {
                 self.ensure_started(report_context, &mut out);
             }
@@ -1856,7 +1932,10 @@ pub struct OpenAIChatClientEmitter {
 struct OpenAIResponsesClientToolState {
     call_id: String,
     name: String,
+    namespace: Option<String>,
     arguments: String,
+    thought_signature_carrier: Option<String>,
+    thought_signature_output_index: Option<usize>,
     output_index: Option<usize>,
     web_search: bool,
 }
@@ -1915,6 +1994,7 @@ pub struct OpenAIResponsesClientEmitter {
     opaque_output_items: BTreeMap<usize, Value>,
     opaque_output_indexes: BTreeMap<String, usize>,
     completed_history_response: Option<Value>,
+    namespace_tool_aliases: NamespaceToolAliases,
 }
 
 impl OpenAIChatClientEmitter {
@@ -2098,6 +2178,7 @@ impl OpenAIChatClientEmitter {
                 );
                 Ok(out)
             }
+            CanonicalStreamEvent::ToolCallSignature { .. } => Ok(Vec::new()),
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
                 let mut out = self.ensure_started()?;
                 let chat_index = self.chat_tool_call_index(index);
@@ -2212,6 +2293,13 @@ impl OpenAIChatClientEmitter {
 }
 
 impl OpenAIResponsesClientEmitter {
+    pub(crate) fn with_report_context(report_context: &Value) -> Self {
+        Self {
+            namespace_tool_aliases: NamespaceToolAliases::from_report_context(report_context),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn set_actual_service_tier(&mut self, value: Option<&str>) {
         if value.is_some_and(|value| {
             self.actual_service_tier
@@ -2240,7 +2328,7 @@ impl OpenAIResponsesClientEmitter {
     fn message_item_id(&self) -> String {
         self.message_item_id
             .clone()
-            .unwrap_or_else(|| format!("{}_msg", self.response_id()))
+            .unwrap_or_else(|| openai_responses_message_item_id(self.response_id(), 0))
     }
 
     fn reasoning_item_id(&self) -> String {
@@ -2259,7 +2347,7 @@ impl OpenAIResponsesClientEmitter {
 
     fn ensure_message_item_id(&mut self) -> String {
         if self.message_item_id.is_none() {
-            self.message_item_id = Some(format!("{}_msg", self.response_id()));
+            self.message_item_id = Some(openai_responses_message_item_id(self.response_id(), 0));
         }
         self.message_item_id()
     }
@@ -2678,20 +2766,26 @@ impl OpenAIResponsesClientEmitter {
                     "arguments": state.arguments.as_str(),
                 }),
             )?);
+            let mut completed_item = json!({
+                "type": "function_call",
+                "id": item_id.clone(),
+                "call_id": call_id,
+                "name": name,
+                "arguments": state.arguments.as_str(),
+                "status": "completed",
+            });
+            if let (Some(namespace), Some(item)) =
+                (state.namespace.clone(), completed_item.as_object_mut())
+            {
+                item.insert("namespace".to_string(), Value::String(namespace));
+            }
             out.extend(self.encode_response_event(
                 "response.output_item.done",
                 json!({
                     "type": "response.output_item.done",
                     "response_id": self.response_id(),
                     "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": item_id.clone(),
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": state.arguments.as_str(),
-                        "status": "completed",
-                    }
+                    "item": completed_item,
                 }),
             )?);
         }
@@ -2829,6 +2923,24 @@ impl OpenAIResponsesClientEmitter {
             ));
         }
         for (index, state) in &self.tool_calls {
+            if let (Some(output_index), Some(carrier)) = (
+                state.thought_signature_output_index,
+                state.thought_signature_carrier.as_ref(),
+            ) {
+                ordered_output.push((
+                    output_index,
+                    json!({
+                        "type": "reasoning",
+                        "id": openai_responses_synthetic_reasoning_item_id(
+                            self.response_id(),
+                            output_index,
+                        ),
+                        "status": "completed",
+                        "encrypted_content": carrier,
+                        "summary": [],
+                    }),
+                ));
+            }
             if let Some(output_index) = state.output_index {
                 let call_id = if state.call_id.is_empty() {
                     build_generated_tool_call_id(*index)
@@ -2851,21 +2963,24 @@ impl OpenAIResponsesClientEmitter {
                     ));
                     continue;
                 }
-                ordered_output.push((
-                    output_index,
-                    json!({
-                        "type": "function_call",
-                        "id": item_id.clone(),
-                        "call_id": call_id,
-                        "name": if state.name.is_empty() {
-                            "unknown".to_string()
-                        } else {
-                            state.name.clone()
-                        },
-                        "arguments": state.arguments.clone(),
-                        "status": "completed",
-                    }),
-                ));
+                let mut item = json!({
+                    "type": "function_call",
+                    "id": item_id.clone(),
+                    "call_id": call_id,
+                    "name": if state.name.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        state.name.clone()
+                    },
+                    "arguments": state.arguments.clone(),
+                    "status": "completed",
+                });
+                if let (Some(namespace), Some(item)) =
+                    (state.namespace.clone(), item.as_object_mut())
+                {
+                    item.insert("namespace".to_string(), Value::String(namespace));
+                }
+                ordered_output.push((output_index, item));
             }
         }
         for (index, state) in &self.tool_results {
@@ -3150,13 +3265,21 @@ impl OpenAIResponsesClientEmitter {
                 let output_index = self.ensure_tool_output_index(index);
                 let response_id = self.response_id().to_string();
                 let item_id = self.tool_call_item_id(index);
+                let namespaced_tool = self.namespace_tool_aliases.responses_name(&name);
+                let emitted_name = namespaced_tool
+                    .map(|(_, child_name)| child_name.to_string())
+                    .unwrap_or_else(|| name.clone());
+                let emitted_namespace = namespaced_tool.map(|(namespace, _)| namespace.to_string());
+                let is_namespaced_tool = namespaced_tool.is_some();
                 let state = self.tool_calls.entry(index).or_default();
                 state.call_id = call_id.clone();
-                state.name = name.clone();
-                state.web_search = is_responses_web_search_tool(&name);
+                state.name = emitted_name;
+                state.namespace = emitted_namespace;
+                state.web_search = !is_namespaced_tool && is_responses_web_search_tool(&name);
                 let emitted_call_id = state.call_id.clone();
                 let emitted_name = state.name.clone();
-                let item = if state.web_search {
+                let emitted_namespace = state.namespace.clone();
+                let mut item = if state.web_search {
                     json!({
                         "type": "web_search_call",
                         "id": item_id,
@@ -3176,6 +3299,9 @@ impl OpenAIResponsesClientEmitter {
                         "status": "in_progress",
                     })
                 };
+                if let (Some(namespace), Some(item)) = (emitted_namespace, item.as_object_mut()) {
+                    item.insert("namespace".to_string(), Value::String(namespace));
+                }
                 out.extend(self.encode_response_event(
                     "response.output_item.added",
                     json!({
@@ -3183,6 +3309,69 @@ impl OpenAIResponsesClientEmitter {
                         "response_id": response_id,
                         "output_index": output_index,
                         "item": item
+                    }),
+                )?);
+                Ok(out)
+            }
+            CanonicalStreamEvent::ToolCallSignature { index, signature } => {
+                let direction = if self
+                    .tool_calls
+                    .get(&index)
+                    .and_then(|state| state.output_index)
+                    .is_some()
+                {
+                    GeminiToolSignatureCarrierDirection::Previous
+                } else {
+                    GeminiToolSignatureCarrierDirection::Next
+                };
+                let Some(carrier) =
+                    encode_gemini_tool_signature_carrier_with_direction(&signature, direction)
+                else {
+                    return Ok(Vec::new());
+                };
+                if self
+                    .tool_calls
+                    .get(&index)
+                    .and_then(|state| state.thought_signature_carrier.as_deref())
+                    == Some(carrier.as_str())
+                {
+                    return Ok(Vec::new());
+                }
+
+                let mut out = self.ensure_started()?;
+                let output_index = self.allocate_output_index();
+                let item = json!({
+                    "type": "reasoning",
+                    "id": openai_responses_synthetic_reasoning_item_id(
+                        self.response_id(),
+                        output_index,
+                    ),
+                    "status": "completed",
+                    "encrypted_content": carrier,
+                    "summary": [],
+                });
+                let state = self.tool_calls.entry(index).or_default();
+                state.thought_signature_carrier = item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                state.thought_signature_output_index = Some(output_index);
+                out.extend(self.encode_response_event(
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "response_id": self.response_id(),
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                )?);
+                out.extend(self.encode_response_event(
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "response_id": self.response_id(),
+                        "output_index": output_index,
+                        "item": item,
                     }),
                 )?);
                 Ok(out)
@@ -3559,6 +3748,7 @@ fn openai_responses_incomplete_finish_reason(payload: &Value) -> String {
 mod tests {
     use super::*;
     use crate::formats::claude::messages::stream::ClaudeClientEmitter;
+    use crate::formats::openai::responses::encode_gemini_tool_signature_carrier;
 
     fn data_line(value: Value) -> Vec<u8> {
         format!("data: {}\n", value).into_bytes()
@@ -4167,7 +4357,7 @@ mod tests {
         assert!(sse.contains("event: response.output_item.done\n"));
         assert!(sse.contains("event: response.completed\n"));
         assert!(sse.contains("\"response_id\":\"resp_stream_123\""));
-        assert!(sse.contains("\"item_id\":\"resp_stream_123_msg\""));
+        assert!(sse.contains("\"item_id\":\"msg_aether_"));
         assert!(sse.contains("\"text\":\"Hello\""));
         assert!(sse.contains("\"output_text\":\"Hello\""));
         assert!(sse.contains("\"created_at\":"));
@@ -4231,8 +4421,8 @@ mod tests {
         );
 
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
-        assert!(sse.contains("\"item_id\":\"msg_first_msg\""));
-        assert!(!sse.contains("\"item_id\":\"msg_second_msg\""));
+        assert!(sse.contains("\"item_id\":\"msg_aether_"));
+        assert!(!sse.contains("msg_second_msg"));
     }
 
     #[test]
@@ -4663,6 +4853,141 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_provider_state_resolves_done_only_namespace_identity() {
+        let report_context = json!({
+            "original_request_body": {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "write_report",
+                        "parameters": {"type": "object"}
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "reports",
+                        "description": "Reporting tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "write_report",
+                            "parameters": {"type": "object"}
+                        }]
+                    }
+                ]
+            }
+        });
+        let expected_alias = NamespaceToolAliases::from_report_context(&report_context)
+            .chat_name("reports", "write_report")
+            .expect("namespace alias")
+            .to_string();
+        let mut state = OpenAIResponsesProviderState::default();
+
+        let frames = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.function_call_arguments.done",
+                    "response_id": "resp_done_only_namespace",
+                    "output_index": 0,
+                    "item_id": "fc_done_only_namespace",
+                    "call_id": "call_done_only_namespace",
+                    "namespace": "reports",
+                    "name": "write_report",
+                    "arguments": "{}"
+                })),
+            )
+            .expect("done-only namespace call should parse");
+
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallStart {
+                ref call_id,
+                ref name,
+                ..
+            } if call_id == "call_done_only_namespace" && name == &expected_alias
+        )));
+    }
+
+    #[test]
+    fn openai_responses_provider_state_keeps_namespace_alias_until_delayed_call_id() {
+        let report_context = json!({
+            "original_request_body": {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "write_report",
+                        "parameters": {"type": "object"}
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "reports",
+                        "description": "Reporting tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "write_report",
+                            "parameters": {"type": "object"}
+                        }]
+                    }
+                ]
+            }
+        });
+        let expected_alias = NamespaceToolAliases::from_report_context(&report_context)
+            .chat_name("reports", "write_report")
+            .expect("namespace alias")
+            .to_string();
+        let mut state = OpenAIResponsesProviderState::default();
+
+        let added = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.output_item.added",
+                    "response_id": "resp_delayed_namespace",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_delayed_namespace",
+                        "namespace": "reports",
+                        "name": "write_report",
+                        "arguments": ""
+                    }
+                })),
+            )
+            .expect("namespace item should parse");
+        assert!(!added
+            .iter()
+            .any(|frame| matches!(frame.event, CanonicalStreamEvent::ToolCallStart { .. })));
+
+        let done = state
+            .push_line(
+                &report_context,
+                data_line(json!({
+                    "type": "response.function_call_arguments.done",
+                    "response_id": "resp_delayed_namespace",
+                    "output_index": 0,
+                    "item_id": "fc_delayed_namespace",
+                    "call_id": "call_delayed_namespace",
+                    "name": "write_report",
+                    "arguments": "{\"path\":\"reports/finding.md\"}"
+                })),
+            )
+            .expect("delayed namespace call identity should parse");
+
+        assert!(done.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallStart {
+                ref call_id,
+                ref name,
+                ..
+            } if call_id == "call_delayed_namespace" && name == &expected_alias
+        )));
+        assert!(!done.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallStart { ref name, .. }
+                if name == "write_report" && name != &expected_alias
+        )));
+    }
+
+    #[test]
     fn openai_responses_provider_state_waits_for_call_id_distinct_from_item_id() {
         let mut state = OpenAIResponsesProviderState::default();
         let report_context = json!({});
@@ -5089,6 +5414,124 @@ mod tests {
         assert!(
             sse.find("event: response.output_item.done") < sse.find("event: response.completed")
         );
+    }
+
+    #[test]
+    fn openai_responses_client_emitter_carries_gemini_tool_signature() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_signed_tool_123".to_string(),
+                model: "gemini-3-flash-preview".to_string(),
+                event: CanonicalStreamEvent::ToolCallSignature {
+                    index: 0,
+                    signature: "opaque-tool-signature".to_string(),
+                },
+            })
+            .expect("tool signature should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::ToolCallStart {
+                        index: 0,
+                        call_id: "call_123".to_string(),
+                        name: "lookup".to_string(),
+                    },
+                })
+                .expect("tool call should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "{\"query\":\"rust\"}".to_string(),
+                    },
+                })
+                .expect("tool arguments should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("tool finish should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let carrier = encode_gemini_tool_signature_carrier("opaque-tool-signature")
+            .expect("signature carrier");
+        let carrier_index = sse.find(&carrier).expect("carrier in Responses stream");
+        let call_index = sse
+            .find("\"call_id\":\"call_123\"")
+            .expect("function call in Responses stream");
+        assert!(carrier_index < call_index);
+        assert!(sse.contains("\"encrypted_content\""));
+        assert!(sse.contains("event: response.completed\n"));
+    }
+
+    #[test]
+    fn openai_responses_client_emitter_carries_late_gemini_tool_signature() {
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let mut bytes = emitter
+            .emit(CanonicalStreamFrame {
+                id: "resp_late_signed_tool_123".to_string(),
+                model: "gemini-3-flash-preview".to_string(),
+                event: CanonicalStreamEvent::ToolCallStart {
+                    index: 0,
+                    call_id: "call_123".to_string(),
+                    name: "lookup".to_string(),
+                },
+            })
+            .expect("tool call should encode");
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_late_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::ToolCallSignature {
+                        index: 0,
+                        signature: "opaque-late-tool-signature".to_string(),
+                    },
+                })
+                .expect("late tool signature should encode"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_late_signed_tool_123".to_string(),
+                    model: "gemini-3-flash-preview".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("tool finish should encode"),
+        );
+
+        let sse = String::from_utf8(bytes).expect("sse should be utf8");
+        let carrier = encode_gemini_tool_signature_carrier_with_direction(
+            "opaque-late-tool-signature",
+            GeminiToolSignatureCarrierDirection::Previous,
+        )
+        .expect("late signature carrier");
+        let call_index = sse
+            .find("\"call_id\":\"call_123\"")
+            .expect("function call in Responses stream");
+        let carrier_index = sse
+            .find(&carrier)
+            .expect("late carrier in Responses stream");
+        assert!(call_index < carrier_index);
+        assert!(sse.contains("event: response.completed\n"));
     }
 
     #[test]

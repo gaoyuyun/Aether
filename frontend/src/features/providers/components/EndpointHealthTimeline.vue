@@ -8,7 +8,7 @@
     :lookback-hours="lookbackHours"
     :fallback-segments="segmentCount ?? GRID_COUNT"
     entity-label="端点"
-    :entity-name="monitor?.api_format"
+    :entity-name="monitor?.api_format ? formatApiFormat(monitor.api_format) : undefined"
   />
   <div
     v-else
@@ -51,6 +51,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { EndpointStatusMonitor, EndpointHealthEvent, PublicEndpointStatusMonitor, PublicHealthEvent } from '@/api/endpoints'
+import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import HealthStatusTimeline from './HealthStatusTimeline.vue'
 import { formatTimestamp, formatTimelineTooltip } from './health-monitor-utils'
@@ -225,7 +226,7 @@ function buildSegmentTooltip(
       avg_tps: null
     },
     entityLabel: '端点',
-    entityName: props.monitor?.api_format
+    entityName: props.monitor?.api_format ? formatApiFormat(props.monitor.api_format) : undefined
   })
 }
 

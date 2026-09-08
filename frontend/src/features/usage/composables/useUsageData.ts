@@ -382,6 +382,12 @@ export function useUsageData(options: UseUsageDataOptions) {
       if (filters?.search?.trim()) {
         params.search = filters.search.trim()
       }
+      if (filters?.status) {
+        params.status = filters.status
+      }
+      if (filters?.api_format) {
+        params.api_format = filters.api_format
+      }
 
       if (isAdminPage.value) {
         // 管理员页面：使用管理员 API
@@ -393,12 +399,6 @@ export function useUsageData(options: UseUsageDataOptions) {
         }
         if (filters?.provider) {
           params.provider = filters.provider
-        }
-        if (filters?.api_format) {
-          params.api_format = filters.api_format
-        }
-        if (filters?.status) {
-          params.status = filters.status
         }
         if (filters?.client_family) {
           params.client_family = filters.client_family
@@ -655,6 +655,22 @@ export function useUsageData(options: UseUsageDataOptions) {
           : existing.image_progress,
         is_stream: upstreamIsStream,
         is_websocket: mergeBooleanTrueWins(existing.is_websocket, record.is_websocket),
+        websocket_transport: record.websocket_transport || existing.websocket_transport,
+        usage_available: existing.usage_available === false || record.usage_available === false
+          ? false
+          : (record.usage_available ?? existing.usage_available),
+        usage_pricing_available: existing.usage_pricing_available === false
+          || record.usage_pricing_available === false
+          ? false
+          : (record.usage_pricing_available ?? existing.usage_pricing_available),
+        input_audio_tokens: mergeSparseRecordMetric(
+          existing.input_audio_tokens,
+          record.input_audio_tokens,
+        ) ?? record.input_audio_tokens,
+        output_audio_tokens: mergeSparseRecordMetric(
+          existing.output_audio_tokens,
+          record.output_audio_tokens,
+        ) ?? record.output_audio_tokens,
         upstream_is_stream: upstreamIsStream,
         client_requested_stream: clientRequestedStream,
         client_is_stream: clientIsStream,

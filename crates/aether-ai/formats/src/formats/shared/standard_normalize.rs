@@ -303,10 +303,6 @@ pub fn build_local_openai_responses_request_body_with_model_directives(
         require_streaming,
         require_body_stream_field,
     );
-    crate::formats::openai::responses::strip_incompatible_openai_responses_reasoning_items(
-        &mut provider_request_body,
-        "openai:responses",
-    );
     Some(provider_request_body)
 }
 

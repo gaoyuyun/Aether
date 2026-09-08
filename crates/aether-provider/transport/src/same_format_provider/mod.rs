@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -66,7 +67,7 @@ pub struct SameFormatProviderRequestBehavior {
     pub report_kind: &'static str,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SameFormatProviderRequestBodyInput<'a> {
     pub body_json: &'a Value,
     pub mapped_model: &'a str,
@@ -83,11 +84,62 @@ pub struct SameFormatProviderRequestBodyInput<'a> {
     pub enable_model_directives: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+impl fmt::Debug for SameFormatProviderRequestBodyInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SameFormatProviderRequestBodyInput")
+            .field(
+                "body_json_bytes",
+                &serde_json::to_vec(self.body_json)
+                    .ok()
+                    .map(|bytes| bytes.len()),
+            )
+            .field("mapped_model", &self.mapped_model)
+            .field("client_api_format", &self.client_api_format)
+            .field("provider_api_format", &self.provider_api_format)
+            .field("source_model", &self.source_model)
+            .field("family", &self.family)
+            .field("has_body_rules", &self.body_rules.is_some())
+            .field(
+                "request_header_names",
+                &self
+                    .request_headers
+                    .map(|headers| headers.keys().map(|name| name.as_str()).collect::<Vec<_>>()),
+            )
+            .field("upstream_is_stream", &self.upstream_is_stream)
+            .field("force_body_stream_field", &self.force_body_stream_field)
+            .field("has_kiro_auth_config", &self.kiro_auth_config.is_some())
+            .field("is_claude_code", &self.is_claude_code)
+            .field("enable_model_directives", &self.enable_model_directives)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct SameFormatProviderRequestBodyOutput {
     pub body: Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compatibility_edits: Vec<SameFormatProviderCompatibilityEdit>,
+}
+
+impl fmt::Debug for SameFormatProviderRequestBodyOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SameFormatProviderRequestBodyOutput")
+            .field(
+                "body_bytes",
+                &serde_json::to_vec(&self.body).ok().map(|bytes| bytes.len()),
+            )
+            .field(
+                "compatibility_edits",
+                &self
+                    .compatibility_edits
+                    .iter()
+                    .map(|edit| (edit.field.as_str(), edit.action, edit.detail.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -106,7 +158,7 @@ pub enum SameFormatProviderCompatibilityEditAction {
     OperatorRule,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SameFormatProviderUpstreamUrlParams<'a> {
     pub provider_api_format: &'a str,
     pub mapped_model: &'a str,
@@ -117,7 +169,26 @@ pub struct SameFormatProviderUpstreamUrlParams<'a> {
     pub provider_request_body: Option<&'a Value>,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl fmt::Debug for SameFormatProviderUpstreamUrlParams<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SameFormatProviderUpstreamUrlParams")
+            .field("provider_api_format", &self.provider_api_format)
+            .field("mapped_model", &self.mapped_model)
+            .field("upstream_is_stream", &self.upstream_is_stream)
+            .field("has_request_query", &self.request_query.is_some())
+            .field("request_query_len", &self.request_query.map(str::len))
+            .field("kiro_api_region", &self.kiro_api_region)
+            .field("api_operation", &self.api_operation)
+            .field(
+                "has_provider_request_body",
+                &self.provider_request_body.is_some(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct SameFormatProviderHeadersInput<'a> {
     pub headers: &'a http::HeaderMap,
     pub provider_request_body: &'a Value,
@@ -130,6 +201,45 @@ pub struct SameFormatProviderHeadersInput<'a> {
     pub extra_headers: &'a BTreeMap<String, String>,
     pub kiro_auth_config: Option<&'a KiroAuthConfig>,
     pub kiro_machine_id: Option<&'a str>,
+}
+
+impl fmt::Debug for SameFormatProviderHeadersInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SameFormatProviderHeadersInput")
+            .field(
+                "request_header_names",
+                &self
+                    .headers
+                    .keys()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "provider_request_body_bytes",
+                &serde_json::to_vec(self.provider_request_body)
+                    .ok()
+                    .map(|bytes| bytes.len()),
+            )
+            .field(
+                "original_request_body_bytes",
+                &serde_json::to_vec(self.original_request_body)
+                    .ok()
+                    .map(|bytes| bytes.len()),
+            )
+            .field("has_header_rules", &self.header_rules.is_some())
+            .field("behavior", &self.behavior)
+            .field("api_operation", &self.api_operation)
+            .field("auth_header", &self.auth_header)
+            .field("has_auth_value", &self.auth_value.is_some())
+            .field(
+                "extra_header_names",
+                &self.extra_headers.keys().collect::<Vec<_>>(),
+            )
+            .field("has_kiro_auth_config", &self.kiro_auth_config.is_some())
+            .field("has_kiro_machine_id", &self.kiro_machine_id.is_some())
+            .finish()
+    }
 }
 
 pub fn classify_same_format_provider_request_behavior(
@@ -207,15 +317,32 @@ pub fn classify_same_format_provider_request_behavior_for_operation(
 pub fn build_same_format_provider_request_body(
     input: SameFormatProviderRequestBodyInput<'_>,
 ) -> Option<Value> {
-    build_same_format_provider_request_body_inner(input, None)
+    build_same_format_provider_request_body_inner(
+        input,
+        None,
+        aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+    )
 }
 
 pub fn build_same_format_provider_request_body_with_compatibility_report(
     input: SameFormatProviderRequestBodyInput<'_>,
 ) -> Option<SameFormatProviderRequestBodyOutput> {
+    build_same_format_provider_request_body_with_compatibility_report_and_reasoning_replay_policy(
+        input,
+        aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+    )
+}
+
+pub fn build_same_format_provider_request_body_with_compatibility_report_and_reasoning_replay_policy(
+    input: SameFormatProviderRequestBodyInput<'_>,
+    reasoning_replay_policy: aether_ai_formats::OpenAiResponsesReasoningReplayPolicy,
+) -> Option<SameFormatProviderRequestBodyOutput> {
     let mut compatibility_edits = Vec::new();
-    let body =
-        build_same_format_provider_request_body_inner(input, Some(&mut compatibility_edits))?;
+    let body = build_same_format_provider_request_body_inner(
+        input,
+        Some(&mut compatibility_edits),
+        reasoning_replay_policy,
+    )?;
     Some(SameFormatProviderRequestBodyOutput {
         body,
         compatibility_edits,
@@ -239,6 +366,7 @@ pub fn enforce_same_format_provider_api_operation_body_policy(
 fn build_same_format_provider_request_body_inner(
     input: SameFormatProviderRequestBodyInput<'_>,
     mut compatibility_edits: Option<&mut Vec<SameFormatProviderCompatibilityEdit>>,
+    reasoning_replay_policy: aether_ai_formats::OpenAiResponsesReasoningReplayPolicy,
 ) -> Option<Value> {
     if let Some(kiro_auth_config) = input.kiro_auth_config {
         let body = build_kiro_provider_request_body(
@@ -401,6 +529,27 @@ fn build_same_format_provider_request_body_inner(
             "gemini:generate_content",
         )
     {
+        let before_mixed_tool_compatibility = compatibility_edits
+            .is_some()
+            .then(|| provider_request_body.clone());
+        aether_ai_formats::ensure_server_side_tool_invocations_for_mixed_tools(
+            &mut provider_request_body,
+        )?;
+        if before_mixed_tool_compatibility.is_some_and(|before| before != provider_request_body) {
+            record_compatibility_edit(
+                &mut compatibility_edits,
+                "toolConfig.includeServerSideToolInvocations",
+                SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite,
+                "enabled Gemini server-side tool invocations for mixed built-in and function tools",
+            );
+        }
+    }
+    if matches!(input.family, SameFormatProviderFamily::Gemini)
+        && aether_ai_formats::api_format_alias_matches(
+            input.provider_api_format,
+            "gemini:generate_content",
+        )
+    {
         let stripped = strip_gemini_function_response_ids(&mut provider_request_body);
         if stripped > 0 {
             record_compatibility_edit(
@@ -437,9 +586,10 @@ fn build_same_format_provider_request_body_inner(
         );
     }
     let stripped_reasoning_items =
-        aether_ai_formats::strip_incompatible_openai_responses_reasoning_items(
+        aether_ai_formats::strip_incompatible_openai_responses_reasoning_items_with_policy(
             &mut provider_request_body,
             input.provider_api_format,
+            reasoning_replay_policy,
         );
     if stripped_reasoning_items > 0 {
         record_compatibility_edit(
@@ -466,7 +616,7 @@ fn build_same_format_provider_request_body_inner(
     ) {
         return None;
     }
-    if aether_ai_formats::finalize_openai_provider_request(
+    if aether_ai_formats::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
         &mut provider_request_body,
         aether_ai_formats::OpenAiProviderRequestFinalization {
             source_api_format: input.provider_api_format,
@@ -478,6 +628,8 @@ fn build_same_format_provider_request_body_inner(
             upstream_is_stream: input.upstream_is_stream,
             require_body_stream_field,
         },
+        None,
+        reasoning_replay_policy,
     )
     .is_err()
     {
@@ -679,6 +831,12 @@ pub fn build_same_format_provider_headers(
         provider_request_headers.insert("accept".to_string(), "text/event-stream".to_string());
         force_identity_accept_encoding(&mut provider_request_headers);
     }
+    let declared_connection_headers =
+        crate::headers::declared_connection_header_names(input.headers, input.extra_headers);
+    crate::headers::remove_declared_connection_headers(
+        &mut provider_request_headers,
+        &declared_connection_headers,
+    );
     Some(provider_request_headers)
 }
 
@@ -814,6 +972,8 @@ fn resolve_same_format_standard_direct_auth(
 ) -> Option<(String, String)> {
     if aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:embedding")
         || aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:search")
+        || aether_ai_formats::api_format_alias_matches(provider_api_format, "openai:realtime")
+        || aether_ai_formats::api_format_alias_matches(provider_api_format, "codex:live")
     {
         resolve_local_openai_bearer_auth(transport)
     } else {
@@ -1411,6 +1571,56 @@ mod tests {
     }
 
     #[test]
+    fn resolves_openai_realtime_direct_auth_with_bearer_header() {
+        let mut transport = sample_transport("openai");
+        transport.endpoint.api_format = "openai:realtime".to_string();
+        transport.key.auth_type = "api_key".to_string();
+        let behavior = classify_same_format_provider_request_behavior(
+            &transport,
+            SameFormatProviderRequestBehaviorParams {
+                require_streaming: true,
+                provider_api_format: "openai:realtime",
+                report_kind: "openai_realtime_websocket_success",
+            },
+        );
+
+        assert_eq!(
+            resolve_same_format_provider_direct_auth(
+                &behavior,
+                &transport,
+                SameFormatProviderFamily::Standard,
+                "openai:realtime",
+            ),
+            Some(("authorization".to_string(), "Bearer secret".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolves_codex_live_direct_auth_with_bearer_header() {
+        let mut transport = sample_transport("openai");
+        transport.endpoint.api_format = "codex:live".to_string();
+        transport.key.auth_type = "api_key".to_string();
+        let behavior = classify_same_format_provider_request_behavior(
+            &transport,
+            SameFormatProviderRequestBehaviorParams {
+                require_streaming: true,
+                provider_api_format: "codex:live",
+                report_kind: "codex_live_websocket_success",
+            },
+        );
+
+        assert_eq!(
+            resolve_same_format_provider_direct_auth(
+                &behavior,
+                &transport,
+                SameFormatProviderFamily::Standard,
+                "codex:live",
+            ),
+            Some(("authorization".to_string(), "Bearer secret".to_string()))
+        );
+    }
+
+    #[test]
     fn keeps_claude_same_format_api_key_on_x_api_key_header() {
         let mut transport = sample_transport("custom");
         transport.endpoint.api_format = "claude:messages".to_string();
@@ -1985,6 +2195,60 @@ mod tests {
     }
 
     #[test]
+    fn same_format_gemini_body_enables_mixed_tool_invocations() {
+        let output = build_same_format_provider_request_body_with_compatibility_report(
+            SameFormatProviderRequestBodyInput {
+                body_json: &json!({
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{"text": "Search, then save the result."}]
+                    }],
+                    "tools": [
+                        {"googleSearch": {}},
+                        {
+                            "functionDeclarations": [{
+                                "name": "save_result",
+                                "parameters": {"type": "object"}
+                            }]
+                        }
+                    ],
+                    "toolConfig": {
+                        "functionCallingConfig": {"mode": "AUTO"}
+                    }
+                }),
+                mapped_model: "gemini-3.7-flash",
+                client_api_format: "gemini:generate_content",
+                provider_api_format: "gemini:generate_content",
+                source_model: Some("gemini-3.7-flash"),
+                family: SameFormatProviderFamily::Gemini,
+                body_rules: None,
+                request_headers: None,
+                upstream_is_stream: true,
+                force_body_stream_field: false,
+                kiro_auth_config: None,
+                is_claude_code: false,
+                enable_model_directives: false,
+            },
+        )
+        .expect("same-format Gemini body should build");
+
+        assert_eq!(output.body["tools"][0]["googleSearch"], json!({}));
+        assert_eq!(
+            output.body["tools"][1]["functionDeclarations"][0]["name"],
+            "save_result"
+        );
+        assert_eq!(
+            output.body["toolConfig"]["includeServerSideToolInvocations"],
+            true
+        );
+        assert!(output.compatibility_edits.iter().any(|edit| {
+            edit.field == "toolConfig.includeServerSideToolInvocations"
+                && edit.action
+                    == SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite
+        }));
+    }
+
+    #[test]
     fn same_format_body_report_records_provider_compatibility_edits() {
         let output = build_same_format_provider_request_body_with_compatibility_report(
             SameFormatProviderRequestBodyInput {
@@ -2092,6 +2356,112 @@ mod tests {
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["id"], "rs_provider_123");
         assert_eq!(input[1]["type"], "message");
+        assert!(output.compatibility_edits.iter().any(|edit| {
+            edit.field == "input[].id"
+                && edit.action
+                    == SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite
+        }));
+    }
+
+    #[test]
+    fn same_format_responses_body_preserves_deepseek_opaque_reasoning_replay() {
+        let reasoning_items = (0..66)
+            .map(|index| {
+                json!({
+                    "type": "reasoning",
+                    "encrypted_content": format!("opaque-deepseek-state-{index}"),
+                    "content": [{
+                        "type": "reasoning_text",
+                        "text": format!("provider thinking state {index}")
+                    }]
+                })
+            })
+            .chain(std::iter::once(json!({
+                "type": "message",
+                "role": "user",
+                "content": "continue"
+            })))
+            .collect::<Vec<_>>();
+        let request_body = json!({
+            "model": "deepseek-v4-flash",
+            "input": reasoning_items
+        });
+        let input = SameFormatProviderRequestBodyInput {
+            body_json: &request_body,
+            mapped_model: "deepseek-v4-flash",
+            client_api_format: "openai:responses",
+            provider_api_format: "openai:responses",
+            source_model: Some("deepseek-v4-flash"),
+            family: SameFormatProviderFamily::Standard,
+            body_rules: None,
+            request_headers: None,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            kiro_auth_config: None,
+            is_claude_code: false,
+            enable_model_directives: false,
+        };
+
+        let deepseek =
+            build_same_format_provider_request_body_with_compatibility_report_and_reasoning_replay_policy(
+                input,
+                aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque,
+            )
+            .expect("DeepSeek same-format Responses body should build");
+        let strict = build_same_format_provider_request_body_with_compatibility_report(input)
+            .expect("strict same-format Responses body should build");
+
+        assert_eq!(
+            deepseek.body["input"]
+                .as_array()
+                .expect("DeepSeek input array")
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            66
+        );
+        assert_eq!(
+            strict.body["input"]
+                .as_array()
+                .expect("strict input array")
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn same_format_compact_keeps_strict_reasoning_replay_under_deepseek_policy() {
+        let request_body = json!({
+            "model": "deepseek-v4-flash",
+            "input": [{
+                "type": "reasoning",
+                "encrypted_content": "opaque-deepseek-state",
+                "content": [{"type": "reasoning_text", "text": "thinking"}]
+            }]
+        });
+        let output = build_same_format_provider_request_body_with_compatibility_report_and_reasoning_replay_policy(
+            SameFormatProviderRequestBodyInput {
+                body_json: &request_body,
+                mapped_model: "deepseek-v4-flash",
+                client_api_format: "openai:responses:compact",
+                provider_api_format: "openai:responses:compact",
+                source_model: Some("deepseek-v4-flash"),
+                family: SameFormatProviderFamily::Standard,
+                body_rules: None,
+                request_headers: None,
+                upstream_is_stream: false,
+                force_body_stream_field: false,
+                kiro_auth_config: None,
+                is_claude_code: false,
+                enable_model_directives: false,
+            },
+            aether_ai_formats::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque,
+        )
+        .expect("Compact body should keep the strict OpenAI replay contract");
+
+        assert_eq!(output.body["input"].as_array().map(Vec::len), Some(0));
         assert!(output.compatibility_edits.iter().any(|edit| {
             edit.field == "input[].id"
                 && edit.action

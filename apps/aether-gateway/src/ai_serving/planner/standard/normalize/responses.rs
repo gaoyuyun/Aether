@@ -51,6 +51,69 @@ pub(crate) fn build_local_openai_responses_request_body_with_codex_model_capabil
     model_capabilities: Option<&crate::ai_serving::CodexResponsesModelCapabilities>,
     enable_model_directives: bool,
 ) -> Option<Value> {
+    build_local_openai_responses_request_body_with_codex_model_capabilities_and_websocket_mode(
+        body_json,
+        mapped_model,
+        require_streaming,
+        force_body_stream_field,
+        provider_type,
+        provider_api_format,
+        body_rules,
+        request_headers,
+        model_capabilities,
+        enable_model_directives,
+        false,
+    )
+}
+
+/// Builds a Responses body for a pinned WebSocket continuation.
+///
+/// This is intentionally an additive variant of the ordinary HTTP builder.
+/// The WebSocket framing layer, rather than a JSON-body heuristic, tells the
+/// Codex compatibility pass that `previous_response_id` is transport state and
+/// that Responses Lite `tools`/`instructions` must not be materialized into a
+/// second historical input prefix.
+pub(crate) fn build_local_openai_responses_request_body_with_codex_model_capabilities_for_websocket_continuation(
+    body_json: &Value,
+    mapped_model: &str,
+    require_streaming: bool,
+    force_body_stream_field: bool,
+    provider_type: &str,
+    provider_api_format: &str,
+    body_rules: Option<&Value>,
+    request_headers: &http::HeaderMap,
+    model_capabilities: Option<&crate::ai_serving::CodexResponsesModelCapabilities>,
+    enable_model_directives: bool,
+) -> Option<Value> {
+    build_local_openai_responses_request_body_with_codex_model_capabilities_and_websocket_mode(
+        body_json,
+        mapped_model,
+        require_streaming,
+        force_body_stream_field,
+        provider_type,
+        provider_api_format,
+        body_rules,
+        request_headers,
+        model_capabilities,
+        enable_model_directives,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_local_openai_responses_request_body_with_codex_model_capabilities_and_websocket_mode(
+    body_json: &Value,
+    mapped_model: &str,
+    require_streaming: bool,
+    force_body_stream_field: bool,
+    provider_type: &str,
+    provider_api_format: &str,
+    body_rules: Option<&Value>,
+    request_headers: &http::HeaderMap,
+    model_capabilities: Option<&crate::ai_serving::CodexResponsesModelCapabilities>,
+    enable_model_directives: bool,
+    websocket_continuation: bool,
+) -> Option<Value> {
     let provider_request_body = surface_build_local_openai_responses_request_body(
         body_json,
         mapped_model,
@@ -68,20 +131,28 @@ pub(crate) fn build_local_openai_responses_request_body_with_codex_model_capabil
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(mapped_model);
-    crate::ai_serving::apply_codex_openai_responses_special_body_edits_with_source_model_and_capabilities(
-        &mut provider_request_body,
-        provider_type,
-        provider_api_format,
-        mapped_model,
-        source_model,
-        model_capabilities,
-        body_rules,
-    );
+    if websocket_continuation {
+        crate::ai_serving::apply_codex_openai_responses_websocket_continuation_body_edits_with_source_model_and_capabilities(
+            &mut provider_request_body,
+            provider_type,
+            provider_api_format,
+            mapped_model,
+            source_model,
+            model_capabilities,
+            body_rules,
+        );
+    } else {
+        crate::ai_serving::apply_codex_openai_responses_special_body_edits_with_source_model_and_capabilities(
+            &mut provider_request_body,
+            provider_type,
+            provider_api_format,
+            mapped_model,
+            source_model,
+            model_capabilities,
+            body_rules,
+        );
+    }
     apply_openai_responses_compact_special_body_edits(
-        &mut provider_request_body,
-        provider_api_format,
-    );
-    crate::ai_serving::strip_incompatible_openai_responses_reasoning_items(
         &mut provider_request_body,
         provider_api_format,
     );
@@ -173,10 +244,6 @@ pub(crate) fn build_cross_format_openai_responses_request_body_with_codex_model_
         body_rules,
     );
     apply_openai_responses_compact_special_body_edits(
-        &mut provider_request_body,
-        provider_api_format,
-    );
-    crate::ai_serving::strip_incompatible_openai_responses_reasoning_items(
         &mut provider_request_body,
         provider_api_format,
     );

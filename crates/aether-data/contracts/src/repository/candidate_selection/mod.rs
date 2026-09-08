@@ -1,9 +1,9 @@
 mod types;
 
 pub use types::{
-    MinimalCandidateSelectionReadRepository, MinimalCandidateSelectionRepository,
-    StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow,
-    StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsByKeyIdsQuery,
-    StoredPoolKeyCandidateRowsQuery, StoredProviderModelMapping,
-    StoredRequestedModelCandidateRowsQuery,
+    provider_model_mapping_api_format_covers, MinimalCandidateSelectionReadRepository,
+    MinimalCandidateSelectionRepository, StoredApiFormatCandidateRowsQuery,
+    StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
+    StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
+    StoredProviderModelMapping, StoredRequestedModelCandidateRowsQuery,
 };

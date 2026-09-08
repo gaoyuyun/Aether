@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS usage_counter_deltas (
     request_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     target_id TEXT NOT NULL,
+    target_tunnel_generation TEXT,
     request_count_delta INTEGER NOT NULL DEFAULT 0,
     total_requests_delta INTEGER NOT NULL DEFAULT 0,
     success_count_delta INTEGER NOT NULL DEFAULT 0,
@@ -246,4 +247,38 @@ CREATE INDEX IF NOT EXISTS usage_settlement_snapshots_billing_status_idx ON usag
 CREATE INDEX IF NOT EXISTS usage_settlement_snapshots_wallet_id_idx ON usage_settlement_snapshots (wallet_id);
 CREATE INDEX IF NOT EXISTS ix_usage_settlement_snapshots_schema_version ON usage_settlement_snapshots (settlement_snapshot_schema_version);
 CREATE INDEX IF NOT EXISTS ix_usage_settlement_snapshots_pricing_source ON usage_settlement_snapshots (billing_pricing_source);
+
+CREATE TABLE IF NOT EXISTS usage_cost_reservations (
+    request_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    reservation_token TEXT PRIMARY KEY NOT NULL,
+    admitted_at INTEGER NOT NULL,
+    reserved_cost_units INTEGER NOT NULL,
+    actual_cost_units INTEGER,
+    state TEXT NOT NULL,
+    reservation_expires_at INTEGER NOT NULL,
+    retain_until INTEGER NOT NULL,
+    finalized_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CONSTRAINT usage_cost_reservations_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES users (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS usage_cost_reservations_request_id_idx ON usage_cost_reservations (request_id);
+CREATE INDEX IF NOT EXISTS usage_cost_reservations_subject_admitted_at_idx ON usage_cost_reservations (subject_id, admitted_at);
+CREATE INDEX IF NOT EXISTS usage_cost_reservations_reservation_expires_at_idx ON usage_cost_reservations (reservation_expires_at);
+CREATE INDEX IF NOT EXISTS usage_cost_reservations_retain_until_token_idx ON usage_cost_reservations (retain_until, reservation_token);
+
+CREATE TABLE IF NOT EXISTS usage_request_admissions (
+    request_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    event_token TEXT PRIMARY KEY NOT NULL,
+    admitted_at INTEGER NOT NULL,
+    retain_until INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    released_at INTEGER,
+    created_at INTEGER NOT NULL,
+    CONSTRAINT usage_request_admissions_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES users (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS usage_request_admissions_subject_admitted_at_idx ON usage_request_admissions (subject_id, admitted_at);
+CREATE INDEX IF NOT EXISTS usage_request_admissions_retain_until_token_idx ON usage_request_admissions (retain_until, event_token);
 

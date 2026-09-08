@@ -181,6 +181,22 @@ afterEach(() => {
 })
 
 describe('HorizontalRequestTimeline', () => {
+  it('only renders allowlisted provider website protocols', async () => {
+    const unsafeRoot = mountTimeline(buildTrace([
+      buildCandidate({ provider_website: 'javascript:alert(document.cookie)' }),
+    ]))
+    await nextTick()
+    expect(unsafeRoot.querySelector('.provider-link')).toBeNull()
+
+    const safeRoot = mountTimeline(buildTrace([
+      buildCandidate({ provider_website: ' HTTPS://provider.example/docs ' }),
+    ]))
+    await nextTick()
+    expect(safeRoot.querySelector<HTMLAnchorElement>('.provider-link')?.href).toBe(
+      'https://provider.example/docs',
+    )
+  })
+
   it('uses the trace aggregate latency instead of the successful candidate latency', async () => {
     const trace = buildTrace([
       buildCandidate({

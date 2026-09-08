@@ -145,7 +145,7 @@ export interface UserExport {
   email: string
   email_verified?: boolean
   username: string
-  password_hash: string
+  password_hash?: string | null
   role: string
   allowed_providers?: string[] | null
   allowed_providers_mode?: 'inherit' | 'unrestricted' | 'specific' | 'deny_all'
@@ -169,9 +169,11 @@ export interface UserExport {
 
 export interface UserApiKeyExport {
   api_key_id?: string
+  // Legacy 1.3-1.5 import-only credential fields. Version 1.6 exports omit them.
   key?: string | null
-  key_hash: string
+  key_hash?: string | null
   key_encrypted?: string | null
+  credential_state?: 'not_exported'
   name?: string | null
   is_standalone: boolean
   allowed_providers?: string[] | null

@@ -3,6 +3,7 @@ mod done_hub;
 mod generic_api;
 mod new_api;
 mod sub2api;
+mod usage_api;
 
 use serde_json::{json, Map, Value};
 use std::sync::LazyLock;
@@ -92,6 +93,7 @@ static PROVIDER_OPS_ARCHITECTURES: LazyLock<Vec<ProviderOpsArchitectureSpec>> =
             generic_api::spec(),
             new_api::spec(),
             sub2api::spec(),
+            usage_api::spec(),
         ]
     });
 
@@ -119,6 +121,7 @@ pub fn normalize_architecture_id(architecture_id: &str) -> &'static str {
         "done_hub" => "done_hub",
         "anyrouter" => "anyrouter",
         "sub2api" => "sub2api",
+        "usage_api" => "usage_api",
         _ => "generic_api",
     }
 }
@@ -174,6 +177,7 @@ fn default_action_config(architecture_id: &str, action_type: &str) -> Option<Map
         "generic_api" => generic_api::default_action_config(action_type),
         "new_api" => new_api::default_action_config(action_type),
         "sub2api" => sub2api::default_action_config(action_type),
+        "usage_api" => usage_api::default_action_config(action_type),
         _ => None,
     }
 }
@@ -192,13 +196,13 @@ mod tests {
     #[test]
     fn list_architectures_hides_generic_api_by_default() {
         let visible = list_architectures(false);
-        assert_eq!(visible.len(), 4);
+        assert_eq!(visible.len(), 5);
         assert!(visible
             .iter()
             .all(|item| item.architecture_id != "generic_api"));
 
         let all = list_architectures(true);
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert!(all.iter().any(|item| item.architecture_id == "generic_api"));
     }
 
@@ -210,6 +214,7 @@ mod tests {
         assert_eq!(normalize_architecture_id("cubence"), "generic_api");
         assert_eq!(normalize_architecture_id("nekocode"), "generic_api");
         assert_eq!(normalize_architecture_id("yescode"), "generic_api");
+        assert_eq!(normalize_architecture_id("usage_api"), "usage_api");
         assert_eq!(normalize_architecture_id("unknown"), "generic_api");
     }
 

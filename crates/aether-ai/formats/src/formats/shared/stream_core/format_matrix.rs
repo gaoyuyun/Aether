@@ -17,8 +17,9 @@ use crate::formats::shared::error_body::{
 };
 use crate::formats::shared::sse::encode_json_sse;
 use crate::formats::shared::stream_core::common::{
-    decode_json_data_line, openai_stream_terminal_error_body, openai_stream_terminal_error_message,
-    unsupported_stream_event_message, CanonicalStreamEvent, CanonicalStreamFrame, CanonicalUsage,
+    canonical_usage_from_openai_usage, decode_json_data_line, openai_stream_terminal_error_body,
+    openai_stream_terminal_error_message, unsupported_stream_event_message, CanonicalStreamEvent,
+    CanonicalStreamFrame, CanonicalUsage,
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
 
@@ -107,7 +108,8 @@ impl StreamingStandardFormatMatrix {
         let client_api_format = client_api_format_for_context(report_context);
 
         self.provider = ProviderStreamParser::for_api_format(provider_api_format.as_str());
-        self.client = ClientStreamEmitter::for_api_format(client_api_format.as_str());
+        self.client =
+            ClientStreamEmitter::for_api_format(client_api_format.as_str(), report_context);
     }
 
     fn emit_frames(
@@ -133,7 +135,11 @@ impl StreamingStandardFormatMatrix {
             }
             if let CanonicalStreamEvent::UnknownEvent(payload) = &frame.event {
                 self.terminated = true;
-                out.extend(client.emit_unknown_event(payload)?);
+                if openai_stream_terminal_error_body(payload).is_some() {
+                    out.extend(client.emit_terminal_error_frame(frame)?);
+                } else {
+                    out.extend(client.emit_unknown_event(payload)?);
+                }
                 break;
             }
             if let CanonicalStreamEvent::OpenAiResponsesOutputItem { raw_event, .. } = &frame.event
@@ -367,6 +373,10 @@ impl StreamingStandardTerminalObserver {
                 summary.observed_finish = true;
                 summary.finish_reason = Some("error".to_string());
                 summary.parser_error = openai_stream_terminal_error_message(&payload);
+                summary.standardized_usage = payload
+                    .pointer("/response/usage")
+                    .and_then(|usage| canonical_usage_from_openai_usage(Some(usage)))
+                    .map(standardized_usage_from_canonical);
             }
             CanonicalStreamEvent::UnknownEvent(_) => {
                 summary.unknown_event_count = summary.unknown_event_count.saturating_add(1);
@@ -375,6 +385,13 @@ impl StreamingStandardTerminalObserver {
                 finish_reason,
                 usage,
             } => {
+                if let Some(parser_error) = finish_reason
+                    .as_deref()
+                    .filter(|reason| !canonical_stream_finish_reason_is_supported(reason))
+                    .map(|reason| format!("unsupported provider stream finish reason: {reason}"))
+                {
+                    summary.parser_error.get_or_insert(parser_error);
+                }
                 summary.finish_reason = finish_reason;
                 summary.standardized_usage = usage.map(standardized_usage_from_canonical);
                 summary.observed_finish = true;
@@ -418,6 +435,7 @@ impl ProviderStreamParser {
             FormatId::ClaudeMessages => Self::Claude(ClaudeProviderState::default()),
             FormatId::GeminiGenerateContent => Self::Gemini(GeminiProviderState::default()),
             FormatId::OpenAiEmbedding
+            | FormatId::OpenAiRealtime
             | FormatId::OpenAiSearch
             | FormatId::OpenAiRerank
             | FormatId::GeminiEmbedding
@@ -425,7 +443,8 @@ impl ProviderStreamParser {
             | FormatId::JinaEmbedding
             | FormatId::JinaRerank
             | FormatId::DoubaoEmbedding
-            | FormatId::AliyunMultimodalEmbedding => return None,
+            | FormatId::AliyunMultimodalEmbedding
+            | FormatId::CodexLive => return None,
         })
     }
 
@@ -528,15 +547,18 @@ fn standardized_usage_from_canonical(usage: CanonicalUsage) -> StandardizedUsage
 }
 
 impl ClientStreamEmitter {
-    fn for_api_format(client_api_format: &str) -> Option<Self> {
+    fn for_api_format(client_api_format: &str, report_context: &Value) -> Option<Self> {
         Some(match FormatId::parse(client_api_format)? {
             FormatId::OpenAiChat => Self::OpenAIChat(OpenAIChatClientEmitter::default()),
             FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact => {
-                Self::OpenAIResponses(Box::default())
+                Self::OpenAIResponses(Box::new(OpenAIResponsesClientEmitter::with_report_context(
+                    report_context,
+                )))
             }
             FormatId::ClaudeMessages => Self::Claude(ClaudeClientEmitter::default()),
             FormatId::GeminiGenerateContent => Self::Gemini(GeminiClientEmitter::default()),
             FormatId::OpenAiEmbedding
+            | FormatId::OpenAiRealtime
             | FormatId::OpenAiSearch
             | FormatId::OpenAiRerank
             | FormatId::GeminiEmbedding
@@ -544,7 +566,8 @@ impl ClientStreamEmitter {
             | FormatId::JinaEmbedding
             | FormatId::JinaRerank
             | FormatId::DoubaoEmbedding
-            | FormatId::AliyunMultimodalEmbedding => return None,
+            | FormatId::AliyunMultimodalEmbedding
+            | FormatId::CodexLive => return None,
         })
     }
 
@@ -592,6 +615,44 @@ impl ClientStreamEmitter {
             self.api_format(),
             &unsupported_stream_event_message(payload),
             Some("unsupported_stream_event"),
+            LocalCoreSyncErrorKind::ServerError,
+        ) else {
+            return Ok(Vec::new());
+        };
+        self.emit_error(error_body)
+    }
+
+    fn emit_terminal_error_frame(
+        &mut self,
+        frame: CanonicalStreamFrame,
+    ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        if matches!(
+            self,
+            ClientStreamEmitter::OpenAIChat(_) | ClientStreamEmitter::OpenAIResponses(_)
+        ) {
+            return self.emit(frame);
+        }
+        let CanonicalStreamEvent::UnknownEvent(payload) = frame.event else {
+            return self.emit(frame);
+        };
+        let Some(source_error_body) = openai_stream_terminal_error_body(&payload) else {
+            return self.emit_unknown_event(&payload);
+        };
+        let Some(error) = source_error_body.get("error") else {
+            return self.emit_unknown_event(&payload);
+        };
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Upstream stream ended with an error");
+        let code = error.get("code").and_then(|value| match value {
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        });
+        let Some(error_body) = build_core_error_body_for_client_format(
+            self.api_format(),
+            message,
+            code,
             LocalCoreSyncErrorKind::ServerError,
         ) else {
             return Ok(Vec::new());
@@ -660,13 +721,15 @@ fn parse_provider_error(
             parse_gemini_error(payload)
         }
         FormatId::OpenAiEmbedding
+        | FormatId::OpenAiRealtime
         | FormatId::OpenAiSearch
         | FormatId::OpenAiRerank
         | FormatId::GeminiEmbedding
         | FormatId::JinaEmbedding
         | FormatId::JinaRerank
         | FormatId::DoubaoEmbedding
-        | FormatId::AliyunMultimodalEmbedding => None,
+        | FormatId::AliyunMultimodalEmbedding
+        | FormatId::CodexLive => None,
     }
 }
 
@@ -746,7 +809,9 @@ fn parse_gemini_error(payload: &Value) -> Option<(String, Option<String>, LocalC
 #[cfg(test)]
 mod tests {
     use super::{StreamingStandardFormatMatrix, StreamingStandardTerminalObserver};
-    use crate::formats::{context::FormatContext, registry::convert_request};
+    use crate::formats::{
+        context::FormatContext, openai::namespace::NamespaceToolAliases, registry::convert_request,
+    };
     use serde_json::{json, Value};
 
     fn report_context(provider_api_format: &str, client_api_format: &str) -> Value {
@@ -772,6 +837,145 @@ mod tests {
 
     fn event_only_line(event: &str) -> Vec<u8> {
         format!("event: {event}\n").into_bytes()
+    }
+
+    #[test]
+    fn terminal_observer_marks_malformed_gemini_function_call_as_failure() {
+        let context = report_context("gemini:generate_content", "openai:responses");
+        let mut observer = StreamingStandardTerminalObserver::default();
+        observer
+            .push_line(
+                &context,
+                data_line(json!({
+                    "response": {
+                        "responseId": "resp_malformed_tool_call",
+                        "modelVersion": "gemini-3.7-flash-tiered",
+                        "candidates": [{
+                            "index": 0,
+                            "content": {
+                                "role": "model",
+                                "parts": [{"thoughtSignature": "signature", "text": ""}]
+                            },
+                            "finishReason": "MALFORMED_FUNCTION_CALL",
+                            "finishMessage": "Malformed function call: Function call is empty - no input to parse."
+                        }],
+                        "usageMetadata": {
+                            "promptTokenCount": 206744,
+                            "cachedContentTokenCount": 203947,
+                            "thoughtsTokenCount": 1130,
+                            "totalTokenCount": 207874
+                        }
+                    },
+                    "responseId": "resp_malformed_tool_call"
+                })),
+            )
+            .expect("Gemini terminal frame should parse");
+
+        let summary = observer
+            .finish(&context)
+            .expect("terminal observation should finish")
+            .expect("Gemini terminal frame should produce a summary");
+
+        assert!(summary.observed_finish);
+        assert_eq!(summary.finish_reason.as_deref(), Some("error"));
+        assert_eq!(
+            summary.parser_error.as_deref(),
+            Some("Malformed function call: Function call is empty - no input to parse.")
+        );
+        let usage = summary
+            .standardized_usage
+            .expect("failed Gemini terminal should preserve usage");
+        assert_eq!(usage.input_tokens, 206744);
+        assert_eq!(usage.output_tokens, 1130);
+        assert_eq!(usage.cache_read_tokens, 203947);
+    }
+
+    #[test]
+    fn streams_gemini_thought_text_to_openai_responses_immediately() {
+        let context = report_context("gemini:generate_content", "openai:responses");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let output = matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "response": {
+                        "responseId": "resp_reasoning_123",
+                        "modelVersion": "gemini-3.7-flash-tiered",
+                        "candidates": [{
+                            "index": 0,
+                            "content": {
+                                "role": "model",
+                                "parts": [{"thought": true, "text": "checking"}]
+                            }
+                        }]
+                    }
+                })),
+            )
+            .expect("first Gemini thought chunk should transform");
+        let sse = String::from_utf8(output).expect("reasoning SSE should be utf8");
+
+        assert!(
+            sse.contains("event: response.reasoning_summary_text.delta\n"),
+            "{sse}"
+        );
+        assert!(sse.contains("\"delta\":\"checking\""), "{sse}");
+    }
+
+    #[test]
+    fn transforms_malformed_gemini_function_call_to_responses_failed() {
+        let context = report_context("gemini:generate_content", "openai:responses");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let output = matrix
+            .transform_line(
+                &context,
+                data_line(json!({
+                    "response": {
+                        "responseId": "resp_malformed_tool_call",
+                        "modelVersion": "gemini-3.7-flash-tiered",
+                        "candidates": [{
+                            "index": 0,
+                            "content": {
+                                "role": "model",
+                                "parts": [{
+                                    "text": "",
+                                    "thoughtSignature": "opaque-thought-signature"
+                                }]
+                            },
+                            "finishReason": "MALFORMED_FUNCTION_CALL",
+                            "finishMessage": "Malformed function call: Function call is empty - no input to parse."
+                        }],
+                        "usageMetadata": {
+                            "promptTokenCount": 206744,
+                            "cachedContentTokenCount": 203947,
+                            "thoughtsTokenCount": 1130,
+                            "totalTokenCount": 207874
+                        }
+                    }
+                })),
+            )
+            .expect("malformed Gemini terminal should transform to a stream error");
+        let sse = String::from_utf8(output).expect("failed response SSE should be utf8");
+
+        assert!(sse.contains("event: response.failed\n"), "{sse}");
+        assert!(sse.contains("\"type\":\"response.failed\""), "{sse}");
+        assert!(
+            sse.contains("\"code\":\"MALFORMED_FUNCTION_CALL\""),
+            "{sse}"
+        );
+        assert!(
+            sse.contains(
+                "\"message\":\"Malformed function call: Function call is empty - no input to parse.\""
+            ),
+            "{sse}"
+        );
+        assert!(sse.contains("\"input_tokens\":206744"), "{sse}");
+        assert!(sse.contains("\"output_tokens\":1130"), "{sse}");
+        assert!(sse.contains("\"cached_tokens\":203947"), "{sse}");
+        assert!(!sse.contains("unsupported_finish_reason"), "{sse}");
+        assert!(matrix
+            .finish(&context)
+            .expect("failed matrix should stay terminated")
+            .is_empty());
     }
 
     #[test]
@@ -949,6 +1153,151 @@ mod tests {
             continuation["messages"][2]["tool_call_id"],
             "call_history_stream_test_1"
         );
+    }
+
+    #[test]
+    fn streamed_chat_namespace_tool_call_restores_responses_identity() {
+        let report_context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "mapped_model": "qwen",
+            "needs_conversion": true,
+            "original_request_body": {
+                "model": "qwen",
+                "input": [{"role": "user", "content": "write the report"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "vulnerability_report",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "mcp__vulnerability_report",
+                        "description": "reporting tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "vulnerability_report",
+                            "description": "write the confirmed report",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"report_path": {"type": "string"}},
+                                "required": ["report_path"]
+                            },
+                            "strict": true
+                        }]
+                    }
+                ]
+            }
+        });
+        let aliases = NamespaceToolAliases::from_report_context(&report_context);
+        let chat_name = aliases
+            .chat_name("mcp__vulnerability_report", "vulnerability_report")
+            .expect("namespace child should have a Chat alias")
+            .to_string();
+        assert_ne!(chat_name, "vulnerability_report");
+
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut output = Vec::new();
+        output.extend(
+            matrix
+                .transform_line(
+                    &report_context,
+                    data_line(json!({
+                        "id": "chatcmpl_namespace_stream_1",
+                        "model": "qwen",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_namespace_stream_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": chat_name,
+                                        "arguments": "{\"report_path\":"
+                                    }
+                                }]
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    })),
+                )
+                .expect("tool start should convert"),
+        );
+        output.extend(
+            matrix
+                .transform_line(
+                    &report_context,
+                    data_line(json!({
+                        "id": "chatcmpl_namespace_stream_1",
+                        "model": "qwen",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": {"arguments": "\"reports/sql-001.md\"}"}
+                                }]
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    })),
+                )
+                .expect("tool arguments should convert"),
+        );
+        output.extend(
+            matrix
+                .transform_line(
+                    &report_context,
+                    data_line(json!({
+                        "id": "chatcmpl_namespace_stream_1",
+                        "model": "qwen",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 4,
+                            "total_tokens": 14
+                        }
+                    })),
+                )
+                .expect("tool finish should convert"),
+        );
+
+        let events = json_data_events(&output);
+        let added = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.added")
+            .expect("function-call item should start");
+        assert_eq!(added["item"]["name"], "vulnerability_report");
+        assert_eq!(added["item"]["namespace"], "mcp__vulnerability_report");
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .expect("function-call item should complete");
+        assert_eq!(done["item"]["name"], "vulnerability_report");
+        assert_eq!(done["item"]["namespace"], "mcp__vulnerability_report");
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("response should complete");
+        let function_call = completed["response"]["output"]
+            .as_array()
+            .expect("response output")
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("completed function call");
+        assert_eq!(function_call["name"], "vulnerability_report");
+        assert_eq!(function_call["namespace"], "mcp__vulnerability_report");
+
+        let persisted = matrix
+            .take_response_history_record()
+            .expect("completed stream should expose response history");
+        assert!(persisted.payload.contains("mcp__vulnerability_report"));
     }
 
     #[test]
@@ -1161,6 +1510,17 @@ mod tests {
             )
             .expect("keepalive should be ignored");
         assert!(keepalive.is_empty());
+
+        let ping = matrix
+            .transform_line(
+                &report_context,
+                data_line(json!({
+                    "type": "ping",
+                    "cost": "0",
+                })),
+            )
+            .expect("provider ping should be ignored");
+        assert!(ping.is_empty());
 
         for line in [
             data_line(json!({

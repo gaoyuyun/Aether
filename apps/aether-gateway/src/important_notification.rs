@@ -24,6 +24,18 @@ pub(crate) const IMPORTANT_NOTIFICATION_DEFAULT_CHANNEL_KEY: &str =
 pub(crate) const IMPORTANT_NOTIFICATION_ITEMS_KEY: &str = "module.important_notification.items";
 pub(crate) const PROVIDER_QUOTA_ALERT_ITEM_KEY: &str = "provider_quota_alert";
 
+// Notification configuration is administrator-controlled but is also read on
+// request paths. Bound fan-out and template materialization so a malformed or
+// compromised configuration cannot trigger unbounded work or SMTP payloads.
+const MAX_NOTIFICATION_RECIPIENTS: usize = 128;
+const MAX_NOTIFICATION_RECIPIENT_BYTES: usize = 320;
+const MAX_NOTIFICATION_RECIPIENT_VALUE_BYTES: usize = 64 * 1024;
+const MAX_NOTIFICATION_RECIPIENT_PARTS_PER_VALUE: usize = 256;
+const MAX_NOTIFICATION_ITEMS: usize = 128;
+const MAX_NOTIFICATION_ITEM_KEY_BYTES: usize = 128;
+const MAX_NOTIFICATION_ITEM_NAME_BYTES: usize = 512;
+const MAX_NOTIFICATION_TEMPLATE_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ImportantNotification {
     pub(crate) title: String,
@@ -430,6 +442,7 @@ fn parse_notification_items(value: Option<&Value>) -> Vec<ImportantNotificationI
     };
     items
         .iter()
+        .take(MAX_NOTIFICATION_ITEMS)
         .filter_map(parse_notification_item)
         .collect::<Vec<_>>()
 }
@@ -437,7 +450,7 @@ fn parse_notification_items(value: Option<&Value>) -> Vec<ImportantNotificationI
 fn parse_notification_item(value: &Value) -> Option<ImportantNotificationItemConfig> {
     let item = value.as_object()?;
     let key = item.get("key")?.as_str()?.trim();
-    if key.is_empty() {
+    if key.is_empty() || key.len() > MAX_NOTIFICATION_ITEM_KEY_BYTES {
         return None;
     }
     let name = item
@@ -445,6 +458,7 @@ fn parse_notification_item(value: &Value) -> Option<ImportantNotificationItemCon
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| value.len() <= MAX_NOTIFICATION_ITEM_NAME_BYTES)
         .unwrap_or(key);
     Some(ImportantNotificationItemConfig {
         key: key.to_string(),
@@ -454,9 +468,9 @@ fn parse_notification_item(value: &Value) -> Option<ImportantNotificationItemCon
             .get("channel")
             .and_then(Value::as_str)
             .and_then(parse_channel_filter),
-        title_template: optional_non_empty_string(item.get("title_template")),
-        markdown_template: optional_non_empty_string(item.get("markdown_template")),
-        text_template: optional_non_empty_string(item.get("text_template")),
+        title_template: bounded_optional_string(item.get("title_template")),
+        markdown_template: bounded_optional_string(item.get("markdown_template")),
+        text_template: bounded_optional_string(item.get("text_template")),
         user_email_enabled: item
             .get("user_email_enabled")
             .and_then(Value::as_bool)
@@ -507,6 +521,10 @@ fn optional_non_empty_string(value: Option<&Value>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn bounded_optional_string(value: Option<&Value>) -> Option<String> {
+    optional_non_empty_string(value).filter(|value| value.len() <= MAX_NOTIFICATION_TEMPLATE_BYTES)
 }
 
 fn find_notification_item<'a>(
@@ -765,7 +783,10 @@ fn parse_recipient_list(value: Option<&Value>) -> Vec<String> {
     let mut recipients = Vec::new();
     match value {
         Some(Value::Array(items)) => {
-            for item in items {
+            for item in items.iter().take(MAX_NOTIFICATION_RECIPIENTS * 4) {
+                if recipients.len() >= MAX_NOTIFICATION_RECIPIENTS {
+                    break;
+                }
                 if let Some(raw) = item.as_str() {
                     push_recipient_parts(&mut recipients, raw);
                 }
@@ -780,11 +801,21 @@ fn parse_recipient_list(value: Option<&Value>) -> Vec<String> {
 }
 
 fn push_recipient_parts(recipients: &mut Vec<String>, raw: &str) {
+    if raw.len() > MAX_NOTIFICATION_RECIPIENT_VALUE_BYTES {
+        return;
+    }
     for item in raw
         .split([',', ';', '\n', '\r'])
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .take(MAX_NOTIFICATION_RECIPIENT_PARTS_PER_VALUE)
     {
+        if recipients.len() >= MAX_NOTIFICATION_RECIPIENTS {
+            return;
+        }
+        if item.len() > MAX_NOTIFICATION_RECIPIENT_BYTES {
+            continue;
+        }
         recipients.push(item.to_string());
     }
 }
@@ -811,6 +842,8 @@ mod tests {
     use super::{
         apply_notification_item_template, parse_channel_filter, parse_notification_items,
         parse_recipient_list, ImportantNotification, ImportantNotificationChannelFilter,
+        MAX_NOTIFICATION_ITEMS, MAX_NOTIFICATION_RECIPIENTS, MAX_NOTIFICATION_RECIPIENT_BYTES,
+        MAX_NOTIFICATION_TEMPLATE_BYTES,
     };
     use serde_json::json;
 
@@ -826,6 +859,18 @@ mod tests {
                 "ops@example.com".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn parse_recipient_list_bounds_fanout_and_drops_oversized_entries() {
+        let oversized = "x".repeat(MAX_NOTIFICATION_RECIPIENT_BYTES + 1);
+        let many = (0..(MAX_NOTIFICATION_RECIPIENTS + 20))
+            .map(|index| format!("user{index}@example.com"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let recipients = parse_recipient_list(Some(&json!([oversized.clone(), many])));
+        assert!(recipients.len() <= MAX_NOTIFICATION_RECIPIENTS);
+        assert!(!recipients.iter().any(|value| value == &oversized));
     }
 
     #[test]
@@ -849,6 +894,22 @@ mod tests {
             Some(ImportantNotificationChannelFilter::Email)
         );
         assert!(items[0].user_email_enabled);
+    }
+
+    #[test]
+    fn parse_notification_items_bounds_templates_and_count() {
+        let oversized = "x".repeat(MAX_NOTIFICATION_TEMPLATE_BYTES + 1);
+        let raw = (0..(MAX_NOTIFICATION_ITEMS + 10))
+            .map(|index| {
+                json!({
+                    "key": format!("item_{index}"),
+                    "title_template": oversized.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let items = parse_notification_items(Some(&json!(raw)));
+        assert!(items.len() <= MAX_NOTIFICATION_ITEMS);
+        assert!(items.iter().all(|item| item.title_template.is_none()));
     }
 
     #[test]

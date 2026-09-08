@@ -9,7 +9,8 @@ use http::StatusCode;
 use serde_json::json;
 
 use super::super::super::{
-    build_router_with_state, sample_endpoint, sample_key, sample_provider, start_server, AppState,
+    build_router_with_state, sample_bound_key as sample_key, sample_endpoint, sample_provider,
+    start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -541,7 +542,7 @@ async fn gateway_creates_admin_provider_endpoint_locally_with_trusted_admin_prin
     assert_eq!(payload["max_retries"], 5);
     assert_eq!(payload["total_keys"], 0);
     assert_eq!(payload["active_keys"], 0);
-    assert_eq!(payload["proxy"]["url"], "http://proxy.internal");
+    assert_eq!(payload["proxy"]["url"], "http://proxy.internal/");
     assert_eq!(payload["proxy"]["password"], "***");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -741,8 +742,8 @@ async fn gateway_updates_admin_provider_endpoint_locally_with_trusted_admin_prin
     assert_eq!(payload["is_active"], false);
     assert_eq!(payload["total_keys"], 1);
     assert_eq!(payload["active_keys"], 1);
-    assert_eq!(payload["proxy"]["url"], "http://proxy-2.internal");
-    assert_eq!(payload["proxy"]["password"], "***");
+    assert_eq!(payload["proxy"]["url"], "http://proxy-2.internal/");
+    assert_eq!(payload["proxy"]["password"], serde_json::Value::Null);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let endpoints = provider_catalog_repository
@@ -757,7 +758,7 @@ async fn gateway_updates_admin_provider_endpoint_locally_with_trusted_admin_prin
     assert_eq!(endpoints[0].config, Some(json!({"foo":"new"})));
     assert_eq!(
         endpoints[0].proxy,
-        Some(json!({"url":"http://proxy-2.internal","password":"secret"}))
+        Some(json!({"url":"http://proxy-2.internal/"}))
     );
 
     gateway_handle.abort();

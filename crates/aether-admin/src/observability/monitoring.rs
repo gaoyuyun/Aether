@@ -1,5 +1,10 @@
 use aether_data_contracts::repository::{
-    candidates::{DecisionTrace, DecisionTraceCandidate, RequestCandidateStatus},
+    candidates::{
+        sanitize_request_candidate_api_formats, sanitize_request_candidate_error_type,
+        sanitize_request_candidate_extra_data, sanitize_request_candidate_required_capabilities,
+        sanitize_request_candidate_skip_reason, DecisionTrace, DecisionTraceCandidate,
+        RequestCandidateStatus,
+    },
     provider_catalog::StoredProviderCatalogKey,
     usage::StoredRequestUsageAudit,
 };
@@ -9,7 +14,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -330,7 +334,19 @@ pub fn build_admin_monitoring_trace_request_candidate_payload_with_key_accounts(
     usage: Option<&StoredRequestUsageAudit>,
     key_accounts: &BTreeMap<String, AdminMonitoringKeyAccountDisplay>,
 ) -> Value {
+    let mut item = item.clone();
+    item.sanitize_sensitive_diagnostics();
     let candidate = &item.candidate;
+    let sanitized_extra_data =
+        build_admin_monitoring_trace_candidate_extra_data(candidate.extra_data.as_ref(), usage);
+    let sanitized_extra_data_ref =
+        (!sanitized_extra_data.is_null()).then_some(&sanitized_extra_data);
+    let sanitized_key_api_formats =
+        sanitize_request_candidate_api_formats(item.provider_key_api_formats.clone());
+    let sanitized_key_capabilities =
+        sanitize_request_candidate_required_capabilities(item.provider_key_capabilities.clone());
+    let sanitized_required_capabilities =
+        sanitize_request_candidate_required_capabilities(candidate.required_capabilities.clone());
     let key_account = candidate
         .key_id
         .as_deref()
@@ -350,32 +366,32 @@ pub fn build_admin_monitoring_trace_request_candidate_payload_with_key_accounts(
         "endpoint_name": item.endpoint_api_format,
         "endpoint_api_family": item.endpoint_api_family,
         "endpoint_kind": item.endpoint_kind,
-        "endpoint_format_acceptance_config": item.endpoint_format_acceptance_config,
+        "endpoint_format_acceptance_config": serde_json::Value::Null,
         "key_id": candidate.key_id,
         "key_name": item.provider_key_name,
         "key_account_label": key_account.and_then(|item| item.label.clone()),
         "key_preview": serde_json::Value::Null,
         "key_auth_type": item.provider_key_auth_type,
-        "key_api_formats": item.provider_key_api_formats,
+        "key_api_formats": sanitized_key_api_formats,
         "key_internal_priority": item.provider_key_internal_priority,
-        "key_global_priority_by_format": item.provider_key_global_priority_by_format,
+        "key_global_priority_by_format": serde_json::Value::Null,
         "key_oauth_plan_type": key_account.and_then(|item| item.oauth_plan_type.clone()),
-        "key_capabilities": item.provider_key_capabilities,
-        "required_capabilities": candidate.required_capabilities,
+        "key_capabilities": sanitized_key_capabilities,
+        "required_capabilities": sanitized_required_capabilities,
         "status": candidate.status,
-        "skip_reason": candidate.skip_reason,
+        "skip_reason": sanitize_request_candidate_skip_reason(candidate.skip_reason.clone()),
         "is_cached": candidate.is_cached,
         "status_code": candidate.status_code,
-        "error_type": candidate.error_type,
-        "error_message": candidate.error_message,
+        "error_type": sanitize_request_candidate_error_type(candidate.error_type.clone()),
+        "error_message": serde_json::Value::Null,
         "latency_ms": candidate.latency_ms,
         "concurrent_requests": candidate.concurrent_requests,
-        "ranking": build_admin_monitoring_trace_candidate_ranking(candidate.extra_data.as_ref()),
-        "image_progress": candidate.extra_data.as_ref()
+        "ranking": build_admin_monitoring_trace_candidate_ranking(sanitized_extra_data_ref),
+        "image_progress": sanitized_extra_data_ref
             .and_then(|value| value.get("image_progress"))
             .cloned()
             .unwrap_or(Value::Null),
-        "extra_data": build_admin_monitoring_trace_candidate_extra_data(candidate.extra_data.as_ref(), usage),
+        "extra_data": sanitized_extra_data,
         "created_at": unix_ms_to_rfc3339(candidate.created_at_unix_ms),
         "started_at": candidate.started_at_unix_ms.and_then(unix_ms_to_rfc3339),
         "finished_at": candidate.finished_at_unix_ms.and_then(unix_ms_to_rfc3339),
@@ -503,11 +519,8 @@ fn build_admin_monitoring_trace_candidate_extra_data(
     existing: Option<&Value>,
     usage: Option<&StoredRequestUsageAudit>,
 ) -> Value {
-    let mut extra_data = match existing {
-        Some(Value::Object(object)) => Some(object.clone()),
-        Some(other) => return other.clone(),
-        None => None,
-    };
+    let mut extra_data = sanitize_request_candidate_extra_data(existing.cloned())
+        .and_then(|value| value.as_object().cloned());
 
     if let Some(usage) = usage {
         let extra_object = extra_data.get_or_insert_with(serde_json::Map::new);
@@ -535,9 +548,6 @@ fn build_admin_monitoring_trace_candidate_extra_data(
             if let Some(response) = admin_monitoring_trace_response_data(
                 "upstream_response",
                 usage.status_code,
-                usage.response_headers.as_ref(),
-                usage.response_body.as_ref(),
-                usage.response_body_ref.as_deref(),
                 usage.response_body_state,
             ) {
                 merge_admin_monitoring_trace_response(extra_object, "upstream_response", response);
@@ -564,90 +574,23 @@ fn build_admin_monitoring_trace_candidate_extra_data(
         }
     }
 
-    match extra_data {
-        Some(object) => Value::Object(object),
-        None => Value::Null,
-    }
+    sanitize_request_candidate_extra_data(extra_data.map(Value::Object)).unwrap_or(Value::Null)
 }
 
 fn admin_monitoring_trace_response_data(
     source: &str,
     status_code: Option<u16>,
-    headers: Option<&Value>,
-    body: Option<&Value>,
-    body_ref: Option<&str>,
     body_state: Option<aether_data_contracts::repository::usage::UsageBodyCaptureState>,
 ) -> Option<Value> {
-    if status_code.is_none()
-        && headers.is_none()
-        && body.is_none()
-        && body_ref.is_none()
-        && body_state.is_none()
-    {
+    if status_code.is_none() && body_state.is_none() {
         return None;
     }
 
-    let body = admin_monitoring_trace_response_body(headers, body);
     Some(json!({
         "source": source,
         "status_code": status_code,
-        "headers": headers.cloned().unwrap_or(Value::Null),
-        "body": body.unwrap_or(Value::Null),
-        "body_ref": body_ref,
         "body_state": body_state.map(|state| state.as_str()),
     }))
-}
-
-fn admin_monitoring_trace_response_body(
-    headers: Option<&Value>,
-    body: Option<&Value>,
-) -> Option<Value> {
-    let body = body?;
-    admin_monitoring_decode_connect_json_error_body(headers, body).or_else(|| Some(body.clone()))
-}
-
-fn admin_monitoring_decode_connect_json_error_body(
-    headers: Option<&Value>,
-    body: &Value,
-) -> Option<Value> {
-    if !admin_monitoring_headers_indicate_connect_json(headers) {
-        return None;
-    }
-
-    let body_base64 = match body {
-        Value::String(value) => Some(value.as_str()),
-        Value::Object(object) => object
-            .get("encoding")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case("base64"))
-            .then(|| object.get("data").and_then(Value::as_str))
-            .flatten(),
-        _ => None,
-    }?
-    .trim();
-    if body_base64.is_empty() {
-        return None;
-    }
-
-    let body_bytes = BASE64_STANDARD.decode(body_base64).ok()?;
-    aether_ai_formats::api::extract_provider_private_stream_error_body(None, &body_bytes)
-}
-
-fn admin_monitoring_headers_indicate_connect_json(headers: Option<&Value>) -> bool {
-    headers
-        .and_then(Value::as_object)
-        .and_then(|object| {
-            object.iter().find_map(|(key, value)| {
-                key.eq_ignore_ascii_case("content-type")
-                    .then(|| value.as_str())
-                    .flatten()
-            })
-        })
-        .map(str::trim)
-        .is_some_and(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("application/connect+json") || value.contains("+connect+json")
-        })
 }
 
 fn merge_admin_monitoring_trace_response(
@@ -708,27 +651,25 @@ fn admin_monitoring_trace_request_path_and_query(
 
 fn admin_monitoring_usage_request_path(usage: &StoredRequestUsageAudit) -> Option<String> {
     admin_monitoring_usage_metadata_string(usage, "request_path")
+        .and_then(|value| aether_ai_formats::api::sanitize_request_path(&value))
 }
 
 fn admin_monitoring_usage_request_query_string(usage: &StoredRequestUsageAudit) -> Option<String> {
     admin_monitoring_usage_metadata_string(usage, "request_query_string")
-        .map(|value| value.trim_start_matches('?').to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|value| aether_ai_formats::api::sanitize_request_query_string(&value))
 }
 
 fn admin_monitoring_usage_request_path_and_query(
     usage: &StoredRequestUsageAudit,
 ) -> Option<String> {
-    admin_monitoring_usage_metadata_string(usage, "request_path_and_query").or_else(|| {
-        let path = admin_monitoring_usage_metadata_string(usage, "request_path")?;
-        let query = admin_monitoring_usage_metadata_string(usage, "request_query_string")
-            .map(|value| value.trim_start_matches('?').to_string())
-            .filter(|value| !value.is_empty());
-        Some(match query {
-            Some(query) if !path.contains('?') => format!("{path}?{query}"),
-            _ => path,
+    admin_monitoring_usage_metadata_string(usage, "request_path_and_query")
+        .and_then(|value| aether_ai_formats::api::sanitize_request_path_and_query(&value, None))
+        .or_else(|| {
+            let path = admin_monitoring_usage_metadata_string(usage, "request_path")?;
+            let query = admin_monitoring_usage_metadata_string(usage, "request_query_string")
+                .and_then(|value| aether_ai_formats::api::sanitize_request_query_string(&value));
+            aether_ai_formats::api::sanitize_request_path_and_query(&path, query.as_deref())
         })
-    })
 }
 
 fn admin_monitoring_usage_metadata_string(

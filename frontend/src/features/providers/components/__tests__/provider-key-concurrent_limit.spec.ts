@@ -378,6 +378,9 @@ describe('provider key concurrent_limit form behavior', () => {
   })
 
   it('hydrates and serializes a positive concurrent_limit number from the normal key form', async () => {
+    const saved = vi.fn()
+    const updatedKey = createProviderKey({ rpm_limit: 42, concurrent_limit: 5 })
+    endpointMocks.updateProviderKey.mockResolvedValue(updatedKey)
     const root = mountDialog(KeyFormDialog, {
       open: true,
       endpoint: null,
@@ -385,6 +388,7 @@ describe('provider key concurrent_limit form behavior', () => {
       providerId: 'provider-1',
       providerType: 'openai',
       availableApiFormats: ['openai:chat'],
+      onSaved: saved,
     })
     await settle()
 
@@ -400,6 +404,7 @@ describe('provider key concurrent_limit form behavior', () => {
     expect(typeof payload.concurrent_limit).toBe('number')
     expect(payload.concurrent_limit).not.toBe('')
     expect(payload.rpm_limit).toBe(42)
+    expect(saved).toHaveBeenCalledWith(updatedKey)
   })
 
   it('serializes cleared normal key concurrent_limit as null instead of an empty string', async () => {

@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +20,7 @@ use super::control_plane::ControlPlaneClient;
 use super::protocol;
 
 const MAX_REQUEST_BODY_FRAME_SIZE: usize = 32 * 1024;
+const MAX_TUNNEL_CONTROL_PAYLOAD_SIZE: usize = 256 * 1024;
 const SOFT_AVOID_QUEUE_PRESSURE_PERCENT: u64 = 50;
 const SOFT_AVOID_STREAM_PRESSURE_PERCENT: u64 = 85;
 const OUTBOUND_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -213,6 +215,9 @@ pub struct ProxyConn {
     pub id: u64,
     pub node_id: String,
     pub node_name: String,
+    pub node_generation: String,
+    pub authenticated_key: Option<String>,
+    pub(crate) management_token_credential: Option<ProxyManagementTokenCredential>,
     pub outbound: BoundedOutbound,
     next_stream_id: AtomicU32,
     pub stream_count: AtomicUsize,
@@ -242,6 +247,9 @@ impl ProxyConn {
             id,
             node_id,
             node_name,
+            node_generation: String::new(),
+            authenticated_key: None,
+            management_token_credential: None,
             outbound: BoundedOutbound::new(tx, close_tx),
             next_stream_id: AtomicU32::new(2),
             stream_count: AtomicUsize::new(0),
@@ -255,6 +263,37 @@ impl ProxyConn {
             flow_window_blocked_ms: AtomicU64::new(0),
             write_latency_last_us: AtomicU64::new(0),
             write_latency_ewma_us: AtomicU64::new(0),
+        }
+    }
+
+    pub fn with_authenticated_key(mut self, authenticated_key: String) -> Self {
+        self.authenticated_key = Some(authenticated_key);
+        self
+    }
+
+    pub fn with_tunnel_generation(mut self, tunnel_generation: String) -> Self {
+        self.node_generation = tunnel_generation;
+        self
+    }
+
+    pub(crate) fn with_management_token_credential(
+        mut self,
+        credential: ProxyManagementTokenCredential,
+    ) -> Self {
+        self.management_token_credential = Some(credential);
+        self
+    }
+
+    pub(crate) fn credential_binding(&self) -> Option<ProxyCredentialBinding> {
+        match (
+            self.authenticated_key.as_deref(),
+            self.management_token_credential.as_ref(),
+        ) {
+            (Some(key), None) => Some(ProxyCredentialBinding::Psk(key.to_string())),
+            (None, Some(credential)) => {
+                Some(ProxyCredentialBinding::ManagementToken(credential.clone()))
+            }
+            _ => None,
         }
     }
 
@@ -440,6 +479,44 @@ impl ProxyConn {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ProxyManagementTokenCredential {
+    pub(crate) verified_token_hash: crate::management_token_auth::VerifiedManagementTokenHash,
+    pub(crate) token_id: String,
+    pub(crate) user_id: String,
+    pub(crate) remote_ip: IpAddr,
+}
+
+#[derive(Clone)]
+pub(crate) enum ProxyCredentialBinding {
+    Psk(String),
+    ManagementToken(ProxyManagementTokenCredential),
+}
+
+impl std::fmt::Debug for ProxyCredentialBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Psk(_) => formatter.write_str("ProxyCredentialBinding::Psk([REDACTED])"),
+            Self::ManagementToken(credential) => formatter
+                .debug_tuple("ProxyCredentialBinding::ManagementToken")
+                .field(credential)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ProxyManagementTokenCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyManagementTokenCredential")
+            .field("verified_token_hash", &"[REDACTED]")
+            .field("token_id", &self.token_id)
+            .field("user_id", &self.user_id)
+            .field("remote_ip", &self.remote_ip)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProxyConnSnapshot {
     conn_id: u64,
@@ -503,6 +580,7 @@ struct LocalWaitState {
 
 pub struct LocalStream {
     pub id: u64,
+    tunnel_generation: String,
     proxy_conn_id: u64,
     proxy_stream_id: u32,
     request_window: StreamFlowWindow,
@@ -515,10 +593,17 @@ pub struct LocalStream {
 }
 
 impl LocalStream {
-    fn new(id: u64, proxy_conn_id: u64, proxy_stream_id: u32, initial_window_bytes: u32) -> Self {
+    fn new(
+        id: u64,
+        tunnel_generation: String,
+        proxy_conn_id: u64,
+        proxy_stream_id: u32,
+        initial_window_bytes: u32,
+    ) -> Self {
         let (body_tx, body_rx) = mpsc::channel(128);
         Self {
             id,
+            tunnel_generation,
             proxy_conn_id,
             proxy_stream_id,
             request_window: StreamFlowWindow::new(initial_window_bytes),
@@ -529,6 +614,10 @@ impl LocalStream {
             body_rx: Mutex::new(Some(body_rx)),
             terminal: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn tunnel_generation(&self) -> &str {
+        &self.tunnel_generation
     }
 
     async fn acquire_request_window(
@@ -676,9 +765,11 @@ pub struct HubRouter {
     drain_reasons: Mutex<HashMap<String, u64>>,
 }
 
-#[derive(Debug)]
 struct NodeStatusEvent {
     node_id: String,
+    authenticated_key: Option<String>,
+    tunnel_generation: String,
+    connection: Option<Arc<ProxyConn>>,
     connected: bool,
     conn_count: usize,
     observed_at_unix_secs: u64,
@@ -692,15 +783,37 @@ impl HubRouter {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 while let Some(event) = node_status_rx.recv().await {
-                    if let Err(error) = worker_control_plane
-                        .push_node_status(
-                            &event.node_id,
-                            event.connected,
-                            event.conn_count,
-                            event.observed_at_unix_secs,
-                        )
-                        .await
-                    {
+                    let connection = event.connection.clone();
+                    let result = match connection {
+                        Some(connection) => {
+                            worker_control_plane
+                                .push_node_status_for_connection(
+                                    connection,
+                                    event.connected,
+                                    event.conn_count,
+                                    event.observed_at_unix_secs,
+                                )
+                                .await
+                        }
+                        None => {
+                            worker_control_plane
+                                .push_node_status(
+                                    &event.node_id,
+                                    event.authenticated_key.as_deref(),
+                                    &event.tunnel_generation,
+                                    event.connected,
+                                    event.conn_count,
+                                    event.observed_at_unix_secs,
+                                )
+                                .await
+                        }
+                    };
+                    if let Err(error) = result {
+                        if super::control_plane::is_credential_revoked_error(&error) {
+                            if let Some(connection) = event.connection.as_ref() {
+                                connection.request_close();
+                            }
+                        }
                         warn!(
                             node_id = %event.node_id,
                             connected = event.connected,
@@ -746,7 +859,7 @@ impl HubRouter {
 
         let healthy_count = {
             let mut map = self.proxy_conns.write();
-            map.entry(node_id.clone()).or_default().push(conn);
+            map.entry(node_id.clone()).or_default().push(conn.clone());
             available_conn_count(map.get(&node_id).map(Vec::as_slice).unwrap_or(&[]))
         };
 
@@ -758,11 +871,23 @@ impl HubRouter {
             "proxy connected"
         );
 
-        self.notify_node_status(node_id, healthy_count > 0, healthy_count);
+        self.notify_node_status(
+            node_id,
+            conn.authenticated_key.clone(),
+            Some(conn),
+            healthy_count > 0,
+            healthy_count,
+        );
     }
 
     pub fn unregister_proxy(&self, conn_id: u64, node_id: &str) {
-        self.proxy_conns_by_id.remove(&conn_id);
+        let disconnected_connection = self
+            .proxy_conns_by_id
+            .remove(&conn_id)
+            .map(|(_, connection)| connection);
+        let disconnected_authenticated_key = disconnected_connection
+            .as_ref()
+            .and_then(|connection| connection.authenticated_key.clone());
 
         let healthy_count = {
             let mut map = self.proxy_conns.write();
@@ -785,7 +910,20 @@ impl HubRouter {
         );
 
         self.cancel_streams_for_proxy(conn_id);
-        self.notify_node_status(node_id.to_string(), healthy_count > 0, healthy_count);
+        let authenticated_key = self
+            .proxy_conns
+            .read()
+            .get(node_id)
+            .and_then(|connections| connections.first())
+            .and_then(|connection| connection.authenticated_key.clone())
+            .or(disconnected_authenticated_key);
+        self.notify_node_status(
+            node_id.to_string(),
+            authenticated_key,
+            disconnected_connection,
+            healthy_count > 0,
+            healthy_count,
+        );
     }
 
     pub fn request_close_all_proxies(&self) -> usize {
@@ -801,9 +939,52 @@ impl HubRouter {
         total
     }
 
-    fn notify_node_status(&self, node_id: String, connected: bool, conn_count: usize) {
+    pub(crate) fn request_close_proxy(&self, conn_id: u64) -> bool {
+        let Some(conn) = self
+            .proxy_conns_by_id
+            .get(&conn_id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            return false;
+        };
+        conn.request_close();
+        true
+    }
+
+    pub(crate) fn request_close_proxies_for_node(&self, node_id: &str) -> usize {
+        let conns = self.proxy_connections_for_node(node_id);
+        let total = conns.len();
+        for conn in conns {
+            conn.request_close();
+        }
+        total
+    }
+
+    pub(crate) fn proxy_connections_for_node(&self, node_id: &str) -> Vec<Arc<ProxyConn>> {
+        self.proxy_conns
+            .read()
+            .get(node_id)
+            .map(|connections| connections.to_vec())
+            .unwrap_or_default()
+    }
+
+    fn notify_node_status(
+        &self,
+        node_id: String,
+        authenticated_key: Option<String>,
+        connection: Option<Arc<ProxyConn>>,
+        connected: bool,
+        conn_count: usize,
+    ) {
+        let tunnel_generation = connection
+            .as_ref()
+            .map(|connection| connection.node_generation.clone())
+            .unwrap_or_default();
         let event = NodeStatusEvent {
             node_id,
+            authenticated_key,
+            tunnel_generation,
+            connection,
             connected,
             conn_count,
             observed_at_unix_secs: current_unix_secs(),
@@ -837,13 +1018,24 @@ impl HubRouter {
     }
 
     fn notify_current_node_status(&self, node_id: &str) {
-        let healthy_count = {
+        let (healthy_count, connection, authenticated_key) = {
             let map = self.proxy_conns.read();
-            map.get(node_id)
-                .map(|v| available_conn_count(v.as_slice()))
-                .unwrap_or(0)
+            let connections = map.get(node_id).map(Vec::as_slice).unwrap_or(&[]);
+            (
+                available_conn_count(connections),
+                connections.first().cloned(),
+                connections
+                    .first()
+                    .and_then(|connection| connection.authenticated_key.clone()),
+            )
         };
-        self.notify_node_status(node_id.to_string(), healthy_count > 0, healthy_count);
+        self.notify_node_status(
+            node_id.to_string(),
+            authenticated_key,
+            connection,
+            healthy_count > 0,
+            healthy_count,
+        );
     }
 
     fn record_stream_reset(&self, reason: &str) {
@@ -856,7 +1048,11 @@ impl HubRouter {
         increment_reason(&self.drain_reasons, reason);
     }
 
-    fn ranked_proxy_conn_candidates(&self, node_id: &str) -> Vec<ProxyConnCandidate> {
+    fn ranked_proxy_conn_candidates(
+        &self,
+        node_id: &str,
+        authorized_conn_ids: Option<&HashSet<u64>>,
+    ) -> Vec<ProxyConnCandidate> {
         let conns = {
             let map = self.proxy_conns.read();
             map.get(node_id)
@@ -866,6 +1062,9 @@ impl HubRouter {
         let mut candidates = conns
             .into_iter()
             .filter_map(|conn| {
+                if authorized_conn_ids.is_some_and(|allowed| !allowed.contains(&conn.id)) {
+                    return None;
+                }
                 let snapshot = conn.snapshot();
                 snapshot
                     .available
@@ -877,7 +1076,7 @@ impl HubRouter {
     }
 
     pub fn has_local_proxy(&self, node_id: &str) -> bool {
-        !self.ranked_proxy_conn_candidates(node_id).is_empty()
+        !self.ranked_proxy_conn_candidates(node_id, None).is_empty()
     }
 
     pub async fn open_local_stream(
@@ -885,7 +1084,17 @@ impl HubRouter {
         node_id: &str,
         meta: &protocol::RequestMeta,
     ) -> Result<Arc<LocalStream>, String> {
-        let candidates = self.ranked_proxy_conn_candidates(node_id);
+        self.open_local_stream_with_authorized_connections(node_id, meta, None)
+            .await
+    }
+
+    pub(crate) async fn open_local_stream_with_authorized_connections(
+        &self,
+        node_id: &str,
+        meta: &protocol::RequestMeta,
+        authorized_conn_ids: Option<&HashSet<u64>>,
+    ) -> Result<Arc<LocalStream>, String> {
+        let candidates = self.ranked_proxy_conn_candidates(node_id, authorized_conn_ids);
         if candidates.is_empty() {
             self.selection_unavailable_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -959,6 +1168,7 @@ impl HubRouter {
         let local_stream_id = self.next_local_stream_id.fetch_add(1, Ordering::Relaxed);
         let local_stream = Arc::new(LocalStream::new(
             local_stream_id,
+            proxy_conn.node_generation.clone(),
             proxy_conn.id,
             proxy_stream_id,
             *STREAM_INITIAL_WINDOW_BYTES,
@@ -1160,8 +1370,14 @@ impl HubRouter {
             Some(h) => h,
             None => return,
         };
-        let expected_len = protocol::HEADER_SIZE + header.payload_len as usize;
-        if data.len() < expected_len {
+        let Some(expected_len) = protocol::HEADER_SIZE.checked_add(header.payload_len as usize)
+        else {
+            return;
+        };
+        if data.len() != expected_len {
+            if header.stream_id != 0 {
+                self.fail_proxy_stream(proxy_conn_id, header.stream_id, "invalid frame length");
+            }
             return;
         }
 
@@ -1176,22 +1392,32 @@ impl HubRouter {
                 self.finish_proxy_stream(proxy_conn_id, header.stream_id);
             }
             protocol::STREAM_ERROR => {
-                let message = protocol::decode_payload(data, &header)
-                    .ok()
-                    .and_then(|payload| String::from_utf8(payload).ok())
-                    .unwrap_or_else(|| "stream error".to_string());
+                let raw_message = protocol::decode_payload_with_limit(
+                    data,
+                    &header,
+                    MAX_TUNNEL_CONTROL_PAYLOAD_SIZE,
+                )
+                .ok()
+                .and_then(|payload| String::from_utf8(payload).ok())
+                .unwrap_or_else(|| "stream error".to_string());
+                let message = safe_peer_stream_error(&raw_message);
                 self.record_stream_reset(&message);
                 self.fail_proxy_stream(proxy_conn_id, header.stream_id, message);
             }
             protocol::RESET_STREAM => {
-                let message = protocol::decode_payload(data, &header)
-                    .ok()
-                    .and_then(|payload| {
-                        serde_json::from_slice::<protocol::ResetStreamPayload>(&payload)
-                            .ok()
-                            .map(|payload| payload.reason)
-                    })
-                    .unwrap_or_else(|| "stream reset".to_string());
+                let raw_message = protocol::decode_payload_with_limit(
+                    data,
+                    &header,
+                    MAX_TUNNEL_CONTROL_PAYLOAD_SIZE,
+                )
+                .ok()
+                .and_then(|payload| {
+                    serde_json::from_slice::<protocol::ResetStreamPayload>(&payload)
+                        .ok()
+                        .map(|payload| payload.reason)
+                })
+                .unwrap_or_else(|| "stream reset".to_string());
+                let message = safe_peer_stream_error(&raw_message);
                 self.record_stream_reset(&message);
                 self.fail_proxy_stream(proxy_conn_id, header.stream_id, message);
             }
@@ -1217,17 +1443,19 @@ impl HubRouter {
                 if let Some(pc) = self.proxy_conns_by_id.get(&proxy_conn_id) {
                     let first = pc.mark_draining();
                     if first {
-                        let drain =
-                            protocol::decode_payload(data, &header)
-                                .ok()
-                                .and_then(|payload| {
-                                    if payload.is_empty() {
-                                        None
-                                    } else {
-                                        serde_json::from_slice::<protocol::GoAwayPayload>(&payload)
-                                            .ok()
-                                    }
-                                });
+                        let drain = protocol::decode_payload_with_limit(
+                            data,
+                            &header,
+                            MAX_TUNNEL_CONTROL_PAYLOAD_SIZE,
+                        )
+                        .ok()
+                        .and_then(|payload| {
+                            if payload.is_empty() {
+                                None
+                            } else {
+                                serde_json::from_slice::<protocol::GoAwayPayload>(&payload).ok()
+                            }
+                        });
                         let reason = drain
                             .as_ref()
                             .map(|payload| payload.reason.as_str())
@@ -1262,12 +1490,13 @@ impl HubRouter {
                 }
             }
             protocol::HELLO => {
-                if let Some(payload) =
-                    protocol::decode_payload(data, &header)
-                        .ok()
-                        .and_then(|payload| {
-                            serde_json::from_slice::<protocol::HelloPayload>(&payload).ok()
-                        })
+                if let Some(payload) = protocol::decode_payload_with_limit(
+                    data,
+                    &header,
+                    MAX_TUNNEL_CONTROL_PAYLOAD_SIZE,
+                )
+                .ok()
+                .and_then(|payload| serde_json::from_slice::<protocol::HelloPayload>(&payload).ok())
                 {
                     if let Some(pc) = self.proxy_conns_by_id.get(&proxy_conn_id) {
                         pc.update_protocol_version(payload.protocol_version);
@@ -1290,13 +1519,15 @@ impl HubRouter {
                 self.handle_window_update(proxy_conn_id, header.stream_id, data, &header);
             }
             protocol::LOAD_REPORT => {
-                if let Some(payload) =
-                    protocol::decode_payload(data, &header)
-                        .ok()
-                        .and_then(|payload| {
-                            serde_json::from_slice::<protocol::LoadReportPayload>(&payload).ok()
-                        })
-                {
+                if let Some(payload) = protocol::decode_payload_with_limit(
+                    data,
+                    &header,
+                    MAX_TUNNEL_CONTROL_PAYLOAD_SIZE,
+                )
+                .ok()
+                .and_then(|payload| {
+                    serde_json::from_slice::<protocol::LoadReportPayload>(&payload).ok()
+                }) {
                     if let Some(pc) = self.proxy_conns_by_id.get(&proxy_conn_id) {
                         pc.update_remote_health_score(payload.health_score);
                     }
@@ -1332,12 +1563,13 @@ impl HubRouter {
         data: &[u8],
         header: &protocol::FrameHeader,
     ) {
-        let Some(delta) = protocol::decode_payload(data, header)
-            .ok()
-            .and_then(|payload| {
-                serde_json::from_slice::<protocol::WindowUpdatePayload>(&payload).ok()
-            })
-            .map(|payload| payload.delta_bytes)
+        let Some(delta) =
+            protocol::decode_payload_with_limit(data, header, MAX_TUNNEL_CONTROL_PAYLOAD_SIZE)
+                .ok()
+                .and_then(|payload| {
+                    serde_json::from_slice::<protocol::WindowUpdatePayload>(&payload).ok()
+                })
+                .map(|payload| payload.delta_bytes)
         else {
             return;
         };
@@ -1457,7 +1689,9 @@ impl HubRouter {
         let Some(local_id) = self.lookup_local_stream(proxy_conn_id, header.stream_id) else {
             return;
         };
-        let Ok(payload) = protocol::decode_payload(data, &header) else {
+        let Ok(payload) =
+            protocol::decode_payload_with_limit(data, &header, MAX_TUNNEL_CONTROL_PAYLOAD_SIZE)
+        else {
             self.fail_proxy_stream(
                 proxy_conn_id,
                 header.stream_id,
@@ -1487,7 +1721,11 @@ impl HubRouter {
         let Some(local_id) = self.lookup_local_stream(proxy_conn_id, header.stream_id) else {
             return;
         };
-        let Ok(payload) = protocol::decode_payload(data, &header) else {
+        let Ok(payload) = protocol::decode_payload_with_limit(
+            data,
+            &header,
+            aether_contracts::tunnel::MAX_TUNNEL_DECOMPRESSED_PAYLOAD_BYTES,
+        ) else {
             self.fail_proxy_stream(
                 proxy_conn_id,
                 header.stream_id,
@@ -1567,16 +1805,70 @@ impl HubRouter {
         data: &[u8],
         header: &protocol::FrameHeader,
     ) {
-        let payload = match protocol::decode_payload(data, header) {
+        let payload = match protocol::decode_payload_with_limit(
+            data,
+            header,
+            MAX_TUNNEL_CONTROL_PAYLOAD_SIZE,
+        ) {
             Ok(payload) => payload,
             Err(error) => {
                 warn!(proxy_conn_id = proxy_conn_id, error = %error, "failed to decode heartbeat payload");
                 return;
             }
         };
-        let ack_payload = match self.control_plane.heartbeat_ack(&payload).await {
+        let Some(authenticated_node_id) = self
+            .proxy_conns_by_id
+            .get(&proxy_conn_id)
+            .map(|entry| entry.node_id.clone())
+        else {
+            warn!(
+                proxy_conn_id,
+                "heartbeat rejected for unregistered proxy connection"
+            );
+            return;
+        };
+        let payload_node_id = match heartbeat_payload_node_id(&payload) {
+            Ok(node_id) => node_id,
+            Err(error) => {
+                warn!(
+                    proxy_conn_id,
+                    authenticated_node_id = %authenticated_node_id,
+                    error = %error,
+                    "heartbeat rejected before control-plane dispatch"
+                );
+                return;
+            }
+        };
+        if payload_node_id != authenticated_node_id {
+            warn!(
+                proxy_conn_id,
+                authenticated_node_id = %authenticated_node_id,
+                payload_node_id = %payload_node_id,
+                "heartbeat rejected because node identity does not match tunnel authentication"
+            );
+            return;
+        }
+        let connection = self
+            .proxy_conns_by_id
+            .get(&proxy_conn_id)
+            .map(|entry| Arc::clone(entry.value()));
+        let Some(connection) = connection else {
+            warn!(
+                proxy_conn_id,
+                "heartbeat rejected for unregistered proxy connection"
+            );
+            return;
+        };
+        let ack_payload = match self
+            .control_plane
+            .heartbeat_ack_for_connection(connection.clone(), &payload)
+            .await
+        {
             Ok(payload) => payload,
             Err(error) => {
+                if super::control_plane::is_credential_revoked_error(&error) {
+                    connection.request_close();
+                }
                 warn!(
                     proxy_conn_id = proxy_conn_id,
                     error = %error,
@@ -1755,6 +2047,18 @@ impl HubRouter {
     }
 }
 
+fn heartbeat_payload_node_id(payload: &[u8]) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|_| "heartbeat payload is not valid JSON".to_string())?;
+    let node_id = value
+        .get("node_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "heartbeat payload is missing node_id".to_string())?;
+    Ok(node_id.to_string())
+}
+
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1828,6 +2132,56 @@ fn metric_reason(raw: &str) -> String {
     } else {
         normalized
     }
+}
+
+fn safe_peer_stream_error(raw: &str) -> String {
+    const CLASSIFICATION_PREFIX_BYTES: usize = 4 * 1024;
+
+    let prefix = if raw.len() <= CLASSIFICATION_PREFIX_BYTES {
+        raw
+    } else {
+        let mut end = CLASSIFICATION_PREFIX_BYTES;
+        while !raw.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        &raw[..end]
+    };
+    let category = if contains_ascii_case_insensitive(prefix, "timed out")
+        || contains_ascii_case_insensitive(prefix, "timeout")
+    {
+        "timeout"
+    } else if contains_ascii_case_insensitive(prefix, "overloaded")
+        || contains_ascii_case_insensitive(prefix, "backpressure")
+        || contains_ascii_case_insensitive(prefix, "congested")
+        || contains_ascii_case_insensitive(prefix, "window")
+    {
+        "overloaded"
+    } else if contains_ascii_case_insensitive(prefix, "forbidden")
+        || contains_ascii_case_insensitive(prefix, "unauthorized")
+        || contains_ascii_case_insensitive(prefix, "authentication")
+    {
+        "forbidden"
+    } else if contains_ascii_case_insensitive(prefix, "dns") {
+        "dns"
+    } else if contains_ascii_case_insensitive(prefix, "connect")
+        || contains_ascii_case_insensitive(prefix, "socket")
+    {
+        "connect"
+    } else if contains_ascii_case_insensitive(prefix, "cancel")
+        || contains_ascii_case_insensitive(prefix, "reset")
+    {
+        "reset"
+    } else {
+        "relay"
+    };
+    format!("tunnel stream {category} error")
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 #[derive(serde::Serialize)]
@@ -2098,12 +2452,35 @@ impl HubStats {
 mod tests {
     use aether_runtime::bounded_queue;
 
-    use super::{protocol, ControlPlaneClient, HubRouter, ProxyConn, MAX_REQUEST_BODY_FRAME_SIZE};
+    use super::{
+        protocol, safe_peer_stream_error, ControlPlaneClient, HubRouter, ProxyConn,
+        MAX_REQUEST_BODY_FRAME_SIZE,
+    };
     use axum::extract::ws::Message;
     use bytes::Bytes;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::watch;
+
+    #[test]
+    fn peer_stream_errors_are_projected_to_finite_categories() {
+        let sensitive = safe_peer_stream_error(
+            "request failed for https://alice:secret@10.0.0.8/private?token=query-secret\r\nx: y",
+        );
+        assert_eq!(sensitive, "tunnel stream relay error");
+        for secret in ["alice", "secret", "10.0.0.8", "private", "query", "x: y"] {
+            assert!(!sensitive.contains(secret), "leaked {secret}: {sensitive}");
+        }
+        assert_eq!(
+            safe_peer_stream_error("upstream connect timeout: Bearer secret"),
+            "tunnel stream timeout error"
+        );
+        assert_eq!(
+            safe_peer_stream_error("outbound backpressure timeout"),
+            "tunnel stream timeout error"
+        );
+    }
 
     fn build_meta() -> protocol::RequestMeta {
         protocol::RequestMeta {
@@ -2358,8 +2735,10 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_callback_failure_does_not_send_fake_ack() {
         let hub = HubRouter::new(ControlPlaneClient::local(
-            |_payload| Box::pin(async { Err("db unavailable".to_string()) }),
-            |_node_id, _connected, _conn_count, _observed_at_unix_secs| Box::pin(async { Ok(()) }),
+            |_connection, _payload| Box::pin(async { Err("db unavailable".to_string()) }),
+            |_connection, _connected, _conn_count, _observed_at_unix_secs| {
+                Box::pin(async { Ok(()) })
+            },
         ));
 
         let (proxy_tx, mut proxy_rx) = bounded_queue(8);
@@ -2383,6 +2762,45 @@ mod tests {
         let mut frame = protocol::encode_frame(1, protocol::HEARTBEAT_DATA, 0, &payload);
         hub.handle_proxy_frame(300, &mut frame).await;
 
+        assert!(proxy_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_for_another_node_is_rejected_before_callback_and_ack() {
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls_for_heartbeat = Arc::clone(&callback_calls);
+        let hub = HubRouter::new(ControlPlaneClient::local(
+            move |_connection, _payload| {
+                callback_calls_for_heartbeat.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Ok(br#"{"heartbeat_id":99}"#.to_vec()) })
+            },
+            |_connection, _connected, _conn_count, _observed_at_unix_secs| {
+                Box::pin(async { Ok(()) })
+            },
+        ));
+
+        let (proxy_tx, mut proxy_rx) = bounded_queue(8);
+        let (proxy_close_tx, _) = watch::channel(false);
+        let proxy = Arc::new(ProxyConn::new(
+            301,
+            "authenticated-node".to_string(),
+            "Authenticated Node".to_string(),
+            proxy_tx,
+            proxy_close_tx,
+            16,
+            2,
+        ));
+        hub.register_proxy(proxy);
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "node_id": "victim-node",
+            "heartbeat_id": 99u64,
+        }))
+        .expect("payload should serialize");
+        let mut frame = protocol::encode_frame(1, protocol::HEARTBEAT_DATA, 0, &payload);
+        hub.handle_proxy_frame(301, &mut frame).await;
+
+        assert_eq!(callback_calls.load(Ordering::Relaxed), 0);
         assert!(proxy_rx.try_recv().is_err());
     }
 

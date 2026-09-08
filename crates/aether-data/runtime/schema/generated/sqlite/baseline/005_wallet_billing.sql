@@ -97,6 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_payment_orders_wallet_created ON payment_orders (
 CREATE INDEX IF NOT EXISTS idx_payment_orders_user_created ON payment_orders (user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_status ON payment_orders (status);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_gateway_order_id ON payment_orders (gateway_order_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_orders_payment_method_gateway_order_id ON payment_orders (payment_method, gateway_order_id);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_kind_status ON payment_orders (order_kind, status);
 CREATE INDEX IF NOT EXISTS idx_payment_orders_product ON payment_orders (product_id);
 
@@ -121,8 +122,6 @@ CREATE TABLE IF NOT EXISTS user_referrals (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE (invitee_user_id),
-    CONSTRAINT user_referrals_inviter_user_id_fkey FOREIGN KEY (inviter_user_id) REFERENCES users (id) ON DELETE CASCADE,
-    CONSTRAINT user_referrals_invitee_user_id_fkey FOREIGN KEY (invitee_user_id) REFERENCES users (id) ON DELETE CASCADE,
     CONSTRAINT user_referrals_first_paid_order_fkey FOREIGN KEY (first_paid_order_id) REFERENCES payment_orders (id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_user_referrals_inviter ON user_referrals (inviter_user_id, created_at);
@@ -150,8 +149,6 @@ CREATE TABLE IF NOT EXISTS referral_rewards (
     updated_at INTEGER NOT NULL,
     UNIQUE (idempotency_key),
     CONSTRAINT referral_rewards_referral_id_fkey FOREIGN KEY (referral_id) REFERENCES user_referrals (id) ON DELETE CASCADE,
-    CONSTRAINT referral_rewards_inviter_user_id_fkey FOREIGN KEY (inviter_user_id) REFERENCES users (id) ON DELETE CASCADE,
-    CONSTRAINT referral_rewards_invitee_user_id_fkey FOREIGN KEY (invitee_user_id) REFERENCES users (id) ON DELETE CASCADE,
     CONSTRAINT referral_rewards_source_order_fkey FOREIGN KEY (source_order_id) REFERENCES payment_orders (id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter_status ON referral_rewards (inviter_user_id, status, created_at);

@@ -18,6 +18,7 @@ pub(crate) const TUNNEL_AFFINITY_FORWARDED_BY_HEADER: &str =
     "x-aether-tunnel-affinity-forwarded-by";
 pub(crate) const TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER: &str =
     "x-aether-tunnel-affinity-owner-instance-id";
+pub(crate) const TUNNEL_AFFINITY_NODE_ID_HEADER: &str = "x-aether-tunnel-affinity-node-id";
 pub(crate) const EXECUTION_PATH_PUBLIC_PROXY_PASSTHROUGH: &str = "public_proxy_passthrough";
 pub(crate) const EXECUTION_PATH_LOCAL_PROXY_PASSTHROUGH_REMOVED: &str =
     "local_proxy_passthrough_removed";
@@ -120,6 +121,10 @@ pub(crate) const RUST_FRONTDOOR_OWNED_ROUTE_PATTERNS: &[&str] = &[
     "/v1/messages/count_tokens",
     "/v1/responses",
     "/v1/responses/compact",
+    "/v1/realtime",
+    "/v1/realtime/calls",
+    "/v1/live",
+    "/v1/live/{call_id}",
     "/v1/alpha/search",
     "/v1/models/{model}:generateContent",
     "/v1/models/{model}:streamGenerateContent",

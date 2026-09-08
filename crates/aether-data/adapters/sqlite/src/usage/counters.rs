@@ -26,6 +26,7 @@ SELECT
   id,
   kind,
   target_id,
+  target_tunnel_generation,
   request_count_delta,
   total_requests_delta,
   success_count_delta,
@@ -61,6 +62,7 @@ struct DeltaRow {
     id: String,
     kind: String,
     target_id: String,
+    target_tunnel_generation: Option<String>,
     request_count_delta: i64,
     total_requests_delta: i64,
     success_count_delta: i64,
@@ -98,7 +100,7 @@ struct Aggregates {
     provider_api_keys: BTreeMap<String, ProviderApiKeyUsageDelta>,
     models: BTreeMap<String, ModelUsageDelta>,
     provider_monthly: BTreeMap<String, Vec<ProviderMonthlyDelta>>,
-    proxy_nodes: BTreeMap<String, ProxyNodeCounterDelta>,
+    proxy_nodes: BTreeMap<(String, String), ProxyNodeCounterDelta>,
     management_tokens: BTreeMap<String, ManagementTokenCounterDelta>,
     api_key_last_used: BTreeMap<String, ApiKeyLastUsedDelta>,
 }
@@ -191,16 +193,28 @@ impl Aggregates {
                         });
                 }
                 KIND_PROXY_NODE => {
-                    let entry = aggregates
-                        .proxy_nodes
-                        .entry(row.target_id.clone())
-                        .or_insert(ProxyNodeCounterDelta {
+                    let Some(tunnel_generation) = row
+                        .target_tunnel_generation
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                    else {
+                        // Legacy rows without an identity fence are intentionally
+                        // discarded when marked processed below.
+                        continue;
+                    };
+                    let aggregate_key = (row.target_id.clone(), tunnel_generation.clone());
+                    let entry = aggregates.proxy_nodes.entry(aggregate_key).or_insert(
+                        ProxyNodeCounterDelta {
                             node_id: row.target_id.clone(),
+                            expected_tunnel_generation: Some(tunnel_generation),
                             total_requests_delta: 0,
                             failed_requests_delta: 0,
                             dns_failures_delta: 0,
                             stream_errors_delta: 0,
-                        });
+                        },
+                    );
                     entry.total_requests_delta += row.total_requests_delta;
                     entry.failed_requests_delta += row.error_count_delta;
                     entry.dns_failures_delta += row.dns_failures_delta;
@@ -296,8 +310,8 @@ pub(super) async fn flush(
     for (target_id, delta) in &aggregates.provider_monthly {
         apply_provider_monthly(&mut tx, target_id, delta).await?;
     }
-    for (target_id, delta) in &aggregates.proxy_nodes {
-        apply_proxy_node(&mut tx, target_id, delta).await?;
+    for ((target_id, tunnel_generation), delta) in &aggregates.proxy_nodes {
+        apply_proxy_node(&mut tx, target_id, tunnel_generation, delta).await?;
     }
     for (target_id, delta) in &aggregates.management_tokens {
         apply_management_token(&mut tx, target_id, delta).await?;
@@ -1044,9 +1058,43 @@ pub(super) async fn enqueue_proxy_node(
     if delta.is_noop() {
         return Ok(false);
     }
+    let Some(expected_tunnel_generation) = delta
+        .expected_tunnel_generation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| value.len() <= 64)
+        .map(ToOwned::to_owned)
+    else {
+        // Never infer an incarnation from a bare node id. A missing fence can
+        // otherwise make a stale request update a node recreated under that id.
+        return Ok(false);
+    };
     let node_id = delta.node_id.trim().to_string();
     let request_id = format!("proxy_node:{node_id}:{}", uuid::Uuid::new_v4());
     let mut tx = pool.begin().await.map_sql_err()?;
+    // Read the generation as a predicate without taking an exclusive parent
+    // lock. Flush claims outbox rows before touching proxy_nodes; keeping this
+    // read lock-free avoids the inverse parent->outbox lock order. The value is
+    // persisted in the outbox row and the flush UPDATE repeats the generation
+    // predicate, so a delete/re-register race can only retire the delta.
+    let tunnel_generation: Option<String> = sqlx::query_scalar(
+        "SELECT tunnel_generation FROM proxy_nodes WHERE id = ? AND tunnel_generation = ? LIMIT 1",
+    )
+    .bind(&node_id)
+    .bind(&expected_tunnel_generation)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_sql_err()?;
+    let Some(_tunnel_generation) = tunnel_generation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        tx.rollback().await.map_sql_err()?;
+        return Ok(false);
+    };
     insert_delta(
         &mut tx,
         DeltaInsert {
@@ -1057,6 +1105,7 @@ pub(super) async fn enqueue_proxy_node(
             error_count_delta: delta.failed_requests_delta,
             dns_failures_delta: delta.dns_failures_delta,
             stream_errors_delta: delta.stream_errors_delta,
+            target_tunnel_generation: Some(&expected_tunnel_generation),
             ..DeltaInsert::default()
         },
     )
@@ -1508,6 +1557,7 @@ struct DeltaInsert<'a> {
     request_id: &'a str,
     kind: &'a str,
     target_id: &'a str,
+    target_tunnel_generation: Option<&'a str>,
     request_count_delta: i64,
     total_requests_delta: i64,
     success_count_delta: i64,
@@ -1537,11 +1587,12 @@ async fn insert_delta(
         r#"
 INSERT INTO usage_counter_deltas (
   id, request_id, kind, target_id, request_count_delta, total_requests_delta,
+  target_tunnel_generation,
   success_count_delta, error_count_delta, dns_failures_delta, stream_errors_delta,
   total_tokens_delta, total_cost_usd_delta, total_response_time_ms_delta,
   last_used_at_unix_secs, last_used_ip, candidate_last_used_at_unix_secs,
   removed_last_used_at_unix_secs, usage_created_at_unix_secs, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
     )
     .bind(uuid::Uuid::new_v4().to_string())
@@ -1550,6 +1601,7 @@ INSERT INTO usage_counter_deltas (
     .bind(target_id)
     .bind(input.request_count_delta)
     .bind(input.total_requests_delta)
+    .bind(input.target_tunnel_generation)
     .bind(input.success_count_delta)
     .bind(input.error_count_delta)
     .bind(input.dns_failures_delta)
@@ -1591,6 +1643,7 @@ fn map_row(row: &sqlx::sqlite::SqliteRow) -> Result<DeltaRow, DataLayerError> {
         id: row.try_get("id").map_sql_err()?,
         kind: row.try_get("kind").map_sql_err()?,
         target_id: row.try_get("target_id").map_sql_err()?,
+        target_tunnel_generation: row.try_get("target_tunnel_generation").map_sql_err()?,
         request_count_delta: row.try_get("request_count_delta").map_sql_err()?,
         total_requests_delta: row.try_get("total_requests_delta").map_sql_err()?,
         success_count_delta: row.try_get("success_count_delta").map_sql_err()?,
@@ -1923,9 +1976,10 @@ WHERE provider_id = ?
 async fn apply_proxy_node(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     target_id: &str,
+    tunnel_generation: &str,
     delta: &ProxyNodeCounterDelta,
 ) -> Result<(), DataLayerError> {
-    if target_id.trim().is_empty() || delta.is_noop() {
+    if target_id.trim().is_empty() || tunnel_generation.trim().is_empty() || delta.is_noop() {
         return Ok(());
     }
     sqlx::query(
@@ -1936,7 +1990,7 @@ SET total_requests = total_requests + MAX(?, 0),
     dns_failures = dns_failures + MAX(?, 0),
     stream_errors = stream_errors + MAX(?, 0),
     updated_at = ?
-WHERE id = ?
+WHERE id = ? AND tunnel_generation = ?
 "#,
     )
     .bind(delta.total_requests_delta)
@@ -1945,6 +1999,7 @@ WHERE id = ?
     .bind(delta.stream_errors_delta)
     .bind(current_unix_secs())
     .bind(target_id)
+    .bind(tunnel_generation)
     .execute(&mut **tx)
     .await
     .map_sql_err()?;
@@ -2080,6 +2135,8 @@ fn optional_nonnegative_u64(value: Option<i64>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use super::{
         apply_provider_monthly, cleanup_processed, current_unix_secs, enqueue_api_key_last_used,
         enqueue_management_token, enqueue_proxy_node, flush, maintain_provider_quota_windows,
@@ -2468,9 +2525,12 @@ INSERT INTO providers (
         .expect("monthly counter should load");
         assert_eq!(unchanged, 10.0);
     }
+    use crate::proxy_nodes::SqliteProxyNodeReadRepository;
+    use aether_data_contracts::repository::proxy_nodes::ProxyNodeWriteRepository;
     use aether_data_contracts::repository::usage::{
         ApiKeyLastUsedDelta, ManagementTokenCounterDelta, ProxyNodeCounterDelta,
     };
+    use tokio::sync::Barrier;
 
     #[tokio::test]
     async fn unresolved_provider_quota_delta_waits_for_reconciliation_before_flush() {
@@ -2572,8 +2632,8 @@ INSERT INTO management_tokens (
 ) VALUES (
   'counter-token', 'counter-user', 'counter token', 'counter-token-hash', 1, 1
 );
-INSERT INTO proxy_nodes (id, name, ip, port, created_at, updated_at)
-VALUES ('counter-node', 'counter node', '127.0.0.1', 8080, 1, 1);
+INSERT INTO proxy_nodes (id, tunnel_generation, name, ip, port, created_at, updated_at)
+VALUES ('counter-node', 'test-generation-counter-node', 'counter node', '127.0.0.1', 8080, 1, 1);
 "#,
         )
         .execute(&pool)
@@ -2584,6 +2644,7 @@ VALUES ('counter-node', 'counter node', '127.0.0.1', 8080, 1, 1);
             &pool,
             ProxyNodeCounterDelta {
                 node_id: "counter-node".to_string(),
+                expected_tunnel_generation: Some("test-generation-counter-node".to_string()),
                 total_requests_delta: 3,
                 failed_requests_delta: 1,
                 dns_failures_delta: 2,
@@ -2665,5 +2726,262 @@ VALUES ('counter-node', 'counter node', '127.0.0.1', 8080, 1, 1);
                 .processed_rows,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_counter_enqueue_requires_the_expected_generation() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        sqlx::query(
+            r#"
+INSERT INTO proxy_nodes (id, tunnel_generation, name, ip, port, created_at, updated_at)
+VALUES ('generation-node', 'generation-a', 'generation node', '127.0.0.1', 8080, 1, 1)
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("proxy node should seed");
+
+        assert!(!enqueue_proxy_node(
+            &pool,
+            ProxyNodeCounterDelta {
+                node_id: "generation-node".to_string(),
+                expected_tunnel_generation: None,
+                total_requests_delta: 1,
+                failed_requests_delta: 0,
+                dns_failures_delta: 0,
+                stream_errors_delta: 0,
+            },
+        )
+        .await
+        .expect("missing generation should be handled"));
+        assert!(!enqueue_proxy_node(
+            &pool,
+            ProxyNodeCounterDelta {
+                node_id: "generation-node".to_string(),
+                expected_tunnel_generation: Some("generation-b".to_string()),
+                total_requests_delta: 1,
+                failed_requests_delta: 0,
+                dns_failures_delta: 0,
+                stream_errors_delta: 0,
+            },
+        )
+        .await
+        .expect("mismatched generation should be handled"));
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_counter_deltas WHERE processed_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pending rows should load");
+        assert_eq!(pending, 0);
+
+        assert!(enqueue_proxy_node(
+            &pool,
+            ProxyNodeCounterDelta {
+                node_id: "generation-node".to_string(),
+                expected_tunnel_generation: Some("generation-a".to_string()),
+                total_requests_delta: 1,
+                failed_requests_delta: 0,
+                dns_failures_delta: 0,
+                stream_errors_delta: 0,
+            },
+        )
+        .await
+        .expect("matching generation should enqueue"));
+    }
+
+    #[tokio::test]
+    async fn proxy_counter_flush_does_not_cross_generation_reuse() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        sqlx::query(
+            r#"
+INSERT INTO proxy_nodes (id, tunnel_generation, name, ip, port, created_at, updated_at)
+VALUES ('reused-node', 'generation-a', 'reused node', '127.0.0.1', 8080, 1, 1)
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("first proxy incarnation should seed");
+        assert!(enqueue_proxy_node(
+            &pool,
+            ProxyNodeCounterDelta {
+                node_id: "reused-node".to_string(),
+                expected_tunnel_generation: Some("generation-a".to_string()),
+                total_requests_delta: 7,
+                failed_requests_delta: 3,
+                dns_failures_delta: 2,
+                stream_errors_delta: 1,
+            },
+        )
+        .await
+        .expect("first incarnation delta should enqueue"));
+
+        // Simulate deletion followed by id reuse while the old outbox row is
+        // still pending. The generation predicate must retire the row without
+        // applying it to the replacement incarnation.
+        sqlx::query("DELETE FROM proxy_nodes WHERE id = 'reused-node'")
+            .execute(&pool)
+            .await
+            .expect("first incarnation should delete");
+        sqlx::query(
+            r#"
+INSERT INTO proxy_nodes (id, tunnel_generation, name, ip, port, created_at, updated_at)
+VALUES ('reused-node', 'generation-b', 'reused node', '127.0.0.1', 8080, 2, 2)
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("replacement incarnation should seed");
+
+        let summary = flush(&pool, 100)
+            .await
+            .expect("counter flush should succeed");
+        assert_eq!(summary.rows_claimed, 1);
+        let counters: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT total_requests, failed_requests, dns_failures, stream_errors FROM proxy_nodes WHERE id = 'reused-node'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("replacement counters should load");
+        assert_eq!(counters, (0, 0, 0, 0));
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_counter_deltas WHERE processed_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pending rows should load");
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_counter_flush_and_delete_do_not_deadlock_or_cross_generation() {
+        let database_path = std::env::temp_dir().join(format!(
+            "aether-proxy-counter-delete-flush-{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(10));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await
+            .expect("sqlite pool should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+
+        let node_id = "delete-flush-node";
+        let generation_a = "delete-flush-generation-a";
+        sqlx::query(
+            r#"
+INSERT INTO proxy_nodes (
+  id, tunnel_generation, name, ip, port, is_manual, proxy_url, created_at, updated_at
+)
+VALUES (?, ?, 'delete/flush node', '127.0.0.91', 8091, 1, 'http://127.0.0.91:8091', 1, 1)
+"#,
+        )
+        .bind(node_id)
+        .bind(generation_a)
+        .execute(&pool)
+        .await
+        .expect("proxy node should seed");
+        assert!(enqueue_proxy_node(
+            &pool,
+            ProxyNodeCounterDelta {
+                node_id: node_id.to_string(),
+                expected_tunnel_generation: Some(generation_a.to_string()),
+                total_requests_delta: 11,
+                failed_requests_delta: 3,
+                dns_failures_delta: 2,
+                stream_errors_delta: 1,
+            },
+        )
+        .await
+        .expect("counter delta should enqueue"));
+
+        let repository = SqliteProxyNodeReadRepository::new(pool.clone());
+        let barrier = Arc::new(Barrier::new(2));
+        let flush_barrier = Arc::clone(&barrier);
+        let flush_pool = pool.clone();
+        let flush_task = tokio::spawn(async move {
+            flush_barrier.wait().await;
+            tokio::time::timeout(Duration::from_secs(15), flush(&flush_pool, 100))
+                .await
+                .expect("counter flush should not deadlock")
+                .expect("counter flush should succeed")
+        });
+        let delete_barrier = Arc::clone(&barrier);
+        let delete_repository = repository.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_barrier.wait().await;
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                delete_repository.delete_node(node_id),
+            )
+            .await
+            .expect("proxy delete should not deadlock")
+            .expect("proxy delete should succeed")
+        });
+        let (flush_summary, deleted) = tokio::join!(flush_task, delete_task);
+        let flush_summary = flush_summary.expect("flush task should join");
+        let deleted = deleted.expect("delete task should join");
+        assert!(deleted.is_some(), "the original node should be deleted");
+        assert!(flush_summary.rows_claimed <= 1);
+
+        // Reuse the id immediately. Any row that lost the race with the
+        // post-commit cleanup is still safe because flush checks generation.
+        let generation_b = "delete-flush-generation-b";
+        sqlx::query(
+            r#"
+INSERT INTO proxy_nodes (
+  id, tunnel_generation, name, ip, port, is_manual, proxy_url, created_at, updated_at
+)
+VALUES (?, ?, 'replacement node', '127.0.0.92', 8092, 1, 'http://127.0.0.92:8092', 2, 2)
+"#,
+        )
+        .bind(node_id)
+        .bind(generation_b)
+        .execute(&pool)
+        .await
+        .expect("replacement node should seed");
+        flush(&pool, 100)
+            .await
+            .expect("stale counter flush should succeed");
+
+        let counters: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT total_requests, failed_requests, dns_failures, stream_errors FROM proxy_nodes WHERE id = ?",
+        )
+        .bind(node_id)
+        .fetch_one(&pool)
+        .await
+        .expect("replacement counters should load");
+        assert_eq!(counters, (0, 0, 0, 0));
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_counter_deltas WHERE processed_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pending rows should load");
+        assert_eq!(pending, 0);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(database_path);
     }
 }

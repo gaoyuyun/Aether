@@ -271,6 +271,7 @@ mod tests {
                     priority_mode: None,
                     scheduling_mode: None,
                     keep_priority_on_conversion: Some(true),
+                    sticky_key_attempts: None,
                 },
                 "set_scheduling",
             ),
@@ -285,6 +286,7 @@ mod tests {
                 RoutingAction::SetKeyPriority {
                     key_id: "key-1".to_string(),
                     priority: 1,
+                    api_format: None,
                 },
                 "set_key_priority",
             ),

@@ -90,6 +90,37 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers(
     request_headers: Option<&http::HeaderMap>,
     enable_model_directives: bool,
 ) -> Option<Value> {
+    build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
+        body_json,
+        client_api_format,
+        mapped_model,
+        provider_type,
+        provider_api_format,
+        request_path,
+        upstream_is_stream,
+        body_rules,
+        user_api_key_id,
+        request_headers,
+        enable_model_directives,
+        crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
+    body_json: &Value,
+    client_api_format: &str,
+    mapped_model: &str,
+    provider_type: &str,
+    provider_api_format: &str,
+    request_path: &str,
+    upstream_is_stream: bool,
+    body_rules: Option<&Value>,
+    user_api_key_id: Option<&str>,
+    request_headers: Option<&http::HeaderMap>,
+    enable_model_directives: bool,
+    reasoning_replay_policy: crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy,
+) -> Option<Value> {
     let mut format_context = FormatContext::default()
         .with_mapped_model(mapped_model)
         .with_request_path(request_path)
@@ -102,13 +133,29 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers(
         client_api_format,
         provider_api_format,
     );
-    let mut provider_request_body = convert_request(
+    // DeepSeek's Responses continuation state is opaque. Parsing a same-wire-format
+    // request through the canonical model would discard its id-less `reasoning_text`
+    // items and future provider-owned fields even though no conversion is required.
+    // Keep that provider-specific route wire-preserving, while retaining canonical
+    // normalization for ordinary OpenAI Responses and for Responses/Compact
+    // cross-format conversions.
+    let mut provider_request_body = if is_wire_preserving_deepseek_responses_hop(
         source_api_format.as_ref(),
         provider_api_format,
-        body_json,
-        &format_context,
-    )
-    .ok()?;
+        reasoning_replay_policy,
+    ) {
+        let mut object = body_json.as_object()?.clone();
+        object.insert("model".to_string(), Value::String(mapped_model.to_string()));
+        Value::Object(object)
+    } else {
+        convert_request(
+            source_api_format.as_ref(),
+            provider_api_format,
+            body_json,
+            &format_context,
+        )
+        .ok()?
+    };
 
     if enable_model_directives {
         apply_model_directive_overrides_from_request(
@@ -153,9 +200,10 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers(
         &mut provider_request_body,
         provider_api_format,
     );
-    crate::formats::openai::responses::strip_incompatible_openai_responses_reasoning_items(
+    crate::formats::openai::responses::strip_incompatible_openai_responses_reasoning_items_with_policy(
         &mut provider_request_body,
         provider_api_format,
+        reasoning_replay_policy,
     );
     strip_openai_responses_input_content_cache_control(
         &mut provider_request_body,
@@ -174,6 +222,21 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers(
         require_body_stream_field,
     );
     Some(provider_request_body)
+}
+
+fn is_wire_preserving_deepseek_responses_hop(
+    source_api_format: &str,
+    provider_api_format: &str,
+    reasoning_replay_policy: crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy,
+) -> bool {
+    if reasoning_replay_policy
+        != crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque
+    {
+        return false;
+    }
+    let source_api_format = aether_ai_formats::normalize_api_format_alias(source_api_format);
+    let provider_api_format = aether_ai_formats::normalize_api_format_alias(provider_api_format);
+    source_api_format == "openai:responses" && source_api_format == provider_api_format
 }
 
 fn compatible_source_format_for_standard_request<'a>(
@@ -352,8 +415,10 @@ mod tests {
     use super::{
         build_standard_request_body, build_standard_request_body_from_canonical,
         build_standard_request_body_with_model_directives,
+        build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy,
         normalize_standard_request_to_openai_chat_request,
     };
+    use crate::formats::openai::responses::OpenAiResponsesReasoningReplayPolicy;
     use serde_json::{json, Value};
 
     const STANDARD_SURFACES: &[&str] = &[
@@ -498,6 +563,110 @@ mod tests {
 
             assert_explicit_stream_flag(provider_api_format, false, &converted);
         }
+    }
+
+    #[test]
+    fn same_responses_family_matrix_preserves_opaque_reasoning_items_and_unknown_fields() {
+        let input = (0..66)
+            .map(|index| {
+                json!({
+                    "type": "reasoning",
+                    "encrypted_content": format!("opaque-state-{index}"),
+                    "content": [{
+                        "type": "reasoning_text",
+                        "text": format!("thinking {index}")
+                    }],
+                    "future_capability": {"budget_class": "dynamic"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let request = json!({
+            "model": "deepseek-v4-flash",
+            "input": input,
+            "future_request_field": {"preserve": true}
+        });
+
+        let preserved = build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
+            &request,
+            "openai:responses",
+            "deepseek-v4-flash",
+            "custom",
+            "openai:responses",
+            "/v1/responses",
+            false,
+            None,
+            None,
+            None,
+            false,
+            OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque,
+        )
+        .expect("same-family Responses body should build");
+        assert_eq!(preserved["model"], "deepseek-v4-flash");
+        assert_eq!(preserved["future_request_field"]["preserve"], true);
+        assert_eq!(
+            preserved["input"]
+                .as_array()
+                .expect("input array")
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            66
+        );
+        assert_eq!(
+            preserved["input"][0]["future_capability"]["budget_class"],
+            "dynamic"
+        );
+
+        let strict = build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
+            &request,
+            "openai:responses",
+            "deepseek-v4-flash",
+            "openai",
+            "openai:responses",
+            "/v1/responses",
+            false,
+            None,
+            None,
+            None,
+            false,
+            OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+        )
+        .expect("strict same-family Responses body should build");
+        assert_eq!(
+            strict["input"]
+                .as_array()
+                .expect("strict input array")
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            0
+        );
+
+        let compact = build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
+            &request,
+            "openai:responses:compact",
+            "deepseek-v4-flash",
+            "custom",
+            "openai:responses:compact",
+            "/v1/responses/compact",
+            false,
+            None,
+            None,
+            None,
+            false,
+            OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque,
+        )
+        .expect("Compact body should continue through canonical normalization");
+        assert_eq!(
+            compact["input"]
+                .as_array()
+                .expect("compact input array")
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            0,
+            "compact must not use the DeepSeek opaque replay policy"
+        );
     }
 
     #[test]
@@ -1241,6 +1410,14 @@ mod tests {
                     assert!(!input_json.contains("sig_123"));
                     continue;
                 }
+                if provider_api_format == "gemini:generate_content" {
+                    assert_eq!(
+                        converted["contents"][2]["parts"][0]["functionResponse"]["response"]
+                            ["result"],
+                        json!({"ok": true})
+                    );
+                    continue;
+                }
                 let legacy =
                     legacy_claude_request_body(&request, provider_api_format, upstream_is_stream);
                 assert_eq!(
@@ -1606,7 +1783,7 @@ mod tests {
         let converted = build_standard_request_body(
             &request,
             "claude:messages",
-            "gemini-2.5-pro",
+            "gemini-3-flash-preview",
             "google",
             "gemini:generate_content",
             "/v1/messages",
@@ -1851,5 +2028,53 @@ mod tests {
             claude["tools"][0]["input_schema"].get("required").is_some(),
             "surface conversion should preserve the Claude tool schema before transport envelopes"
         );
+    }
+
+    #[test]
+    fn openai_responses_builtin_and_function_tools_enable_gemini_server_invocations() {
+        let request = json!({
+            "model": "gpt-5",
+            "input": "Search first, then save the result.",
+            "tools": [
+                {"type": "web_search_preview"},
+                {
+                    "type": "function",
+                    "name": "save_result",
+                    "description": "Save a search result",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "result": {"type": "string"}
+                        },
+                        "required": ["result"]
+                    }
+                }
+            ],
+            "tool_choice": "required"
+        });
+
+        let gemini = build_standard_request_body(
+            &request,
+            "openai:responses",
+            "gemini-3-flash-preview",
+            "google",
+            "gemini:generate_content",
+            "/v1/responses",
+            true,
+            None,
+            None,
+        )
+        .expect("openai responses should convert to gemini generate content");
+
+        assert_eq!(gemini["tools"][0]["googleSearch"], json!({}));
+        assert_eq!(
+            gemini["tools"][1]["functionDeclarations"][0]["name"],
+            "save_result"
+        );
+        assert_eq!(
+            gemini["toolConfig"]["includeServerSideToolInvocations"],
+            true
+        );
+        assert_eq!(gemini["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
     }
 }

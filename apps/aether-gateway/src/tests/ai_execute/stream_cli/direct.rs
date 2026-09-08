@@ -504,16 +504,27 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
                             .and_then(|value| value.get("json_body"))
                             .is_some_and(|body| body.get("context_management").is_some()),
                     });
-                let frames = concat!(
-                    "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
-                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.output_item.done\\ndata: {\\\"type\\\":\\\"response.output_item.done\\\",\\\"item\\\":{\\\"type\\\":\\\"compaction\\\",\\\"encrypted_content\\\":\\\"ENCRYPTED_CONTEXT_COMPACTION_SUMMARY\\\"}}\\n\\n\"}}\n",
-                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.completed\\ndata: {\\\"type\\\":\\\"response.completed\\\",\\\"response\\\":{\\\"id\\\":\\\"resp_codex_cli_stream_local_123\\\",\\\"object\\\":\\\"response\\\",\\\"model\\\":\\\"gpt-5.6-sol\\\",\\\"status\\\":\\\"completed\\\",\\\"usage\\\":{\\\"input_tokens\\\":1,\\\"output_tokens\\\":2,\\\"total_tokens\\\":3}}}\\n\\n\"}}\n",
-                    "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":41}}}\n",
-                    "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
-                );
+                let frames = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"application/octet-stream\"}}}\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.output_item.done\\ndata: {\\\"type\\\":\\\"response.output_item.done\\\",\\\"item\\\":{\\\"type\\\":\\\"compaction\\\",\\\"encrypted_content\\\":\\\"ENCRYPTED_CONTEXT_COMPACTION_SUMMARY\\\"}}\\n\\n\"}}\n",
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.completed\\ndata: {\\\"type\\\":\\\"response.completed\\\",\\\"response\\\":{\\\"id\\\":\\\"resp_codex_cli_stream_local_123\\\",\\\"object\\\":\\\"response\\\",\\\"model\\\":\\\"gpt-5.6-sol\\\",\\\"status\\\":\\\"completed\\\",\\\"usage\\\":{\\\"input_tokens\\\":1,\\\"output_tokens\\\":2,\\\"total_tokens\\\":3}}}\\n\\n\"}}\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":41}}}\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n",
+                    ));
+                };
                 let mut response = Response::builder()
                     .status(StatusCode::OK)
-                    .body(Body::from(frames))
+                    .body(Body::from_stream(frames))
                     .expect("response should build");
                 response.headers_mut().insert(
                     http::header::CONTENT_TYPE,
@@ -574,12 +585,14 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
         enabled: true,
         ..UsageRuntimeConfig::default()
     });
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_state(gateway_state)
+        .layer(tower_http::compression::CompressionLayer::new());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
+    let mut response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/responses"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::ACCEPT_ENCODING, "gzip")
         .header(
             http::header::AUTHORIZATION,
             format!("Bearer {client_api_key}"),
@@ -599,8 +612,34 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert!(
+        response
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none(),
+        "SSE responses must not be gzip-buffered"
+    );
+    let first_event = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        super::super::next_non_keepalive_chunk(&mut response),
+    )
+    .await
+    .expect("first upstream SSE event should reach the client before completion");
+    assert!(
+        first_event.starts_with(b"event: response.output_item.done\n"),
+        "unexpected first event: {}",
+        String::from_utf8_lossy(&first_event)
+    );
     let response_body =
         strip_sse_keepalive_comments(&response.text().await.expect("body should read"));
+    let response_body = format!("{}{}", String::from_utf8_lossy(&first_event), response_body);
     assert!(response_body.contains("event: response.output_item.done\n"));
     assert!(response_body.contains("\"type\":\"compaction\""));
     assert!(response_body.contains("ENCRYPTED_CONTEXT_COMPACTION_SUMMARY"));

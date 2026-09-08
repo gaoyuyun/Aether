@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 const KIRO_DEVICE_DEFAULT_START_URL: &str = "https://view.awsapps.com/start";
 const KIRO_DEVICE_DEFAULT_REGION: &str = "us-east-1";
+const MAX_UNVERIFIED_JWT_CLAIMS_BYTES: usize = 64 * 1024;
 
 pub fn current_unix_secs() -> u64 {
     SystemTime::now()
@@ -112,7 +113,18 @@ pub fn json_u64_value(value: Option<&Value>) -> Option<u64> {
 
 pub fn decode_jwt_claims(token: &str) -> Option<Map<String, Value>> {
     let payload = token.split('.').nth(1)?;
+    let max_encoded_len = MAX_UNVERIFIED_JWT_CLAIMS_BYTES
+        .saturating_add(2)
+        .checked_div(3)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    if payload.len() > max_encoded_len {
+        return None;
+    }
     let bytes = URL_SAFE_NO_PAD.decode(payload.as_bytes()).ok()?;
+    if bytes.len() > MAX_UNVERIFIED_JWT_CLAIMS_BYTES {
+        return None;
+    }
     serde_json::from_slice::<Value>(&bytes)
         .ok()?
         .as_object()
@@ -398,7 +410,10 @@ pub fn build_kiro_device_key_name(email: Option<&str>, refresh_token: Option<&st
 
 #[cfg(test)]
 mod tests {
-    use super::{enrich_admin_provider_oauth_auth_config, parse_provider_oauth_callback_params};
+    use super::{
+        decode_jwt_claims, enrich_admin_provider_oauth_auth_config,
+        parse_provider_oauth_callback_params, MAX_UNVERIFIED_JWT_CLAIMS_BYTES,
+    };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
 
@@ -515,5 +530,17 @@ mod tests {
         assert_eq!(auth_config.get("plan_type"), Some(&json!("plus")));
         assert_eq!(auth_config.get("user_id"), Some(&json!("user-image")));
         assert_eq!(auth_config.get("is_fedramp"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn decode_jwt_claims_rejects_oversized_payload_before_decode() {
+        let max_encoded_len = MAX_UNVERIFIED_JWT_CLAIMS_BYTES
+            .saturating_add(2)
+            .checked_div(3)
+            .unwrap()
+            .saturating_mul(4);
+        let token = format!("header.{}.signature", "A".repeat(max_encoded_len + 1));
+
+        assert_eq!(decode_jwt_claims(&token), None);
     }
 }

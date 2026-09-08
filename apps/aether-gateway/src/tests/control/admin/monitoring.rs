@@ -528,7 +528,7 @@ async fn gateway_handles_admin_monitoring_trace_request_locally_with_trusted_adm
     assert_eq!(payload["candidates"][0]["provider_name"], json!("OpenAI"));
     assert_eq!(
         payload["candidates"][0]["provider_website"],
-        json!("https://openai.com")
+        json!("https://openai.com/")
     );
     assert_eq!(
         payload["candidates"][0]["endpoint_name"],
@@ -761,11 +761,12 @@ async fn gateway_handles_admin_monitoring_cache_affinities_locally_with_trusted_
         AppState::new()
             .expect("gateway should build")
             .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_provider_catalog_reader_for_tests(
+                crate::data::GatewayDataState::with_provider_catalog_repository_for_tests(
                     provider_catalog,
                 )
                 .with_user_reader(user_repository)
-                .with_auth_api_key_reader(auth_repository),
+                .with_auth_api_key_reader(auth_repository)
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
             )
             .with_admin_monitoring_cache_affinity_entry_for_tests(
                 "cache_affinity:user-key-1:openai:model-alpha",

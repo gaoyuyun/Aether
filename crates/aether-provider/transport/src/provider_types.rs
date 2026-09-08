@@ -5,7 +5,6 @@ pub struct ProviderOAuthTemplate {
     pub authorize_url: &'static str,
     pub token_url: &'static str,
     pub client_id: &'static str,
-    pub client_secret: &'static str,
     pub scopes: &'static [&'static str],
     pub redirect_uri: &'static str,
     pub use_pkce: bool,
@@ -291,7 +290,7 @@ const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProvider
 
 const CODEX_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "codex",
-    version: 1,
+    version: 2,
     base_url: "https://chatgpt.com/backend-api/codex",
     endpoints: &[
         FixedProviderEndpointTemplate {
@@ -315,6 +314,12 @@ const CODEX_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTempla
         FixedProviderEndpointTemplate {
             item_key: "openai:image",
             api_format: "openai:image",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "codex:live",
+            api_format: "codex:live",
             custom_path: None,
             config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
         },
@@ -544,7 +549,6 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: aether_oauth::provider::providers::CLAUDE_CODE_AUTHORIZE_URL,
             token_url: aether_oauth::provider::providers::CLAUDE_CODE_TOKEN_URL,
             client_id: aether_oauth::provider::providers::CLAUDE_CODE_CLIENT_ID,
-            client_secret: "",
             scopes: aether_oauth::provider::providers::CLAUDE_CODE_OAUTH_SCOPES,
             redirect_uri: aether_oauth::provider::providers::CLAUDE_CODE_REDIRECT_URI,
             use_pkce: true,
@@ -555,7 +559,6 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: "https://auth.openai.com/oauth/authorize",
             token_url: "https://auth.openai.com/oauth/token",
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-            client_secret: "",
             scopes: &["openid", "email", "profile", "offline_access"],
             redirect_uri: "http://localhost:1455/auth/callback",
             use_pkce: true,
@@ -566,7 +569,6 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: "https://auth.openai.com/oauth/authorize",
             token_url: "https://auth.openai.com/oauth/token",
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
-            client_secret: "",
             scopes: &["openid", "email", "profile", "offline_access"],
             redirect_uri: "http://localhost:1455/auth/callback",
             use_pkce: true,
@@ -577,7 +579,6 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
             client_id: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-            client_secret: "",
             scopes: &[
                 "https://www.googleapis.com/auth/cloud-platform",
                 "https://www.googleapis.com/auth/userinfo.email",
@@ -592,7 +593,6 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
             token_url: "https://oauth2.googleapis.com/token",
             client_id: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-            client_secret: "",
             scopes: &[
                 "https://www.googleapis.com/auth/cloud-platform",
                 "https://www.googleapis.com/auth/userinfo.email",
@@ -609,7 +609,6 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             authorize_url: "https://windsurf.com/windsurf/signin",
             token_url: "https://register.windsurf.com/exa.seat_management_pb.SeatManagementService/RegisterUser",
             client_id: "3GUryQ7ldAeKEuD2obYnppsnmj58eP5u",
-            client_secret: "",
             scopes: &[],
             redirect_uri: "show-auth-token",
             use_pkce: false,
@@ -656,7 +655,7 @@ mod tests {
     fn codex_fixed_provider_template_includes_codex_companion_endpoints() {
         let template = fixed_provider_template("codex").expect("codex template should exist");
         assert_eq!(template.base_url, "https://chatgpt.com/backend-api/codex");
-        assert_eq!(template.version, 1);
+        assert_eq!(template.version, 2);
         assert_eq!(
             template
                 .endpoints
@@ -667,7 +666,8 @@ mod tests {
                 "openai:responses",
                 "openai:responses:compact",
                 "openai:search",
-                "openai:image"
+                "openai:image",
+                "codex:live"
             ]
         );
 
@@ -680,6 +680,12 @@ mod tests {
             fixed_provider_endpoint_template_by_api_format("codex", "openai:search")
                 .expect("codex search endpoint should exist");
         assert!(search_template.config_defaults.is_empty());
+
+        let live_template = fixed_provider_endpoint_template_by_api_format("codex", "codex:live")
+            .expect("codex Live endpoint should exist");
+        assert_eq!(live_template.item_key, "codex:live");
+        assert_eq!(live_template.custom_path, None);
+        assert!(live_template.config_defaults.is_empty());
     }
 
     #[test]

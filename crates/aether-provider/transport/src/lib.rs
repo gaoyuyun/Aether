@@ -17,6 +17,7 @@ pub mod kiro;
 mod network;
 pub mod oauth_refresh;
 mod openai_image;
+mod outbound_request_policy;
 pub mod policy;
 pub mod provider_types;
 mod request_body;
@@ -57,7 +58,8 @@ pub use auth::{build_passthrough_headers, ensure_upstream_auth_header};
 pub use auth_config::apply_local_auth_config_header_overrides;
 pub use cache::{provider_transport_snapshot_looks_refreshed, ProviderTransportSnapshotCacheKey};
 pub use codex_fingerprint::{
-    apply_codex_oauth_fingerprint_convergence, codex_fingerprint_convergence_enabled,
+    apply_codex_fingerprint_convergence, apply_codex_fingerprint_convergence_with_context,
+    codex_fingerprint_convergence_enabled, CodexFingerprintConvergenceContext,
     CODEX_FINGERPRINT_CONFIG_NAMESPACE, CODEX_FINGERPRINT_ENABLED_CONFIG_KEY,
 };
 pub use conversion::{
@@ -119,6 +121,13 @@ pub use openai_image::{
     openai_image_transport_unsupported_reason, resolve_openai_image_auth,
     ProviderOpenAiImageHeadersInput,
 };
+pub use outbound_request_policy::{
+    apply_provider_outbound_request_policies, ProviderOutboundRequestContext,
+    ProviderOutboundRequestIdentityScope, ProviderOutboundRequestMutationScope,
+    ProviderOutboundRequestPolicy, ProviderOutboundRequestPolicyOutcome,
+    ProviderOutboundRequestPolicyReason, ProviderOutboundRequestPolicyResult,
+    PROVIDER_OUTBOUND_CONTEXT_MAX_VALUE_BYTES,
+};
 pub use policy::{
     local_gemini_transport_unsupported_reason,
     local_gemini_transport_unsupported_reason_with_network,
@@ -145,6 +154,7 @@ pub use rules::{
 pub use same_format_provider::{
     build_same_format_provider_headers, build_same_format_provider_request_body,
     build_same_format_provider_request_body_with_compatibility_report,
+    build_same_format_provider_request_body_with_compatibility_report_and_reasoning_replay_policy,
     build_same_format_provider_upstream_url, classify_same_format_provider_request_behavior,
     classify_same_format_provider_request_behavior_for_operation,
     enforce_same_format_provider_api_operation_body_policy,

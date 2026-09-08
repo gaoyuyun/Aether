@@ -61,12 +61,41 @@ pub(crate) fn request_identity_response_encoding_when_redacted(
     }
 }
 
+/// Removes credential-bearing URL components before attaching an upstream URL
+/// to a diagnostic event. Endpoint query parameters remain untouched on the
+/// wire, but they can contain API keys or signed tokens and must not reach
+/// logs.
+pub(crate) fn sanitize_upstream_url_for_log(raw: &str) -> String {
+    if let Ok(mut url) = url::Url::parse(raw) {
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return "<invalid-upstream-url>".to_string();
+        }
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        return url.to_string();
+    }
+
+    let suffix_offset = raw
+        .char_indices()
+        .find_map(|(offset, character)| matches!(character, '?' | '#').then_some(offset))
+        .unwrap_or(raw.len());
+    let path = &raw[..suffix_offset];
+    if path.starts_with('/') && !path.starts_with("//") && !path.contains('@') {
+        path.to_string()
+    } else {
+        "<invalid-upstream-url>".to_string()
+    }
+}
+
 pub(crate) async fn resolve_provider_chat_pii_redaction<'a>(
     state: &AppState,
     parts: &http::request::Parts,
     body_json: &'a Value,
     auth_context: &ExecutionRuntimeAuthContext,
     client_api_format: &str,
+    reasoning_replay_policy: crate::ai_serving::OpenAiResponsesReasoningReplayPolicy,
     candidate_id: &str,
 ) -> Result<ProviderRequestRedaction<'a>, GatewayError> {
     let Some(format) = ChatPiiRedactionRequestFormat::from_api_format(client_api_format) else {
@@ -75,7 +104,7 @@ pub(crate) async fn resolve_provider_chat_pii_redaction<'a>(
     let Some(slot) = parts.extensions.get::<RedactionSessionSlot>() else {
         return Ok(ProviderRequestRedaction::disabled(body_json));
     };
-    let request_cache_key = request_redaction_cache_key(format, body_json);
+    let request_cache_key = request_redaction_cache_key(format, reasoning_replay_policy, body_json);
     if let Some(cached) = slot.cached_request_redaction(&request_cache_key) {
         crate::stage_metrics::record_chat_pii_redaction_request_cache_hit();
         observe_gateway_stage_ms("chat_pii_redaction_request_cache_hit", 0);
@@ -132,7 +161,7 @@ pub(crate) async fn resolve_provider_chat_pii_redaction<'a>(
         body_json,
         format,
         build_redaction_session_config(hmac_key, &runtime_config, now_unix_secs),
-        MaskChatRequestOptions::runtime(),
+        MaskChatRequestOptions::runtime().with_reasoning_replay_policy(reasoning_replay_policy),
         Some(&cache),
     )
     .await
@@ -165,8 +194,16 @@ pub(crate) async fn resolve_provider_chat_pii_redaction<'a>(
     })
 }
 
-fn request_redaction_cache_key(format: ChatPiiRedactionRequestFormat, body_json: &Value) -> String {
-    format!("{format:?}:{:p}", body_json)
+fn request_redaction_cache_key(
+    format: ChatPiiRedactionRequestFormat,
+    reasoning_replay_policy: crate::ai_serving::OpenAiResponsesReasoningReplayPolicy,
+    body_json: &Value,
+) -> String {
+    // A request may be attempted against providers with different replay
+    // contracts. Reusing a cached DeepSeek opaque decision for an ordinary
+    // Responses candidate (or vice versa) would either bypass masking or
+    // corrupt provider-owned continuation state.
+    format!("{format:?}:{reasoning_replay_policy:?}:{:p}", body_json)
 }
 
 fn provider_redaction_from_cached<'a>(
@@ -216,14 +253,47 @@ async fn resolve_chat_pii_redaction_feature_settings(
 }
 
 fn redaction_mask_error_to_gateway_error(error: RedactionMaskError) -> GatewayError {
-    match error {}
+    match error {
+        RedactionMaskError::SensitiveOpaqueReasoningState => {
+            warn!("gateway rejected provider-bound reasoning state containing sensitive text");
+            GatewayError::Client {
+                status: http::StatusCode::BAD_REQUEST,
+                message: "provider-bound reasoning state contains sensitive text and cannot be safely replayed while chat PII redaction is enabled".to_string(),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::ChatPiiRedactionFeatureSettings;
+    use super::{sanitize_upstream_url_for_log, ChatPiiRedactionFeatureSettings};
+
+    #[test]
+    fn upstream_url_log_projection_removes_all_credential_carriers() {
+        assert_eq!(
+            sanitize_upstream_url_for_log(
+                "https://user:password@api.example.test/v1/responses?api-version=2026-08-01&token=secret#fragment"
+            ),
+            "https://api.example.test/v1/responses"
+        );
+        assert_eq!(
+            sanitize_upstream_url_for_log("/v1/responses?key=secret#fragment"),
+            "/v1/responses"
+        );
+        for invalid in [
+            "https://user:secret@invalid host/v1/responses",
+            "//user:secret@api.example.test/v1/responses?token=hidden",
+            "not-a-url?token=hidden",
+            "data:text/plain,secret",
+        ] {
+            assert_eq!(
+                sanitize_upstream_url_for_log(invalid),
+                "<invalid-upstream-url>"
+            );
+        }
+    }
 
     #[test]
     fn chat_pii_redaction_feature_settings_only_control_enablement() {

@@ -9,9 +9,9 @@ use crate::api::response::build_client_response_from_parts;
 use crate::control::GatewayControlDecision;
 use crate::usage::spawn_sync_report;
 use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
+use aether_usage_runtime::decode_internal_report_body_base64;
 use axum::body::Body;
 use axum::http::{Response, StatusCode};
-use base64::Engine as _;
 use tracing::warn;
 
 #[derive(Clone, Debug)]
@@ -144,9 +144,8 @@ fn build_local_core_sync_finalize_fallback_response(
     }
 
     if let Some(body_base64) = payload.body_base64.as_ref() {
-        let body_bytes = base64::engine::general_purpose::STANDARD
-            .decode(body_base64)
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let body_bytes =
+            decode_internal_report_body_base64(body_base64).map_err(GatewayError::Internal)?;
         return build_local_sync_response_from_bytes(trace_id, decision, payload, body_bytes);
     }
 
@@ -297,9 +296,8 @@ fn resolve_local_sync_source_body_json(
     let body_json = if let Some(body_json) = payload.body_json.clone() {
         body_json
     } else if let Some(body_base64) = payload.body_base64.as_deref() {
-        let body_bytes = base64::engine::general_purpose::STANDARD
-            .decode(body_base64)
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        let body_bytes =
+            decode_internal_report_body_base64(body_base64).map_err(GatewayError::Internal)?;
         let stripped = strip_utf8_bom_and_ws(&body_bytes);
         let Ok(body_json) = serde_json::from_slice::<serde_json::Value>(stripped) else {
             return Ok(None);
@@ -326,9 +324,8 @@ fn decode_local_sync_body_text(
     let Some(body_base64) = payload.body_base64.as_deref() else {
         return Ok(None);
     };
-    let body_bytes = base64::engine::general_purpose::STANDARD
-        .decode(body_base64)
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let body_bytes =
+        decode_internal_report_body_base64(body_base64).map_err(GatewayError::Internal)?;
     let stripped = strip_utf8_bom_and_ws(&body_bytes);
     let body_text = String::from_utf8_lossy(stripped).trim().to_string();
     if body_text.is_empty() {

@@ -3,8 +3,12 @@ use sqlx::{PgPool, Row};
 
 use aether_data_contracts::repository::settlement::{
     finite_wallet_available_usd, plan_finite_wallet_debit, settlement_billable_cost_usd,
-    settlement_billing_status_for_usage_status, SettlementWriteRepository, StoredUsageSettlement,
-    UsageSettlementInput, SETTLEMENT_EPSILON_USD,
+    settlement_billing_status_for_usage_status, validate_wallet_settlement_values,
+    ReconcileUsagePolicyCostInput, ReleaseUsagePolicyRequestAdmissionInput,
+    ReserveUsagePolicyCostInput, ReserveUsagePolicyCostOutcome, ReserveUsagePolicyRequestInput,
+    ReserveUsagePolicyRequestOutcome, SettlementWriteRepository, StoredUsagePolicyCostReservation,
+    StoredUsagePolicyRequestAdmission, StoredUsageSettlement, UsagePolicyCostReservationState,
+    UsagePolicyRequestAdmissionState, UsageSettlementInput, SETTLEMENT_EPSILON_USD,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -201,6 +205,144 @@ impl SqlxSettlementRepository {
         let tx_runner = PostgresTransactionRunner::new(pool);
         Self { tx_runner }
     }
+}
+
+fn usage_policy_cost_i64(value: u64, field: &str) -> Result<i64, DataLayerError> {
+    i64::try_from(value)
+        .map_err(|_| DataLayerError::InvalidInput(format!("{field} exceeds the integer range")))
+}
+
+fn usage_policy_cost_u64(value: i64, field: &str) -> Result<u64, DataLayerError> {
+    u64::try_from(value)
+        .map_err(|_| DataLayerError::UnexpectedValue(format!("{field} must not be negative")))
+}
+
+fn usage_policy_request_admission_from_postgres_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<StoredUsagePolicyRequestAdmission, DataLayerError> {
+    let state: String = row.try_get("state").map_postgres_err()?;
+    Ok(StoredUsagePolicyRequestAdmission {
+        request_id: row.try_get("request_id").map_postgres_err()?,
+        subject_id: row.try_get("subject_id").map_postgres_err()?,
+        event_token: row.try_get("event_token").map_postgres_err()?,
+        admitted_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("admitted_at_unix_secs").map_postgres_err()?,
+            "usage policy request admitted_at",
+        )?,
+        retain_until_unix_secs: usage_policy_cost_u64(
+            row.try_get("retain_until_unix_secs").map_postgres_err()?,
+            "usage policy request retain_until",
+        )?,
+        state: UsagePolicyRequestAdmissionState::parse(&state).ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "unknown usage policy request admission state {state}"
+            ))
+        })?,
+        released_at_unix_secs: row
+            .try_get::<Option<i64>, _>("released_at_unix_secs")
+            .map_postgres_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy request released_at"))
+            .transpose()?,
+    })
+}
+
+const FIND_USAGE_POLICY_REQUEST_ADMISSION_POSTGRES_SQL: &str = r#"
+SELECT
+  request_id,
+  subject_id,
+  event_token,
+  CAST(EXTRACT(EPOCH FROM admitted_at) AS BIGINT) AS admitted_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM retain_until) AS BIGINT) AS retain_until_unix_secs,
+  state,
+  CAST(EXTRACT(EPOCH FROM released_at) AS BIGINT) AS released_at_unix_secs
+FROM usage_request_admissions
+WHERE event_token = $1
+FOR UPDATE
+"#;
+
+fn usage_policy_cost_reservation_from_postgres_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<StoredUsagePolicyCostReservation, DataLayerError> {
+    let state: String = row.try_get("state").map_postgres_err()?;
+    Ok(StoredUsagePolicyCostReservation {
+        request_id: row.try_get("request_id").map_postgres_err()?,
+        subject_id: row.try_get("subject_id").map_postgres_err()?,
+        reservation_token: row.try_get("reservation_token").map_postgres_err()?,
+        admitted_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("admitted_at_unix_secs").map_postgres_err()?,
+            "usage policy admitted_at",
+        )?,
+        reserved_cost_units: usage_policy_cost_u64(
+            row.try_get("reserved_cost_units").map_postgres_err()?,
+            "usage policy reserved_cost_units",
+        )?,
+        actual_cost_units: row
+            .try_get::<Option<i64>, _>("actual_cost_units")
+            .map_postgres_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy actual_cost_units"))
+            .transpose()?,
+        state: UsagePolicyCostReservationState::parse(&state).ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "unknown usage policy reservation state {state}"
+            ))
+        })?,
+        reservation_expires_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("reservation_expires_at_unix_secs")
+                .map_postgres_err()?,
+            "usage policy reservation_expires_at",
+        )?,
+        retain_until_unix_secs: usage_policy_cost_u64(
+            row.try_get("retain_until_unix_secs").map_postgres_err()?,
+            "usage policy retain_until",
+        )?,
+        finalized_at_unix_secs: row
+            .try_get::<Option<i64>, _>("finalized_at_unix_secs")
+            .map_postgres_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy finalized_at"))
+            .transpose()?,
+    })
+}
+
+const FIND_USAGE_POLICY_COST_RESERVATION_POSTGRES_SQL: &str = r#"
+SELECT
+  request_id,
+  subject_id,
+  reservation_token,
+  CAST(EXTRACT(EPOCH FROM admitted_at) AS BIGINT) AS admitted_at_unix_secs,
+  reserved_cost_units,
+  actual_cost_units,
+  state,
+  CAST(EXTRACT(EPOCH FROM reservation_expires_at) AS BIGINT)
+    AS reservation_expires_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM retain_until) AS BIGINT) AS retain_until_unix_secs,
+  CAST(EXTRACT(EPOCH FROM finalized_at) AS BIGINT) AS finalized_at_unix_secs
+FROM usage_cost_reservations
+WHERE reservation_token = $1
+FOR UPDATE
+"#;
+
+async fn lock_usage_policy_subject_postgres(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    subject_id: &str,
+) -> Result<bool, DataLayerError> {
+    let exists = sqlx::query_scalar::<_, String>(
+        r#"
+SELECT id
+FROM users
+WHERE id = $1
+FOR UPDATE
+        "#,
+    )
+    .bind(subject_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_postgres_err()?
+    .is_some();
+    Ok(exists)
+}
+
+fn usage_policy_subject_missing() -> DataLayerError {
+    DataLayerError::InvalidInput("usage policy subject does not exist".to_string())
 }
 
 fn settlement_from_row(
@@ -460,6 +602,7 @@ fn daily_quota_usage_date(
 fn daily_quota_grants_from_entitlement(
     entitlement_id: &str,
     entitlements: &serde_json::Value,
+    current_allow_wallet_overage: Option<bool>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<DailyQuotaGrant>, DataLayerError> {
     let mut grants = Vec::new();
@@ -486,13 +629,25 @@ fn daily_quota_grants_from_entitlement(
             entitlement_id: entitlement_id.to_string(),
             daily_quota_usd,
             usage_date,
-            allow_wallet_overage: item
-                .get("allow_wallet_overage")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            allow_wallet_overage: current_allow_wallet_overage.unwrap_or_else(|| {
+                item.get("allow_wallet_overage")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            }),
         });
     }
     Ok(grants)
+}
+
+fn daily_quota_wallet_overage_policy(entitlements: &serde_json::Value) -> Option<bool> {
+    entitlements.as_array()?.iter().find_map(|item| {
+        (item.get("type").and_then(serde_json::Value::as_str) == Some("daily_quota"))
+            .then(|| {
+                item.get("allow_wallet_overage")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .flatten()
+    })
 }
 
 async fn consume_daily_quota_postgres(
@@ -503,19 +658,30 @@ async fn consume_daily_quota_postgres(
     wallet_available_usd: Option<f64>,
     wallet_can_overdraft: bool,
 ) -> Result<DailyQuotaDebitResult, DataLayerError> {
-    if total_cost_usd <= 0.0 {
+    if !total_cost_usd.is_finite() || total_cost_usd < 0.0 {
+        return Err(DataLayerError::InvalidInput(
+            "daily quota settlement cost must be finite and non-negative".to_string(),
+        ));
+    }
+    if total_cost_usd == 0.0 {
         return Ok(DailyQuotaDebitResult::default());
     }
     let now = chrono::Utc::now();
     let entitlement_rows = sqlx::query(
         r#"
-SELECT id, entitlements_snapshot
+SELECT
+    user_plan_entitlements.id,
+    user_plan_entitlements.entitlements_snapshot,
+    billing_plans.entitlements_json AS plan_entitlements_json
 FROM user_plan_entitlements
-WHERE user_id = $1
-  AND status = 'active'
-  AND starts_at <= NOW()
-  AND expires_at > NOW()
-ORDER BY expires_at ASC, created_at ASC, id ASC
+JOIN billing_plans ON billing_plans.id = user_plan_entitlements.plan_id
+WHERE user_plan_entitlements.user_id = $1
+    AND user_plan_entitlements.status = 'active'
+    AND user_plan_entitlements.starts_at <= NOW()
+    AND user_plan_entitlements.expires_at > NOW()
+ORDER BY user_plan_entitlements.expires_at ASC,
+                 user_plan_entitlements.created_at ASC,
+                 user_plan_entitlements.id ASC
 FOR UPDATE
         "#,
     )
@@ -528,9 +694,12 @@ FOR UPDATE
         let entitlement_id: String = row.try_get("id").map_postgres_err()?;
         let entitlements: serde_json::Value =
             row.try_get("entitlements_snapshot").map_postgres_err()?;
+        let plan_entitlements: serde_json::Value =
+            row.try_get("plan_entitlements_json").map_postgres_err()?;
         grants.extend(daily_quota_grants_from_entitlement(
             &entitlement_id,
             &entitlements,
+            daily_quota_wallet_overage_policy(&plan_entitlements),
             now,
         )?);
     }
@@ -557,28 +726,27 @@ WHERE user_entitlement_id = $1
         .await
         .map_postgres_err()?
         .unwrap_or(0.0);
+        if !used.is_finite() || used < 0.0 {
+            return Err(DataLayerError::UnexpectedValue(
+                "daily quota usage ledger total is invalid".to_string(),
+            ));
+        }
         let remaining = (grant.daily_quota_usd - used).max(0.0);
         total_remaining += remaining;
+        if !total_remaining.is_finite() {
+            return Err(DataLayerError::UnexpectedValue(
+                "daily quota remaining total overflowed".to_string(),
+            ));
+        }
         grants_with_remaining.push((grant, remaining));
     }
 
-    if !allow_wallet_overage && total_remaining + 0.000_000_01 < total_cost_usd {
-        return Ok(DailyQuotaDebitResult {
-            debited_usd: 0.0,
-            insufficient: true,
-        });
-    }
-    if allow_wallet_overage
-        && !wallet_can_overdraft
-        && wallet_available_usd.is_some_and(|available| {
-            total_remaining + available + SETTLEMENT_EPSILON_USD < total_cost_usd
-        })
-    {
-        return Ok(DailyQuotaDebitResult {
-            debited_usd: 0.0,
-            insufficient: true,
-        });
-    }
+    let insufficient = (!allow_wallet_overage && total_remaining + 0.000_000_01 < total_cost_usd)
+        || (allow_wallet_overage
+            && !wallet_can_overdraft
+            && wallet_available_usd.is_some_and(|available| {
+                total_remaining + available + SETTLEMENT_EPSILON_USD < total_cost_usd
+            }));
 
     let mut remaining_cost = total_cost_usd;
     let mut debited = 0.0;
@@ -614,12 +782,502 @@ ON CONFLICT (user_entitlement_id, request_id) DO NOTHING
     }
     Ok(DailyQuotaDebitResult {
         debited_usd: debited,
-        insufficient: false,
+        insufficient,
     })
 }
 
 #[async_trait]
 impl SettlementWriteRepository for SqlxSettlementRepository {
+    async fn reserve_usage_policy_request(
+        &self,
+        input: ReserveUsagePolicyRequestInput,
+    ) -> Result<ReserveUsagePolicyRequestOutcome, DataLayerError> {
+        input.validate()?;
+        self.tx_runner
+            .run_read_write(|tx| {
+                Box::pin(async move {
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Err(usage_policy_subject_missing());
+                    }
+                    let existing_row =
+                        sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_POSTGRES_SQL)
+                            .bind(&input.event_token)
+                            .fetch_optional(&mut **tx)
+                            .await
+                            .map_postgres_err()?;
+                    if let Some(row) = existing_row.as_ref() {
+                        let existing = usage_policy_request_admission_from_postgres_row(row)?;
+                        if existing.request_id != input.request_id
+                            || existing.subject_id != input.subject_id
+                        {
+                            return Ok(ReserveUsagePolicyRequestOutcome::Conflict);
+                        }
+                        if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+                            return Err(DataLayerError::InvalidInput(
+                                "usage policy event_token must keep its original admitted_at"
+                                    .to_string(),
+                            ));
+                        }
+                        sqlx::query(
+                            r#"
+UPDATE usage_request_admissions
+SET retain_until = GREATEST(retain_until, TO_TIMESTAMP($2::double precision))
+WHERE event_token = $1
+                            "#,
+                        )
+                        .bind(&input.event_token)
+                        .bind(usage_policy_cost_i64(
+                            input.retain_until_unix_secs,
+                            "usage policy request retain_until",
+                        )?)
+                        .execute(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        return Ok(match existing.state {
+                            UsagePolicyRequestAdmissionState::Active => {
+                                ReserveUsagePolicyRequestOutcome::Allowed
+                            }
+                            UsagePolicyRequestAdmissionState::Released => {
+                                ReserveUsagePolicyRequestOutcome::AlreadyReleased
+                            }
+                        });
+                    }
+
+                    for (window_index, window) in input.windows.iter().enumerate() {
+                        let used_requests = sqlx::query_scalar::<_, i64>(
+                            r#"
+SELECT COUNT(*)::BIGINT
+FROM usage_request_admissions
+WHERE subject_id = $1
+  AND state = 'active'
+  AND admitted_at >= TO_TIMESTAMP($2::double precision)
+  AND admitted_at < TO_TIMESTAMP($3::double precision)
+                            "#,
+                        )
+                        .bind(&input.subject_id)
+                        .bind(usage_policy_cost_i64(
+                            window.starts_at_unix_secs,
+                            "usage policy request window start",
+                        )?)
+                        .bind(usage_policy_cost_i64(
+                            window.ends_at_unix_secs,
+                            "usage policy request window end",
+                        )?)
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        let used_requests = usage_policy_cost_u64(
+                            used_requests,
+                            "usage policy request used_requests",
+                        )?;
+                        if used_requests >= window.limit_requests {
+                            return Ok(ReserveUsagePolicyRequestOutcome::Rejected {
+                                window_index,
+                                limit_requests: window.limit_requests,
+                                used_requests,
+                            });
+                        }
+                    }
+
+                    let insert_result = sqlx::query(
+                        r#"
+INSERT INTO usage_request_admissions (
+  request_id, subject_id, event_token, admitted_at, retain_until,
+  state, released_at, created_at
+) VALUES (
+  $1, $2, $3, TO_TIMESTAMP($4::double precision),
+  TO_TIMESTAMP($5::double precision), 'active', NULL, NOW()
+)
+ON CONFLICT (event_token) DO NOTHING
+                        "#,
+                    )
+                    .bind(&input.request_id)
+                    .bind(&input.subject_id)
+                    .bind(&input.event_token)
+                    .bind(usage_policy_cost_i64(
+                        input.admitted_at_unix_secs,
+                        "usage policy request admitted_at",
+                    )?)
+                    .bind(usage_policy_cost_i64(
+                        input.retain_until_unix_secs,
+                        "usage policy request retain_until",
+                    )?)
+                    .execute(&mut **tx)
+                    .await
+                    .map_postgres_err()?;
+                    if insert_result.rows_affected() == 1 {
+                        return Ok(ReserveUsagePolicyRequestOutcome::Allowed);
+                    }
+
+                    // A token can race across different subjects, which hold different subject
+                    // locks. The unique key resolves that race; classify it explicitly here.
+                    let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_POSTGRES_SQL)
+                        .bind(&input.event_token)
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                    let existing = usage_policy_request_admission_from_postgres_row(&row)?;
+                    if existing.request_id != input.request_id
+                        || existing.subject_id != input.subject_id
+                    {
+                        return Ok(ReserveUsagePolicyRequestOutcome::Conflict);
+                    }
+                    if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+                        return Err(DataLayerError::InvalidInput(
+                            "usage policy event_token must keep its original admitted_at"
+                                .to_string(),
+                        ));
+                    }
+                    Ok(match existing.state {
+                        UsagePolicyRequestAdmissionState::Active => {
+                            ReserveUsagePolicyRequestOutcome::Allowed
+                        }
+                        UsagePolicyRequestAdmissionState::Released => {
+                            ReserveUsagePolicyRequestOutcome::AlreadyReleased
+                        }
+                    })
+                })
+            })
+            .await
+    }
+
+    async fn release_usage_policy_request_admission(
+        &self,
+        input: ReleaseUsagePolicyRequestAdmissionInput,
+    ) -> Result<Option<StoredUsagePolicyRequestAdmission>, DataLayerError> {
+        input.validate()?;
+        self.tx_runner
+            .run_read_write(|tx| {
+                Box::pin(async move {
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Ok(None);
+                    }
+                    let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_POSTGRES_SQL)
+                        .bind(&input.event_token)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
+                    let mut admission = usage_policy_request_admission_from_postgres_row(&row)?;
+                    if admission.request_id != input.request_id
+                        || admission.subject_id != input.subject_id
+                    {
+                        return Ok(None);
+                    }
+                    if input.released_at_unix_secs < admission.admitted_at_unix_secs {
+                        return Err(DataLayerError::InvalidInput(
+                            "usage policy released_at must not precede admitted_at".to_string(),
+                        ));
+                    }
+                    if admission.state == UsagePolicyRequestAdmissionState::Active {
+                        sqlx::query(
+                            r#"
+UPDATE usage_request_admissions
+SET state = 'released', released_at = TO_TIMESTAMP($2::double precision)
+WHERE event_token = $1 AND state = 'active'
+                            "#,
+                        )
+                        .bind(&input.event_token)
+                        .bind(usage_policy_cost_i64(
+                            input.released_at_unix_secs,
+                            "usage policy request released_at",
+                        )?)
+                        .execute(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        admission.state = UsagePolicyRequestAdmissionState::Released;
+                        admission.released_at_unix_secs = Some(input.released_at_unix_secs);
+                    }
+                    Ok(Some(admission))
+                })
+            })
+            .await
+    }
+
+    async fn cleanup_usage_policy_request_admissions(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        let now = usage_policy_cost_i64(now_unix_secs, "usage policy request cleanup timestamp")?;
+        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let result = sqlx::query(
+            r#"
+DELETE FROM usage_request_admissions
+WHERE retain_until <= TO_TIMESTAMP($1::double precision)
+  AND event_token IN (
+  SELECT event_token
+  FROM usage_request_admissions
+  WHERE retain_until <= TO_TIMESTAMP($1::double precision)
+  ORDER BY retain_until, event_token
+  LIMIT $2
+)
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(self.tx_runner.pool())
+        .await
+        .map_postgres_err()?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn reserve_usage_policy_cost(
+        &self,
+        input: ReserveUsagePolicyCostInput,
+    ) -> Result<ReserveUsagePolicyCostOutcome, DataLayerError> {
+        input.validate()?;
+        self.tx_runner
+            .run_read_write(|tx| {
+                Box::pin(async move {
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Err(usage_policy_subject_missing());
+                    }
+                    let existing_row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_POSTGRES_SQL)
+                        .bind(&input.reservation_token)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                    let existing = existing_row
+                        .as_ref()
+                        .map(usage_policy_cost_reservation_from_postgres_row)
+                        .transpose()?;
+                    if let Some(existing) = existing.as_ref() {
+                        if existing.request_id != input.request_id
+                            || existing.subject_id != input.subject_id
+                        {
+                            return Ok(ReserveUsagePolicyCostOutcome::Conflict);
+                        }
+                        if existing.state != UsagePolicyCostReservationState::Reserved {
+                            return Ok(ReserveUsagePolicyCostOutcome::AlreadyTerminal {
+                                state: existing.state,
+                            });
+                        }
+                        if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+                            return Err(DataLayerError::InvalidInput(
+                                "usage policy reservation_token must keep its original admitted_at"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+
+                    let previous_reserved_cost_units = existing
+                        .as_ref()
+                        .map(|reservation| reservation.reserved_cost_units)
+                        .unwrap_or(0);
+                    let target_reserved_cost_units =
+                        previous_reserved_cost_units.max(input.reserved_cost_units);
+                    for (window_index, window) in input.windows.iter().enumerate() {
+                        let used_cost_units = sqlx::query_scalar::<_, i64>(
+                            r#"
+SELECT COALESCE(SUM(
+  CASE
+    WHEN state = 'finalized' THEN COALESCE(actual_cost_units, 0)
+    WHEN state = 'reserved' AND reservation_expires_at > TO_TIMESTAMP($4::double precision)
+      THEN reserved_cost_units
+    ELSE 0
+  END
+), 0)::BIGINT
+FROM usage_cost_reservations
+WHERE subject_id = $1
+  AND admitted_at >= TO_TIMESTAMP($2::double precision)
+  AND admitted_at < TO_TIMESTAMP($3::double precision)
+  AND reservation_token <> $5
+                            "#,
+                        )
+                        .bind(&input.subject_id)
+                        .bind(usage_policy_cost_i64(
+                            window.starts_at_unix_secs,
+                            "usage policy window start",
+                        )?)
+                        .bind(usage_policy_cost_i64(
+                            window.ends_at_unix_secs,
+                            "usage policy window end",
+                        )?)
+                        .bind(usage_policy_cost_i64(
+                            input.admitted_at_unix_secs,
+                            "usage policy admitted_at",
+                        )?)
+                        .bind(&input.reservation_token)
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        let used_cost_units =
+                            usage_policy_cost_u64(used_cost_units, "usage policy used_cost_units")?;
+                        if used_cost_units
+                            .checked_add(target_reserved_cost_units)
+                            .is_none_or(|total| total > window.limit_cost_units)
+                        {
+                            return Ok(ReserveUsagePolicyCostOutcome::Rejected {
+                                window_index,
+                                limit_cost_units: window.limit_cost_units,
+                                used_cost_units,
+                            });
+                        }
+                    }
+
+                    sqlx::query(
+                        r#"
+INSERT INTO usage_cost_reservations (
+  request_id, subject_id, reservation_token, admitted_at,
+  reserved_cost_units, actual_cost_units,
+  state, reservation_expires_at, retain_until, finalized_at, created_at, updated_at
+) VALUES (
+  $1, $2, $3, TO_TIMESTAMP($4::double precision), $5, NULL,
+  'reserved', TO_TIMESTAMP($6::double precision), TO_TIMESTAMP($7::double precision),
+  NULL, NOW(), NOW()
+)
+ON CONFLICT (reservation_token) DO UPDATE SET
+  reserved_cost_units = GREATEST(
+    usage_cost_reservations.reserved_cost_units,
+    EXCLUDED.reserved_cost_units
+  ),
+  reservation_expires_at = GREATEST(
+    usage_cost_reservations.reservation_expires_at,
+    EXCLUDED.reservation_expires_at
+  ),
+  retain_until = GREATEST(
+    usage_cost_reservations.retain_until,
+    EXCLUDED.retain_until
+  ),
+  updated_at = NOW()
+                        "#,
+                    )
+                    .bind(&input.request_id)
+                    .bind(&input.subject_id)
+                    .bind(&input.reservation_token)
+                    .bind(usage_policy_cost_i64(
+                        input.admitted_at_unix_secs,
+                        "usage policy admitted_at",
+                    )?)
+                    .bind(usage_policy_cost_i64(
+                        target_reserved_cost_units,
+                        "usage policy reserved_cost_units",
+                    )?)
+                    .bind(usage_policy_cost_i64(
+                        input.reservation_expires_at_unix_secs,
+                        "usage policy reservation_expires_at",
+                    )?)
+                    .bind(usage_policy_cost_i64(
+                        input.retain_until_unix_secs,
+                        "usage policy retain_until",
+                    )?)
+                    .execute(&mut **tx)
+                    .await
+                    .map_postgres_err()?;
+
+                    Ok(ReserveUsagePolicyCostOutcome::Allowed {
+                        reserved_cost_units: target_reserved_cost_units,
+                        additional_reserved_cost_units: target_reserved_cost_units
+                            .saturating_sub(previous_reserved_cost_units),
+                    })
+                })
+            })
+            .await
+    }
+
+    async fn reconcile_usage_policy_cost(
+        &self,
+        input: ReconcileUsagePolicyCostInput,
+    ) -> Result<Option<StoredUsagePolicyCostReservation>, DataLayerError> {
+        input.validate()?;
+        self.tx_runner
+            .run_read_write(|tx| {
+                Box::pin(async move {
+                    if !lock_usage_policy_subject_postgres(tx, &input.subject_id).await? {
+                        return Ok(None);
+                    }
+                    let row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_POSTGRES_SQL)
+                        .bind(&input.reservation_token)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
+                    let mut reservation = usage_policy_cost_reservation_from_postgres_row(&row)?;
+                    if reservation.request_id != input.request_id
+                        || reservation.subject_id != input.subject_id
+                    {
+                        // The token selects the row; audit identity must still match before the
+                        // reservation can be finalized.
+                        return Ok(None);
+                    }
+                    if reservation.state == UsagePolicyCostReservationState::Reserved {
+                        sqlx::query(
+                            r#"
+UPDATE usage_cost_reservations
+SET state = $4,
+    actual_cost_units = $5,
+    finalized_at = TO_TIMESTAMP($6::double precision),
+    updated_at = NOW()
+WHERE reservation_token = $1
+  AND request_id = $2
+  AND subject_id = $3
+  AND state = 'reserved'
+                            "#,
+                        )
+                        .bind(&input.reservation_token)
+                        .bind(&input.request_id)
+                        .bind(&input.subject_id)
+                        .bind(input.terminal_state.as_str())
+                        .bind(usage_policy_cost_i64(
+                            input.actual_cost_units,
+                            "usage policy actual_cost_units",
+                        )?)
+                        .bind(usage_policy_cost_i64(
+                            input.finalized_at_unix_secs,
+                            "usage policy finalized_at",
+                        )?)
+                        .execute(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
+                        reservation.state = input.terminal_state;
+                        reservation.actual_cost_units = Some(input.actual_cost_units);
+                        reservation.finalized_at_unix_secs = Some(input.finalized_at_unix_secs);
+                    }
+                    Ok(Some(reservation))
+                })
+            })
+            .await
+    }
+
+    async fn cleanup_usage_policy_cost_reservations(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        let now = usage_policy_cost_i64(now_unix_secs, "usage policy cleanup timestamp")?;
+        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let result = sqlx::query(
+            r#"
+DELETE FROM usage_cost_reservations
+WHERE retain_until <= TO_TIMESTAMP($1::double precision)
+  AND reservation_token IN (
+  SELECT reservation_token
+  FROM usage_cost_reservations
+  WHERE retain_until <= TO_TIMESTAMP($1::double precision)
+  ORDER BY retain_until, reservation_token
+  LIMIT $2
+)
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(self.tx_runner.pool())
+        .await
+        .map_postgres_err()?;
+        Ok(result.rows_affected() as usize)
+    }
+
     async fn settle_usage(
         &self,
         input: UsageSettlementInput,
@@ -775,6 +1433,7 @@ SELECT
   id,
   CAST(balance AS DOUBLE PRECISION) AS balance,
   CAST(gift_balance AS DOUBLE PRECISION) AS gift_balance,
+  CAST(total_consumed AS DOUBLE PRECISION) AS total_consumed,
   limit_mode
 FROM wallets
 WHERE api_key_id = $1
@@ -802,6 +1461,7 @@ SELECT
   id,
   CAST(balance AS DOUBLE PRECISION) AS balance,
   CAST(gift_balance AS DOUBLE PRECISION) AS gift_balance,
+  CAST(total_consumed AS DOUBLE PRECISION) AS total_consumed,
   limit_mode
 FROM wallets
 WHERE user_id = $1
@@ -823,14 +1483,26 @@ LIMIT 1
                         let wallet_can_overdraft = wallet_row.is_some();
                         let wallet_available_usd = match wallet_row.as_ref() {
                             Some(row) => {
+                                let recharge_balance: f64 =
+                                    row.try_get("balance").map_postgres_err()?;
+                                let gift_balance: f64 =
+                                    row.try_get("gift_balance").map_postgres_err()?;
+                                let total_consumed: f64 =
+                                    row.try_get("total_consumed").map_postgres_err()?;
+                                validate_wallet_settlement_values(
+                                    recharge_balance,
+                                    gift_balance,
+                                    total_consumed,
+                                    0.0,
+                                )?;
                                 let limit_mode: String =
                                     row.try_get("limit_mode").map_postgres_err()?;
                                 if limit_mode.eq_ignore_ascii_case("unlimited") {
                                     None
                                 } else {
                                     Some(finite_wallet_available_usd(
-                                        row.try_get("balance").map_postgres_err()?,
-                                        row.try_get("gift_balance").map_postgres_err()?,
+                                        recharge_balance,
+                                        gift_balance,
                                     ))
                                 }
                             }
@@ -900,6 +1572,8 @@ LIMIT 1
                                     wallet_row.try_get("balance").map_postgres_err()?;
                                 let before_gift: f64 =
                                     wallet_row.try_get("gift_balance").map_postgres_err()?;
+                                let total_consumed: f64 =
+                                    wallet_row.try_get("total_consumed").map_postgres_err()?;
                                 let limit_mode: String =
                                     wallet_row.try_get("limit_mode").map_postgres_err()?;
                                 let before_total = before_recharge + before_gift;
@@ -914,6 +1588,13 @@ LIMIT 1
                                     (after_recharge, after_gift) =
                                         debit_plan.after_balances(before_recharge, before_gift);
                                 }
+                                let total_consumed_after = total_consumed + wallet_debit_cost_usd;
+                                validate_wallet_settlement_values(
+                                    after_recharge,
+                                    after_gift,
+                                    total_consumed_after,
+                                    0.0,
+                                )?;
                                 if final_billing_status == "settled" {
                                     sqlx::query(
                                         r#"
@@ -921,7 +1602,7 @@ UPDATE wallets
 SET
   balance = $2,
   gift_balance = $3,
-  total_consumed = CAST(total_consumed AS DOUBLE PRECISION) + $4,
+  total_consumed = $4,
   updated_at = NOW()
 WHERE id = $1
                                 "#,
@@ -929,7 +1610,7 @@ WHERE id = $1
                                     .bind(&wallet_id)
                                     .bind(after_recharge)
                                     .bind(after_gift)
-                                    .bind(wallet_debit_cost_usd)
+                                    .bind(total_consumed_after)
                                     .execute(&mut **tx)
                                     .await
                                     .map_postgres_err()?;

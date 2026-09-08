@@ -164,9 +164,15 @@ import {
   isUsageRecordFailed,
   isUsageRecordPollable,
   isUsageUpstreamStream,
+  isUsageWebSocket,
   normalizeRequestStatus,
   resolveDisplayRequestStatus,
 } from '@/features/usage/utils/status'
+import { matchesUsageRecordSearch } from '@/features/usage/utils/recordSearch'
+import {
+  isUserLocalOnlyRecordStatus,
+  shouldUseServerUserRecordFilters,
+} from '@/features/usage/utils/recordFilterPolicy'
 import type { DateRangeParams, FilterStatusValue, RequestStatus, UsageRecord } from '@/features/usage/types'
 import type { UserOption } from '@/features/usage/components/UsageRecordsTable.vue'
 import { log } from '@/utils/logger'
@@ -451,6 +457,10 @@ const filteredRecords = computed(() => {
     : [...currentRecords.value]
 
   if (!isAdminPage.value) {
+    if (isUserLocalOnlyRecordStatus(filterStatus.value) && filterSearch.value.trim()) {
+      records = records.filter(record => matchesUsageRecordSearch(record, filterSearch.value))
+    }
+
     if (filterModel.value !== '__all__') {
       records = records.filter(record => record.model === filterModel.value)
     }
@@ -466,13 +476,19 @@ const filteredRecords = computed(() => {
     }
 
     if (filterStatus.value !== '__all__') {
-      if (filterStatus.value === 'stream') {
+      if (filterStatus.value === 'websocket') {
+        records = records.filter(record => isUsageWebSocket(record))
+      } else if (filterStatus.value === 'stream') {
         records = records.filter(record =>
-          isUsageUpstreamStream(record) && !isUsageRecordFailed(record)
+          isUsageUpstreamStream(record)
+          && !isUsageWebSocket(record)
+          && !isUsageRecordFailed(record)
         )
       } else if (filterStatus.value === 'standard') {
         records = records.filter(record =>
-          !isUsageUpstreamStream(record) && !isUsageRecordFailed(record)
+          !isUsageUpstreamStream(record)
+          && !isUsageWebSocket(record)
+          && !isUsageRecordFailed(record)
         )
       } else if (filterStatus.value === 'active') {
         records = records.filter(record =>
@@ -641,6 +657,26 @@ async function pollActiveRequests() {
         }
         if (typeof update.is_websocket === 'boolean') {
           record.is_websocket = record.is_websocket === true || update.is_websocket
+        }
+        if (typeof update.websocket_transport === 'string' && update.websocket_transport.trim()) {
+          record.websocket_transport = update.websocket_transport
+        }
+        if (typeof update.usage_available === 'boolean') {
+          record.usage_available = record.usage_available === false || update.usage_available === false
+            ? false
+            : true
+        }
+        if (typeof update.usage_pricing_available === 'boolean') {
+          record.usage_pricing_available = record.usage_pricing_available === false
+            || update.usage_pricing_available === false
+            ? false
+            : true
+        }
+        if (typeof update.input_audio_tokens === 'number') {
+          record.input_audio_tokens = update.input_audio_tokens
+        }
+        if (typeof update.output_audio_tokens === 'number') {
+          record.output_audio_tokens = update.output_audio_tokens
         }
         if (typeof update.client_is_stream === 'boolean') {
           record.client_is_stream = update.client_is_stream
@@ -889,8 +925,21 @@ watch(statsExpanded, (expanded) => {
 })
 
 // 用户页面的前端分页（后端一次性返回所有记录，前端分页+筛选）
+// Retry/fallback are derived from the locally loaded records and are not accepted by the
+// normal-user records API. Keep those statuses entirely local, including when combined with
+// search/API-format filters, so an unsupported status never produces a misleading server total.
+// 普通用户的 API 格式/传输类型/搜索筛选由后端执行，避免只筛选当前已加载页。
+// 模型及后端不支持的 retry/fallback 筛选仍保持现有的本地分页语义。
+const userUsesServerRecordFilters = computed(() => !isAdminPage.value && (
+  shouldUseServerUserRecordFilters({
+    search: filterSearch.value,
+    apiFormat: filterApiFormat.value,
+    status: filterStatus.value,
+  })
+))
+
 const paginatedRecords = computed(() => {
-  if (!isAdminPage.value) {
+  if (!isAdminPage.value && !userUsesServerRecordFilters.value) {
     const start = (currentPage.value - 1) * pageSize.value
     const end = start + pageSize.value
     return filteredRecords.value.slice(start, end)
@@ -900,7 +949,7 @@ const paginatedRecords = computed(() => {
 
 // 用户页面使用前端筛选后的总数，管理员页面使用后端返回的总数
 const effectiveTotalRecords = computed(() => {
-  if (!isAdminPage.value) {
+  if (!isAdminPage.value && !userUsesServerRecordFilters.value) {
     return filteredRecords.value.length
   }
   return totalRecords.value
@@ -967,27 +1016,29 @@ async function handleTimeRangeChange(value: DateRangeParams) {
     await refreshAdminAnalyticsForSelectionChange()
     return
   }
-  await loadRecords({ page: 1, pageSize: 100 }, undefined, timeRange.value)
+  await loadRecords(
+    { page: 1, pageSize: userUsesServerRecordFilters.value ? pageSize.value : 100 },
+    userUsesServerRecordFilters.value ? getCurrentFilters() : undefined,
+    timeRange.value,
+  )
   await loadStats(timeRange.value, { includeRecords: false })
 }
 
 // 处理分页变化
 async function handlePageChange(page: number) {
   currentPage.value = page
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
   }
-  // 用户页面使用前端分页，无需重新请求
 }
 
 // 处理每页大小变化
 async function handlePageSizeChange(size: number) {
   pageSize.value = size
   currentPage.value = 1  // 重置到第一页
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page: 1, pageSize: size }, getCurrentFilters(), timeRange.value)
   }
-  // 用户页面使用前端分页，无需重新请求
 }
 
 // 获取当前筛选参数
@@ -1011,9 +1062,11 @@ async function handleFilterSearchChange(value: string) {
 
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else if (userUsesServerRecordFilters.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else {
+    await loadStats(timeRange.value)
   }
-  // 用户页面：search 需要重新从后端拉取数据（后端支持 search 参数）
-  // 但通过 filteredRecords 做前端过滤已覆盖，无需额外请求
 }
 
 async function handleFilterUserChange(value: string) {
@@ -1050,8 +1103,10 @@ async function handleFilterApiFormatChange(value: string) {
   filterApiFormat.value = value
   currentPage.value = 1
 
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else {
+    await loadStats(timeRange.value)
   }
 }
 
@@ -1059,8 +1114,10 @@ async function handleFilterStatusChange(value: string) {
   filterStatus.value = value as FilterStatusValue
   currentPage.value = 1
 
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else {
+    await loadStats(timeRange.value)
   }
 }
 
@@ -1079,7 +1136,7 @@ async function refreshData() {
   if (refreshInFlight) return refreshInFlight
 
   refreshInFlight = (async () => {
-    if (isAdminPage.value) {
+    if (isAdminPage.value || userUsesServerRecordFilters.value) {
       await loadRecords(
         { page: currentPage.value, pageSize: pageSize.value },
         getCurrentFilters(),
@@ -1088,7 +1145,11 @@ async function refreshData() {
       return
     }
 
-    await loadRecords({ page: 1, pageSize: 100 }, undefined, timeRange.value)
+    await loadRecords(
+      { page: 1, pageSize: userUsesServerRecordFilters.value ? pageSize.value : 100 },
+      userUsesServerRecordFilters.value ? getCurrentFilters() : undefined,
+      timeRange.value,
+    )
     await loadStats(timeRange.value, { includeRecords: false })
   })()
 
@@ -1143,6 +1204,12 @@ function handleDetailRequestState(update: {
   responseTimeMs?: number | null
   firstByteTimeMs?: number | null
   isStream?: boolean | null
+  isWebSocket?: boolean | null
+  websocketTransport?: string | null
+  usageAvailable?: boolean | null
+  usagePricingAvailable?: boolean | null
+  inputAudioTokens?: number | null
+  outputAudioTokens?: number | null
   upstreamIsStream?: boolean | null
   clientRequestedStream?: boolean | null
   clientIsStream?: boolean | null
@@ -1233,6 +1300,31 @@ function handleDetailRequestState(update: {
   }
   if ('isStream' in update && typeof update.isStream === 'boolean') {
     record.is_stream = update.isStream
+  }
+  if ('isWebSocket' in update && typeof update.isWebSocket === 'boolean') {
+    record.is_websocket = record.is_websocket === true || update.isWebSocket
+  }
+  if (
+    'websocketTransport' in update
+    && typeof update.websocketTransport === 'string'
+    && update.websocketTransport.trim()
+  ) {
+    record.websocket_transport = update.websocketTransport
+  }
+  if ('usageAvailable' in update && typeof update.usageAvailable === 'boolean') {
+    record.usage_available = update.usageAvailable
+  }
+  if (
+    'usagePricingAvailable' in update
+    && typeof update.usagePricingAvailable === 'boolean'
+  ) {
+    record.usage_pricing_available = update.usagePricingAvailable
+  }
+  if ('inputAudioTokens' in update && typeof update.inputAudioTokens === 'number') {
+    record.input_audio_tokens = update.inputAudioTokens
+  }
+  if ('outputAudioTokens' in update && typeof update.outputAudioTokens === 'number') {
+    record.output_audio_tokens = update.outputAudioTokens
   }
   if ('upstreamIsStream' in update && typeof update.upstreamIsStream === 'boolean') {
     record.upstream_is_stream = update.upstreamIsStream

@@ -17,6 +17,7 @@ pub fn parse_query_balance_payload(
         "generic_api" | "new_api" | "anyrouter" | "done_hub" => {
             parse_new_api_balance_payload(action_config, response_json)
         }
+        "usage_api" => parse_usage_api_balance_payload(action_config, response_json),
         _ => Err("Provider 操作仅支持 Rust execution runtime".to_string()),
     }
 }
@@ -30,11 +31,7 @@ pub fn parse_sub2api_balance_payload(
         return Err("响应格式无效".to_string());
     };
     if me_payload.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
-        return Err(me_payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("查询用户信息失败")
-            .to_string());
+        return Err("查询用户信息失败".to_string());
     }
     let Some(me_data) = me_payload.get("data").and_then(Value::as_object) else {
         return Err("响应格式无效".to_string());
@@ -103,11 +100,12 @@ pub fn attach_balance_checkin_outcome(
             .entry("extra".to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         if let Some(extra) = extra.as_object_mut() {
+            let message = stable_checkin_outcome_message(outcome);
             if outcome.cookie_expired {
                 extra.insert("cookie_expired".to_string(), Value::Bool(true));
                 extra.insert(
                     "cookie_expired_message".to_string(),
-                    Value::String(outcome.message.clone()),
+                    Value::String(message.to_string()),
                 );
             } else {
                 extra.insert(
@@ -116,7 +114,7 @@ pub fn attach_balance_checkin_outcome(
                 );
                 extra.insert(
                     "checkin_message".to_string(),
-                    Value::String(outcome.message.clone()),
+                    Value::String(message.to_string()),
                 );
             }
         }
@@ -125,6 +123,17 @@ pub fn attach_balance_checkin_outcome(
         if let Some(object) = action_payload.as_object_mut() {
             object.insert("status".to_string(), json!("auth_expired"));
         }
+    }
+}
+
+fn stable_checkin_outcome_message(outcome: &ProviderOpsCheckinOutcome) -> &'static str {
+    if outcome.cookie_expired {
+        return "Cookie 已失效";
+    }
+    match outcome.success {
+        Some(true) => "签到成功",
+        Some(false) => "签到失败",
+        None => "今日已签到",
     }
 }
 
@@ -154,11 +163,7 @@ fn parse_new_api_balance_payload(
     {
         response_json.get("data")
     } else if response_json.get("success").and_then(Value::as_bool) == Some(false) {
-        return Err(response_json
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("业务状态码表示失败")
-            .to_string());
+        return Err("业务状态码表示失败".to_string());
     } else {
         Some(response_json)
     };
@@ -179,6 +184,57 @@ fn parse_new_api_balance_payload(
             .and_then(Value::as_str)
             .unwrap_or("USD"),
         Map::new(),
+    ))
+}
+
+fn parse_usage_api_balance_payload(
+    action_config: &Map<String, Value>,
+    response_json: &Value,
+) -> Result<Value, String> {
+    let data = response_json
+        .as_object()
+        .ok_or_else(|| "响应格式无效".to_string())?;
+    let is_valid = data
+        .get("is_active")
+        .and_then(Value::as_bool)
+        .or_else(|| data.get("isValid").and_then(Value::as_bool));
+    if is_valid == Some(false) {
+        return Err("API Key 无效或已停用".to_string());
+    }
+
+    let quota = data.get("quota").and_then(Value::as_object);
+    let remaining = admin_provider_ops_value_as_f64(data.get("remaining"))
+        .or_else(|| quota.and_then(|quota| admin_provider_ops_value_as_f64(quota.get("remaining"))))
+        .or_else(|| admin_provider_ops_value_as_f64(data.get("balance")))
+        .ok_or_else(|| "响应缺少余额字段".to_string())?;
+    let currency = data
+        .get("unit")
+        .and_then(Value::as_str)
+        .or_else(|| quota.and_then(|quota| quota.get("unit").and_then(Value::as_str)))
+        .or_else(|| action_config.get("currency").and_then(Value::as_str))
+        .unwrap_or("USD");
+
+    let mut extra = Map::new();
+    extra.insert(
+        "is_valid".to_string(),
+        Value::Bool(is_valid.unwrap_or(true)),
+    );
+    if let Some(value) = data.get("balance") {
+        extra.insert("balance".to_string(), value.clone());
+    }
+    if let Some(value) = data.get("planName").or_else(|| data.get("plan_name")) {
+        extra.insert("plan_name".to_string(), value.clone());
+    }
+    if let Some(value) = data.get("mode") {
+        extra.insert("mode".to_string(), value.clone());
+    }
+
+    Ok(build_balance_data(
+        None,
+        None,
+        Some(remaining),
+        currency,
+        extra,
     ))
 }
 
@@ -233,7 +289,7 @@ mod tests {
         attach_balance_checkin_outcome, parse_query_balance_payload, parse_sub2api_balance_payload,
         ProviderOpsCheckinOutcome,
     };
-    use serde_json::json;
+    use serde_json::{json, Map};
 
     #[test]
     fn anyrouter_single_request_parser_uses_usage_fields() {
@@ -252,6 +308,48 @@ mod tests {
 
         assert_eq!(payload["total_available"], json!(5.0));
         assert_eq!(payload["total_used"], json!(1.0));
+    }
+
+    #[test]
+    fn usage_api_parser_reads_remaining_and_unit() {
+        let payload = parse_query_balance_payload(
+            "usage_api",
+            &json!({ "currency": "USD" })
+                .as_object()
+                .cloned()
+                .expect("config"),
+            &json!({
+                "remaining": 42.5,
+                "balance": 42.5,
+                "unit": "USD",
+                "isValid": true,
+                "planName": "Example Plan"
+            }),
+        )
+        .expect("payload should parse");
+
+        assert_eq!(payload["total_available"], json!(42.5));
+        assert_eq!(payload["currency"], json!("USD"));
+        assert_eq!(payload["extra"]["plan_name"], json!("Example Plan"));
+        assert_eq!(payload["extra"]["is_valid"], json!(true));
+    }
+
+    #[test]
+    fn usage_api_parser_falls_back_to_nested_quota() {
+        let payload = parse_query_balance_payload(
+            "usage_api",
+            &Map::new(),
+            &json!({
+                "quota": {
+                    "remaining": "12.5",
+                    "unit": "CNY"
+                }
+            }),
+        )
+        .expect("payload should parse");
+
+        assert_eq!(payload["total_available"], json!(12.5));
+        assert_eq!(payload["currency"], json!("CNY"));
     }
 
     #[test]
@@ -321,5 +419,48 @@ mod tests {
 
         assert_eq!(payload["status"], json!("auth_expired"));
         assert_eq!(payload["data"]["extra"]["cookie_expired"], json!(true));
+    }
+
+    #[test]
+    fn attach_balance_checkin_outcome_does_not_copy_upstream_message() {
+        let mut payload = json!({
+            "status": "success",
+            "data": { "extra": {} }
+        });
+        attach_balance_checkin_outcome(
+            &mut payload,
+            &ProviderOpsCheckinOutcome {
+                success: Some(true),
+                message: "authorization=Bearer upstream-secret".to_string(),
+                cookie_expired: false,
+            },
+        );
+
+        assert_eq!(
+            payload["data"]["extra"]["checkin_message"],
+            json!("签到成功")
+        );
+        assert!(!payload.to_string().contains("upstream-secret"));
+    }
+
+    #[test]
+    fn balance_parsers_do_not_return_upstream_error_messages() {
+        let config = json!({}).as_object().cloned().expect("config");
+        let secret = "authorization=Bearer upstream-secret";
+
+        let generic_error = parse_query_balance_payload(
+            "generic_api",
+            &config,
+            &json!({"success": false, "message": secret}),
+        )
+        .expect_err("generic API failure should be rejected");
+        let sub2api_error =
+            parse_sub2api_balance_payload(&config, &json!({"code": 401, "message": secret}), None)
+                .expect_err("Sub2API failure should be rejected");
+
+        assert_eq!(generic_error, "业务状态码表示失败");
+        assert_eq!(sub2api_error, "查询用户信息失败");
+        assert!(!generic_error.contains("upstream-secret"));
+        assert!(!sub2api_error.contains("upstream-secret"));
     }
 }

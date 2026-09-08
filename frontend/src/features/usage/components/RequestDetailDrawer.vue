@@ -42,34 +42,47 @@
                 <Badge
                   v-if="detail?.status_code === 200"
                   variant="success"
+                  data-request-lifecycle-status
                 >
                   {{ detail.status_code }}
                 </Badge>
                 <Badge
                   v-else-if="detail"
                   variant="destructive"
+                  data-request-lifecycle-status
                 >
                   {{ detail.status_code }}
                 </Badge>
                 <Badge
-                  v-if="detail && resolveUsageStreamLabelSegments(detail).hasConversion"
+                  v-if="detail && isUsageWebSocket(detail)"
+                  variant="outline"
+                  data-usage-transport="websocket"
+                  :title="formatUsageWebSocketTransportTitle(detail)"
+                  class="border-sky-500/50 text-xs text-sky-600 dark:text-sky-400"
+                >
+                  WS
+                </Badge>
+                <Badge
+                  v-else-if="detail && resolveUsageStreamLabelSegments(detail).hasConversion"
+                  data-usage-transport="http"
                   :variant="streamBadgeVariant(resolveUsageStreamLabelSegments(detail).client === '流式')"
                   :class="streamBadgeVariant(resolveUsageStreamLabelSegments(detail).client === '流式') === 'secondary'
                     ? 'text-xs inline-flex items-center gap-1'
                     : 'text-xs inline-flex items-center gap-1 border-border/60 text-muted-foreground'"
                 >
-                  <span>{{ resolveUsageStreamLabelSegments(detail).client }}</span>
+                  <span>HTTP {{ resolveUsageStreamLabelSegments(detail).client }}</span>
                   <span class="opacity-60">→</span>
-                  <span>{{ resolveUsageStreamLabelSegments(detail).upstream }}</span>
+                  <span>HTTP {{ resolveUsageStreamLabelSegments(detail).upstream }}</span>
                 </Badge>
                 <Badge
                   v-else-if="detail"
+                  data-usage-transport="http"
                   :variant="streamBadgeVariant(isUsageUpstreamStream(detail))"
                   :class="streamBadgeVariant(isUsageUpstreamStream(detail)) === 'secondary'
                     ? 'text-xs'
                     : 'text-xs border-border/60 text-muted-foreground'"
                 >
-                  {{ formatUsageStreamLabel(detail) }}
+                  HTTP {{ formatUsageStreamLabel(detail) }}
                 </Badge>
               </div>
               <div class="flex items-center gap-1 shrink-0">
@@ -162,13 +175,17 @@
                 <div class="p-3 sm:p-4">
                   <div class="mb-4 text-sm">
                     <div class="sm:hidden">
-                      <span class="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground/70">{{ priceSourceLabel }}</span>
+                      <span class="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground/70">{{ detailPricingLabel }}</span>
                     </div>
                     <div class="mt-2 grid grid-cols-[max-content_max-content_max-content_max-content_max-content] items-center gap-x-2 overflow-x-auto whitespace-nowrap text-xs sm:hidden">
                       <span>
                         <span class="text-muted-foreground">总费用</span>
-                        <span class="ml-1 font-bold text-green-600 dark:text-green-400">
-                          ${{ ((typeof detail.cost === 'object' ? detail.cost?.total : detail.cost) || detail.total_cost || 0).toFixed(6) }}
+                        <span
+                          class="ml-1 font-bold"
+                          :class="detailPricingAvailable ? 'text-green-600 dark:text-green-400' : 'text-muted-foreground'"
+                          data-request-detail-total-cost
+                        >
+                          {{ detailPricingAvailable ? `$${detailTotalCostForDisplay.toFixed(6)}` : (detailUsageAvailable ? '未计价' : '不可用') }}
                         </span>
                       </span>
                       <span class="text-muted-foreground">|</span>
@@ -185,12 +202,16 @@
                       </span>
                     </div>
                     <div class="hidden flex-wrap items-center gap-x-2 gap-y-1 sm:flex">
-                      <span class="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground/70">{{ priceSourceLabel }}</span>
+                      <span class="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground/70">{{ detailPricingLabel }}</span>
                       <span class="text-muted-foreground">|</span>
                       <span class="whitespace-nowrap">
                         <span class="text-muted-foreground">总费用</span>
-                        <span class="ml-1 font-bold text-green-600 dark:text-green-400">
-                          ${{ ((typeof detail.cost === 'object' ? detail.cost?.total : detail.cost) || detail.total_cost || 0).toFixed(6) }}
+                        <span
+                          class="ml-1 font-bold"
+                          :class="detailPricingAvailable ? 'text-green-600 dark:text-green-400' : 'text-muted-foreground'"
+                          data-request-detail-total-cost
+                        >
+                          {{ detailPricingAvailable ? `$${detailTotalCostForDisplay.toFixed(6)}` : (detailUsageAvailable ? '未计价' : '不可用') }}
                         </span>
                       </span>
                       <span class="text-muted-foreground">|</span>
@@ -217,9 +238,27 @@
                   <!-- 分隔线 -->
                   <Separator class="mb-4" />
 
+                  <div
+                    v-if="!detailUsageAvailable"
+                    data-request-detail-usage-unavailable
+                    class="rounded-lg border border-dashed border-muted-foreground/30 bg-muted/20 p-3 text-xs text-muted-foreground"
+                  >
+                    上游未提供可验证的 token/费用用量，本会话不显示伪造的 0 token 或 0 费用。
+                  </div>
+                  <div
+                    v-else-if="!detailPricingAvailable"
+                    data-request-detail-usage-unpriced
+                    class="rounded-lg border border-dashed border-muted-foreground/30 bg-muted/20 p-3 text-xs text-muted-foreground"
+                  >
+                    上游提供了权威 token 用量，但包含 Aether 当前计价规则无法安全拆分的音频 token；保留 token 统计并将本会话标记为未计价。
+                    <span v-if="(detail.input_audio_tokens || 0) > 0 || (detail.output_audio_tokens || 0) > 0">
+                      音频输入/输出：{{ detail.input_audio_tokens || 0 }} / {{ detail.output_audio_tokens || 0 }}。
+                    </span>
+                  </div>
+
                   <!-- ========== 1. Token分阶段成本 ========== -->
                   <div
-                    v-if="hasTokenCost"
+                    v-if="detailPricingAvailable && hasTokenCost"
                     class="space-y-2 mb-3"
                   >
                     <!-- 阶梯标题 -->
@@ -424,7 +463,7 @@
 
                   <!-- ========== 3. 按次计费 ========== -->
                   <div
-                    v-if="perRequestCost > 0 && !detail.video_billing"
+                    v-if="detailPricingAvailable && perRequestCost > 0 && !detail.video_billing"
                     class="space-y-2 mb-3"
                   >
                     <div class="flex items-center gap-2 text-xs">
@@ -450,7 +489,7 @@
 
                   <!-- ========== 4. 图片输出计费 ========== -->
                   <div
-                    v-if="hasImageBillingDetail"
+                    v-if="detailPricingAvailable && hasImageBillingDetail"
                     class="rounded-lg p-3 space-y-2 bg-primary/5 border border-primary/30 mb-3"
                   >
                     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 sm:gap-2 text-xs">
@@ -495,7 +534,7 @@
 
                   <!-- ========== 5. 视频/图像/音频计费（独立隔离，与Token计费风格一致） ========== -->
                   <div
-                    v-if="detail.video_billing"
+                    v-if="detailPricingAvailable && detail.video_billing"
                     class="rounded-lg p-3 space-y-2 bg-primary/5 border border-primary/30"
                   >
                     <!-- 标题行（与阶梯标题行风格一致） -->
@@ -866,9 +905,11 @@ import {
 import {
   formatUsageStreamLabel,
   isUsageUpstreamStream,
+  isUsageWebSocket,
   resolveDisplayRequestStatus,
   resolveUsageStreamLabelSegments,
 } from '../utils/status'
+import { formatUsageWebSocketTransportTitle } from '../utils/websocketTransport'
 import { isCyberPolicyError } from '../utils/cyberError'
 import {
   mergeUsageRecordErrorMessage,
@@ -933,6 +974,12 @@ const emit = defineEmits<{
     responseTimeMs?: number | null
     firstByteTimeMs?: number | null
     isStream?: boolean | null
+    isWebSocket?: boolean | null
+    websocketTransport?: string | null
+    usageAvailable?: boolean | null
+    usagePricingAvailable?: boolean | null
+    inputAudioTokens?: number | null
+    outputAudioTokens?: number | null
     upstreamIsStream?: boolean | null
     clientRequestedStream?: boolean | null
     clientIsStream?: boolean | null
@@ -961,6 +1008,13 @@ const REQUEST_STATE_STATUSES = new Set<RequestStateStatus>([
 const loading = ref(false)
 const error = ref<string | null>(null)
 const detail = ref<RequestDetail | null>(null)
+const detailUsageAvailable = computed(() => detail.value?.usage_available !== false)
+const detailPricingAvailable = computed(() => (
+  detailUsageAvailable.value && detail.value?.usage_pricing_available !== false
+))
+const detailTotalCostForDisplay = computed(() => (
+  detail.value ? (detailTotalCost(detail.value) ?? 0) : 0
+))
 const timelineRef = ref<InstanceType<typeof HorizontalRequestTimeline> | null>(null)
 const timelineLoaded = ref(false)
 const timelineHasTrace = ref(false)
@@ -1237,6 +1291,12 @@ function emitDetailRequestState(nextDetail: RequestDetail) {
     responseTimeMs: nextDetail.response_time_ms ?? undefined,
     firstByteTimeMs: nextDetail.first_byte_time_ms ?? null,
     isStream: nextDetail.is_stream ?? null,
+    isWebSocket: nextDetail.is_websocket ?? null,
+    websocketTransport: nextDetail.websocket_transport ?? null,
+    usageAvailable: nextDetail.usage_available ?? null,
+    usagePricingAvailable: nextDetail.usage_pricing_available ?? null,
+    inputAudioTokens: nextDetail.input_audio_tokens ?? null,
+    outputAudioTokens: nextDetail.output_audio_tokens ?? null,
     upstreamIsStream: nextDetail.upstream_is_stream ?? null,
     clientRequestedStream: nextDetail.client_requested_stream ?? null,
     clientIsStream: nextDetail.client_is_stream ?? null,
@@ -1857,6 +1917,11 @@ const hasValidConversation = computed(() => {
 const priceSourceLabel = computed(() => {
   if (!detail.value) return '历史定价'
   return resolveSettlementPricingSourceLabel(detail.value) ?? '历史定价'
+})
+const detailPricingLabel = computed(() => {
+  if (!detailUsageAvailable.value) return '用量不可用'
+  if (!detailPricingAvailable.value) return '音频用量未计价'
+  return priceSourceLabel.value
 })
 
 const cacheCreationInputTokens5m = computed(() => {

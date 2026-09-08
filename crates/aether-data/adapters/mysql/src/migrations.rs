@@ -155,6 +155,30 @@ mod tests {
     }
 
     #[test]
+    fn embeds_scoped_codex_live_permission_migration() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 20260821000000)
+            .expect("Codex Live permission migration should be embedded");
+        let sql = migration.sql.as_ref();
+
+        for required_fragment in [
+            "UPDATE users",
+            "UPDATE user_groups",
+            "UPDATE api_keys",
+            "UPDATE provider_api_keys",
+            "provider.provider_type",
+            "openai:responses",
+            "codex:live",
+        ] {
+            assert!(
+                sql.contains(required_fragment),
+                "Codex Live permission migration is missing {required_fragment}"
+            );
+        }
+    }
+
+    #[test]
     fn embeds_cross_driver_schema_parity_migration() {
         let migration = MIGRATOR
             .iter()

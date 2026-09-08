@@ -389,7 +389,6 @@ async function loadRewards() {
     offset: 0
   })
   rewards.value = response.items
-  stats.value = response.stats
 }
 
 async function loadAll() {

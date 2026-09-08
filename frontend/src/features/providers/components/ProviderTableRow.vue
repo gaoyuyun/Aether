@@ -9,12 +9,12 @@
         <div class="flex items-center gap-1.5">
           <span class="text-sm font-medium text-foreground">{{ provider.name }}</span>
           <a
-            v-if="provider.website"
-            :href="provider.website"
+            v-if="safeProviderWebsite"
+            :href="safeProviderWebsite"
             target="_blank"
             rel="noopener noreferrer"
             class="text-muted-foreground hover:text-primary transition-colors shrink-0"
-            :title="provider.website"
+            :title="safeProviderWebsite"
             @click.stop
           >
             <ExternalLink class="w-3.5 h-3.5" />
@@ -110,7 +110,7 @@
               {{ formatApiFormatShort(endpoint.api_format) }}
             </span>
             <span class="font-medium text-muted-foreground/80">
-              {{ isEndpointAvailable(endpoint) ? `${(endpoint.health_score * 100).toFixed(0)}%` : '-' }}
+              {{ getEndpointHealthLabel(endpoint) }}
             </span>
           </div>
 
@@ -119,7 +119,7 @@
             <div
               class="h-full rounded-full transition-all duration-300"
               :class="getEndpointDotColor(endpoint)"
-              :style="{ width: isEndpointAvailable(endpoint) ? `${Math.max(endpoint.health_score * 100, 5)}%` : '100%' }"
+              :style="{ width: getEndpointHealthBarWidth(endpoint) }"
             />
           </div>
         </div>
@@ -193,7 +193,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   Edit,
   Eye,
@@ -211,9 +211,16 @@ import TableRow from '@/components/ui/table-row.vue'
 import TableCell from '@/components/ui/table-cell.vue'
 import ProviderBalanceCell from './ProviderBalanceCell.vue'
 import { type ProviderWithEndpointsSummary, formatApiFormatShort } from '@/api/endpoints'
-import { sortEndpoints, isEndpointAvailable, getEndpointDotColor, getEndpointTooltip } from '@/features/providers/composables/useEndpointStatus'
+import {
+  sortEndpoints,
+  getEndpointHealthLabel,
+  getEndpointHealthBarWidth,
+  getEndpointDotColor,
+  getEndpointTooltip,
+} from '@/features/providers/composables/useEndpointStatus'
 import type { BalanceExtraItem } from '@/features/providers/auth-templates'
 import { useI18n } from '@/i18n'
+import { safeExternalWebUrl } from '@/utils/navigationSecurity'
 
 const props = defineProps<{
   provider: ProviderWithEndpointsSummary
@@ -250,6 +257,7 @@ const vAutoFocus = {
 
 const localDescriptionValue = ref('')
 const { legacyT, locale } = useI18n()
+const safeProviderWebsite = computed(() => safeExternalWebUrl(props.provider.website))
 
 // 当进入编辑模式时，同步 props 的 description
 watch(

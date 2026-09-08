@@ -13,8 +13,6 @@ use async_trait::async_trait;
 
 use crate::GatewayError;
 
-use super::config::SchedulerOrderingConfig;
-
 #[async_trait]
 pub(crate) trait SchedulerRuntimeState {
     async fn read_provider_quota_snapshot(
@@ -74,7 +72,4 @@ pub(crate) trait SchedulerRuntimeState {
         max_entries: usize,
         expected_epoch: Option<u64>,
     ) -> bool;
-
-    async fn read_scheduler_ordering_config(&self)
-        -> Result<SchedulerOrderingConfig, GatewayError>;
 }

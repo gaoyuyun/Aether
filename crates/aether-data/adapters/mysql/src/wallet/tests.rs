@@ -75,7 +75,7 @@ fn mysql_wallet_admin_builders_cover_filters_ordering_and_mapping_columns() {
     let order_sql = compact_sql(admin_payment_order_list_builder(&order_query, 100, 8, 6).sql());
     assert!(order_sql.contains("payment_method = ?"));
     assert!(order_sql.contains(
-        "CASE WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at < ? THEN 'expired'"
+        "CASE WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ? THEN 'expired'"
     ));
     assert!(order_sql.contains("ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"));
 
@@ -112,6 +112,66 @@ fn mysql_wallet_admin_builders_cover_filters_ordering_and_mapping_columns() {
 
 fn compact_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn mysql_gateway_order_uniqueness_preflights_before_persistent_changes() {
+    const UNIQUENESS_MIGRATION: &str = include_str!(
+        "../../migrations/20260821120000_enforce_payment_gateway_order_uniqueness.sql"
+    );
+
+    let executable_migration = UNIQUENESS_MIGRATION
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let migration = compact_sql(&executable_migration);
+    let initial_cleanup = migration
+        .find("DROP TEMPORARY TABLE IF EXISTS aether_payment_gateway_order_uniqueness_preflight")
+        .expect("migration should clean up a same-session failed preflight");
+    let create_preflight = migration
+        .find("CREATE TEMPORARY TABLE aether_payment_gateway_order_uniqueness_preflight")
+        .expect("migration should create a non-persistent conflict guard");
+    let seed_preflight = migration
+        .find("INSERT INTO aether_payment_gateway_order_uniqueness_preflight (conflict_marker) VALUES (1)")
+        .expect("migration should seed the duplicate-key conflict guard");
+    let conflict_probe = migration
+        .find("INSERT INTO aether_payment_gateway_order_uniqueness_preflight (conflict_marker) SELECT 1 FROM payment_orders")
+        .expect("migration should reject normalized historical conflicts");
+    let final_cleanup = migration
+        .find("DROP TEMPORARY TABLE aether_payment_gateway_order_uniqueness_preflight;")
+        .expect("migration should remove the successful preflight guard");
+    let first_persistent_update = migration
+        .find("UPDATE payment_orders SET payment_method")
+        .expect("migration should normalize payment order methods");
+    let alter = migration
+        .find(
+            "MODIFY COLUMN gateway_order_id VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NULL",
+        )
+        .expect("migration should enforce binary gateway identifiers");
+    let unique = migration
+        .find("ADD UNIQUE INDEX uq_payment_orders_payment_method_gateway_order_id")
+        .expect("migration should create composite uniqueness");
+
+    assert!(migration.contains("GROUP BY LOWER(TRIM(payment_method)), CONVERT(gateway_order_id USING utf8mb4) COLLATE utf8mb4_0900_bin HAVING COUNT(*) > 1 LIMIT 1"));
+    assert!(migration.contains("WHERE BINARY payment_method <> BINARY LOWER(TRIM(payment_method))"));
+    let preflight = &migration[..final_cleanup];
+    assert!(!preflight.contains("UPDATE payment_orders"));
+    assert!(!preflight.contains("UPDATE payment_callbacks"));
+    assert!(!preflight.contains("ALTER TABLE"));
+    assert!(
+        initial_cleanup < create_preflight
+            && create_preflight < seed_preflight
+            && seed_preflight < conflict_probe
+            && conflict_probe < final_cleanup
+            && final_cleanup < first_persistent_update
+            && first_persistent_update < alter,
+        "the conflict probe must finish before any persistent UPDATE or ALTER"
+    );
+    assert!(
+        alter < unique && !migration.contains("CREATE UNIQUE INDEX"),
+        "the collation and unique index must be one atomic ALTER TABLE"
+    );
 }
 
 #[tokio::test]

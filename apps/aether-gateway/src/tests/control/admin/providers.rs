@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
 use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
@@ -23,9 +22,10 @@ use serde_json::json;
 
 use super::super::{
     build_router_with_state, issue_test_admin_access_token, sample_admin_provider_model,
-    sample_endpoint, sample_key, sample_provider, sample_provider_active_global_model,
-    sample_provider_model_stats, sample_provider_quota, sample_public_global_model_with_mappings,
-    sample_request_candidate, start_server, AppState,
+    sample_bound_key, sample_bound_key as sample_key, sample_bound_provider_proxy, sample_endpoint,
+    sample_provider, sample_provider_active_global_model, sample_provider_model_stats,
+    sample_provider_quota, sample_public_global_model_with_mappings, sample_request_candidate,
+    start_server, AppState,
 };
 use crate::admin_api::{
     maybe_build_local_admin_providers_response, AdminAppState, AdminRequestContext,
@@ -39,6 +39,198 @@ use crate::control::resolve_public_request_context;
 use crate::data::GatewayDataState;
 
 const ADMIN_PROVIDERS_DATA_UNAVAILABLE_DETAIL: &str = "Admin provider catalog data unavailable";
+
+async fn provider_health_summary(
+    endpoints: &[StoredProviderCatalogEndpoint],
+    keys: &[StoredProviderCatalogKey],
+) -> serde_json::Value {
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        endpoints.to_vec(),
+        keys.to_vec(),
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            repository,
+        ));
+    let response = local_admin_providers_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/providers/summary",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("summary body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("summary should parse");
+    assert_eq!(payload["items"].as_array().map(Vec::len), Some(1));
+    payload["items"][0].clone()
+}
+
+#[tokio::test]
+async fn admin_provider_summary_health_ignores_disabled_keys() {
+    let endpoint = sample_endpoint(
+        "endpoint-chat",
+        "provider-openai",
+        "openai:chat",
+        "https://api.openai.example",
+    );
+    for (active_score, disabled_score) in [(0.2, 1.0), (1.0, 0.2), (0.0, 1.0)] {
+        let active_key = sample_key("key-active", "provider-openai", "openai:chat", "test")
+            .with_health_fields(
+                Some(json!({"openai:chat": {"health_score": active_score}})),
+                None,
+            );
+        let mut disabled_key = sample_key("key-disabled", "provider-openai", "openai:chat", "test")
+            .with_health_fields(
+                Some(json!({"openai:chat": {"health_score": disabled_score}})),
+                None,
+            );
+        disabled_key.is_active = false;
+
+        let payload =
+            provider_health_summary(std::slice::from_ref(&endpoint), &[active_key, disabled_key])
+                .await;
+
+        assert_eq!(
+            payload["endpoint_health_details"][0]["health_score"],
+            active_score
+        );
+        assert_eq!(payload["endpoint_health_details"][0]["total_keys"], 2);
+        assert_eq!(payload["endpoint_health_details"][0]["active_keys"], 1);
+        assert_eq!(payload["avg_health_score"], active_score);
+        assert_eq!(
+            payload["unhealthy_endpoints"],
+            usize::from(active_score < 0.5)
+        );
+    }
+}
+
+#[tokio::test]
+async fn admin_provider_summary_health_does_not_inflate_observed_scores_with_missing_data() {
+    let endpoint = sample_endpoint(
+        "endpoint-chat",
+        "provider-openai",
+        "openai:chat",
+        "https://api.openai.example",
+    );
+    let keys = [
+        sample_key("key-observed", "provider-openai", "openai:chat", "test")
+            .with_health_fields(Some(json!({"openai:chat": {"health_score": 0.2}})), None),
+        sample_key("key-unobserved", "provider-openai", "openai:chat", "test"),
+        sample_key("key-other-format", "provider-openai", "openai:chat", "test")
+            .with_health_fields(
+                Some(json!({"openai:responses": {"health_score": 1.0}})),
+                None,
+            ),
+    ];
+
+    let payload = provider_health_summary(&[endpoint], &keys).await;
+
+    assert_eq!(payload["endpoint_health_details"][0]["health_score"], 0.2);
+    assert_eq!(payload["endpoint_health_details"][0]["active_keys"], 3);
+    assert_eq!(payload["avg_health_score"], 0.2);
+    assert_eq!(payload["unhealthy_endpoints"], 1);
+}
+
+#[tokio::test]
+async fn admin_provider_summary_health_is_unknown_without_active_observations() {
+    let endpoint = sample_endpoint(
+        "endpoint-chat",
+        "provider-openai",
+        "openai:chat",
+        "https://api.openai.example",
+    );
+    let mut disabled_key = sample_key("key-disabled", "provider-openai", "openai:chat", "test")
+        .with_health_fields(Some(json!({"openai:chat": {"health_score": 0.2}})), None);
+    disabled_key.is_active = false;
+    for keys in [
+        Vec::new(),
+        vec![sample_key(
+            "key-unobserved",
+            "provider-openai",
+            "openai:chat",
+            "test",
+        )],
+        vec![disabled_key],
+    ] {
+        let payload = provider_health_summary(std::slice::from_ref(&endpoint), &keys).await;
+
+        assert_eq!(
+            payload["endpoint_health_details"][0]["health_score"],
+            json!(null)
+        );
+        assert_eq!(payload["avg_health_score"], json!(null));
+        assert_eq!(payload["unhealthy_endpoints"], 0);
+    }
+
+    let payload = provider_health_summary(&[], &[]).await;
+    assert_eq!(payload["avg_health_score"], json!(null));
+    assert_eq!(payload["unhealthy_endpoints"], 0);
+}
+
+#[tokio::test]
+async fn admin_provider_summary_health_excludes_disabled_and_unobserved_endpoints() {
+    let mut disabled_endpoint = sample_endpoint(
+        "endpoint-disabled",
+        "provider-openai",
+        "openai:responses",
+        "https://api.openai.example",
+    );
+    disabled_endpoint.is_active = false;
+    let endpoints = [
+        sample_endpoint(
+            "endpoint-chat",
+            "provider-openai",
+            "openai:chat",
+            "https://api.openai.example",
+        ),
+        disabled_endpoint,
+        sample_endpoint(
+            "endpoint-unobserved",
+            "provider-openai",
+            "openai:embedding",
+            "https://api.openai.example",
+        ),
+    ];
+    let keys = [
+        sample_key("key-chat", "provider-openai", "openai:chat", "test")
+            .with_health_fields(Some(json!({"openai:chat": {"health_score": 0.8}})), None),
+        sample_key(
+            "key-responses",
+            "provider-openai",
+            "openai:responses",
+            "test",
+        )
+        .with_health_fields(
+            Some(json!({"openai:responses": {"health_score": 0.2}})),
+            None,
+        ),
+        sample_key(
+            "key-unobserved",
+            "provider-openai",
+            "openai:embedding",
+            "test",
+        ),
+    ];
+
+    let payload = provider_health_summary(&endpoints, &keys).await;
+
+    assert_eq!(payload["endpoint_health_details"][0]["health_score"], 0.8);
+    assert_eq!(
+        payload["endpoint_health_details"][1]["health_score"],
+        json!(null)
+    );
+    assert_eq!(
+        payload["endpoint_health_details"][2]["health_score"],
+        json!(null)
+    );
+    assert_eq!(payload["avg_health_score"], 0.8);
+    assert_eq!(payload["unhealthy_endpoints"], 0);
+}
 
 fn trusted_admin_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -233,7 +425,11 @@ async fn gateway_handles_admin_provider_summary_locally_with_trusted_admin_princ
             true,
             None,
             Some(4),
-            Some(json!({"host": "proxy.example", "password": "secret"})),
+            Some(sample_bound_provider_proxy(
+                "provider-openai",
+                "proxy.example",
+                "secret",
+            )),
             Some(45.0),
             Some(12.0),
             Some(json!({
@@ -269,25 +465,12 @@ async fn gateway_handles_admin_provider_summary_locally_with_trusted_admin_princ
                 "sk-test-chat",
             )
             .with_health_fields(Some(json!({"openai:chat": {"health_score": 0.25}})), None),
-            sample_key(
+            sample_bound_key(
                 "key-openai-cli",
                 "provider-openai",
                 "openai:responses",
-                "sk-test-cli",
+                "sk-test-cli-2",
             )
-            .with_transport_fields(
-                Some(json!(["openai:responses"])),
-                encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "sk-test-cli-2")
-                    .expect("api key ciphertext should build"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("key transport should build")
             .with_health_fields(
                 Some(json!({"openai:responses": {"health_score": 0.75}})),
                 None,
@@ -780,6 +963,14 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![
             sample_provider("provider-openai", "openai", 10)
+                .with_billing_fields(
+                    Some("free_tier".to_string()),
+                    None,
+                    None,
+                    Some(30),
+                    None,
+                    None,
+                )
                 .with_transport_fields(
                     true,
                     false,
@@ -879,7 +1070,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         Some(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS as f64)
     );
     assert_eq!(payload["stream_first_byte_timeout"], 11.0);
-    assert_eq!(payload["proxy"], json!({"url": "https://proxy.example"}));
+    assert_eq!(payload["proxy"], json!({"url": "https://proxy.example/"}));
     assert_eq!(payload["claude_code_advanced"], json!({"pool_size": 2}));
     assert_eq!(payload["pool_advanced"], json!({}));
     assert_eq!(payload["failover_rules"], json!({"strategy": "ordered"}));
@@ -1028,6 +1219,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         .iter()
         .find(|provider| provider.id == "provider-openai")
         .expect("provider should exist");
+    assert_eq!(updated_provider.billing_type.as_deref(), Some("free_tier"));
     assert_eq!(
         updated_provider.request_timeout_secs,
         Some(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS as f64)
@@ -1160,6 +1352,7 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
         .find(|provider| provider.id == "provider-existing")
         .expect("existing provider should remain");
     assert_eq!(created.provider_type, "codex");
+    assert_eq!(created.billing_type.as_deref(), Some("pay_as_you_go"));
     assert_eq!(created.provider_priority, 0);
     assert_eq!(existing.provider_priority, 1);
     assert_eq!(created.website.as_deref(), Some("https://codex.example"));
@@ -1242,7 +1435,7 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
         .list_endpoints_by_provider_ids(std::slice::from_ref(&created.id))
         .await
         .expect("endpoints should list");
-    assert_eq!(endpoints.len(), 4);
+    assert_eq!(endpoints.len(), 5);
     let responses_endpoint = endpoints
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses")
@@ -1259,6 +1452,10 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:image")
         .expect("image endpoint should exist");
+    let live_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.api_format == "codex:live")
+        .expect("Codex Live endpoint should exist");
     assert_eq!(
         responses_endpoint.base_url,
         "https://chatgpt.com/backend-api/codex"
@@ -1279,6 +1476,14 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
     assert_eq!(compact_endpoint.max_retries, Some(7));
     assert_eq!(search_endpoint.max_retries, Some(7));
     assert_eq!(image_endpoint.max_retries, Some(7));
+    assert_eq!(live_endpoint.api_family.as_deref(), Some("codex"));
+    assert_eq!(live_endpoint.endpoint_kind.as_deref(), Some("live"));
+    assert_eq!(
+        crate::api::ai::public_api_format_local_path(&live_endpoint.api_format),
+        "/v1/live"
+    );
+    assert!(live_endpoint.custom_path.is_none());
+    assert_eq!(live_endpoint.max_retries, Some(7));
     assert_eq!(
         responses_endpoint
             .config
@@ -1307,6 +1512,7 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
     assert!(compact_endpoint.body_rules.is_none());
     assert!(search_endpoint.body_rules.is_none());
     assert!(image_endpoint.body_rules.is_none());
+    assert!(live_endpoint.body_rules.is_none());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -1350,6 +1556,14 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
     );
     cli_endpoint.max_retries = Some(2);
     cli_endpoint.config = Some(json!({"upstream_stream_policy": "force_stream"}));
+    let mut live_endpoint = sample_endpoint(
+        "endpoint-codex-live",
+        "provider-codex",
+        "codex:live",
+        "https://chatgpt.com/backend-api/codex",
+    );
+    live_endpoint.max_retries = Some(2);
+    live_endpoint.custom_path = Some("/custom/live".to_string());
     let mut key = sample_key(
         "key-codex-oauth",
         "provider-codex",
@@ -1361,7 +1575,7 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
-        vec![cli_endpoint],
+        vec![cli_endpoint, live_endpoint],
         vec![key],
     ));
 
@@ -1421,7 +1635,7 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
         .list_endpoints_by_provider_ids(&["provider-codex".to_string()])
         .await
         .expect("endpoints should list");
-    assert_eq!(endpoints.len(), 4);
+    assert_eq!(endpoints.len(), 5);
     let responses_endpoint = endpoints
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses")
@@ -1438,11 +1652,23 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:image")
         .expect("image endpoint should exist");
+    let live_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.api_format == "codex:live")
+        .expect("Codex Live endpoint should exist");
 
     assert_eq!(responses_endpoint.max_retries, Some(9));
     assert_eq!(compact_endpoint.max_retries, Some(9));
     assert_eq!(search_endpoint.max_retries, Some(9));
     assert_eq!(image_endpoint.max_retries, Some(9));
+    assert_eq!(live_endpoint.api_family.as_deref(), Some("codex"));
+    assert_eq!(live_endpoint.endpoint_kind.as_deref(), Some("live"));
+    assert_eq!(
+        crate::api::ai::public_api_format_local_path(&live_endpoint.api_format),
+        "/v1/live"
+    );
+    assert_eq!(live_endpoint.custom_path.as_deref(), Some("/custom/live"));
+    assert_eq!(live_endpoint.max_retries, Some(9));
     assert_eq!(
         responses_endpoint
             .config
@@ -1762,7 +1988,7 @@ async fn gateway_handles_admin_provider_mapping_preview_locally_with_trusted_adm
     let keys = payload["keys"].as_array().expect("keys should be an array");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0]["key_id"], "key-openai-preview");
-    assert_eq!(keys[0]["masked_key"], "sk-p***1234");
+    assert_eq!(keys[0]["masked_key"], "sk-p***234");
     assert_eq!(keys[0]["allowed_models"], json!(["gpt-5", "gpt-4.1-mini"]));
 
     let matches = keys[0]["matching_global_models"]

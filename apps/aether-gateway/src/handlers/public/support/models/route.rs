@@ -147,9 +147,8 @@ async fn load_codex_model_cards(
             event_name = "codex_catalog_aggregate_incomplete",
             client_version = %client_version.as_str(),
             target_count = targets.len(),
-            "Codex catalog aggregation was incomplete; returning an empty remote catalog so the client can use its bundled fallback"
+            "Codex catalog aggregation was incomplete; serving cards from available last-known-good snapshots"
         );
-        return (Vec::new(), None);
     }
     let mut seen_global_models = BTreeSet::new();
     let possible_inference_catalogs = rows
@@ -211,9 +210,8 @@ async fn load_codex_model_cards(
             expected_model_count = expected_global_models.len(),
             projected_model_count = cards.len(),
             missing_model_count,
-            "Codex upstream catalogs omitted authorized mappings; returning an empty remote catalog so the client can use its bundled fallback"
+            "Codex upstream catalogs omitted authorized mappings; serving the available cards without fabricating missing model metadata"
         );
-        return (Vec::new(), None);
     }
     if !codex_projected_catalog_fits_response_limits(&cards) {
         warn!(

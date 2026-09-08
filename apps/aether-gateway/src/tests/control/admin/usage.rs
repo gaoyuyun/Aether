@@ -13,15 +13,15 @@ use aether_data_contracts::repository::candidates::{
     RequestCandidateStatus, StoredRequestCandidate,
 };
 use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageBodyCaptureState};
-use axum::body::{Body, Bytes};
+use axum::body::{to_bytes, Body, Bytes};
 use axum::routing::{any, get, post};
 use axum::{extract::Request, Router};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde_json::json;
 
 use super::super::{
-    build_router_with_state, issue_test_admin_access_token, sample_endpoint, sample_key,
-    sample_provider, start_server, AppState,
+    build_router_with_state, issue_test_admin_access_token, sample_bound_key, sample_endpoint,
+    sample_key, sample_provider, start_server, AppState,
 };
 use crate::admin_api::{
     maybe_build_local_admin_usage_response, AdminAppState, AdminRequestContext,
@@ -1041,7 +1041,8 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
             DAY_1_UNIX_SECS,
         ),
     ]));
-    let mut provider_key = sample_key("provider-key-1", "provider-1", "openai:chat", "sk-upstream");
+    let mut provider_key =
+        sample_bound_key("provider-key-1", "provider-1", "openai:chat", "sk-upstream");
     provider_key.name = "upstream-primary".to_string();
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider("provider-1", "OpenAI", 10)],
@@ -1513,7 +1514,8 @@ async fn gateway_handles_admin_usage_records_locally_with_trusted_admin_principa
             DAY_2_UNIX_SECS,
         ),
     ]));
-    let mut provider_key = sample_key("provider-key-1", "provider-1", "openai:chat", "sk-upstream");
+    let mut provider_key =
+        sample_bound_key("provider-key-1", "provider-1", "openai:chat", "sk-upstream");
     provider_key.name = "upstream-primary".to_string();
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider("provider-1", "OpenAI", 10)],
@@ -2401,6 +2403,82 @@ async fn gateway_handles_admin_usage_detail_locally_with_trusted_admin_principal
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_admin_usage_detail_preserves_live_websocket_session_metadata() {
+    let live_session = json!({
+        "schema_version": "1",
+        "transport": "websocket",
+        "mode": "direct",
+        "state": "closed",
+        "client_frames": 3,
+        "upstream_frames": 5,
+    });
+    let realtime_session = json!({
+        "schema_version": "1",
+        "transport": "websocket",
+        "usage_state": "authoritative",
+        "input_audio_tokens": 11,
+        "output_audio_tokens": 6,
+    });
+    let mut usage = sample_usage_row(
+        "usage-live-detail",
+        "req-live-detail",
+        None,
+        None,
+        None,
+        "OpenAI",
+        "gpt-live",
+        "completed",
+        0,
+        0,
+        0.0,
+        0.0,
+        DAY_1_UNIX_SECS,
+    );
+    usage.request_type = Some("live".to_string());
+    usage.api_format = Some("codex:live".to_string());
+    usage.api_family = Some("codex".to_string());
+    usage.endpoint_kind = Some("live".to_string());
+    usage.endpoint_api_format = Some("codex:live".to_string());
+    usage.provider_api_family = Some("codex".to_string());
+    usage.provider_endpoint_kind = Some("live".to_string());
+    usage.is_stream = true;
+    usage.request_metadata = Some(json!({
+        "websocket_mode": true,
+        "websocket_transport": "codex_live_direct",
+        "usage_available": false,
+        "usage_pricing_available": false,
+        "live_session": live_session,
+        "realtime_session": realtime_session,
+    }));
+
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(Arc::new(
+            InMemoryUsageReadRepository::seed(vec![usage]),
+        )));
+    let response = local_admin_usage_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/usage/usage-live-detail?include_bodies=false",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("usage detail body should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).expect("usage detail body should be JSON");
+    assert_eq!(payload["is_websocket"], true);
+    assert_eq!(payload["websocket_transport"], "codex_live_direct");
+    assert_eq!(payload["live_session"], live_session);
+    assert_eq!(payload["realtime_session"], realtime_session);
+    assert_eq!(payload["metadata"]["live_session"], live_session);
+    assert_eq!(payload["metadata"]["realtime_session"], realtime_session);
 }
 
 #[tokio::test]
@@ -3614,6 +3692,7 @@ async fn gateway_handles_admin_usage_cache_affinity_interval_timeline_with_legac
                 allowed_models_mode: "unrestricted".to_string(),
                 is_active: true,
                 is_deleted: false,
+                security_version: 0,
                 created_at: None,
                 last_login_at: None,
             }]),

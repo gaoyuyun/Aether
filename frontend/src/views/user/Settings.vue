@@ -697,8 +697,8 @@ import SelectItem from '@/components/ui/select-item.vue'
 import Switch from '@/components/ui/switch.vue'
 import { useToast } from '@/composables/useToast'
 import { formatCurrency } from '@/utils/format'
-import { getApiUrl } from '@/utils/url'
 import { log } from '@/utils/logger'
+import { safeExternalHttpsUrl } from '@/utils/navigationSecurity'
 import { getErrorMessage, getErrorStatus } from '@/types/api-error'
 import {
   mergeChatPiiRedactionFeatureSettings,
@@ -948,20 +948,22 @@ function handleBind(providerType: string) {
   // 保存返回路径（OAuth callback 会读取）
   sessionStorage.setItem('redirectPath', route.fullPath)
 
-  // 先获取一次性绑定令牌，再在新标签页打开（避免在 URL 中暴露 access_token）
+  // 后端以当前认证会话创建一次性 OAuth state；URL 中不携带任何绑定凭据。
   oauthActionLoading.value = true
-  oauthApi.createBindToken(providerType)
-    .then((bindToken) => {
-      // getApiUrl 可能返回相对路径，需要拼接完整 URL
-      const basePath = getApiUrl(`/api/user/oauth/${providerType}/bind`)
-      const bindUrl = basePath.startsWith('http')
-        ? new URL(basePath)
-        : new URL(basePath, window.location.origin)
-      bindUrl.searchParams.set('bind_token', bindToken)
-      bindUrl.searchParams.set('client_device_id', getClientDeviceId())
+  oauthApi.createBindAuthorization(providerType)
+    .then((authorizeUrl) => {
+      const bindUrl = safeExternalHttpsUrl(authorizeUrl)
+      if (!bindUrl) {
+        throw new Error('OAuth 服务返回了不安全的授权地址')
+      }
 
-      // 新标签页打开 OAuth 流程
-      const newTab = window.open(bindUrl.toString(), '_blank')
+      // Keep a handle for close detection, but sever opener before the tab reaches
+      // the external OAuth provider so it cannot navigate the authenticated page.
+      const newTab = window.open('', '_blank')
+      if (newTab) {
+        newTab.opener = null
+        newTab.location.replace(bindUrl)
+      }
 
       // 监听标签页关闭，刷新绑定状态
       if (newTab) {
@@ -977,7 +979,7 @@ function handleBind(providerType: string) {
       } else {
         // 被浏览器阻止，回退到当前页面跳转
         oauthActionLoading.value = false
-        window.location.href = bindUrl.toString()
+        window.location.href = bindUrl
       }
     })
     .catch((err) => {

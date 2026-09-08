@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use aether_contracts::{ExecutionPlan, ExecutionTimeouts, RequestBody};
 use aether_gateway::tunnel_protocol as protocol;
 use aether_testkit::{
-    fetch_prometheus_samples, find_metric_value_u64, init_test_runtime_for, run_http_load_probe,
-    BenchmarkRuntimeSnapshot, ExecutionRuntimeHarness, ExecutionRuntimeHarnessConfig,
-    GatewayHarness, GatewayHarnessConfig, HttpLoadProbeConfig, HttpLoadProbeResponseMode,
-    HttpLoadProbeResult, SpawnedServer, TunnelHarness, TunnelHarnessConfig,
-    GATEWAY_HARNESS_API_KEY,
+    fetch_prometheus_samples, find_metric_value_u64, init_test_runtime_for,
+    insert_tunnel_harness_auth_headers, run_http_load_probe, BenchmarkRuntimeSnapshot,
+    ExecutionRuntimeHarness, ExecutionRuntimeHarnessConfig, GatewayHarness, GatewayHarnessConfig,
+    HttpLoadProbeConfig, HttpLoadProbeResponseMode, HttpLoadProbeResult, SpawnedServer,
+    TunnelHarness, TunnelHarnessConfig, GATEWAY_HARNESS_API_KEY, TUNNEL_HARNESS_NODE_ID,
 };
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::StatusCode;
@@ -308,6 +308,7 @@ async fn run_tunnel_curve(
     for limit in &config.points {
         let relay_concurrency = (*limit).saturating_sub(1).max(1);
         let tunnel = TunnelHarness::start(TunnelHarnessConfig {
+            node_id: TUNNEL_HARNESS_NODE_ID.to_string(),
             max_streams: (*limit).max(128),
             ping_interval: Duration::from_secs(15),
             outbound_queue_capacity: 128,
@@ -657,9 +658,7 @@ async fn connect_protocol_peer(
     );
     let request = ws_url.into_client_request()?;
     let mut request = request;
-    request
-        .headers_mut()
-        .insert("x-node-id", http::HeaderValue::from_static("node-baseline"));
+    insert_tunnel_harness_auth_headers(request.headers_mut(), TUNNEL_HARNESS_NODE_ID)?;
     request.headers_mut().insert(
         aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER,
         http::HeaderValue::from_static(

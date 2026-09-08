@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS proxy_nodes (
     `id` VARCHAR(64) NOT NULL,
+    `tunnel_generation` VARCHAR(64) NOT NULL,
     `name` VARCHAR(255) NOT NULL,
     `ip` VARCHAR(512) NOT NULL,
     `port` INT NOT NULL,
@@ -17,7 +18,7 @@ CREATE TABLE IF NOT EXISTS proxy_nodes (
     `is_manual` TINYINT(1) NOT NULL DEFAULT 0,
     `proxy_url` VARCHAR(500),
     `proxy_username` VARCHAR(255),
-    `proxy_password` VARCHAR(500),
+    `proxy_password` TEXT,
     `created_at` BIGINT NOT NULL,
     `updated_at` BIGINT NOT NULL,
     `remote_config` JSON,
@@ -31,7 +32,8 @@ CREATE TABLE IF NOT EXISTS proxy_nodes (
     `dns_failures` BIGINT NOT NULL DEFAULT 0,
     `stream_errors` BIGINT NOT NULL DEFAULT 0,
     `proxy_metadata` JSON,
-    PRIMARY KEY (`id`)
+    PRIMARY KEY (`id`),
+    UNIQUE KEY uq_proxy_node_ip_port (`ip`, `port`)
 );
 
 CREATE TABLE IF NOT EXISTS proxy_node_events (

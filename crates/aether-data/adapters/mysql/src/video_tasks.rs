@@ -72,6 +72,22 @@ impl MysqlVideoTaskRepository {
         row.as_ref().map(map_video_task_row).transpose()
     }
 
+    async fn find_by_id_for_user(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> Result<Option<StoredVideoTask>, DataLayerError> {
+        let row = sqlx::query(&format!(
+            "{VIDEO_TASK_COLUMNS} WHERE BINARY id = BINARY ? AND BINARY user_id = BINARY ? LIMIT 1"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+        row.as_ref().map(map_video_task_row).transpose()
+    }
+
     async fn find_by_short_id(
         &self,
         short_id: &str,
@@ -84,13 +100,29 @@ impl MysqlVideoTaskRepository {
         row.as_ref().map(map_video_task_row).transpose()
     }
 
+    async fn find_by_short_id_for_user(
+        &self,
+        short_id: &str,
+        user_id: &str,
+    ) -> Result<Option<StoredVideoTask>, DataLayerError> {
+        let row = sqlx::query(&format!(
+            "{VIDEO_TASK_COLUMNS} WHERE BINARY short_id = BINARY ? AND BINARY user_id = BINARY ? LIMIT 1"
+        ))
+        .bind(short_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+        row.as_ref().map(map_video_task_row).transpose()
+    }
+
     async fn find_by_user_external(
         &self,
         user_id: &str,
         external_task_id: &str,
     ) -> Result<Option<StoredVideoTask>, DataLayerError> {
         let row = sqlx::query(&format!(
-            "{VIDEO_TASK_COLUMNS} WHERE user_id = ? AND external_task_id = ? LIMIT 1"
+            "{VIDEO_TASK_COLUMNS} WHERE BINARY user_id = BINARY ? AND BINARY external_task_id = BINARY ? LIMIT 1"
         ))
         .bind(user_id)
         .bind(external_task_id)
@@ -114,6 +146,26 @@ impl VideoTaskReadRepository for MysqlVideoTaskRepository {
                 user_id,
                 external_task_id,
             } => self.find_by_user_external(user_id, external_task_id).await,
+        }
+    }
+
+    async fn find_for_user(
+        &self,
+        key: VideoTaskLookupKey<'_>,
+        user_id: &str,
+    ) -> Result<Option<StoredVideoTask>, DataLayerError> {
+        match key {
+            VideoTaskLookupKey::Id(id) => self.find_by_id_for_user(id, user_id).await,
+            VideoTaskLookupKey::ShortId(short_id) => {
+                self.find_by_short_id_for_user(short_id, user_id).await
+            }
+            VideoTaskLookupKey::UserExternal {
+                user_id: lookup_user_id,
+                external_task_id,
+            } if lookup_user_id == user_id => {
+                self.find_by_user_external(user_id, external_task_id).await
+            }
+            VideoTaskLookupKey::UserExternal { .. } => Ok(None),
         }
     }
 
@@ -258,15 +310,21 @@ impl VideoTaskReadRepository for MysqlVideoTaskRepository {
 
 #[async_trait]
 impl VideoTaskWriteRepository for MysqlVideoTaskRepository {
-    async fn upsert(&self, task: UpsertVideoTask) -> Result<StoredVideoTask, DataLayerError> {
+    async fn upsert(&self, mut task: UpsertVideoTask) -> Result<StoredVideoTask, DataLayerError> {
+        task.sanitize_for_persistence();
         let id = task.id.clone();
-        bind_task(sqlx::query(UPSERT_SQL), task, true, false)?
+        let expected_identity = task.clone();
+        bind_task(sqlx::query(upsert_sql()), task, true, false)?
             .execute(&self.pool)
             .await
             .map_sql_err()?;
-        self.find_by_id(&id)
-            .await?
-            .ok_or_else(|| DataLayerError::UnexpectedValue("upserted video task missing".into()))
+        let stored = self.find_by_id(&id).await?.ok_or_else(|| {
+            DataLayerError::InvalidInput(format!(
+                "video task {id} conflicts with persisted immutable identity"
+            ))
+        })?;
+        stored.ensure_immutable_identity_matches(&expected_identity)?;
+        Ok(stored)
     }
 
     async fn update_if_active(
@@ -368,7 +426,76 @@ FOR UPDATE SKIP LOCKED
     }
 }
 
-const UPSERT_SQL: &str = r#"
+const IMMUTABLE_IDENTITY_MATCH_SQL: &str = r#"BINARY id <=> BINARY VALUES(id)
+    AND BINARY short_id <=> BINARY VALUES(short_id)
+    AND BINARY request_id <=> BINARY VALUES(request_id)
+    AND BINARY user_id <=> BINARY VALUES(user_id)
+    AND BINARY api_key_id <=> BINARY VALUES(api_key_id)
+    AND BINARY external_task_id <=> BINARY VALUES(external_task_id)
+    AND BINARY provider_id <=> BINARY VALUES(provider_id)
+    AND BINARY endpoint_id <=> BINARY VALUES(endpoint_id)
+    AND BINARY key_id <=> BINARY VALUES(key_id)
+    AND BINARY client_api_format <=> BINARY VALUES(client_api_format)
+    AND BINARY provider_api_format <=> BINARY VALUES(provider_api_format)
+    AND format_converted <=> VALUES(format_converted)
+    AND BINARY model <=> BINARY VALUES(model)
+    AND duration_seconds <=> VALUES(duration_seconds)
+    AND BINARY resolution <=> BINARY VALUES(resolution)
+    AND BINARY aspect_ratio <=> BINARY VALUES(aspect_ratio)
+    AND BINARY size <=> BINARY VALUES(size)"#;
+
+const UPSERT_UPDATE_COLUMNS: &[&str] = &[
+    "short_id",
+    "request_id",
+    "user_id",
+    "api_key_id",
+    "username",
+    "api_key_name",
+    "external_task_id",
+    "provider_id",
+    "endpoint_id",
+    "key_id",
+    "client_api_format",
+    "provider_api_format",
+    "format_converted",
+    "model",
+    "prompt",
+    "original_request_body",
+    "duration_seconds",
+    "resolution",
+    "aspect_ratio",
+    "size",
+    "status",
+    "progress_percent",
+    "progress_message",
+    "retry_count",
+    "poll_interval_seconds",
+    "next_poll_at",
+    "poll_count",
+    "max_poll_count",
+    "video_url",
+    "error_code",
+    "error_message",
+    "request_metadata",
+    "submitted_at",
+    "completed_at",
+    "updated_at",
+];
+
+fn upsert_sql() -> &'static str {
+    static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SQL.get_or_init(|| {
+        let guarded_updates = UPSERT_UPDATE_COLUMNS
+            .iter()
+            .map(|column| {
+                format!(
+                    "  {column} = IF(({IMMUTABLE_IDENTITY_MATCH_SQL}), VALUES({column}), {column})"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!(
+            r#"
 INSERT INTO video_tasks (
   id, short_id, request_id, user_id, api_key_id, username, api_key_name,
   external_task_id, provider_id, endpoint_id, key_id, client_api_format,
@@ -380,43 +507,11 @@ INSERT INTO video_tasks (
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
-  short_id = VALUES(short_id),
-  request_id = VALUES(request_id),
-  user_id = VALUES(user_id),
-  api_key_id = VALUES(api_key_id),
-  username = VALUES(username),
-  api_key_name = VALUES(api_key_name),
-  external_task_id = VALUES(external_task_id),
-  provider_id = VALUES(provider_id),
-  endpoint_id = VALUES(endpoint_id),
-  key_id = VALUES(key_id),
-  client_api_format = VALUES(client_api_format),
-  provider_api_format = VALUES(provider_api_format),
-  format_converted = VALUES(format_converted),
-  model = VALUES(model),
-  prompt = VALUES(prompt),
-  original_request_body = VALUES(original_request_body),
-  duration_seconds = VALUES(duration_seconds),
-  resolution = VALUES(resolution),
-  aspect_ratio = VALUES(aspect_ratio),
-  size = VALUES(size),
-  status = VALUES(status),
-  progress_percent = VALUES(progress_percent),
-  progress_message = VALUES(progress_message),
-  retry_count = VALUES(retry_count),
-  poll_interval_seconds = VALUES(poll_interval_seconds),
-  next_poll_at = VALUES(next_poll_at),
-  poll_count = VALUES(poll_count),
-  max_poll_count = VALUES(max_poll_count),
-  video_url = VALUES(video_url),
-  error_code = VALUES(error_code),
-  error_message = VALUES(error_message),
-  request_metadata = VALUES(request_metadata),
-  created_at = VALUES(created_at),
-  submitted_at = VALUES(submitted_at),
-  completed_at = VALUES(completed_at),
-  updated_at = VALUES(updated_at)
-"#;
+{guarded_updates}
+"#
+        )
+    })
+}
 
 const UPDATE_IF_ACTIVE_SQL: &str = r#"
 UPDATE video_tasks SET
@@ -452,20 +547,38 @@ UPDATE video_tasks SET
   error_code = ?,
   error_message = ?,
   request_metadata = ?,
-  created_at = ?,
+  created_at = COALESCE(created_at, ?),
   submitted_at = ?,
   completed_at = ?,
   updated_at = ?
 WHERE id = ?
   AND status IN ('pending', 'submitted', 'queued', 'processing')
+  AND BINARY short_id <=> BINARY ?
+  AND BINARY request_id <=> BINARY ?
+  AND BINARY user_id <=> BINARY ?
+  AND BINARY api_key_id <=> BINARY ?
+  AND BINARY external_task_id <=> BINARY ?
+  AND BINARY provider_id <=> BINARY ?
+  AND BINARY endpoint_id <=> BINARY ?
+  AND BINARY key_id <=> BINARY ?
+  AND BINARY client_api_format <=> BINARY ?
+  AND BINARY provider_api_format <=> BINARY ?
+  AND format_converted <=> ?
+  AND BINARY model <=> BINARY ?
+  AND duration_seconds <=> ?
+  AND BINARY resolution <=> BINARY ?
+  AND BINARY aspect_ratio <=> BINARY ?
+  AND BINARY size <=> BINARY ?
 "#;
 
 fn bind_task<'q>(
     query: sqlx::query::Query<'q, MySql, sqlx::mysql::MySqlArguments>,
-    task: UpsertVideoTask,
+    mut task: UpsertVideoTask,
     include_insert_id: bool,
     include_update_id: bool,
 ) -> Result<sqlx::query::Query<'q, MySql, sqlx::mysql::MySqlArguments>, DataLayerError> {
+    task.sanitize_for_persistence();
+    let identity = task.clone();
     let original_request_body = json_to_string(&task.original_request_body)?;
     let request_metadata = json_to_string(&task.request_metadata)?;
     let query = if include_insert_id {
@@ -535,10 +648,36 @@ fn bind_task<'q>(
             "video task updated_at",
         )?);
     if include_update_id {
-        Ok(bound.bind(task.id))
+        bind_identity_guard(bound.bind(task.id), identity)
     } else {
         Ok(bound)
     }
+}
+
+fn bind_identity_guard<'q>(
+    query: sqlx::query::Query<'q, MySql, sqlx::mysql::MySqlArguments>,
+    identity: UpsertVideoTask,
+) -> Result<sqlx::query::Query<'q, MySql, sqlx::mysql::MySqlArguments>, DataLayerError> {
+    Ok(query
+        .bind(identity.short_id)
+        .bind(identity.request_id)
+        .bind(identity.user_id)
+        .bind(identity.api_key_id)
+        .bind(identity.external_task_id)
+        .bind(identity.provider_id)
+        .bind(identity.endpoint_id)
+        .bind(identity.key_id)
+        .bind(identity.client_api_format)
+        .bind(identity.provider_api_format)
+        .bind(identity.format_converted)
+        .bind(identity.model)
+        .bind(optional_u32_to_i32(
+            identity.duration_seconds,
+            "video task duration_seconds",
+        )?)
+        .bind(identity.resolution)
+        .bind(identity.aspect_ratio)
+        .bind(identity.size))
 }
 
 fn push_filter<'args>(
@@ -547,7 +686,7 @@ fn push_filter<'args>(
     created_since_unix_secs: Option<u64>,
 ) {
     if let Some(user_id) = filter.user_id.as_deref() {
-        push_clause(builder, "user_id = ");
+        push_clause(builder, "BINARY user_id = BINARY ");
         builder.push_bind(user_id);
     }
     if let Some(status) = filter.status {
@@ -706,12 +845,85 @@ fn optional_u32_to_i32(value: Option<u32>, name: &str) -> Result<Option<i32>, Da
 
 #[cfg(test)]
 mod tests {
-    use super::MysqlVideoTaskRepository;
+    use super::{
+        upsert_sql, MysqlVideoTaskRepository, IMMUTABLE_IDENTITY_MATCH_SQL, UPDATE_IF_ACTIVE_SQL,
+        UPSERT_UPDATE_COLUMNS,
+    };
     use crate::run_migrations;
     use aether_data_contracts::repository::video_tasks::{
         UpsertVideoTask, VideoTaskStatus, VideoTaskWriteRepository,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn mysql_write_sql_atomically_guards_immutable_identity() {
+        assert!(IMMUTABLE_IDENTITY_MATCH_SQL.contains("BINARY id <=> BINARY VALUES(id)"));
+        for column in [
+            "short_id",
+            "request_id",
+            "user_id",
+            "api_key_id",
+            "external_task_id",
+            "provider_id",
+            "endpoint_id",
+            "key_id",
+            "client_api_format",
+            "provider_api_format",
+            "model",
+            "resolution",
+            "aspect_ratio",
+            "size",
+        ] {
+            assert!(
+                IMMUTABLE_IDENTITY_MATCH_SQL
+                    .contains(&format!("BINARY {column} <=> BINARY VALUES({column})")),
+                "upsert identity predicate should guard {column}"
+            );
+        }
+        for column in ["format_converted", "duration_seconds"] {
+            assert!(
+                IMMUTABLE_IDENTITY_MATCH_SQL.contains(&format!("{column} <=> VALUES({column})")),
+                "upsert identity predicate should guard {column}"
+            );
+        }
+
+        let upsert = upsert_sql();
+        assert!(!UPSERT_UPDATE_COLUMNS.contains(&"created_at"));
+        for column in UPSERT_UPDATE_COLUMNS {
+            assert!(
+                upsert.contains(&format!("{column} = IF((BINARY id <=> BINARY VALUES(id)")),
+                "upsert assignment should be conditional for {column}"
+            );
+        }
+        for column in [
+            "short_id",
+            "request_id",
+            "user_id",
+            "api_key_id",
+            "external_task_id",
+            "provider_id",
+            "endpoint_id",
+            "key_id",
+            "client_api_format",
+            "provider_api_format",
+            "model",
+            "resolution",
+            "aspect_ratio",
+            "size",
+        ] {
+            assert!(
+                UPDATE_IF_ACTIVE_SQL.contains(&format!("BINARY {column} <=> BINARY ?")),
+                "active update should guard {column}"
+            );
+        }
+        for column in ["format_converted", "duration_seconds"] {
+            assert!(
+                UPDATE_IF_ACTIVE_SQL.contains(&format!("{column} <=> ?")),
+                "active update should guard {column}"
+            );
+        }
+        assert!(UPDATE_IF_ACTIVE_SQL.contains("created_at = COALESCE(created_at, ?)"));
+    }
 
     #[tokio::test]
     async fn repository_builds_from_lazy_pool() {

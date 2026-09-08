@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::{
     migrate::{Migrate, MigrateError, Migrator},
-    query, Connection, MySqlConnection, Row,
+    query, query_scalar, Connection, MySqlConnection, Row,
 };
 use tracing::{error, info, warn};
 
@@ -11,6 +11,7 @@ use crate::driver::mysql::MysqlPool;
 
 static BACKFILL_MIGRATOR: Migrator = sqlx::migrate!("./backfills/mysql");
 
+const SCHEMA_BACKFILLS_TABLE_EXISTS_SQL: &str = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'schema_backfills'";
 const ENSURE_SCHEMA_BACKFILLS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_backfills (
     version BIGINT NOT NULL,
@@ -161,10 +162,19 @@ async fn run_backfills_locked(conn: &mut MySqlConnection) -> Result<(), MigrateE
 async fn pending_backfills_locked(
     conn: &mut MySqlConnection,
 ) -> Result<Vec<PendingBackfillInfo>, MigrateError> {
-    ensure_schema_backfills_table(conn).await?;
+    if !schema_backfills_table_exists(conn).await? {
+        return Ok(pending_backfills_from_applied(&[]));
+    }
     let applied_backfills = list_applied_backfills(conn).await?;
     validate_applied_backfills(&applied_backfills)?;
     Ok(pending_backfills_from_applied(&applied_backfills))
+}
+
+async fn schema_backfills_table_exists(conn: &mut MySqlConnection) -> Result<bool, MigrateError> {
+    let total: i64 = query_scalar(SCHEMA_BACKFILLS_TABLE_EXISTS_SQL)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(total > 0)
 }
 
 async fn ensure_schema_backfills_table(conn: &mut MySqlConnection) -> Result<(), MigrateError> {

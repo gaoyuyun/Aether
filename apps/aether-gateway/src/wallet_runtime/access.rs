@@ -79,6 +79,9 @@ async fn resolve_wallet_auth_gate_with_cache(
         None => WalletAccessDecision::wallet_unavailable(None),
     };
     if !auth_snapshot.api_key_is_standalone && commerce_policy.billing_plans_enabled {
+        let wallet_is_unlimited = wallet
+            .as_ref()
+            .is_some_and(|wallet| wallet.limit_mode.eq_ignore_ascii_case("unlimited"));
         let quota = if use_cache {
             state
                 .find_user_daily_quota_availability_for_auth(&auth_snapshot.user_id)
@@ -95,7 +98,11 @@ async fn resolve_wallet_auth_gate_with_cache(
                     quota.remaining_usd,
                 ))));
             }
-            if decision.failure.is_none() && !quota.allow_wallet_overage && !has_remaining_quota {
+            if !wallet_is_unlimited
+                && decision.failure.is_none()
+                && !quota.allow_wallet_overage
+                && !has_remaining_quota
+            {
                 return Ok(Some(WalletAccessDecision::balance_denied(Some(0.0))));
             }
         }
@@ -134,6 +141,23 @@ fn map_wallet_snapshot(snapshot: &StoredWalletSnapshot) -> WalletSnapshot {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn unlimited_wallet_ignores_exhausted_non_overage_quota() {
+        let mut wallet = empty_user_wallet();
+        wallet.limit_mode = "unlimited".to_string();
+        let state = state_with_wallet_and_quota(wallet, Some(quota_availability(10.0, 0.0, false)));
+        let auth_snapshot = ordinary_user_api_key_snapshot();
+
+        let decision = resolve_wallet_auth_gate(&state, &auth_snapshot)
+            .await
+            .expect("wallet gate should resolve")
+            .expect("wallet gate should return a decision");
+
+        assert!(decision.allowed);
+        assert_eq!(decision.failure, None);
+        assert_eq!(decision.remaining, None);
+    }
+
     use std::sync::Arc;
     use std::time::Duration;
 

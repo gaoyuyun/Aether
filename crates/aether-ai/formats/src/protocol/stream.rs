@@ -60,6 +60,10 @@ pub enum CanonicalStreamEvent {
         call_id: String,
         name: String,
     },
+    ToolCallSignature {
+        index: usize,
+        signature: String,
+    },
     ToolCallArgumentsDelta {
         index: usize,
         arguments: String,

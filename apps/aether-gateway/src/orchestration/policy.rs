@@ -4,11 +4,13 @@ use aether_contracts::ExecutionPlan;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use aether_routing_core::RoutingExecutionPolicy;
+
 use crate::provider_transport::GatewayProviderTransportSnapshot;
 use crate::AppState;
 
-pub(crate) const CYBER_CONTINUE_FAILOVER_CONFIG_KEY: &str = "cyber_continue_failover";
 pub(crate) const RESPONSES_WEBSOCKET_CONFIG_KEY: &str = "responses_websocket";
+pub(crate) const ROUTING_EXECUTION_POLICY_REPORT_FIELD: &str = "routing_execution_policy";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalFailoverPolicy {
@@ -50,7 +52,7 @@ pub(crate) struct LocalFailoverRegexRule {
 pub(crate) async fn resolve_local_failover_policy(
     state: &AppState,
     plan: &ExecutionPlan,
-    _report_context: Option<&serde_json::Value>,
+    report_context: Option<&serde_json::Value>,
 ) -> LocalFailoverPolicy {
     let mut policy = match state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
@@ -59,7 +61,8 @@ pub(crate) async fn resolve_local_failover_policy(
         Ok(Some(transport)) => local_failover_policy_from_transport(&transport),
         Ok(None) | Err(_) => LocalFailoverPolicy::default(),
     };
-    let cyber_continue_failover = cyber_continue_failover_enabled(state).await;
+    let cyber_continue_failover = routing_execution_policy_from_report_context(report_context)
+        .is_some_and(|policy| policy.cyber_continue_failover);
     policy.stop_cyber_policy_errors = !cyber_continue_failover;
     debug!(
         event_name = "local_failover_policy_loaded",
@@ -83,15 +86,13 @@ pub(crate) async fn resolve_local_failover_policy(
     policy
 }
 
-pub(crate) async fn cyber_continue_failover_enabled(state: &AppState) -> bool {
-    state
-        .read_system_config_json_value(CYBER_CONTINUE_FAILOVER_CONFIG_KEY)
-        .await
-        .ok()
-        .flatten()
-        .as_ref()
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+pub(crate) fn routing_execution_policy_from_report_context(
+    report_context: Option<&Value>,
+) -> Option<RoutingExecutionPolicy> {
+    report_context
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(ROUTING_EXECUTION_POLICY_REPORT_FIELD))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
 pub(crate) fn local_failover_policy_from_transport(
@@ -302,7 +303,8 @@ pub(crate) fn codex_cyber_flag_passthrough_enabled(
 /// WebSocket upstream. Provider-scoped feature switches remain the source of
 /// truth; this enum only identifies provider-specific extensions around the
 /// otherwise standard Responses WebSocket protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ResponsesWebSocketAdapter {
     /// A provider that speaks the standard OpenAI Responses WebSocket protocol.
     Standard,

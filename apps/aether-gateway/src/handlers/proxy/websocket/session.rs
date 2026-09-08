@@ -20,6 +20,21 @@ pub(crate) const RESPONSES_WEBSOCKET_SESSION_LIMITS: WebSocketSessionLimits =
         max_connection_duration: Duration::from_secs(60 * 60),
     };
 
+pub(crate) const LIVE_WEBSOCKET_SESSION_LIMITS: WebSocketSessionLimits = WebSocketSessionLimits {
+    max_frame_size: 16 << 20,
+    max_message_size: 16 << 20,
+    initial_message_timeout: Duration::from_secs(60),
+    max_connection_duration: Duration::from_secs(60 * 60),
+};
+
+pub(crate) const REALTIME_WEBSOCKET_SESSION_LIMITS: WebSocketSessionLimits =
+    WebSocketSessionLimits {
+        max_frame_size: 16 << 20,
+        max_message_size: 16 << 20,
+        initial_message_timeout: Duration::from_secs(60),
+        max_connection_duration: Duration::from_secs(60 * 60),
+    };
+
 /// A peer that stops draining its receive window must not be able to pin the
 /// relay loop.  Session loops await socket writes inside a `tokio::select!`,
 /// so an unbounded write also suspends the connection and per-turn deadlines

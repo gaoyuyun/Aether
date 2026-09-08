@@ -396,7 +396,11 @@ SET api_key_name = excluded.api_key_name,
         add_aggregate_import_count(&mut summary.stats_daily_api_key, existing.is_some());
     }
 
-    tx.commit().await.map_sql_err()?;
+    if mode == AdminSystemUsageAggregateImportMode::ValidateError {
+        tx.rollback().await.map_sql_err()?;
+    } else {
+        tx.commit().await.map_sql_err()?;
+    }
     Ok(summary)
 }
 
@@ -1072,6 +1076,35 @@ LIMIT 1
                 .and_then(parse_json_value)
         })
         .transpose()
+    }
+
+    pub async fn compare_and_set_system_config_string_value(
+        &self,
+        key: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<bool, DataLayerError> {
+        let now = current_unix_secs();
+        let replacement =
+            serialize_json_value(&serde_json::Value::String(replacement.to_string()))?;
+        let result = sqlx::query(
+            r#"
+UPDATE system_configs
+SET value = ?, updated_at = ?
+WHERE key = ?
+  AND json_valid(value)
+  AND json_type(value) = 'text'
+  AND CAST(json_extract(value, '$') AS TEXT) = ? COLLATE BINARY
+"#,
+        )
+        .bind(replacement)
+        .bind(now as i64)
+        .bind(key)
+        .bind(expected)
+        .execute(self.pool())
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn upsert_system_config_value(

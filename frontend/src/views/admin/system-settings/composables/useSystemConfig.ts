@@ -10,6 +10,7 @@ export interface SystemConfig {
   site_subtitle: string
   // 网络代理
   system_proxy_node_id: string | null
+  execution_extra_trusted_dns_hosts: string[]
   // 基础配置
   default_user_initial_gift_usd: number
   rate_limit_per_minute: number
@@ -34,12 +35,6 @@ export interface SystemConfig {
   auto_delete_expired_keys: boolean
   // 格式转换
   enable_format_conversion: boolean
-  // 同步生图心跳
-  enable_openai_image_sync_heartbeat: boolean
-  // 标准文本非流式心跳
-  enable_standard_text_sync_heartbeat: boolean
-  // Cyber Policy 错误继续故障转移
-  cyber_continue_failover: boolean
   // 请求记录
   request_record_level: string
   sensitive_headers: string[]
@@ -68,6 +63,7 @@ const CONFIG_KEYS = [
   'site_subtitle',
   // 网络代理
   'system_proxy_node_id',
+  'execution_extra_trusted_dns_hosts',
   // 基础配置
   'default_user_initial_gift_usd',
   'rate_limit_per_minute',
@@ -91,12 +87,6 @@ const CONFIG_KEYS = [
   'auto_delete_expired_keys',
   // 格式转换
   'enable_format_conversion',
-  // 同步生图心跳
-  'enable_openai_image_sync_heartbeat',
-  // 标准文本非流式心跳
-  'enable_standard_text_sync_heartbeat',
-  // Cyber Policy 错误继续故障转移
-  'cyber_continue_failover',
   // 请求记录
   'request_record_level',
   'sensitive_headers',
@@ -126,6 +116,7 @@ function createDefaultConfig(): SystemConfig {
     site_subtitle: 'AI Gateway',
     // 网络代理
     system_proxy_node_id: null,
+    execution_extra_trusted_dns_hosts: [],
     // 基础配置
     default_user_initial_gift_usd: 10.0,
     rate_limit_per_minute: 0,
@@ -150,14 +141,8 @@ function createDefaultConfig(): SystemConfig {
     auto_delete_expired_keys: false,
     // 格式转换
     enable_format_conversion: false,
-    // 同步生图心跳
-    enable_openai_image_sync_heartbeat: false,
-    // 标准文本非流式心跳
-    enable_standard_text_sync_heartbeat: false,
-    // Cyber Policy 错误继续故障转移
-    cyber_continue_failover: false,
     // 请求记录
-    request_record_level: 'full',
+    request_record_level: 'basic',
     sensitive_headers: ['authorization', 'x-api-key', 'api-key', 'cookie', 'set-cookie'],
     // 请求记录清理
     enable_auto_cleanup: true,
@@ -209,6 +194,8 @@ export function useSystemConfig() {
     if (systemConfigLoading.value) return false
     if (!originalConfig.value) return false
     return systemConfig.value.system_proxy_node_id !== originalConfig.value.system_proxy_node_id
+      || JSON.stringify(systemConfig.value.execution_extra_trusted_dns_hosts) !==
+      JSON.stringify(originalConfig.value.execution_extra_trusted_dns_hosts)
   })
 
   const hasBasicConfigChanges = computed(() => {
@@ -240,13 +227,7 @@ export function useSystemConfig() {
       systemConfig.value.registration_privacy_policy_version !==
       originalConfig.value.registration_privacy_policy_version ||
       systemConfig.value.auto_delete_expired_keys !== originalConfig.value.auto_delete_expired_keys ||
-      systemConfig.value.enable_format_conversion !== originalConfig.value.enable_format_conversion ||
-      systemConfig.value.enable_openai_image_sync_heartbeat !==
-      originalConfig.value.enable_openai_image_sync_heartbeat ||
-      systemConfig.value.enable_standard_text_sync_heartbeat !==
-      originalConfig.value.enable_standard_text_sync_heartbeat ||
-      systemConfig.value.cyber_continue_failover !==
-      originalConfig.value.cyber_continue_failover
+      systemConfig.value.enable_format_conversion !== originalConfig.value.enable_format_conversion
     )
   })
 
@@ -303,6 +284,16 @@ export function useSystemConfig() {
       systemConfig.value.turnstile_allowed_hostnames = val
         .split(',')
         .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0)
+    },
+  })
+
+  const extraTrustedDnsHostsStr = computed({
+    get: () => systemConfig.value.execution_extra_trusted_dns_hosts.join('\n'),
+    set: (val: string) => {
+      systemConfig.value.execution_extra_trusted_dns_hosts = val
+        .split(/[\n,]/)
+        .map((s) => s.trim().toLowerCase().replace(/\.$/, ''))
         .filter((s) => s.length > 0)
     },
   })
@@ -384,13 +375,23 @@ export function useSystemConfig() {
   async function saveProxyConfig() {
     proxyConfigLoading.value = true
     try {
-      await adminApi.updateSystemConfig(
+      await Promise.all([
+        adminApi.updateSystemConfig(
         'system_proxy_node_id',
         systemConfig.value.system_proxy_node_id || null,
         '系统默认代理节点 ID'
-      )
+        ),
+        adminApi.updateSystemConfig(
+          'execution_extra_trusted_dns_hosts',
+          systemConfig.value.execution_extra_trusted_dns_hosts,
+          '执行运行时额外可信 Fake-IP 域名'
+        ),
+      ])
       if (originalConfig.value) {
         originalConfig.value.system_proxy_node_id = systemConfig.value.system_proxy_node_id
+        originalConfig.value.execution_extra_trusted_dns_hosts = [
+          ...systemConfig.value.execution_extra_trusted_dns_hosts,
+        ]
       }
       success('网络代理配置已保存')
     } catch (err) {
@@ -500,21 +501,6 @@ export function useSystemConfig() {
           value: systemConfig.value.enable_format_conversion,
           description: '全局格式转换开关：开启时强制允许所有提供商的格式转换',
         },
-        {
-          key: 'enable_openai_image_sync_heartbeat',
-          value: systemConfig.value.enable_openai_image_sync_heartbeat,
-          description: '同步生图心跳开关：开启后外层 HTTP 状态固定为 200，上游失败写入响应体',
-        },
-        {
-          key: 'enable_standard_text_sync_heartbeat',
-          value: systemConfig.value.enable_standard_text_sync_heartbeat,
-          description: '标准文本非流式心跳开关：开启后外层 HTTP 状态固定为 200，上游失败写入响应体',
-        },
-        {
-          key: 'cyber_continue_failover',
-          value: systemConfig.value.cyber_continue_failover,
-          description: 'Cyber继续转移开关：开启后在响应内容开始前将Cyber Policy错误按普通错误继续故障转移，可能增加首字等待时间',
-        },
       ]
       const turnstileSecret = systemConfig.value.turnstile_secret_key.trim()
       if (turnstileSecret) {
@@ -567,12 +553,6 @@ export function useSystemConfig() {
           systemConfig.value.auto_delete_expired_keys
         originalConfig.value.enable_format_conversion =
           systemConfig.value.enable_format_conversion
-        originalConfig.value.enable_openai_image_sync_heartbeat =
-          systemConfig.value.enable_openai_image_sync_heartbeat
-        originalConfig.value.enable_standard_text_sync_heartbeat =
-          systemConfig.value.enable_standard_text_sync_heartbeat
-        originalConfig.value.cyber_continue_failover =
-          systemConfig.value.cyber_continue_failover
       }
       success('基础配置已保存')
     } catch (err) {
@@ -773,6 +753,7 @@ export function useSystemConfig() {
     // 计算属性
     sensitiveHeadersStr,
     turnstileAllowedHostnamesStr,
+    extraTrustedDnsHostsStr,
     // 加载函数
     loadSystemConfig,
     loadSystemVersion,

@@ -63,6 +63,80 @@ LIMIT 1
         row.as_ref().map(map_row).transpose()
     }
 
+    async fn find_active_by_file_name_for_user(
+        &self,
+        file_name: &str,
+        user_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<Option<StoredGeminiFileMapping>, DataLayerError> {
+        let row = sqlx::query(
+            r#"
+SELECT
+  id,
+  file_name,
+  key_id,
+  user_id,
+  display_name,
+  mime_type,
+  source_hash,
+  created_at AS created_at_unix_ms,
+  expires_at AS expires_at_unix_secs
+FROM gemini_file_mappings
+WHERE file_name = ? AND user_id = ? AND expires_at > ?
+LIMIT 1
+"#,
+        )
+        .bind(file_name)
+        .bind(user_id)
+        .bind(i64_from_u64(
+            now_unix_secs,
+            "gemini_file_mappings.owner_read_now",
+        )?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+
+        row.as_ref().map(map_row).transpose()
+    }
+
+    async fn find_active_by_file_name_for_owner(
+        &self,
+        file_name: &str,
+        key_id: &str,
+        user_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<Option<StoredGeminiFileMapping>, DataLayerError> {
+        let row = sqlx::query(
+            r#"
+SELECT
+  id,
+  file_name,
+  key_id,
+  user_id,
+  display_name,
+  mime_type,
+  source_hash,
+  created_at AS created_at_unix_ms,
+  expires_at AS expires_at_unix_secs
+FROM gemini_file_mappings
+WHERE file_name = ? AND key_id = ? AND user_id = ? AND expires_at > ?
+LIMIT 1
+"#,
+        )
+        .bind(file_name)
+        .bind(key_id)
+        .bind(user_id)
+        .bind(i64_from_u64(
+            now_unix_secs,
+            "gemini_file_mappings.owner_read_now",
+        )?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+
+        row.as_ref().map(map_row).transpose()
+    }
+
     async fn list_mappings(
         &self,
         query: &GeminiFileMappingListQuery,
@@ -185,6 +259,49 @@ ON CONFLICT(file_name) DO UPDATE SET
         self.reload_by_file_name(&record.file_name).await
     }
 
+    async fn upsert_if_owner_matches(
+        &self,
+        record: UpsertGeminiFileMappingRecord,
+    ) -> Result<Option<StoredGeminiFileMapping>, DataLayerError> {
+        record.validate()?;
+        let rows_affected = sqlx::query(
+            r#"
+INSERT INTO gemini_file_mappings (
+  id, file_name, key_id, user_id, display_name, mime_type, source_hash,
+  created_at, expires_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(file_name) DO UPDATE SET
+  display_name = excluded.display_name,
+  mime_type = excluded.mime_type,
+  source_hash = excluded.source_hash,
+  expires_at = excluded.expires_at
+WHERE gemini_file_mappings.key_id = excluded.key_id
+  AND gemini_file_mappings.user_id IS excluded.user_id
+"#,
+        )
+        .bind(&record.id)
+        .bind(&record.file_name)
+        .bind(&record.key_id)
+        .bind(&record.user_id)
+        .bind(&record.display_name)
+        .bind(&record.mime_type)
+        .bind(&record.source_hash)
+        .bind(current_unix_secs() as i64)
+        .bind(i64_from_u64(
+            record.expires_at_unix_secs,
+            "gemini_file_mappings.expires_at",
+        )?)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        if rows_affected == 0 {
+            return Ok(None);
+        }
+        self.reload_by_file_name(&record.file_name).await.map(Some)
+    }
+
     async fn delete_by_file_name(&self, file_name: &str) -> Result<bool, DataLayerError> {
         let rows_affected = sqlx::query("DELETE FROM gemini_file_mappings WHERE file_name = ?")
             .bind(file_name)
@@ -192,6 +309,41 @@ ON CONFLICT(file_name) DO UPDATE SET
             .await
             .map_sql_err()?
             .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
+    async fn delete_by_file_name_for_user(
+        &self,
+        file_name: &str,
+        user_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let rows_affected =
+            sqlx::query("DELETE FROM gemini_file_mappings WHERE file_name = ? AND user_id = ?")
+                .bind(file_name)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await
+                .map_sql_err()?
+                .rows_affected();
+        Ok(rows_affected > 0)
+    }
+
+    async fn delete_by_file_name_for_owner(
+        &self,
+        file_name: &str,
+        key_id: &str,
+        user_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let rows_affected = sqlx::query(
+            "DELETE FROM gemini_file_mappings WHERE file_name = ? AND key_id = ? AND user_id = ?",
+        )
+        .bind(file_name)
+        .bind(key_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
         Ok(rows_affected > 0)
     }
 
@@ -282,6 +434,11 @@ fn apply_list_filters(
     where_clause: &mut WhereClause,
     query: &GeminiFileMappingListQuery,
 ) {
+    if let Some(user_id) = query.user_id.as_deref() {
+        where_clause.push_next(builder);
+        builder.push("user_id = ");
+        builder.push_bind(user_id.to_string());
+    }
     if !query.include_expired {
         where_clause.push_next(builder);
         builder.push("expires_at > ");
@@ -394,8 +551,77 @@ mod tests {
         assert_eq!(updated.id, "mapping-1");
         assert_eq!(updated.key_id, "key-2");
 
+        let guarded_reassignment = repository
+            .upsert_if_owner_matches(UpsertGeminiFileMappingRecord {
+                id: "mapping-attacker".to_string(),
+                file_name: "files/example.png".to_string(),
+                key_id: "key-attacker".to_string(),
+                user_id: Some("user-attacker".to_string()),
+                display_name: Some("Attacker".to_string()),
+                mime_type: Some("application/octet-stream".to_string()),
+                source_hash: Some("hash-attacker".to_string()),
+                expires_at_unix_secs: 900,
+            })
+            .await
+            .expect("guarded reassignment should run");
+        assert!(guarded_reassignment.is_none());
+        let after_reassignment = repository
+            .find_by_file_name("files/example.png")
+            .await
+            .expect("mapping should read")
+            .expect("mapping should remain");
+        assert_eq!(after_reassignment.key_id, "key-2");
+        assert_eq!(after_reassignment.user_id.as_deref(), Some("user-2"));
+
+        let guarded_refresh = repository
+            .upsert_if_owner_matches(UpsertGeminiFileMappingRecord {
+                id: "mapping-refresh".to_string(),
+                file_name: "files/example.png".to_string(),
+                key_id: "key-2".to_string(),
+                user_id: Some("user-2".to_string()),
+                display_name: Some("Updated".to_string()),
+                mime_type: Some("image/jpeg".to_string()),
+                source_hash: Some("hash-refreshed".to_string()),
+                expires_at_unix_secs: 500,
+            })
+            .await
+            .expect("same-owner refresh should run");
+        assert!(guarded_refresh.is_some());
+
+        assert!(repository
+            .find_active_by_file_name_for_user("files/example.png", "user-2", 400)
+            .await
+            .expect("owner-scoped read should run")
+            .is_some());
+        assert!(repository
+            .find_active_by_file_name_for_user("files/example.png", "user-1", 400)
+            .await
+            .expect("foreign owner read should run")
+            .is_none());
+        assert!(repository
+            .find_active_by_file_name_for_owner("files/example.png", "key-2", "user-2", 400,)
+            .await
+            .expect("provider owner read should run")
+            .is_some());
+        assert!(repository
+            .find_active_by_file_name_for_owner("files/example.png", "key-attacker", "user-2", 400,)
+            .await
+            .expect("foreign provider read should run")
+            .is_none());
+        assert!(repository
+            .find_active_by_file_name_for_user("files/example.png", "user-2", 500)
+            .await
+            .expect("expired owner read should run")
+            .is_none());
+
+        assert!(!repository
+            .delete_by_file_name_for_owner("files/example.png", "key-attacker", "user-2")
+            .await
+            .expect("wrong-key owner delete should run"));
+
         let page = repository
             .list_mappings(&GeminiFileMappingListQuery {
+                user_id: Some("user-2".to_string()),
                 include_expired: false,
                 search: Some("updated".to_string()),
                 offset: 0,
@@ -406,6 +632,16 @@ mod tests {
             .expect("mappings should list");
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].file_name, "files/example.png");
+
+        assert!(!repository
+            .delete_by_file_name_for_user("files/example.png", "user-1")
+            .await
+            .expect("non-owner delete should run"));
+        assert!(repository
+            .find_by_file_name("files/example.png")
+            .await
+            .expect("mapping should remain")
+            .is_some());
 
         let stats = repository
             .summarize_mappings(400)

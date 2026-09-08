@@ -70,6 +70,7 @@ impl UpstreamBindingIdentity {
             .map_err(|_| UpstreamBindingIdentityError::InvalidUpstreamUrl)?
             .to_string();
 
+        let adapter_kind = adapter.kind();
         let headers = websocket_handshake_headers(&decision.provider_request_headers, "invalid")
             .map_err(|_| UpstreamBindingIdentityError::InvalidHandshakeHeaders)?;
         let authentication_header_names = authentication_header_names(decision);
@@ -82,7 +83,7 @@ impl UpstreamBindingIdentity {
                 .map_err(|_| UpstreamBindingIdentityError::InvalidHandshakeHeaders)?;
             if authentication_header_names.contains(name.as_str()) {
                 authentication_headers.insert(name, value.to_string());
-            } else {
+            } else if !is_turn_scoped_handshake_header(adapter_kind, name.as_str()) {
                 handshake_headers.insert(name, value.to_string());
             }
         }
@@ -90,7 +91,7 @@ impl UpstreamBindingIdentity {
             credential_binding_fingerprint(decision, &authentication_headers);
 
         Ok(Self {
-            adapter_kind: adapter.kind(),
+            adapter_kind,
             provider_id: decision.provider_id.clone(),
             endpoint_id: decision.endpoint_id.clone(),
             key_id: decision.key_id.clone(),
@@ -101,6 +102,203 @@ impl UpstreamBindingIdentity {
             transport_profile: decision.transport_profile.clone(),
         })
     }
+
+    /// Returns only safe field/header names for operator diagnostics. Header
+    /// values and credential fingerprints must never reach logs.
+    pub(super) fn changed_field_names(&self, other: &Self) -> Vec<String> {
+        let mut changed = Vec::new();
+        if self.adapter_kind != other.adapter_kind {
+            changed.push("adapter_kind".to_string());
+        }
+        if self.provider_id != other.provider_id {
+            changed.push("provider_id".to_string());
+        }
+        if self.endpoint_id != other.endpoint_id {
+            changed.push("endpoint_id".to_string());
+        }
+        if self.key_id != other.key_id {
+            changed.push("key_id".to_string());
+        }
+        if self.upstream_url != other.upstream_url {
+            changed.push("upstream_url".to_string());
+        }
+        for name in self
+            .handshake_headers
+            .keys()
+            .chain(other.handshake_headers.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            if self.handshake_headers.get(name) != other.handshake_headers.get(name) {
+                changed.push(format!("handshake_header:{name}"));
+            }
+        }
+        if self.credential_fingerprint != other.credential_fingerprint {
+            changed.push("credential_fingerprint".to_string());
+        }
+        if self.proxy != other.proxy {
+            changed.push("proxy".to_string());
+        }
+        if self.transport_profile != other.transport_profile {
+            changed.push("transport_profile".to_string());
+        }
+        changed
+    }
+
+    /// Returns a versioned, one-way identity suitable for a continuation
+    /// registry. The digest covers every field used by `PartialEq`, including
+    /// effective credential and transport state, without persisting header or
+    /// credential values themselves.
+    pub(super) fn continuation_fingerprint(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"aether-responses-websocket-binding-v1");
+        digest.update([match self.adapter_kind {
+            ResponsesWebSocketAdapter::Standard => 0,
+            ResponsesWebSocketAdapter::Codex => 1,
+        }]);
+        update_optional_string_digest(&mut digest, self.provider_id.as_deref());
+        update_optional_string_digest(&mut digest, self.endpoint_id.as_deref());
+        update_optional_string_digest(&mut digest, self.key_id.as_deref());
+        update_string_digest(&mut digest, self.upstream_url.as_str());
+        update_string_map_digest(&mut digest, &self.handshake_headers);
+        digest.update(self.credential_fingerprint);
+        update_proxy_digest(&mut digest, self.proxy.as_ref());
+        update_transport_profile_digest(&mut digest, self.transport_profile.as_ref());
+        digest.finalize().into()
+    }
+
+    pub(super) fn adapter_kind(&self) -> ResponsesWebSocketAdapter {
+        self.adapter_kind
+    }
+}
+
+fn update_bytes_digest(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn update_string_digest(digest: &mut Sha256, value: &str) {
+    update_bytes_digest(digest, value.as_bytes());
+}
+
+fn update_optional_string_digest(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            update_string_digest(digest, value);
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn update_optional_bool_digest(digest: &mut Sha256, value: Option<bool>) {
+    digest.update([match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }]);
+}
+
+fn update_string_map_digest(digest: &mut Sha256, values: &BTreeMap<String, String>) {
+    digest.update((values.len() as u64).to_be_bytes());
+    for (name, value) in values {
+        update_string_digest(digest, name);
+        update_string_digest(digest, value);
+    }
+}
+
+fn update_optional_json_digest(digest: &mut Sha256, value: Option<&serde_json::Value>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            update_json_digest(digest, value);
+        }
+        None => digest.update([0]),
+    }
+}
+
+fn update_json_digest(digest: &mut Sha256, value: &serde_json::Value) {
+    use serde_json::Value;
+
+    match value {
+        Value::Null => digest.update(b"n"),
+        Value::Bool(value) => digest.update(if *value { b"t" } else { b"f" }),
+        Value::Number(value) => {
+            digest.update(b"d");
+            update_string_digest(digest, value.to_string().as_str());
+        }
+        Value::String(value) => {
+            digest.update(b"s");
+            update_string_digest(digest, value);
+        }
+        Value::Array(values) => {
+            digest.update(b"[");
+            digest.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                update_json_digest(digest, value);
+            }
+            digest.update(b"]");
+        }
+        Value::Object(values) => {
+            digest.update(b"{");
+            digest.update((values.len() as u64).to_be_bytes());
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                update_string_digest(digest, key);
+                update_json_digest(digest, &values[key]);
+            }
+            digest.update(b"}");
+        }
+    }
+}
+
+fn update_proxy_digest(digest: &mut Sha256, proxy: Option<&ProxySnapshot>) {
+    let Some(proxy) = proxy else {
+        digest.update([0]);
+        return;
+    };
+    digest.update([1]);
+    update_optional_bool_digest(digest, proxy.enabled);
+    update_optional_string_digest(digest, proxy.mode.as_deref());
+    update_optional_string_digest(digest, proxy.node_id.as_deref());
+    update_optional_string_digest(digest, proxy.label.as_deref());
+    update_optional_string_digest(digest, proxy.url.as_deref());
+    update_optional_json_digest(digest, proxy.extra.as_ref());
+}
+
+fn update_transport_profile_digest(
+    digest: &mut Sha256,
+    profile: Option<&ResolvedTransportProfile>,
+) {
+    let Some(profile) = profile else {
+        digest.update([0]);
+        return;
+    };
+    digest.update([1]);
+    update_string_digest(digest, profile.profile_id.as_str());
+    update_string_digest(digest, profile.backend.as_str());
+    update_string_digest(digest, profile.http_mode.as_str());
+    update_string_digest(digest, profile.pool_scope.as_str());
+    update_optional_json_digest(digest, profile.header_fingerprint.as_ref());
+    update_optional_json_digest(digest, profile.extra.as_ref());
+}
+
+/// Excludes headers whose values identify one downstream request/turn rather
+/// than the provider connection contract.
+///
+/// `x-trace-id` is generated by Aether's access middleware for every
+/// downstream request. A cross-socket continuation therefore receives a new
+/// value even when it revalidates to the exact same provider binding.
+///
+/// `x-codex-turn-metadata` likewise describes one logical response turn.
+/// Fingerprint convergence intentionally rewrites its `turn_id` and timestamp
+/// for every `response.create`, including a continuation on an already-upgraded
+/// socket. The per-turn copy in `client_metadata` still travels in the
+/// response.create body.
+fn is_turn_scoped_handshake_header(adapter_kind: ResponsesWebSocketAdapter, name: &str) -> bool {
+    name.eq_ignore_ascii_case(crate::constants::TRACE_ID_HEADER)
+        || (adapter_kind == ResponsesWebSocketAdapter::Codex
+            && name.eq_ignore_ascii_case("x-codex-turn-metadata"))
 }
 
 /// Header names that carry credentials in the provider handshake.  The
@@ -334,6 +532,51 @@ mod tests {
     }
 
     #[test]
+    fn request_trace_id_does_not_change_standard_or_codex_binding_identity() {
+        for adapter_kind in [
+            ResponsesWebSocketAdapter::Standard,
+            ResponsesWebSocketAdapter::Codex,
+        ] {
+            let adapter = resolve_responses_websocket_adapter(adapter_kind);
+            let mut first = decision();
+            if adapter_kind == ResponsesWebSocketAdapter::Codex {
+                first.provider_type = Some("codex".to_string());
+                first.report_context = Some(json!({
+                    "codex_credential_generation": "credential-generation-1"
+                }));
+            }
+            first
+                .provider_request_headers
+                .insert("x-trace-id".to_string(), "request-1".to_string());
+            let first_identity = UpstreamBindingIdentity::from_decision(adapter, &first).unwrap();
+            assert!(!first_identity.handshake_headers.contains_key("x-trace-id"));
+
+            let mut continuation = first;
+            continuation
+                .provider_request_headers
+                .insert("x-trace-id".to_string(), "request-2".to_string());
+            let continuation_identity =
+                UpstreamBindingIdentity::from_decision(adapter, &continuation).unwrap();
+            assert_eq!(first_identity, continuation_identity);
+            assert_eq!(
+                first_identity.continuation_fingerprint(),
+                continuation_identity.continuation_fingerprint()
+            );
+
+            continuation
+                .provider_request_headers
+                .insert("x-correlation-id".to_string(), "changed".to_string());
+            let changed_identity =
+                UpstreamBindingIdentity::from_decision(adapter, &continuation).unwrap();
+            assert_ne!(first_identity, changed_identity);
+            assert_eq!(
+                first_identity.changed_field_names(&changed_identity),
+                vec!["handshake_header:x-correlation-id".to_string()]
+            );
+        }
+    }
+
+    #[test]
     fn identity_changes_when_physical_binding_changes() {
         let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Standard);
         let base = decision();
@@ -389,6 +632,25 @@ mod tests {
     }
 
     #[test]
+    fn continuation_fingerprint_changes_with_binding_and_is_not_secret_text() {
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Standard);
+        let base = decision();
+        let identity = UpstreamBindingIdentity::from_decision(adapter, &base).unwrap();
+        let mut changed = base;
+        changed
+            .provider_request_headers
+            .insert("X-Client".to_string(), "different-client".to_string());
+        let changed_identity = UpstreamBindingIdentity::from_decision(adapter, &changed).unwrap();
+        assert_ne!(
+            identity.continuation_fingerprint(),
+            changed_identity.continuation_fingerprint()
+        );
+        let digest = format!("{:?}", identity.continuation_fingerprint());
+        assert!(!digest.contains("secret"));
+        assert!(!digest.contains("api.example"));
+    }
+
+    #[test]
     fn stable_key_identity_rejects_custom_static_auth_value_rotation() {
         let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Standard);
         let mut base = decision();
@@ -432,6 +694,81 @@ mod tests {
             first_identity,
             UpstreamBindingIdentity::from_decision(adapter, &access_token_refreshed).unwrap()
         );
+    }
+
+    #[test]
+    fn codex_turn_metadata_changes_do_not_change_the_physical_binding() {
+        let adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Codex);
+        let mut first = decision();
+        first.provider_type = Some("codex".to_string());
+        first.report_context = Some(json!({
+            "codex_credential_generation": "credential-generation-1"
+        }));
+        first.provider_request_headers.insert(
+            "x-codex-turn-metadata".to_string(),
+            json!({
+                "session_id": "session-1",
+                "thread_id": "thread-1",
+                "turn_id": "turn-1",
+                "turn_started_at_unix_ms": 1
+            })
+            .to_string(),
+        );
+        let first_identity = UpstreamBindingIdentity::from_decision(adapter, &first).unwrap();
+        assert!(!first_identity
+            .handshake_headers
+            .contains_key("x-codex-turn-metadata"));
+
+        let mut continuation = first;
+        continuation.provider_request_headers.insert(
+            "x-codex-turn-metadata".to_string(),
+            json!({
+                "session_id": "session-1",
+                "thread_id": "thread-1",
+                "turn_id": "turn-2",
+                "turn_started_at_unix_ms": 2
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            first_identity,
+            UpstreamBindingIdentity::from_decision(adapter, &continuation).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_codex_headers_remain_part_of_the_binding_identity() {
+        let codex_adapter = resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Codex);
+        let mut first = decision();
+        first.provider_type = Some("codex".to_string());
+        first.report_context = Some(json!({
+            "codex_credential_generation": "credential-generation-1"
+        }));
+        first.provider_request_headers.insert(
+            "x-codex-turn-metadata".to_string(),
+            r#"{"turn_id":"turn-1"}"#.to_string(),
+        );
+        let first_identity = UpstreamBindingIdentity::from_decision(codex_adapter, &first).unwrap();
+
+        let mut changed = first;
+        changed
+            .provider_request_headers
+            .insert("x-codex-window-id".to_string(), "window-2".to_string());
+        let changed_identity =
+            UpstreamBindingIdentity::from_decision(codex_adapter, &changed).unwrap();
+        assert_ne!(first_identity, changed_identity);
+        assert_eq!(
+            first_identity.changed_field_names(&changed_identity),
+            vec!["handshake_header:x-codex-window-id".to_string()]
+        );
+
+        let standard_adapter =
+            resolve_responses_websocket_adapter(ResponsesWebSocketAdapter::Standard);
+        let standard_identity =
+            UpstreamBindingIdentity::from_decision(standard_adapter, &changed).unwrap();
+        assert!(standard_identity
+            .handshake_headers
+            .contains_key("x-codex-turn-metadata"));
     }
 
     #[test]

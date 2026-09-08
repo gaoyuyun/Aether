@@ -25,6 +25,7 @@ SELECT
   id,
   kind,
   target_id,
+  target_tunnel_generation,
   request_count_delta,
   total_requests_delta,
   success_count_delta,
@@ -61,6 +62,7 @@ struct DeltaRow {
     id: String,
     kind: String,
     target_id: String,
+    target_tunnel_generation: Option<String>,
     request_count_delta: i64,
     total_requests_delta: i64,
     success_count_delta: i64,
@@ -98,7 +100,7 @@ struct Aggregates {
     provider_api_keys: BTreeMap<String, ProviderApiKeyUsageDelta>,
     models: BTreeMap<String, ModelUsageDelta>,
     provider_monthly: BTreeMap<String, Vec<ProviderMonthlyDelta>>,
-    proxy_nodes: BTreeMap<String, ProxyNodeCounterDelta>,
+    proxy_nodes: BTreeMap<(String, String), ProxyNodeCounterDelta>,
     management_tokens: BTreeMap<String, ManagementTokenCounterDelta>,
     api_key_last_used: BTreeMap<String, ApiKeyLastUsedDelta>,
 }
@@ -191,16 +193,28 @@ impl Aggregates {
                         });
                 }
                 KIND_PROXY_NODE => {
-                    let entry = aggregates
-                        .proxy_nodes
-                        .entry(row.target_id.clone())
-                        .or_insert(ProxyNodeCounterDelta {
+                    let Some(tunnel_generation) = row
+                        .target_tunnel_generation
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                    else {
+                        // Legacy rows have no identity fence. Mark them
+                        // processed without applying them to any node.
+                        continue;
+                    };
+                    let aggregate_key = (row.target_id.clone(), tunnel_generation.clone());
+                    let entry = aggregates.proxy_nodes.entry(aggregate_key).or_insert(
+                        ProxyNodeCounterDelta {
                             node_id: row.target_id.clone(),
+                            expected_tunnel_generation: Some(tunnel_generation),
                             total_requests_delta: 0,
                             failed_requests_delta: 0,
                             dns_failures_delta: 0,
                             stream_errors_delta: 0,
-                        });
+                        },
+                    );
                     entry.total_requests_delta += row.total_requests_delta;
                     entry.failed_requests_delta += row.error_count_delta;
                     entry.dns_failures_delta += row.dns_failures_delta;
@@ -290,8 +304,8 @@ pub(super) async fn flush(
     for (target_id, delta) in &aggregates.provider_monthly {
         apply_provider_monthly(&mut tx, target_id, delta).await?;
     }
-    for (target_id, delta) in &aggregates.proxy_nodes {
-        apply_proxy_node(&mut tx, target_id, delta).await?;
+    for ((target_id, tunnel_generation), delta) in &aggregates.proxy_nodes {
+        apply_proxy_node(&mut tx, target_id, tunnel_generation, delta).await?;
     }
     for (target_id, delta) in &aggregates.management_tokens {
         apply_management_token(&mut tx, target_id, delta).await?;
@@ -916,9 +930,42 @@ pub(super) async fn enqueue_proxy_node(
     if delta.is_noop() {
         return Ok(false);
     }
+    let Some(expected_tunnel_generation) = delta
+        .expected_tunnel_generation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| value.len() <= 64)
+        .map(ToOwned::to_owned)
+    else {
+        // A bare id is not an identity fence. Reject it instead of rebinding
+        // the delta to whichever incarnation currently owns that id.
+        return Ok(false);
+    };
     let node_id = delta.node_id.trim().to_string();
     let request_id = format!("proxy_node:{node_id}:{}", uuid::Uuid::new_v4());
     let mut tx = pool.begin().await.map_sql_err()?;
+    // Keep the parent lookup lock-free because flush claims outbox rows before
+    // updating proxy_nodes. The generation is stored in the outbox row and is
+    // checked again by flush, so a concurrent id reuse can only discard this
+    // delta, never apply it to the replacement row.
+    let tunnel_generation: Option<String> = sqlx::query_scalar(
+        "SELECT tunnel_generation FROM proxy_nodes WHERE id = ? AND BINARY tunnel_generation = BINARY ? LIMIT 1",
+    )
+    .bind(&node_id)
+    .bind(&expected_tunnel_generation)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_sql_err()?;
+    let Some(_tunnel_generation) = tunnel_generation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        tx.rollback().await.map_sql_err()?;
+        return Ok(false);
+    };
     insert_delta(
         &mut tx,
         DeltaInsert {
@@ -929,6 +976,7 @@ pub(super) async fn enqueue_proxy_node(
             error_count_delta: delta.failed_requests_delta,
             dns_failures_delta: delta.dns_failures_delta,
             stream_errors_delta: delta.stream_errors_delta,
+            target_tunnel_generation: Some(&expected_tunnel_generation),
             ..DeltaInsert::default()
         },
     )
@@ -1383,6 +1431,7 @@ struct DeltaInsert<'a> {
     request_id: &'a str,
     kind: &'a str,
     target_id: &'a str,
+    target_tunnel_generation: Option<&'a str>,
     request_count_delta: i64,
     total_requests_delta: i64,
     success_count_delta: i64,
@@ -1411,18 +1460,20 @@ async fn insert_delta(
     sqlx::query(
         r#"
 INSERT INTO usage_counter_deltas (
-  id, request_id, kind, target_id, request_count_delta, total_requests_delta,
+  id, request_id, kind, target_id, target_tunnel_generation,
+  request_count_delta, total_requests_delta,
   success_count_delta, error_count_delta, dns_failures_delta, stream_errors_delta,
   total_tokens_delta, total_cost_usd_delta, total_response_time_ms_delta,
   last_used_at_unix_secs, last_used_ip, candidate_last_used_at_unix_secs,
   removed_last_used_at_unix_secs, usage_created_at_unix_secs, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(request_id)
     .bind(input.kind)
     .bind(target_id)
+    .bind(input.target_tunnel_generation)
     .bind(input.request_count_delta)
     .bind(input.total_requests_delta)
     .bind(input.success_count_delta)
@@ -1466,6 +1517,7 @@ fn map_row(row: &sqlx::mysql::MySqlRow) -> Result<DeltaRow, DataLayerError> {
         id: row.try_get("id").map_sql_err()?,
         kind: row.try_get("kind").map_sql_err()?,
         target_id: row.try_get("target_id").map_sql_err()?,
+        target_tunnel_generation: row.try_get("target_tunnel_generation").map_sql_err()?,
         request_count_delta: row.try_get("request_count_delta").map_sql_err()?,
         total_requests_delta: row.try_get("total_requests_delta").map_sql_err()?,
         success_count_delta: row.try_get("success_count_delta").map_sql_err()?,
@@ -1789,9 +1841,10 @@ WHERE provider_id = ? AND duration_secs = ? AND quota_epoch_start = ?
 async fn apply_proxy_node(
     tx: &mut sqlx::Transaction<'_, MySql>,
     target_id: &str,
+    tunnel_generation: &str,
     delta: &ProxyNodeCounterDelta,
 ) -> Result<(), DataLayerError> {
-    if target_id.trim().is_empty() || delta.is_noop() {
+    if target_id.trim().is_empty() || tunnel_generation.trim().is_empty() || delta.is_noop() {
         return Ok(());
     }
     sqlx::query(
@@ -1802,7 +1855,7 @@ SET total_requests = total_requests + GREATEST(?, 0),
     dns_failures = dns_failures + GREATEST(?, 0),
     stream_errors = stream_errors + GREATEST(?, 0),
     updated_at = ?
-WHERE id = ?
+    WHERE id = ? AND BINARY tunnel_generation = BINARY ?
 "#,
     )
     .bind(delta.total_requests_delta)
@@ -1811,6 +1864,7 @@ WHERE id = ?
     .bind(delta.stream_errors_delta)
     .bind(current_unix_secs())
     .bind(target_id)
+    .bind(tunnel_generation)
     .execute(&mut **tx)
     .await
     .map_sql_err()?;

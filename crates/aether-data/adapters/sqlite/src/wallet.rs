@@ -1,19 +1,41 @@
 use crate::error::SqlResultExt;
 use crate::{sqlite_optional_real, sqlite_real, SqlitePool};
-use aether_data_contracts::repository::wallet::{
-    redeem_code_credits_recharge_balance, redeem_code_payment_method, redeem_code_refundable_amount,
+use aether_data_contracts::repository::billing::{
+    checked_plan_duration_days_from_snapshot, entitlements_have_replacement_selector,
+    entitlements_should_replace_existing,
 };
 use aether_data_contracts::repository::wallet::{
+    canonicalize_payment_method, canonicalize_wallet_refund_fields,
+    payment_callback_amount_matches_order, payment_callback_method_matches_order,
+    payment_callback_provider_matches_order, payment_order_is_failed_wallet_checkout_placeholder,
+    payment_order_is_uncertain_wallet_checkout_placeholder,
+    payment_order_refund_amounts_are_consistent,
+    payment_order_stripe_client_secret_cas_replacement, project_wallet_gateway_response,
+    project_wallet_recharge_gateway_response, redeem_code_payment_method,
+    redeem_code_refundable_amount, validate_admin_redeem_code_batch_input,
+    validate_manual_wallet_recharge, validate_payment_order_credit_amounts,
+    validate_plan_purchase_order_input, validate_plan_wallet_credit_entitlements,
+    validate_redeem_wallet_credit, validate_wallet_recharge_order_input,
+    wallet_recharge_replay_matches,
+};
+use aether_data_contracts::repository::wallet::{
+    wallet_recharge_checkout_claim_response, wallet_recharge_checkout_claim_token,
+    wallet_recharge_checkout_failed_response, wallet_recharge_checkout_uncertain_response,
+    wallet_recharge_order_is_checkout_placeholder,
+    wallet_recharge_order_is_reclaimable_placeholder,
+    wallet_recharge_response_is_checkout_placeholder, wallet_refund_proof_is_success,
     AdjustWalletBalanceInput, AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery,
     AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
-    AdminWalletRefundRequestListQuery, CompleteAdminWalletRefundInput,
-    CreateAdminRedeemCodeBatchInput, CreateAdminRedeemCodeBatchResult,
-    CreateManualWalletRechargeInput, CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome,
-    CreateWalletRechargeOrderInput, CreateWalletRechargeOrderOutcome,
-    CreateWalletRefundRequestInput, CreateWalletRefundRequestOutcome,
-    CreatedAdminRedeemCodePlaintext, CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
+    AdminWalletRefundRequestListQuery, CompareAndSwapPaymentOrderStripeClientSecretInput,
+    CompleteAdminWalletRefundInput, CreateAdminRedeemCodeBatchInput,
+    CreateAdminRedeemCodeBatchResult, CreateManualWalletRechargeInput,
+    CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome, CreateWalletRechargeOrderInput,
+    CreateWalletRechargeOrderOutcome, CreateWalletRefundRequestInput,
+    CreateWalletRefundRequestOutcome, CreatedAdminRedeemCodePlaintext,
+    CreditAdminPaymentOrderInput, DeleteAdminRedeemCodeBatchInput,
     DisableAdminRedeemCodeBatchInput, DisableAdminRedeemCodeInput, FailAdminWalletRefundInput,
-    ProcessAdminWalletRefundInput, ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome,
+    FailWalletRechargeCheckoutInput, InitializeAuthWalletOutcome, ProcessAdminWalletRefundInput,
+    ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome, ReclaimWalletRechargeCheckoutInput,
     RedeemWalletCodeInput, RedeemWalletCodeOutcome, StoredAdminPaymentCallback,
     StoredAdminPaymentCallbackPage, StoredAdminPaymentOrder, StoredAdminPaymentOrderPage,
     StoredAdminRedeemCode, StoredAdminRedeemCodeBatch, StoredAdminRedeemCodeBatchPage,
@@ -22,7 +44,8 @@ use aether_data_contracts::repository::wallet::{
     StoredAdminWalletRefundPage, StoredAdminWalletRefundRequestItem,
     StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
     StoredAdminWalletTransactionPage, StoredWalletDailyUsageLedger,
-    StoredWalletDailyUsageLedgerPage, StoredWalletSnapshot, WalletLookupKey, WalletMutationOutcome,
+    StoredWalletDailyUsageLedgerPage, StoredWalletSnapshot, UpdateAdminWalletRefundGatewayInput,
+    UpdateWalletRechargeCheckoutInput, WalletLookupKey, WalletMutationOutcome,
     WalletReadRepository, WalletWriteRepository,
 };
 use aether_data_contracts::DataLayerError;
@@ -107,6 +130,20 @@ impl WalletReadRepository for SqliteWalletReadRepository {
     ) -> Result<Option<StoredWalletSnapshot>, DataLayerError> {
         initialize_sqlite_auth_wallet(&self.pool, Some(user_id), None, initial_gift_usd, unlimited)
             .await
+            .map(|result| result.map(|(wallet, _created)| wallet))
+    }
+
+    async fn initialize_auth_user_wallet_with_outcome(
+        &self,
+        user_id: &str,
+        initial_gift_usd: f64,
+        unlimited: bool,
+    ) -> Result<Option<InitializeAuthWalletOutcome>, DataLayerError> {
+        initialize_sqlite_auth_wallet(&self.pool, Some(user_id), None, initial_gift_usd, unlimited)
+            .await
+            .map(|result| {
+                result.map(|(wallet, created)| InitializeAuthWalletOutcome { wallet, created })
+            })
     }
 
     async fn initialize_auth_api_key_wallet(
@@ -123,6 +160,26 @@ impl WalletReadRepository for SqliteWalletReadRepository {
             unlimited,
         )
         .await
+        .map(|result| result.map(|(wallet, _created)| wallet))
+    }
+
+    async fn initialize_auth_api_key_wallet_with_outcome(
+        &self,
+        api_key_id: &str,
+        initial_gift_usd: f64,
+        unlimited: bool,
+    ) -> Result<Option<InitializeAuthWalletOutcome>, DataLayerError> {
+        initialize_sqlite_auth_wallet(
+            &self.pool,
+            None,
+            Some(api_key_id),
+            initial_gift_usd,
+            unlimited,
+        )
+        .await
+        .map(|result| {
+            result.map(|(wallet, created)| InitializeAuthWalletOutcome { wallet, created })
+        })
     }
 
     async fn update_auth_user_wallet_snapshot(
@@ -590,7 +647,7 @@ WHERE (? IS NULL OR payment_method = ?)
     ? IS NULL
     OR (
       CASE
-        WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at < ? THEN 'expired'
+        WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ? THEN 'expired'
         ELSE status
       END
     ) = ?
@@ -623,7 +680,7 @@ WHERE (? IS NULL OR payment_method = ?)
     ? IS NULL
     OR (
       CASE
-        WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at < ? THEN 'expired'
+        WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ? THEN 'expired'
         ELSE status
       END
     ) = ?
@@ -669,7 +726,7 @@ LIMIT ? OFFSET ?
         offset: usize,
     ) -> Result<StoredAdminPaymentOrderPage, DataLayerError> {
         let total = read_count_row(
-            sqlx::query("SELECT COUNT(*) AS total FROM payment_orders WHERE user_id = ?")
+            sqlx::query("SELECT COUNT(*) AS total FROM payment_orders WHERE user_id = ? AND order_kind = 'wallet_recharge'")
                 .bind(user_id)
                 .fetch_one(&self.pool)
                 .await
@@ -684,7 +741,7 @@ SELECT
   payment_provider, payment_channel, order_kind, product_id, product_snapshot,
   gateway_order_id, gateway_response,
   CASE
-    WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at < ? THEN 'expired'
+    WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ? THEN 'expired'
     ELSE status
   END AS status,
   created_at AS created_at_unix_ms,
@@ -693,6 +750,7 @@ SELECT
   expires_at AS expires_at_unix_secs
 FROM payment_orders
 WHERE user_id = ?
+  AND order_kind = 'wallet_recharge'
 ORDER BY created_at DESC
 LIMIT ? OFFSET ?
 "#,
@@ -761,7 +819,7 @@ SELECT
   payment_provider, payment_channel, order_kind, product_id, product_snapshot,
   gateway_order_id, gateway_response,
   CASE
-    WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at < ? THEN 'expired'
+    WHEN status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ? THEN 'expired'
     ELSE status
   END AS status,
   created_at AS created_at_unix_ms,
@@ -771,6 +829,7 @@ SELECT
 FROM payment_orders
 WHERE user_id = ?
   AND id = ?
+  AND order_kind = 'wallet_recharge'
 LIMIT 1
 "#,
         )
@@ -780,6 +839,23 @@ LIMIT 1
         .fetch_optional(&self.pool)
         .await
         .map_sql_err()?;
+        row.as_ref().map(map_payment_order_row).transpose()
+    }
+
+    async fn find_wallet_recharge_order_by_order_no(
+        &self,
+        user_id: &str,
+        order_no: &str,
+    ) -> Result<Option<StoredAdminPaymentOrder>, DataLayerError> {
+        let sql = payment_order_select_sql(
+            "WHERE user_id = ? AND order_no = ? AND order_kind = 'wallet_recharge' LIMIT 1",
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(order_no)
+            .fetch_optional(&self.pool)
+            .await
+            .map_sql_err()?;
         row.as_ref().map(map_payment_order_row).transpose()
     }
 
@@ -803,6 +879,19 @@ LIMIT 1
             .bind(user_id)
             .bind(product_id)
             .bind(current_unix_secs_i64())
+            .fetch_optional(&self.pool)
+            .await
+            .map_sql_err()?;
+        row.as_ref().map(map_payment_order_row).transpose()
+    }
+
+    async fn find_payment_order_by_order_no(
+        &self,
+        order_no: &str,
+    ) -> Result<Option<StoredAdminPaymentOrder>, DataLayerError> {
+        let sql = payment_order_select_sql("WHERE order_no = ? LIMIT 1");
+        let row = sqlx::query(&sql)
+            .bind(order_no)
             .fetch_optional(&self.pool)
             .await
             .map_sql_err()?;
@@ -1005,17 +1094,422 @@ WHERE batch_id = ?
 
 #[async_trait]
 impl WalletWriteRepository for SqliteWalletReadRepository {
+    async fn delete_wallet_if_unreferenced(
+        &self,
+        wallet_id: &str,
+        owner: WalletLookupKey<'_>,
+    ) -> Result<bool, DataLayerError> {
+        if wallet_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let (owner_clause, owner_id) = match owner {
+            WalletLookupKey::UserId(user_id) if !user_id.trim().is_empty() => {
+                ("user_id = ? AND api_key_id IS NULL", user_id)
+            }
+            WalletLookupKey::ApiKeyId(api_key_id) if !api_key_id.trim().is_empty() => {
+                ("api_key_id = ? AND user_id IS NULL", api_key_id)
+            }
+            WalletLookupKey::WalletId(_) => {
+                return Err(DataLayerError::InvalidInput(
+                    "wallet compensation requires an explicit user or API-key owner".to_string(),
+                ))
+            }
+            _ => return Ok(false),
+        };
+        // The reference predicates and the delete must run while holding SQLite's single
+        // writer slot. A deferred transaction could observe an unreferenced wallet, then let a
+        // concurrent writer attach a financial row before the delete is issued.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let select_sql = format!(
+            r#"
+SELECT id
+FROM wallets
+WHERE id = ?
+  AND {owner_clause}
+  AND balance = 0
+  AND gift_balance = 0
+  AND total_recharged = 0
+  AND total_consumed = 0
+  AND total_refunded = 0
+  AND total_adjusted = 0
+  AND limit_mode IN ('finite', 'unlimited')
+  AND currency = 'USD'
+  AND status = 'active'
+  AND NOT EXISTS (SELECT 1 FROM payment_orders p WHERE p.wallet_id = wallets.id)
+  AND NOT EXISTS (SELECT 1 FROM refund_requests r WHERE r.wallet_id = wallets.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM wallet_daily_usage_ledgers d WHERE d.wallet_id = wallets.id
+  )
+  AND NOT EXISTS (SELECT 1 FROM "usage" u WHERE u.wallet_id = wallets.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM usage_settlement_snapshots s WHERE s.wallet_id = wallets.id
+  )
+  AND NOT EXISTS (SELECT 1 FROM wallet_transactions t WHERE t.wallet_id = wallets.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM redeem_codes c WHERE c.redeemed_wallet_id = wallets.id
+  )
+LIMIT 1
+            "#
+        );
+        let found = sqlx::query_scalar::<_, String>(&select_sql)
+            .bind(wallet_id)
+            .bind(owner_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(found_id) = found else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        let removed = sqlx::query("DELETE FROM wallets WHERE id = ?")
+            .bind(&found_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?
+            .rows_affected()
+            > 0;
+        tx.commit().await.map_sql_err()?;
+        Ok(removed)
+    }
+
+    async fn delete_wallet_if_snapshot_matches_and_unreferenced(
+        &self,
+        expected: &StoredWalletSnapshot,
+        owner: WalletLookupKey<'_>,
+    ) -> Result<bool, DataLayerError> {
+        if expected.id.trim().is_empty() {
+            return Ok(false);
+        }
+        let (owner_clause, owner_id) = match owner {
+            WalletLookupKey::UserId(user_id) if !user_id.trim().is_empty() => {
+                ("user_id = ? AND api_key_id IS NULL", user_id)
+            }
+            WalletLookupKey::ApiKeyId(api_key_id) if !api_key_id.trim().is_empty() => {
+                ("api_key_id = ? AND user_id IS NULL", api_key_id)
+            }
+            WalletLookupKey::WalletId(_) => {
+                return Err(DataLayerError::InvalidInput(
+                    "wallet compensation requires an explicit user or API-key owner".to_string(),
+                ))
+            }
+            _ => return Ok(false),
+        };
+        // Serialize the snapshot check, reference check, and delete behind SQLite's writer lock.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let select_sql = wallet_select_sql(&format!(
+            r#"WHERE id = ?
+  AND {owner_clause}
+  AND NOT EXISTS (SELECT 1 FROM payment_orders p WHERE p.wallet_id = wallets.id)
+  AND NOT EXISTS (SELECT 1 FROM refund_requests r WHERE r.wallet_id = wallets.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM wallet_daily_usage_ledgers d WHERE d.wallet_id = wallets.id
+  )
+  AND NOT EXISTS (SELECT 1 FROM "usage" u WHERE u.wallet_id = wallets.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM usage_settlement_snapshots s WHERE s.wallet_id = wallets.id
+  )
+  AND NOT EXISTS (SELECT 1 FROM wallet_transactions t WHERE t.wallet_id = wallets.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM redeem_codes c WHERE c.redeemed_wallet_id = wallets.id
+  )
+LIMIT 1"#
+        ));
+        let row = sqlx::query(&select_sql)
+            .bind(&expected.id)
+            .bind(owner_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(row) = row else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        let current = map_wallet_row(&row)?;
+        if &current != expected {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        let removed = sqlx::query("DELETE FROM wallets WHERE id = ?")
+            .bind(&expected.id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?
+            .rows_affected()
+            > 0;
+        tx.commit().await.map_sql_err()?;
+        Ok(removed)
+    }
+
+    async fn restore_wallet_if_snapshot_matches(
+        &self,
+        before: &StoredWalletSnapshot,
+        after: &StoredWalletSnapshot,
+        owner: WalletLookupKey<'_>,
+    ) -> Result<bool, DataLayerError> {
+        if before.id.trim().is_empty() || after.id.trim().is_empty() {
+            return Ok(false);
+        }
+        if before.id != after.id {
+            return Err(DataLayerError::InvalidInput(
+                "wallet restore snapshots must reference the same wallet".to_string(),
+            ));
+        }
+        let (owner_clause, owner_id) = match owner {
+            WalletLookupKey::UserId(user_id) if !user_id.trim().is_empty() => {
+                ("user_id = ? AND api_key_id IS NULL", user_id)
+            }
+            WalletLookupKey::ApiKeyId(api_key_id) if !api_key_id.trim().is_empty() => {
+                ("api_key_id = ? AND user_id IS NULL", api_key_id)
+            }
+            WalletLookupKey::WalletId(_) => {
+                return Err(DataLayerError::InvalidInput(
+                    "wallet restore requires an explicit user or API-key owner".to_string(),
+                ))
+            }
+            _ => return Ok(false),
+        };
+        let owner_matches = match owner {
+            WalletLookupKey::UserId(user_id) => {
+                before.user_id.as_deref() == Some(user_id)
+                    && after.user_id.as_deref() == Some(user_id)
+                    && before.api_key_id.is_none()
+                    && after.api_key_id.is_none()
+            }
+            WalletLookupKey::ApiKeyId(api_key_id) => {
+                before.api_key_id.as_deref() == Some(api_key_id)
+                    && after.api_key_id.as_deref() == Some(api_key_id)
+                    && before.user_id.is_none()
+                    && after.user_id.is_none()
+            }
+            WalletLookupKey::WalletId(_) => false,
+        };
+        if !owner_matches {
+            return Ok(false);
+        }
+        let before_updated_at = i64::try_from(before.updated_at_unix_secs).map_err(|_| {
+            DataLayerError::InvalidInput(
+                "wallet restore timestamp is outside the supported range".to_string(),
+            )
+        })?;
+
+        // BEGIN IMMEDIATE serializes the snapshot check and replacement with all SQLite wallet
+        // writers. No caller can change the row after it is read but before it is restored.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let select_sql = wallet_select_sql(&format!("WHERE id = ? AND {owner_clause} LIMIT 1"));
+        let row = sqlx::query(&select_sql)
+            .bind(&after.id)
+            .bind(owner_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(row) = row else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        let current = map_wallet_row(&row)?;
+        if current != *after {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            r#"
+UPDATE wallets
+SET balance = ?,
+    gift_balance = ?,
+    limit_mode = ?,
+    currency = ?,
+    status = ?,
+    total_recharged = ?,
+    total_consumed = ?,
+    total_refunded = ?,
+    total_adjusted = ?,
+    updated_at = ?
+WHERE id = ?
+"#,
+        )
+        .bind(before.balance)
+        .bind(before.gift_balance)
+        .bind(&before.limit_mode)
+        .bind(&before.currency)
+        .bind(&before.status)
+        .bind(before.total_recharged)
+        .bind(before.total_consumed)
+        .bind(before.total_refunded)
+        .bind(before.total_adjusted)
+        .bind(before_updated_at)
+        .bind(&before.id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        if updated == 0 {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(true)
+    }
+
+    async fn delete_provisional_auth_user_wallet(
+        &self,
+        wallet_id: &str,
+        user_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        if wallet_id.trim().is_empty() || user_id.trim().is_empty() {
+            return Ok(false);
+        }
+        // Keep the eligibility read and the compensating delete atomic with respect to any new
+        // wallet/order/ledger writes (SQLite transactions are deferred by default).
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let found_wallet_id = sqlx::query_scalar::<_, String>(
+            r#"
+SELECT w.id
+FROM wallets AS w
+WHERE w.id = ?
+  AND w.user_id = ?
+  AND w.api_key_id IS NULL
+  AND w.balance = 0
+  AND w.gift_balance >= 0
+  AND w.total_recharged = 0
+  AND w.total_consumed = 0
+  AND w.total_refunded = 0
+  AND w.total_adjusted = w.gift_balance
+  AND w.limit_mode IN ('finite', 'unlimited')
+  AND w.currency = 'USD'
+  AND w.status = 'active'
+  AND NOT EXISTS (SELECT 1 FROM payment_orders p WHERE p.wallet_id = w.id)
+  AND NOT EXISTS (SELECT 1 FROM refund_requests r WHERE r.wallet_id = w.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM wallet_daily_usage_ledgers d WHERE d.wallet_id = w.id
+  )
+  AND NOT EXISTS (SELECT 1 FROM "usage" u WHERE u.wallet_id = w.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM usage_settlement_snapshots s WHERE s.wallet_id = w.id
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM redeem_codes c WHERE c.redeemed_wallet_id = w.id
+  )
+  AND (
+      (w.gift_balance = 0 AND NOT EXISTS (
+          SELECT 1 FROM wallet_transactions t WHERE t.wallet_id = w.id
+      ))
+      OR
+      (w.gift_balance > 0
+       AND (SELECT COUNT(*) FROM wallet_transactions t WHERE t.wallet_id = w.id) = 1
+       AND EXISTS (
+          SELECT 1 FROM wallet_transactions t
+          WHERE t.wallet_id = w.id
+            AND t.category = 'gift'
+            AND t.reason_code = 'gift_initial'
+            AND t.amount = w.gift_balance
+            AND t.balance_before = 0
+            AND t.balance_after = w.gift_balance
+            AND t.recharge_balance_before = 0
+            AND t.recharge_balance_after = 0
+            AND t.gift_balance_before = 0
+            AND t.gift_balance_after = w.gift_balance
+            AND t.link_type = 'system_task'
+            AND t.link_id = w.user_id
+            AND t.operator_id IS NULL
+       ))
+  )
+LIMIT 1
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let Some(found_wallet_id) = found_wallet_id else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        sqlx::query("DELETE FROM wallet_transactions WHERE wallet_id = ?")
+            .bind(&found_wallet_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let removed = sqlx::query("DELETE FROM wallets WHERE id = ? AND user_id = ?")
+            .bind(&found_wallet_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?
+            .rows_affected()
+            > 0;
+        tx.commit().await.map_sql_err()?;
+        Ok(removed)
+    }
+
     async fn create_wallet_recharge_order(
         &self,
-        input: CreateWalletRechargeOrderInput,
+        mut input: CreateWalletRechargeOrderInput,
     ) -> Result<CreateWalletRechargeOrderOutcome, DataLayerError> {
+        input.payment_method = canonicalize_payment_method(&input.payment_method)
+            .map_err(DataLayerError::InvalidInput)?;
+        validate_wallet_recharge_order_input(&input).map_err(DataLayerError::InvalidInput)?;
+        if !input.amount_usd.is_finite()
+            || input.amount_usd <= 0.0
+            || input
+                .pay_amount
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+            || input
+                .exchange_rate
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(DataLayerError::InvalidInput(
+                "invalid wallet recharge numeric fields".to_string(),
+            ));
+        }
+        let projected_gateway_response =
+            project_wallet_recharge_gateway_response(&input.gateway_response)
+                .map_err(DataLayerError::InvalidInput)?;
         let now = current_unix_secs_i64();
         let expires_at = i64::try_from(input.expires_at_unix_secs).map_err(|_| {
             DataLayerError::InvalidInput("wallet recharge expires_at overflow".to_string())
         })?;
-        let gateway_response =
-            json_string(&input.gateway_response, "payment_orders.gateway_response")?;
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let gateway_response = json_string(
+            &projected_gateway_response,
+            "payment_orders.gateway_response",
+        )?;
+        // Serialize wallet creation and order idempotency checks with the insert. A deferred
+        // transaction can let concurrent callers race through the read-before-write section.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+
+        // The wallet schema intentionally keeps `user_id` nullable for
+        // deleted-user history, so it cannot protect this creation path with
+        // a mandatory foreign key. Validate the owner while holding the
+        // writer transaction before creating either the wallet or order.
+        let user_exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+            .bind(&input.user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if user_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Err(DataLayerError::InvalidInput("user not found".to_string()));
+        }
 
         let wallet_row = sqlx::query(
             r#"
@@ -1029,14 +1523,18 @@ LIMIT 1
         .fetch_optional(&mut *tx)
         .await
         .map_sql_err()?;
-        let (wallet_id, wallet_status) = if let Some(row) = wallet_row {
-            (get::<String>(&row, "id")?, get::<String>(&row, "status")?)
+        let (wallet_id, wallet_status, created_wallet) = if let Some(row) = wallet_row {
+            (
+                get::<String>(&row, "id")?,
+                get::<String>(&row, "status")?,
+                false,
+            )
         } else {
-            let wallet_id = input
+            let requested_wallet_id = input
                 .preferred_wallet_id
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            sqlx::query(
+            let insert_result = sqlx::query(
                 r#"
 INSERT INTO wallets (
   id, user_id, balance, gift_balance, limit_mode, currency, status,
@@ -1044,24 +1542,71 @@ INSERT INTO wallets (
   created_at, updated_at
 )
 VALUES (?, ?, 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, ?, ?)
+ON CONFLICT DO NOTHING
 "#,
             )
-            .bind(&wallet_id)
+            .bind(&requested_wallet_id)
             .bind(&input.user_id)
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
-            (wallet_id, "active".to_string())
+            if insert_result.rows_affected() == 0 {
+                let Some(row) = sqlite_wallet_by_user_id(&mut tx, &input.user_id).await? else {
+                    tx.rollback().await.map_sql_err()?;
+                    return Err(DataLayerError::InvalidInput(
+                        "wallet identifier already belongs to another owner".to_string(),
+                    ));
+                };
+                (
+                    get::<String>(&row, "id")?,
+                    get::<String>(&row, "status")?,
+                    false,
+                )
+            } else {
+                (requested_wallet_id, "active".to_string(), true)
+            }
         };
         if wallet_status != "active" {
-            tx.commit().await.map_sql_err()?;
+            if created_wallet {
+                tx.rollback().await.map_sql_err()?;
+            } else {
+                tx.commit().await.map_sql_err()?;
+            }
             return Ok(CreateWalletRechargeOrderOutcome::WalletInactive);
         }
 
+        if let Some(existing_row) =
+            sqlite_payment_order_by_order_no(&mut tx, &input.order_no).await?
+        {
+            let existing_user_id: Option<String> = existing_row.try_get("user_id").map_sql_err()?;
+            let existing_kind: String = existing_row.try_get("order_kind").map_sql_err()?;
+            if existing_user_id.as_deref() == Some(input.user_id.as_str())
+                && existing_kind == "wallet_recharge"
+            {
+                if !sqlite_wallet_recharge_replay_matches(&existing_row, &wallet_id, &input)? {
+                    tx.rollback().await.map_sql_err()?;
+                    return Err(DataLayerError::InvalidInput(
+                        "wallet recharge replay changes immutable order fields".to_string(),
+                    ));
+                }
+                let existing = map_payment_order_row(&existing_row)?;
+                if created_wallet {
+                    tx.rollback().await.map_sql_err()?;
+                } else {
+                    tx.commit().await.map_sql_err()?;
+                }
+                return Ok(CreateWalletRechargeOrderOutcome::Existing(existing));
+            }
+            tx.rollback().await.map_sql_err()?;
+            return Err(DataLayerError::InvalidInput(
+                "payment order number already belongs to another order".to_string(),
+            ));
+        }
+
         let order_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
+        let insert_result = sqlx::query(
             r#"
 INSERT INTO payment_orders (
   id, order_no, wallet_id, user_id, amount_usd, pay_amount, pay_currency,
@@ -1070,6 +1615,7 @@ INSERT INTO payment_orders (
   gateway_order_id, gateway_response, status, created_at, expires_at
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'wallet_recharge', 'pending', ?, ?, 'pending', ?, ?)
+ON CONFLICT DO NOTHING
 "#,
         )
         .bind(&order_id)
@@ -1091,6 +1637,54 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'wallet_recharge', 'pending', ?, 
         .await
         .map_sql_err()?;
 
+        if insert_result.rows_affected() == 0 {
+            if let Some(existing_row) =
+                sqlite_payment_order_by_order_no(&mut tx, &input.order_no).await?
+            {
+                let existing_user_id: Option<String> =
+                    existing_row.try_get("user_id").map_sql_err()?;
+                let existing_kind: String = existing_row.try_get("order_kind").map_sql_err()?;
+                let existing = map_payment_order_row(&existing_row)?;
+                if existing_user_id.as_deref() == Some(input.user_id.as_str())
+                    && existing_kind == "wallet_recharge"
+                {
+                    if !sqlite_wallet_recharge_replay_matches(&existing_row, &wallet_id, &input)? {
+                        tx.rollback().await.map_sql_err()?;
+                        return Err(DataLayerError::InvalidInput(
+                            "wallet recharge replay changes immutable order fields".to_string(),
+                        ));
+                    }
+                    if created_wallet {
+                        tx.rollback().await.map_sql_err()?;
+                    } else {
+                        tx.commit().await.map_sql_err()?;
+                    }
+                    return Ok(CreateWalletRechargeOrderOutcome::Existing(existing));
+                }
+                tx.rollback().await.map_sql_err()?;
+                return Err(DataLayerError::InvalidInput(
+                    "payment order number already belongs to another order".to_string(),
+                ));
+            }
+            if sqlite_payment_order_by_gateway_order_id(
+                &mut tx,
+                &input.payment_method,
+                &input.gateway_order_id,
+            )
+            .await?
+            .is_some()
+            {
+                tx.rollback().await.map_sql_err()?;
+                return Err(DataLayerError::InvalidInput(
+                    "payment gateway order already belongs to another order".to_string(),
+                ));
+            }
+            tx.rollback().await.map_sql_err()?;
+            return Err(DataLayerError::InvalidInput(
+                "wallet recharge order could not be created".to_string(),
+            ));
+        }
+
         let row = sqlite_payment_order_by_id(&mut tx, &order_id).await?;
         tx.commit().await.map_sql_err()?;
         Ok(CreateWalletRechargeOrderOutcome::Created(
@@ -1098,19 +1692,342 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'wallet_recharge', 'pending', ?, 
         ))
     }
 
+    async fn update_wallet_recharge_checkout(
+        &self,
+        input: UpdateWalletRechargeCheckoutInput,
+    ) -> Result<WalletMutationOutcome<StoredAdminPaymentOrder>, DataLayerError> {
+        if input.order_id.trim().is_empty() || input.gateway_order_id.trim().is_empty() {
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout identifiers are required".to_string(),
+            ));
+        }
+        let projected_gateway_response =
+            match project_wallet_recharge_gateway_response(&input.gateway_response) {
+                Ok(value) => value,
+                Err(error) => return Ok(WalletMutationOutcome::Invalid(error)),
+            };
+        let gateway_response = json_string(
+            &projected_gateway_response,
+            "payment_orders.gateway_response",
+        )?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let Some(current_row) =
+            sqlite_payment_order_by_id_optional(&mut tx, &input.order_id).await?
+        else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::NotFound);
+        };
+        let order_kind: Option<String> = get(&current_row, "order_kind")?;
+        if order_kind.as_deref() != Some("wallet_recharge") {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "payment order is not a wallet recharge".to_string(),
+            ));
+        }
+        let current = map_payment_order_row(&current_row)?;
+        let current_is_checkout_placeholder =
+            wallet_recharge_order_is_checkout_placeholder(&current);
+        let current_token = current
+            .gateway_response
+            .as_ref()
+            .and_then(wallet_recharge_checkout_claim_token);
+        let requested_token = wallet_recharge_checkout_claim_token(&projected_gateway_response);
+        if current_token.is_some() && current_token != requested_token {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout claim is no longer current".to_string(),
+            ));
+        }
+        if current.status != "pending" {
+            if current.gateway_order_id.as_deref() == Some(input.gateway_order_id.as_str()) {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Applied(current));
+            }
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge order is no longer pending".to_string(),
+            ));
+        }
+        let now = current_unix_secs_i64();
+        if current
+            .expires_at_unix_secs
+            .is_none_or(|expires_at| expires_at <= now.max(0) as u64)
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge order is expired".to_string(),
+            ));
+        }
+        // A newly-created row uses order_no as a temporary gateway id. Once
+        // the provider checkout is stored, do not let a concurrent request
+        // replace that checkout evidence.
+        if current.gateway_order_id.as_deref().is_some_and(|existing| {
+            existing != input.gateway_order_id.as_str()
+                && existing != current.order_no.as_str()
+                && !current_is_checkout_placeholder
+        }) {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout is already bound".to_string(),
+            ));
+        }
+        let conflict = sqlite_payment_order_by_gateway_order_id(
+            &mut tx,
+            &current.payment_method,
+            &input.gateway_order_id,
+        )
+        .await?
+        .is_some_and(|row| {
+            row.try_get::<String, _>("id").ok().as_deref() != Some(input.order_id.as_str())
+        });
+        if conflict {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "payment gateway order already belongs to another order".to_string(),
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE payment_orders SET gateway_order_id = ?, gateway_response = ? WHERE id = ? AND status = 'pending' AND expires_at > ?",
+        )
+        .bind(&input.gateway_order_id)
+        .bind(gateway_response)
+        .bind(&input.order_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge order is expired or no longer pending".to_string(),
+            ));
+        }
+        let updated =
+            map_payment_order_row(&sqlite_payment_order_by_id(&mut tx, &input.order_id).await?)?;
+        tx.commit().await.map_sql_err()?;
+        Ok(WalletMutationOutcome::Applied(updated))
+    }
+
+    async fn compare_and_swap_payment_order_stripe_client_secret(
+        &self,
+        input: CompareAndSwapPaymentOrderStripeClientSecretInput,
+    ) -> Result<bool, DataLayerError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let Some(row) = sqlite_payment_order_by_id_optional(&mut tx, &input.order_id).await? else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(false);
+        };
+        let current = map_payment_order_row(&row)?;
+        let Some(replacement) =
+            payment_order_stripe_client_secret_cas_replacement(&current, &input)
+                .map_err(DataLayerError::InvalidInput)?
+        else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(false);
+        };
+        let replacement = json_string(&replacement, "payment_orders.gateway_response")?;
+        let updated = sqlx::query("UPDATE payment_orders SET gateway_response = ? WHERE id = ?")
+            .bind(replacement)
+            .bind(&input.order_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn fail_wallet_recharge_checkout(
+        &self,
+        input: FailWalletRechargeCheckoutInput,
+    ) -> Result<WalletMutationOutcome<StoredAdminPaymentOrder>, DataLayerError> {
+        if input.order_id.trim().is_empty()
+            || input.claim_token.trim().is_empty()
+            || input.claim_token.len() > 128
+        {
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout failure identifiers are required".to_string(),
+            ));
+        }
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let Some(row) = sqlite_payment_order_by_id_optional(&mut tx, &input.order_id).await? else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::NotFound);
+        };
+        let order = map_payment_order_row(&row)?;
+        if !wallet_recharge_order_is_checkout_placeholder(&order) {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "payment order is not a checkout placeholder".to_string(),
+            ));
+        }
+        let current_token = order
+            .gateway_response
+            .as_ref()
+            .and_then(wallet_recharge_checkout_claim_token);
+        if current_token != Some(input.claim_token.trim()) {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout claim is no longer current".to_string(),
+            ));
+        }
+        if order.status != "pending" {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Applied(order));
+        }
+        let failed = if input.provider_request_may_have_succeeded {
+            wallet_recharge_checkout_uncertain_response(
+                order.gateway_response.as_ref(),
+                &input.reason,
+                current_unix_secs_i64().max(0) as u64,
+            )
+        } else {
+            wallet_recharge_checkout_failed_response(
+                order.gateway_response.as_ref(),
+                &input.reason,
+                current_unix_secs_i64().max(0) as u64,
+            )
+        };
+        let failed = json_string(&failed, "payment_orders.gateway_response")?;
+        let updated = sqlx::query(
+            "UPDATE payment_orders SET status = 'failed', gateway_response = ? WHERE id = ? AND status = 'pending'",
+        )
+        .bind(failed)
+        .bind(&input.order_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout claim is no longer current".to_string(),
+            ));
+        }
+        let updated =
+            map_payment_order_row(&sqlite_payment_order_by_id(&mut tx, &input.order_id).await?)?;
+        tx.commit().await.map_sql_err()?;
+        Ok(WalletMutationOutcome::Applied(updated))
+    }
+
+    async fn reclaim_wallet_recharge_checkout(
+        &self,
+        input: ReclaimWalletRechargeCheckoutInput,
+    ) -> Result<WalletMutationOutcome<StoredAdminPaymentOrder>, DataLayerError> {
+        let now = current_unix_secs_i64().max(0) as u64;
+        if input.order_id.trim().is_empty()
+            || input.claim_token.trim().is_empty()
+            || input.claim_token.len() > 128
+            || input.expires_at_unix_secs <= now
+            || input.expires_at_unix_secs > i64::MAX as u64
+        {
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout reclaim identifiers are invalid".to_string(),
+            ));
+        }
+        if !wallet_recharge_response_is_checkout_placeholder(&input.gateway_response) {
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge reclaim response must be a placeholder".to_string(),
+            ));
+        }
+        let response = wallet_recharge_checkout_claim_response(
+            &input.gateway_response,
+            &input.claim_token,
+            now,
+        )
+        .map_err(DataLayerError::InvalidInput)?;
+        let response = json_string(&response, "payment_orders.gateway_response")?;
+        let expires_at = i64::try_from(input.expires_at_unix_secs).map_err(|_| {
+            DataLayerError::InvalidInput("wallet recharge expires_at overflow".to_string())
+        })?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let Some(row) = sqlite_payment_order_by_id_optional(&mut tx, &input.order_id).await? else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::NotFound);
+        };
+        let order_kind: Option<String> = get(&row, "order_kind")?;
+        let order = map_payment_order_row(&row)?;
+        if order_kind.as_deref() != Some("wallet_recharge")
+            || !wallet_recharge_order_is_reclaimable_placeholder(&order, now)
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout is still in progress or already completed".to_string(),
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE payment_orders SET gateway_order_id = ?, gateway_response = ?, status = 'pending', expires_at = ? WHERE id = ?",
+        )
+        .bind(&order.order_no)
+        .bind(response)
+        .bind(expires_at)
+        .bind(&input.order_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet recharge checkout reclaim lost the order race".to_string(),
+            ));
+        }
+        let updated =
+            map_payment_order_row(&sqlite_payment_order_by_id(&mut tx, &input.order_id).await?)?;
+        tx.commit().await.map_sql_err()?;
+        Ok(WalletMutationOutcome::Applied(updated))
+    }
+
     async fn create_plan_purchase_order(
         &self,
-        input: CreatePlanPurchaseOrderInput,
+        mut input: CreatePlanPurchaseOrderInput,
     ) -> Result<CreatePlanPurchaseOrderOutcome, DataLayerError> {
+        input.payment_method = canonicalize_payment_method(&input.payment_method)
+            .map_err(DataLayerError::InvalidInput)?;
+        validate_plan_purchase_order_input(&input).map_err(DataLayerError::InvalidInput)?;
         let now = current_unix_secs_i64();
         let expires_at = i64::try_from(input.expires_at_unix_secs).map_err(|_| {
             DataLayerError::InvalidInput("plan purchase expires_at overflow".to_string())
         })?;
-        let gateway_response =
-            json_string(&input.gateway_response, "payment_orders.gateway_response")?;
+        let projected_gateway_response = project_wallet_gateway_response(&input.gateway_response)
+            .map_err(DataLayerError::InvalidInput)?;
+        let gateway_response = json_string(
+            &projected_gateway_response,
+            "payment_orders.gateway_response",
+        )?;
         let product_snapshot =
             json_string(&input.product_snapshot, "payment_orders.product_snapshot")?;
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+
+        // The baseline SQLite schema does not enforce the wallet -> user
+        // relationship. Validate the order owner before creating an automatic
+        // wallet, so an invalid checkout cannot leave a financial row behind.
+        let user_exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+            .bind(&input.user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if user_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Err(DataLayerError::InvalidInput("user not found".to_string()));
+        }
 
         let wallet_row = sqlx::query(
             r#"
@@ -1127,11 +2044,16 @@ LIMIT 1
         let (wallet_id, wallet_status) = if let Some(row) = wallet_row {
             (get::<String>(&row, "id")?, get::<String>(&row, "status")?)
         } else {
-            let wallet_id = input
+            let requested_wallet_id = input
                 .preferred_wallet_id
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            sqlx::query(
+            // `user_id` is unique in the portable schema, but the explicit
+            // read above can still race with another initializer on a
+            // connection that started before it committed. Treat either a
+            // user or wallet-id conflict as a no-op, then resolve the winner
+            // by owner instead of leaking a database constraint error.
+            let insert_result = sqlx::query(
                 r#"
 INSERT INTO wallets (
   id, user_id, balance, gift_balance, limit_mode, currency, status,
@@ -1139,16 +2061,27 @@ INSERT INTO wallets (
   created_at, updated_at
 )
 VALUES (?, ?, 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, ?, ?)
+ON CONFLICT DO NOTHING
 "#,
             )
-            .bind(&wallet_id)
+            .bind(&requested_wallet_id)
             .bind(&input.user_id)
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
-            (wallet_id, "active".to_string())
+            if insert_result.rows_affected() == 0 {
+                let Some(row) = sqlite_wallet_by_user_id(&mut tx, &input.user_id).await? else {
+                    tx.rollback().await.map_sql_err()?;
+                    return Err(DataLayerError::InvalidInput(
+                        "wallet identifier already belongs to another owner".to_string(),
+                    ));
+                };
+                (get::<String>(&row, "id")?, get::<String>(&row, "status")?)
+            } else {
+                (requested_wallet_id, "active".to_string())
+            }
         };
         if wallet_status != "active" {
             tx.commit().await.map_sql_err()?;
@@ -1258,8 +2191,39 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'plan_purchase', ?, ?, 'pending',
         &self,
         input: CreateWalletRefundRequestInput,
     ) -> Result<CreateWalletRefundRequestOutcome, DataLayerError> {
+        if !input.amount_usd.is_finite() || input.amount_usd <= 0.0 {
+            return Ok(CreateWalletRefundRequestOutcome::InvalidInput(
+                "refund amount must be finite and greater than zero".to_string(),
+            ));
+        }
         let now = current_unix_secs_i64();
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        // Hold SQLite's single writer slot while checking existing reservations and inserting
+        // the new request. A deferred transaction would allow two callers to both observe the
+        // same available balance before either reservation is written.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+
+        let Some(wallet_row) = sqlx::query(
+            r#"
+SELECT id, balance
+FROM wallets
+WHERE id = ?
+  AND user_id = ?
+LIMIT 1
+"#,
+        )
+        .bind(&input.wallet_id)
+        .bind(&input.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?
+        else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(CreateWalletRefundRequestOutcome::WalletMissing);
+        };
 
         if let Some(idempotency_key) = input.idempotency_key.as_deref() {
             let existing =
@@ -1272,54 +2236,51 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'plan_purchase', ?, ?, 'pending',
             }
         }
 
-        let Some(wallet_row) = sqlx::query(
-            r#"
-SELECT id, balance
-FROM wallets
-WHERE id = ?
-LIMIT 1
-"#,
-        )
-        .bind(&input.wallet_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_sql_err()?
-        else {
-            tx.commit().await.map_sql_err()?;
-            return Ok(CreateWalletRefundRequestOutcome::WalletMissing);
-        };
         let wallet_recharge_balance = sqlite_real(&wallet_row, "balance")?;
-        let wallet_reserved_amount: f64 = sqlx::query_scalar(
+        if !wallet_recharge_balance.is_finite() {
+            tx.commit().await.map_sql_err()?;
+            return Ok(CreateWalletRefundRequestOutcome::InvalidInput(
+                "wallet recharge balance is invalid".to_string(),
+            ));
+        }
+        let wallet_reserved_amount = sqlx::query_scalar::<_, Option<f64>>(
             r#"
-SELECT COALESCE(SUM(amount_usd), 0.0)
+SELECT amount_usd
 FROM refund_requests
 WHERE wallet_id = ?
   AND status IN ('pending_approval', 'approved')
 "#,
         )
         .bind(&input.wallet_id)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
-        .map_sql_err()?;
+        .map_sql_err()?
+        .into_iter()
+        .try_fold(0.0_f64, |total, amount| {
+            let amount = amount?;
+            if !amount.is_finite() || amount <= 0.0 {
+                return None;
+            }
+            let next = total + amount;
+            next.is_finite().then_some(next)
+        });
+        let Some(wallet_reserved_amount) = wallet_reserved_amount else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(CreateWalletRefundRequestOutcome::InvalidInput(
+                "wallet refund reservation is invalid".to_string(),
+            ));
+        };
         if input.amount_usd > (wallet_recharge_balance - wallet_reserved_amount) {
             tx.commit().await.map_sql_err()?;
             return Ok(CreateWalletRefundRequestOutcome::RefundAmountExceedsAvailableBalance);
         }
 
         let mut payment_order_id = None;
-        let mut source_type = input
-            .source_type
-            .clone()
-            .unwrap_or_else(|| "wallet_balance".to_string());
-        let mut source_id = input.source_id.clone();
-        let mut refund_mode = input
-            .refund_mode
-            .clone()
-            .unwrap_or_else(|| "offline_payout".to_string());
+        let mut resolved_payment_method = None;
         if let Some(order_id) = input.payment_order_id.as_deref() {
             let Some(order_row) = sqlx::query(
                 r#"
-SELECT id, status, payment_method, refundable_amount_usd
+SELECT id, status, payment_method, amount_usd, refunded_amount_usd, refundable_amount_usd
 FROM payment_orders
 WHERE id = ?
   AND wallet_id = ?
@@ -1340,19 +2301,46 @@ LIMIT 1
                 tx.commit().await.map_sql_err()?;
                 return Ok(CreateWalletRefundRequestOutcome::PaymentOrderNotRefundable);
             }
-            let order_reserved_amount: f64 = sqlx::query_scalar(
+            let order_reserved_amount = sqlx::query_scalar::<_, Option<f64>>(
                 r#"
-SELECT COALESCE(SUM(amount_usd), 0.0)
+SELECT amount_usd
 FROM refund_requests
 WHERE payment_order_id = ?
   AND status IN ('pending_approval', 'approved')
 "#,
             )
             .bind(order_id)
-            .fetch_one(&mut *tx)
+            .fetch_all(&mut *tx)
             .await
-            .map_sql_err()?;
+            .map_sql_err()?
+            .into_iter()
+            .try_fold(0.0_f64, |total, amount| {
+                let amount = amount?;
+                if !amount.is_finite() || amount <= 0.0 {
+                    return None;
+                }
+                let next = total + amount;
+                next.is_finite().then_some(next)
+            });
+            let Some(order_reserved_amount) = order_reserved_amount else {
+                tx.commit().await.map_sql_err()?;
+                return Ok(CreateWalletRefundRequestOutcome::InvalidInput(
+                    "payment order refund reservation is invalid".to_string(),
+                ));
+            };
+            let order_amount = sqlite_real(&order_row, "amount_usd")?;
+            let refunded_amount = sqlite_real(&order_row, "refunded_amount_usd")?;
             let refundable_amount = sqlite_real(&order_row, "refundable_amount_usd")?;
+            if !payment_order_refund_amounts_are_consistent(
+                order_amount,
+                refunded_amount,
+                refundable_amount,
+            ) {
+                tx.commit().await.map_sql_err()?;
+                return Ok(CreateWalletRefundRequestOutcome::InvalidInput(
+                    "payment order refund amounts are invalid".to_string(),
+                ));
+            }
             if input.amount_usd > (refundable_amount - order_reserved_amount) {
                 tx.commit().await.map_sql_err()?;
                 return Ok(
@@ -1360,13 +2348,20 @@ WHERE payment_order_id = ?
                 );
             }
             payment_order_id = Some(order_id.to_string());
-            source_type = "payment_order".to_string();
-            source_id = Some(order_id.to_string());
-            if input.refund_mode.is_none() {
-                let payment_method: String = get(&order_row, "payment_method")?;
-                refund_mode = default_refund_mode_for_payment_method(&payment_method).to_string();
-            }
+            resolved_payment_method = Some(get::<String>(&order_row, "payment_method")?);
         }
+
+        let canonical = canonicalize_wallet_refund_fields(
+            payment_order_id.as_deref(),
+            input.source_type.as_deref(),
+            input.source_id.as_deref(),
+            input.refund_mode.as_deref(),
+            resolved_payment_method.as_deref(),
+        )
+        .map_err(DataLayerError::InvalidInput)?;
+        let source_type = canonical.source_type;
+        let source_id = canonical.source_id;
+        let refund_mode = canonical.refund_mode;
 
         let refund_id = uuid::Uuid::new_v4().to_string();
         let insert = sqlx::query(
@@ -1397,7 +2392,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?, ?)
         .await;
 
         if let Err(err) = insert {
-            if input.idempotency_key.is_some() {
+            if input.idempotency_key.is_some()
+                && err
+                    .as_database_error()
+                    .is_some_and(|database_error| database_error.is_unique_violation())
+            {
                 tx.rollback().await.map_sql_err()?;
                 return Ok(CreateWalletRefundRequestOutcome::DuplicateRejected);
             }
@@ -1413,58 +2412,100 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?, ?)
 
     async fn process_payment_callback(
         &self,
-        input: ProcessPaymentCallbackInput,
+        mut input: ProcessPaymentCallbackInput,
     ) -> Result<ProcessPaymentCallbackOutcome, DataLayerError> {
+        input
+            .canonicalize_and_validate()
+            .map_err(DataLayerError::InvalidInput)?;
+        if input.callback_key.trim().is_empty()
+            || input.callback_key.chars().count() > 128
+            || input.payload_hash.trim().is_empty()
+            || !input.amount_usd.is_finite()
+            || input.amount_usd <= 0.0
+            || input
+                .pay_amount
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+            || input
+                .exchange_rate
+                .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(DataLayerError::InvalidInput(
+                "invalid payment callback numeric or identity fields".to_string(),
+            ));
+        }
         let now = current_unix_secs_i64();
         let payload = json_string(&input.payload, "payment_callbacks.payload")?;
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        // Callback processing reads and then mutates the callback, order, and
+        // wallet rows. Acquire SQLite's writer lock before the first read so
+        // a deferred transaction cannot observe `pending` and later fail while
+        // upgrading after another callback or admin credit has committed.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
 
-        let existing_callback = sqlx::query(
+        // Register the callback atomically.  A preceding SELECT allows two
+        // concurrent first deliveries to both observe a missing key and then
+        // race on the unique constraint.  Insert first and re-read by the
+        // key so every caller uses the row that actually won the race.
+        let candidate_callback_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
             r#"
-SELECT id, payment_order_id, status, order_no, gateway_order_id
+INSERT INTO payment_callbacks (
+  id, payment_order_id, payment_method, callback_key, order_no, gateway_order_id,
+  payload_hash, signature_valid, status, payload, error_message, created_at, processed_at
+)
+VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', NULL, NULL, ?, NULL)
+ON CONFLICT(callback_key) DO NOTHING
+"#,
+        )
+        .bind(&candidate_callback_id)
+        .bind(&input.payment_method)
+        .bind(&input.callback_key)
+        .bind(input.order_no.as_deref())
+        .bind(input.gateway_order_id.as_deref())
+        .bind(&input.payload_hash)
+        .bind(sqlite_bool(input.signature_valid))
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+
+        let callback_row = sqlx::query(
+            r#"
+SELECT id, payment_order_id, payment_method, payload_hash, status, order_no, gateway_order_id
 FROM payment_callbacks
 WHERE callback_key = ?
 LIMIT 1
 "#,
         )
         .bind(&input.callback_key)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_sql_err()?;
-        let duplicate = existing_callback.is_some();
-        let callback_id = if let Some(row) = existing_callback.as_ref() {
-            let status: String = get(row, "status")?;
-            if status == "processed" {
-                let order_id: Option<String> = get(row, "payment_order_id")?;
-                tx.commit().await.map_sql_err()?;
-                return Ok(ProcessPaymentCallbackOutcome::DuplicateProcessed { order_id });
-            }
-            get(row, "id")?
-        } else {
-            let callback_id = uuid::Uuid::new_v4().to_string();
-            sqlx::query(
-                r#"
-INSERT INTO payment_callbacks (
-  id, payment_order_id, payment_method, callback_key, order_no, gateway_order_id,
-  payload_hash, signature_valid, status, payload, error_message, created_at, processed_at
-)
-VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
-"#,
-            )
-            .bind(&callback_id)
-            .bind(&input.payment_method)
-            .bind(&input.callback_key)
-            .bind(input.order_no.as_deref())
-            .bind(input.gateway_order_id.as_deref())
-            .bind(&input.payload_hash)
-            .bind(sqlite_bool(input.signature_valid))
-            .bind(&payload)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_sql_err()?;
-            callback_id
-        };
+        let callback_id: String = get(&callback_row, "id")?;
+        let duplicate = callback_id != candidate_callback_id;
+        let callback_order_no: Option<String> = get(&callback_row, "order_no")?;
+        let callback_gateway_order_id: Option<String> = get(&callback_row, "gateway_order_id")?;
+
+        let stored_method: String = get(&callback_row, "payment_method")?;
+        let stored_hash: Option<String> = get(&callback_row, "payload_hash")?;
+        if !stored_method.eq_ignore_ascii_case(&input.payment_method)
+            || stored_hash.as_deref() != Some(input.payload_hash.as_str())
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate: true,
+                error: "callback key reused with different payment payload".to_string(),
+            });
+        }
+        let status: String = get(&callback_row, "status")?;
+        if status == "processed" {
+            let order_id: Option<String> = get(&callback_row, "payment_order_id")?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::DuplicateProcessed { order_id });
+        }
 
         if !input.signature_valid {
             update_sqlite_payment_callback_failure(
@@ -1482,20 +2523,20 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
             });
         }
 
-        let lookup_order_no = input.order_no.clone().or_else(|| {
-            existing_callback
-                .as_ref()
-                .and_then(|row| get(row, "order_no").ok())
-        });
-        let lookup_gateway_order_id = input.gateway_order_id.clone().or_else(|| {
-            existing_callback
-                .as_ref()
-                .and_then(|row| get(row, "gateway_order_id").ok())
-        });
+        let lookup_order_no = input.order_no.clone().or_else(|| callback_order_no.clone());
+        let lookup_gateway_order_id = input
+            .gateway_order_id
+            .clone()
+            .or_else(|| callback_gateway_order_id.clone());
         let order_row = if let Some(order_no) = lookup_order_no.as_deref() {
             sqlite_payment_order_by_order_no(&mut tx, order_no).await?
         } else if let Some(gateway_order_id) = lookup_gateway_order_id.as_deref() {
-            sqlite_payment_order_by_gateway_order_id(&mut tx, gateway_order_id).await?
+            sqlite_payment_order_by_gateway_order_id(
+                &mut tx,
+                &input.payment_method,
+                gateway_order_id,
+            )
+            .await?
         } else {
             None
         };
@@ -1521,19 +2562,262 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
         let order_payment_method: String = get(&order_row, "payment_method")?;
         let order_payment_provider: Option<String> = get(&order_row, "payment_provider")?;
         let order_payment_channel: Option<String> = get(&order_row, "payment_channel")?;
+        let order_pay_currency: Option<String> = get(&order_row, "pay_currency")?;
+        let order_gateway_order_id: Option<String> = get(&order_row, "gateway_order_id")?;
         let order_kind: String = get(&order_row, "order_kind")?;
         let order_amount_usd = sqlite_real(&order_row, "amount_usd")?;
         let order_pay_amount = sqlite_optional_real(&order_row, "pay_amount")?;
+        let order_exchange_rate = sqlite_optional_real(&order_row, "exchange_rate")?;
         let order_status: String = get(&order_row, "status")?;
         let expires_at_unix_secs: Option<i64> = get(&order_row, "expires_at_unix_secs")?;
-
-        let amount_matches = if let (Some(callback_pay_amount), Some(order_pay_amount)) =
-            (input.pay_amount, order_pay_amount)
-        {
-            (callback_pay_amount - order_pay_amount).abs() <= 0.01
+        let order_gateway_response = if order_status.eq_ignore_ascii_case("failed") {
+            optional_json(
+                get(&order_row, "gateway_response")?,
+                "payment_orders.gateway_response",
+            )?
         } else {
-            (input.amount_usd - order_amount_usd).abs() <= f64::EPSILON
+            None
         };
+        let failed_checkout_recoverable = payment_order_is_failed_wallet_checkout_placeholder(
+            &order_status,
+            &order_kind,
+            order_gateway_response.as_ref(),
+        );
+        let uncertain_checkout = payment_order_is_uncertain_wallet_checkout_placeholder(
+            &order_status,
+            &order_kind,
+            order_gateway_response.as_ref(),
+        );
+        if !order_amount_usd.is_finite()
+            || order_amount_usd <= 0.0
+            || order_pay_amount.is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "payment order amount is invalid",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "payment order amount is invalid".to_string(),
+            });
+        }
+
+        // A payment order must credit the wallet that belongs to the same
+        // live user.  Do this before binding a gateway id or changing any
+        // entitlement, wallet, or order state.  Legacy rows may violate the
+        // wallet owner XOR invariant, so reject every ambiguous shape here.
+        let order_user_id: Option<String> = get(&order_row, "user_id")?;
+        let Some(order_user_id) = order_user_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "payment order user missing",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "payment order user missing".to_string(),
+            });
+        };
+        let Some(wallet_owner_row) = sqlx::query(
+            r#"
+SELECT
+  w.user_id AS wallet_user_id,
+  w.api_key_id AS wallet_api_key_id,
+  api_keys.user_id AS api_key_user_id
+FROM wallets AS w
+LEFT JOIN api_keys ON api_keys.id = w.api_key_id
+WHERE w.id = ?
+LIMIT 1
+            "#,
+        )
+        .bind(&order_wallet_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?
+        else {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "wallet not found",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "wallet not found".to_string(),
+            });
+        };
+        let wallet_user_id: Option<String> = get(&wallet_owner_row, "wallet_user_id")?;
+        let wallet_api_key_id: Option<String> = get(&wallet_owner_row, "wallet_api_key_id")?;
+        let api_key_user_id: Option<String> = get(&wallet_owner_row, "api_key_user_id")?;
+        let wallet_owner_matches = match (
+            wallet_user_id.as_deref(),
+            wallet_api_key_id.as_deref(),
+            api_key_user_id.as_deref(),
+        ) {
+            (Some(wallet_user_id), None, _) if !wallet_user_id.trim().is_empty() => {
+                wallet_user_id == order_user_id
+            }
+            (None, Some(wallet_api_key_id), Some(api_key_user_id))
+                if !wallet_api_key_id.trim().is_empty() && !api_key_user_id.trim().is_empty() =>
+            {
+                api_key_user_id == order_user_id
+            }
+            _ => false,
+        };
+        if !wallet_owner_matches {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "payment order wallet owner mismatch",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "payment order wallet owner mismatch".to_string(),
+            });
+        }
+
+        // The lookup identifier is not proof that the callback belongs to
+        // this order: order_no takes precedence over gateway_order_id. Check
+        // every identifier supplied by this delivery (and any persisted
+        // fallback from the callback row) before changing the order or
+        // wallet. Orders created before the gateway returns a provider
+        // transaction id store order_no as a placeholder; that value may be
+        // replaced by a verified callback, but a real id must never be
+        // rebound to another order.
+        if input
+            .order_no
+            .as_deref()
+            .is_some_and(|value| value != order_no)
+            || callback_order_no
+                .as_deref()
+                .is_some_and(|value| value != order_no)
+        {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "payment order number mismatch",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "payment order number mismatch".to_string(),
+            });
+        }
+        let input_gateway_order_id = input
+            .gateway_order_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let callback_gateway_order_id = callback_gateway_order_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let stored_real_gateway_order_id = order_gateway_order_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != order_no);
+        let input_real_gateway_order_id = input_gateway_order_id.filter(|value| *value != order_no);
+        let callback_real_gateway_order_id =
+            callback_gateway_order_id.filter(|value| *value != order_no);
+        let effective_gateway_order_id = input_real_gateway_order_id
+            .or(callback_real_gateway_order_id)
+            .or(stored_real_gateway_order_id);
+        if let Some(expected_gateway_order_id) = stored_real_gateway_order_id {
+            if input_gateway_order_id.is_some_and(|value| value != expected_gateway_order_id)
+                || callback_gateway_order_id.is_some_and(|value| value != expected_gateway_order_id)
+            {
+                update_sqlite_payment_callback_failure(
+                    &mut tx,
+                    &callback_id,
+                    &input,
+                    &payload,
+                    "payment gateway order mismatch",
+                )
+                .await?;
+                tx.commit().await.map_sql_err()?;
+                return Ok(ProcessPaymentCallbackOutcome::Failed {
+                    duplicate,
+                    error: "payment gateway order mismatch".to_string(),
+                });
+            }
+        } else if let (Some(input_gateway), Some(callback_gateway)) =
+            (input_real_gateway_order_id, callback_real_gateway_order_id)
+        {
+            if input_gateway != callback_gateway {
+                update_sqlite_payment_callback_failure(
+                    &mut tx,
+                    &callback_id,
+                    &input,
+                    &payload,
+                    "payment gateway order identifier mismatch",
+                )
+                .await?;
+                tx.commit().await.map_sql_err()?;
+                return Ok(ProcessPaymentCallbackOutcome::Failed {
+                    duplicate,
+                    error: "payment gateway order identifier mismatch".to_string(),
+                });
+            }
+        }
+        if stored_real_gateway_order_id.is_none() {
+            if let Some(gateway_order_id) = effective_gateway_order_id {
+                let conflicting_order_id: Option<String> = sqlx::query_scalar(
+                    "SELECT id FROM payment_orders WHERE payment_method = ? AND gateway_order_id = ? AND id <> ? LIMIT 1",
+                )
+                .bind(&order_payment_method)
+                .bind(gateway_order_id)
+                .bind(&order_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+                if conflicting_order_id.is_some() {
+                    update_sqlite_payment_callback_failure(
+                        &mut tx,
+                        &callback_id,
+                        &input,
+                        &payload,
+                        "payment gateway order belongs to another payment order",
+                    )
+                    .await?;
+                    tx.commit().await.map_sql_err()?;
+                    return Ok(ProcessPaymentCallbackOutcome::Failed {
+                        duplicate,
+                        error: "payment gateway order belongs to another payment order".to_string(),
+                    });
+                }
+            }
+        }
+
+        let amount_matches = payment_callback_amount_matches_order(
+            order_amount_usd,
+            order_pay_amount,
+            order_pay_currency.as_deref(),
+            order_exchange_rate,
+            input.amount_usd,
+            input.pay_amount,
+        );
         if !amount_matches {
             update_sqlite_payment_callback_failure(
                 &mut tx,
@@ -1549,7 +2833,12 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
                 error: "callback amount mismatch".to_string(),
             });
         }
-        if !order_payment_method.eq_ignore_ascii_case(&input.payment_method) {
+        if !payment_callback_method_matches_order(
+            &order_payment_method,
+            order_payment_provider.as_deref(),
+            &input.payment_method,
+            input.payment_provider.as_deref(),
+        ) {
             update_sqlite_payment_callback_failure(
                 &mut tx,
                 &callback_id,
@@ -1564,31 +2853,57 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
                 error: "payment method mismatch".to_string(),
             });
         }
-        if let Some(expected_provider) = input.payment_provider.as_deref() {
-            if order_payment_provider
-                .as_deref()
-                .is_some_and(|value| !value.eq_ignore_ascii_case(expected_provider))
-            {
-                update_sqlite_payment_callback_failure(
-                    &mut tx,
-                    &callback_id,
-                    &input,
-                    &payload,
-                    "payment provider mismatch",
-                )
-                .await?;
-                tx.commit().await.map_sql_err()?;
-                return Ok(ProcessPaymentCallbackOutcome::Failed {
-                    duplicate,
-                    error: "payment provider mismatch".to_string(),
-                });
-            }
+        let payment_provider_matches = payment_callback_provider_matches_order(
+            &order_payment_method,
+            order_payment_provider.as_deref(),
+            &input.payment_method,
+            input.payment_provider.as_deref(),
+        );
+        if !payment_provider_matches {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "payment provider mismatch",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "payment provider mismatch".to_string(),
+            });
+        }
+        let currency_matches = match (input.pay_currency.as_deref(), order_pay_currency.as_deref())
+        {
+            (Some(callback), Some(order)) => order.eq_ignore_ascii_case(callback),
+            (None, None) => input.pay_amount.is_none() && order_pay_amount.is_none(),
+            _ => false,
+        };
+        if !currency_matches {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "payment currency mismatch",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "payment currency mismatch".to_string(),
+            });
         }
         if let Some(expected_channel) = input.payment_channel.as_deref() {
-            if order_payment_channel
-                .as_deref()
-                .is_some_and(|value| !value.eq_ignore_ascii_case(expected_channel))
-            {
+            let stored_channel = order_payment_channel.as_deref().or_else(|| {
+                (order_payment_provider.is_none()
+                    && ["alipay", "wxpay"]
+                        .iter()
+                        .any(|method| method.eq_ignore_ascii_case(&order_payment_method)))
+                .then_some(order_payment_method.as_str())
+            });
+            if !stored_channel.is_some_and(|value| value.eq_ignore_ascii_case(expected_channel)) {
                 update_sqlite_payment_callback_failure(
                     &mut tx,
                     &callback_id,
@@ -1622,14 +2937,16 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
                 wallet_id: order_wallet_id,
             });
         }
-        if matches!(order_status.as_str(), "failed" | "expired" | "refunded") {
+        if !matches!(order_status.as_str(), "pending" | "paid") && !failed_checkout_recoverable {
             let error = format!("payment order is not creditable: {order_status}");
             update_sqlite_payment_callback_failure(&mut tx, &callback_id, &input, &payload, &error)
                 .await?;
             tx.commit().await.map_sql_err()?;
             return Ok(ProcessPaymentCallbackOutcome::Failed { duplicate, error });
         }
-        if order_status == "pending" && expires_at_unix_secs.is_some_and(|value| value < now) {
+        if (order_status == "pending" || (failed_checkout_recoverable && !uncertain_checkout))
+            && expires_at_unix_secs.is_some_and(|value| value <= now)
+        {
             sqlx::query("UPDATE payment_orders SET status = 'expired' WHERE id = ?")
                 .bind(&order_id)
                 .execute(&mut *tx)
@@ -1648,6 +2965,28 @@ VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'received', ?, NULL, ?, NULL)
                 duplicate,
                 error: "payment order expired".to_string(),
             });
+        }
+
+        if stored_real_gateway_order_id.is_none() {
+            if let Some(gateway_order_id) = effective_gateway_order_id {
+                if !sqlite_bind_payment_gateway_order_id(&mut tx, &order_id, gateway_order_id)
+                    .await?
+                {
+                    update_sqlite_payment_callback_failure(
+                        &mut tx,
+                        &callback_id,
+                        &input,
+                        &payload,
+                        "payment gateway order belongs to another payment order",
+                    )
+                    .await?;
+                    tx.commit().await.map_sql_err()?;
+                    return Ok(ProcessPaymentCallbackOutcome::Failed {
+                        duplicate,
+                        error: "payment gateway order belongs to another payment order".to_string(),
+                    });
+                }
+            }
         }
 
         if order_kind == "plan_purchase" {
@@ -1757,7 +3096,7 @@ VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
                 .bind(&plan_id)
                 .bind(&order_id)
                 .bind(now)
-                .bind(plan_expires_at_unix(&snapshot, now))
+                .bind(plan_expires_at_unix(&snapshot, now)?)
                 .bind(json_string(
                     &entitlements,
                     "user_plan_entitlements.entitlements_snapshot",
@@ -1782,9 +3121,9 @@ VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
 UPDATE payment_orders
 SET gateway_order_id = COALESCE(?, gateway_order_id),
     gateway_response = ?,
-    pay_amount = COALESCE(?, pay_amount),
-    pay_currency = COALESCE(?, pay_currency),
-    exchange_rate = COALESCE(?, exchange_rate),
+    pay_amount = COALESCE(pay_amount, ?),
+    pay_currency = COALESCE(pay_currency, ?),
+    exchange_rate = COALESCE(exchange_rate, ?),
     status = 'credited',
     fulfillment_status = 'fulfilled',
     fulfillment_error = NULL,
@@ -1794,8 +3133,11 @@ SET gateway_order_id = COALESCE(?, gateway_order_id),
 WHERE id = ?
                 "#,
             )
-            .bind(input.gateway_order_id.as_deref())
-            .bind(&payload)
+            .bind(effective_gateway_order_id)
+            .bind(json_string(
+                &input.gateway_response_projection(&order_no, effective_gateway_order_id),
+                "payment_orders.gateway_response",
+            )?)
             .bind(input.pay_amount)
             .bind(input.pay_currency.as_deref())
             .bind(input.exchange_rate)
@@ -1827,7 +3169,7 @@ WHERE id = ?
 
         let Some(wallet_row) = sqlx::query(
             r#"
-SELECT id, status, balance, gift_balance
+SELECT id, status, balance, gift_balance, total_recharged
 FROM wallets
 WHERE id = ?
 LIMIT 1
@@ -1871,6 +3213,33 @@ LIMIT 1
 
         let before_recharge = sqlite_real(&wallet_row, "balance")?;
         let before_gift = sqlite_real(&wallet_row, "gift_balance")?;
+        let total_recharged = sqlite_real(&wallet_row, "total_recharged")?;
+        // Finite recharge balances may be negative: usage settlement permits a
+        // finite wallet to overdraft, and a later recharge must be able to
+        // restore that balance. Reject only malformed values and arithmetic
+        // overflow here.
+        if !before_recharge.is_finite()
+            || !before_gift.is_finite()
+            || before_gift < 0.0
+            || !total_recharged.is_finite()
+            || total_recharged < 0.0
+            || !(total_recharged + order_amount_usd).is_finite()
+            || !(before_recharge + before_gift + order_amount_usd).is_finite()
+        {
+            update_sqlite_payment_callback_failure(
+                &mut tx,
+                &callback_id,
+                &input,
+                &payload,
+                "wallet balance is invalid",
+            )
+            .await?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(ProcessPaymentCallbackOutcome::Failed {
+                duplicate,
+                error: "wallet balance is invalid".to_string(),
+            });
+        }
         let before_total = before_recharge + before_gift;
         let after_recharge = before_recharge + order_amount_usd;
         let after_total = after_recharge + before_gift;
@@ -1921,9 +3290,9 @@ VALUES (?, ?, 'recharge', 'topup_gateway', ?, ?, ?, ?, ?, ?, ?, 'payment_order',
 UPDATE payment_orders
 SET gateway_order_id = COALESCE(?, gateway_order_id),
     gateway_response = ?,
-    pay_amount = COALESCE(?, pay_amount),
-    pay_currency = COALESCE(?, pay_currency),
-    exchange_rate = COALESCE(?, exchange_rate),
+    pay_amount = COALESCE(pay_amount, ?),
+    pay_currency = COALESCE(pay_currency, ?),
+    exchange_rate = COALESCE(exchange_rate, ?),
     status = 'credited',
     paid_at = COALESCE(paid_at, ?),
     credited_at = ?,
@@ -1931,8 +3300,11 @@ SET gateway_order_id = COALESCE(?, gateway_order_id),
 WHERE id = ?
 "#,
         )
-        .bind(input.gateway_order_id.as_deref())
-        .bind(&payload)
+        .bind(effective_gateway_order_id)
+        .bind(json_string(
+            &input.gateway_response_projection(&order_no, effective_gateway_order_id),
+            "payment_orders.gateway_response",
+        )?)
         .bind(input.pay_amount)
         .bind(input.pay_currency.as_deref())
         .bind(input.exchange_rate)
@@ -1966,8 +3338,20 @@ WHERE id = ?
         &self,
         input: AdjustWalletBalanceInput,
     ) -> Result<Option<(StoredWalletSnapshot, StoredAdminWalletTransaction)>, DataLayerError> {
+        if !input.amount_usd.is_finite() || input.amount_usd == 0.0 {
+            return Err(DataLayerError::InvalidInput(
+                "adjustment amount must be finite and non-zero".to_string(),
+            ));
+        }
         let now = current_unix_secs_i64();
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        // Admin credit follows the same read/validate/write sequence as a
+        // provider callback. Serialize it at transaction start to prevent two
+        // writers from both crediting a pending order.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
         let Some(row) = sqlite_wallet_by_id_optional(&mut tx, &input.wallet_id).await? else {
             tx.commit().await.map_sql_err()?;
             return Ok(None);
@@ -1976,6 +3360,16 @@ WHERE id = ?
         let before_recharge = sqlite_real(&row, "balance")?;
         let before_gift = sqlite_real(&row, "gift_balance")?;
         let before_total = before_recharge + before_gift;
+        let before_total_adjusted = sqlite_real(&row, "total_adjusted")?;
+        if !before_recharge.is_finite()
+            || !before_gift.is_finite()
+            || !before_total.is_finite()
+            || !before_total_adjusted.is_finite()
+        {
+            return Err(DataLayerError::UnexpectedValue(
+                "wallet balance is invalid".to_string(),
+            ));
+        }
         let mut after_recharge = before_recharge;
         let mut after_gift = before_gift;
         apply_admin_balance_adjustment(
@@ -1984,6 +3378,17 @@ WHERE id = ?
             &mut after_recharge,
             &mut after_gift,
         );
+        let after_total = after_recharge + after_gift;
+        let after_total_adjusted = before_total_adjusted + input.amount_usd;
+        if !after_recharge.is_finite()
+            || !after_gift.is_finite()
+            || !after_total.is_finite()
+            || !after_total_adjusted.is_finite()
+        {
+            return Err(DataLayerError::UnexpectedValue(
+                "wallet balance overflow during admin adjustment".to_string(),
+            ));
+        }
 
         sqlx::query(
             r#"
@@ -2026,7 +3431,7 @@ VALUES (?, ?, 'adjust', 'adjust_admin', ?, ?, ?, ?, ?, ?, ?, 'admin_action', ?, 
         .bind(&input.wallet_id)
         .bind(input.amount_usd)
         .bind(before_total)
-        .bind(after_recharge + after_gift)
+        .bind(after_total)
         .bind(before_recharge)
         .bind(after_recharge)
         .bind(before_gift)
@@ -2049,7 +3454,7 @@ VALUES (?, ?, 'adjust', 'adjust_admin', ?, ?, ?, ?, ?, ?, ?, 'admin_action', ?, 
                 reason_code: "adjust_admin".to_string(),
                 amount: input.amount_usd,
                 balance_before: before_total,
-                balance_after: after_recharge + after_gift,
+                balance_after: after_total,
                 recharge_balance_before: before_recharge,
                 recharge_balance_after: after_recharge,
                 gift_balance_before: before_gift,
@@ -2067,10 +3472,21 @@ VALUES (?, ?, 'adjust', 'adjust_admin', ?, ?, ?, ?, ?, ?, ?, 'admin_action', ?, 
 
     async fn create_manual_wallet_recharge(
         &self,
-        input: CreateManualWalletRechargeInput,
+        mut input: CreateManualWalletRechargeInput,
     ) -> Result<Option<(StoredWalletSnapshot, StoredAdminPaymentOrder)>, DataLayerError> {
+        input.payment_method = canonicalize_payment_method(&input.payment_method)
+            .map_err(DataLayerError::InvalidInput)?;
+        if !input.amount_usd.is_finite() || input.amount_usd <= 0.0 {
+            return Err(DataLayerError::InvalidInput(
+                "manual recharge amount must be finite and positive".to_string(),
+            ));
+        }
         let now = current_unix_secs_i64();
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
         let Some(wallet_row) = sqlite_wallet_by_id_optional(&mut tx, &input.wallet_id).await?
         else {
             tx.commit().await.map_sql_err()?;
@@ -2079,6 +3495,14 @@ VALUES (?, ?, 'adjust', 'adjust_admin', ?, ?, ?, ?, ?, ?, ?, 'admin_action', ?, 
 
         let before_recharge = sqlite_real(&wallet_row, "balance")?;
         let before_gift = sqlite_real(&wallet_row, "gift_balance")?;
+        let before_total_recharged = sqlite_real(&wallet_row, "total_recharged")?;
+        let (after_recharge, after_total_recharged) = validate_manual_wallet_recharge(
+            input.amount_usd,
+            before_recharge,
+            before_gift,
+            before_total_recharged,
+        )
+        .map_err(DataLayerError::InvalidInput)?;
         let user_id: Option<String> = get(&wallet_row, "user_id")?;
         let order_id = uuid::Uuid::new_v4().to_string();
         let gateway_response = json_string(
@@ -2115,18 +3539,17 @@ VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'credited', ?, ?, ?, ?)
         .await
         .map_sql_err()?;
 
-        let after_recharge = before_recharge + input.amount_usd;
         sqlx::query(
             r#"
 UPDATE wallets
 SET balance = ?,
-    total_recharged = total_recharged + ?,
+    total_recharged = ?,
     updated_at = ?
 WHERE id = ?
 "#,
         )
         .bind(after_recharge)
-        .bind(input.amount_usd)
+        .bind(after_total_recharged)
         .bind(now)
         .bind(&input.wallet_id)
         .execute(&mut *tx)
@@ -2193,7 +3616,11 @@ VALUES (?, ?, 'recharge', ?, ?, ?, ?, ?, ?, ?, ?, 'payment_order', ?, ?, ?, ?)
         DataLayerError,
     > {
         let now = current_unix_secs_i64();
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
         let Some(refund_row) =
             sqlite_refund_by_id_and_wallet(&mut tx, &input.refund_id, &input.wallet_id).await?
         else {
@@ -2201,6 +3628,12 @@ VALUES (?, ?, 'recharge', ?, ?, ?, ?, ?, ?, ?, ?, 'payment_order', ?, ?, ?, ?)
             return Ok(WalletMutationOutcome::NotFound);
         };
         let refund = map_refund_row(&refund_row)?;
+        if !refund.amount_usd.is_finite() || refund.amount_usd <= 0.0 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "refund amount must be finite and greater than zero".to_string(),
+            ));
+        }
         if !matches!(refund.status.as_str(), "approved" | "pending_approval") {
             tx.commit().await.map_sql_err()?;
             return Ok(WalletMutationOutcome::Invalid(
@@ -2217,9 +3650,28 @@ VALUES (?, ?, 'recharge', ?, ?, ?, ?, ?, ?, ?, ?, 'payment_order', ?, ?, ?, ?)
         };
         let before_recharge = sqlite_real(&wallet_row, "balance")?;
         let before_gift = sqlite_real(&wallet_row, "gift_balance")?;
-        let before_total = before_recharge + before_gift;
+        let before_total_refunded = sqlite_real(&wallet_row, "total_refunded")?;
         let amount_usd = refund.amount_usd;
         let after_recharge = before_recharge - amount_usd;
+        let before_total = before_recharge + before_gift;
+        let after_total = after_recharge + before_gift;
+        let after_total_refunded = before_total_refunded + amount_usd;
+        if !before_recharge.is_finite()
+            || before_recharge < 0.0
+            || !before_gift.is_finite()
+            || before_gift < 0.0
+            || !before_total_refunded.is_finite()
+            || before_total_refunded < 0.0
+            || !before_total.is_finite()
+            || !after_recharge.is_finite()
+            || !after_total.is_finite()
+            || !after_total_refunded.is_finite()
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet balance is invalid".to_string(),
+            ));
+        }
         if after_recharge < 0.0 {
             tx.commit().await.map_sql_err()?;
             return Ok(WalletMutationOutcome::Invalid(
@@ -2236,45 +3688,78 @@ VALUES (?, ?, 'recharge', ?, ?, ?, ?, ?, ?, ?, ?, 'payment_order', ?, ?, ?, ?)
                     "payment order not found".to_string(),
                 ));
             };
-            let refundable_amount = sqlite_real(&order_row, "refundable_amount_usd")?;
-            if amount_usd > refundable_amount {
+            let order_wallet_id: String = get(&order_row, "wallet_id")?;
+            let order_status: String = get(&order_row, "status")?;
+            if order_wallet_id != input.wallet_id || order_status != "credited" {
                 tx.commit().await.map_sql_err()?;
                 return Ok(WalletMutationOutcome::Invalid(
-                    "refund amount exceeds refundable amount".to_string(),
+                    "payment order is not refundable for this wallet".to_string(),
                 ));
             }
-            sqlx::query(
+            let order_amount = sqlite_real(&order_row, "amount_usd")?;
+            let refunded_before = sqlite_real(&order_row, "refunded_amount_usd")?;
+            let refundable_before = sqlite_real(&order_row, "refundable_amount_usd")?;
+            let refunded_after = refunded_before + amount_usd;
+            let refundable_after = refundable_before - amount_usd;
+            if !payment_order_refund_amounts_are_consistent(
+                order_amount,
+                refunded_before,
+                refundable_before,
+            ) || amount_usd > refundable_before
+                || !refunded_after.is_finite()
+                || refunded_after < 0.0
+                || refunded_after > order_amount
+                || !refundable_after.is_finite()
+                || refundable_after < 0.0
+                || refundable_after > order_amount
+            {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Invalid(
+                    "payment order refund amounts are invalid".to_string(),
+                ));
+            }
+            let result = sqlx::query(
                 r#"
 UPDATE payment_orders
-SET refunded_amount_usd = refunded_amount_usd + ?,
-    refundable_amount_usd = refundable_amount_usd - ?
+SET refunded_amount_usd = ?,
+    refundable_amount_usd = ?
 WHERE id = ?
 "#,
             )
-            .bind(amount_usd)
-            .bind(amount_usd)
+            .bind(refunded_after)
+            .bind(refundable_after)
             .bind(payment_order_id)
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
+            if result.rows_affected() != 1 {
+                return Err(DataLayerError::UnexpectedValue(
+                    "payment order disappeared during refund processing".to_string(),
+                ));
+            }
         }
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
 UPDATE wallets
 SET balance = ?,
-    total_refunded = total_refunded + ?,
+    total_refunded = ?,
     updated_at = ?
 WHERE id = ?
 "#,
         )
         .bind(after_recharge)
-        .bind(amount_usd)
+        .bind(after_total_refunded)
         .bind(now)
         .bind(&input.wallet_id)
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
+        if result.rows_affected() != 1 {
+            return Err(DataLayerError::UnexpectedValue(
+                "wallet disappeared during refund processing".to_string(),
+            ));
+        }
         let wallet = map_wallet_row(&sqlite_wallet_by_id(&mut tx, &input.wallet_id).await?)?;
 
         let transaction_id = uuid::Uuid::new_v4().to_string();
@@ -2304,15 +3789,17 @@ VALUES (?, ?, 'refund', 'refund_out', ?, ?, ?, ?, ?, ?, ?, 'refund_request', ?, 
         .await
         .map_sql_err()?;
 
-        sqlx::query(
+        let refund_update = sqlx::query(
             r#"
-UPDATE refund_requests
+            UPDATE refund_requests
 SET status = 'processing',
     approved_by = ?,
     processed_by = ?,
     processed_at = ?,
     updated_at = ?
-WHERE id = ? AND wallet_id = ?
+WHERE id = ?
+  AND wallet_id = ?
+  AND status IN ('approved', 'pending_approval')
 "#,
         )
         .bind(input.operator_id.as_deref())
@@ -2324,6 +3811,11 @@ WHERE id = ? AND wallet_id = ?
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
+        if refund_update.rows_affected() != 1 {
+            return Err(DataLayerError::UnexpectedValue(
+                "refund status changed during refund processing".to_string(),
+            ));
+        }
         let refund = map_refund_row(&sqlite_refund_by_id(&mut tx, &input.refund_id).await?)?;
         tx.commit().await.map_sql_err()?;
         Ok(WalletMutationOutcome::Applied((
@@ -2357,36 +3849,68 @@ WHERE id = ? AND wallet_id = ?
         input: CompleteAdminWalletRefundInput,
     ) -> Result<WalletMutationOutcome<StoredAdminWalletRefund>, DataLayerError> {
         let now = current_unix_secs_i64();
-        let payout_proof = input
-            .payout_proof
-            .as_ref()
-            .map(|value| json_string(value, "refund_requests.payout_proof"))
-            .transpose()?;
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
         let Some(current_refund) =
             sqlite_refund_by_id_and_wallet(&mut tx, &input.refund_id, &input.wallet_id).await?
         else {
             tx.commit().await.map_sql_err()?;
             return Ok(WalletMutationOutcome::NotFound);
         };
-        let status: String = get(&current_refund, "status")?;
-        if status != "processing" {
+        let refund = map_refund_row(&current_refund)?;
+        if !refund.amount_usd.is_finite() || refund.amount_usd <= 0.0 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "refund amount must be finite and greater than zero".to_string(),
+            ));
+        }
+        if let (Some(existing_id), Some(incoming_id)) = (
+            refund.gateway_refund_id.as_deref(),
+            input.gateway_refund_id.as_deref(),
+        ) {
+            if existing_id != incoming_id {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Invalid(
+                    "gateway refund identifier conflicts with existing evidence".to_string(),
+                ));
+            }
+        }
+        if refund.status == "succeeded" {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Applied(refund));
+        }
+        if refund.status != "processing" {
             tx.commit().await.map_sql_err()?;
             return Ok(WalletMutationOutcome::Invalid(
                 "refund status must be processing before completion".to_string(),
             ));
         }
+        // Preserve a processing proof for ordinary replays, but allow an
+        // explicit successful gateway proof to upgrade it at completion.
+        let selected_payout_proof = input
+            .payout_proof
+            .as_ref()
+            .filter(|proof| refund.payout_proof.is_none() || wallet_refund_proof_is_success(proof))
+            .cloned()
+            .or_else(|| refund.payout_proof.clone());
+        let payout_proof = selected_payout_proof
+            .as_ref()
+            .map(|value| json_string(value, "refund_requests.payout_proof"))
+            .transpose()?;
 
-        sqlx::query(
+        let refund_update = sqlx::query(
             r#"
 UPDATE refund_requests
 SET status = 'succeeded',
-    gateway_refund_id = ?,
-    payout_reference = ?,
+    gateway_refund_id = COALESCE(gateway_refund_id, ?),
+    payout_reference = COALESCE(payout_reference, ?),
     payout_proof = ?,
     completed_at = ?,
     updated_at = ?
-WHERE id = ? AND wallet_id = ?
+WHERE id = ? AND wallet_id = ? AND status = 'processing'
 "#,
         )
         .bind(input.gateway_refund_id.as_deref())
@@ -2399,9 +3923,108 @@ WHERE id = ? AND wallet_id = ?
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
+        if refund_update.rows_affected() != 1 {
+            return Err(DataLayerError::UnexpectedValue(
+                "refund status changed during refund completion".to_string(),
+            ));
+        }
         let refund = map_refund_row(&sqlite_refund_by_id(&mut tx, &input.refund_id).await?)?;
         tx.commit().await.map_sql_err()?;
         Ok(WalletMutationOutcome::Applied(refund))
+    }
+
+    async fn update_admin_wallet_refund_gateway(
+        &self,
+        input: UpdateAdminWalletRefundGatewayInput,
+    ) -> Result<WalletMutationOutcome<StoredAdminWalletRefund>, DataLayerError> {
+        if input.gateway_refund_id.trim().is_empty() || input.gateway_refund_id.len() > 128 {
+            return Ok(WalletMutationOutcome::Invalid(
+                "gateway refund identifier is invalid".to_string(),
+            ));
+        }
+        if input
+            .payout_proof
+            .as_ref()
+            .is_some_and(|proof| !proof.is_object())
+        {
+            return Ok(WalletMutationOutcome::Invalid(
+                "gateway refund proof must be an object".to_string(),
+            ));
+        }
+        let now = current_unix_secs_i64();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let Some(current_row) =
+            sqlite_refund_by_id_and_wallet(&mut tx, &input.refund_id, &input.wallet_id).await?
+        else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::NotFound);
+        };
+        let current = map_refund_row(&current_row)?;
+        if !current.amount_usd.is_finite() || current.amount_usd <= 0.0 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "refund amount must be finite and greater than zero".to_string(),
+            ));
+        }
+        if let Some(existing_id) = current.gateway_refund_id.as_deref() {
+            if existing_id != input.gateway_refund_id {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Invalid(
+                    "gateway refund identifier conflicts with existing evidence".to_string(),
+                ));
+            }
+        }
+        if current.status == "succeeded" {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Applied(current));
+        }
+        if current.status != "processing" {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "refund status must be processing before gateway update".to_string(),
+            ));
+        }
+        // Do not overwrite durable processing evidence with an arbitrary
+        // replay; only a terminal success proof may replace it.
+        let selected_payout_proof = input
+            .payout_proof
+            .as_ref()
+            .filter(|proof| current.payout_proof.is_none() || wallet_refund_proof_is_success(proof))
+            .cloned()
+            .or_else(|| current.payout_proof.clone());
+        let proof = selected_payout_proof
+            .as_ref()
+            .map(|value| json_string(value, "refund_requests.payout_proof"))
+            .transpose()?;
+        let gateway_update = sqlx::query(
+            r#"
+UPDATE refund_requests
+SET gateway_refund_id = COALESCE(gateway_refund_id, ?),
+    payout_proof = ?,
+    updated_at = ?
+WHERE id = ? AND wallet_id = ? AND status = 'processing'
+"#,
+        )
+        .bind(&input.gateway_refund_id)
+        .bind(proof.as_deref())
+        .bind(now)
+        .bind(&input.refund_id)
+        .bind(&input.wallet_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if gateway_update.rows_affected() != 1 {
+            return Err(DataLayerError::UnexpectedValue(
+                "refund status changed during gateway evidence update".to_string(),
+            ));
+        }
+        let updated = map_refund_row(&sqlite_refund_by_id(&mut tx, &input.refund_id).await?)?;
+        tx.commit().await.map_sql_err()?;
+        Ok(WalletMutationOutcome::Applied(updated))
     }
 
     async fn fail_admin_wallet_refund(
@@ -2416,7 +4039,11 @@ WHERE id = ? AND wallet_id = ?
         DataLayerError,
     > {
         let now = current_unix_secs_i64();
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
         let Some(refund_row) =
             sqlite_refund_by_id_and_wallet(&mut tx, &input.refund_id, &input.wallet_id).await?
         else {
@@ -2424,15 +4051,21 @@ WHERE id = ? AND wallet_id = ?
             return Ok(WalletMutationOutcome::NotFound);
         };
         let refund = map_refund_row(&refund_row)?;
+        if !refund.amount_usd.is_finite() || refund.amount_usd <= 0.0 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "refund amount must be finite and greater than zero".to_string(),
+            ));
+        }
 
         if matches!(refund.status.as_str(), "pending_approval" | "approved") {
-            sqlx::query(
+            let refund_update = sqlx::query(
                 r#"
 UPDATE refund_requests
 SET status = 'failed',
     failure_reason = ?,
     updated_at = ?
-WHERE id = ? AND wallet_id = ?
+WHERE id = ? AND wallet_id = ? AND status IN ('pending_approval', 'approved')
 "#,
             )
             .bind(&input.reason)
@@ -2442,6 +4075,11 @@ WHERE id = ? AND wallet_id = ?
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
+            if refund_update.rows_affected() != 1 {
+                return Err(DataLayerError::UnexpectedValue(
+                    "refund status changed during refund failure".to_string(),
+                ));
+            }
             let wallet = map_wallet_row(&sqlite_wallet_by_id(&mut tx, &input.wallet_id).await?)?;
             let refund = map_refund_row(&sqlite_refund_by_id(&mut tx, &input.refund_id).await?)?;
             tx.commit().await.map_sql_err()?;
@@ -2456,6 +4094,22 @@ WHERE id = ? AND wallet_id = ?
             )));
         }
 
+        // Only an explicitly offline payout can be released without external
+        // settlement evidence.  An original-channel refund may still be in
+        // flight between the provider request and the evidence update.
+        if refund.gateway_refund_id.is_some()
+            || refund.payout_proof.is_some()
+            || !refund
+                .refund_mode
+                .trim()
+                .eq_ignore_ascii_case("offline_payout")
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "cannot fail refund while gateway settlement is processing".to_string(),
+            ));
+        }
+
         let Some(wallet_row) = sqlite_wallet_by_id_optional(&mut tx, &input.wallet_id).await?
         else {
             tx.commit().await.map_sql_err()?;
@@ -2466,26 +4120,95 @@ WHERE id = ? AND wallet_id = ?
         let amount_usd = refund.amount_usd;
         let before_recharge = sqlite_real(&wallet_row, "balance")?;
         let before_gift = sqlite_real(&wallet_row, "gift_balance")?;
+        let before_total_refunded = sqlite_real(&wallet_row, "total_refunded")?;
         let before_total = before_recharge + before_gift;
         let after_recharge = before_recharge + amount_usd;
+        let after_total = after_recharge + before_gift;
+        let after_total_refunded = before_total_refunded - amount_usd;
+        if !before_recharge.is_finite()
+            || before_recharge < 0.0
+            || !before_gift.is_finite()
+            || before_gift < 0.0
+            || !before_total_refunded.is_finite()
+            || before_total_refunded < 0.0
+            || before_total_refunded < amount_usd
+            || !before_total.is_finite()
+            || !after_recharge.is_finite()
+            || !after_total.is_finite()
+            || !after_total_refunded.is_finite()
+            || after_total_refunded < 0.0
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet balance is invalid for refund recovery".to_string(),
+            ));
+        }
 
-        sqlx::query(
+        let mut order_amounts = None;
+        if let Some(payment_order_id) = refund.payment_order_id.as_deref() {
+            let Some(order_row) =
+                sqlite_payment_order_by_id_optional(&mut tx, payment_order_id).await?
+            else {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Invalid(
+                    "payment order not found".to_string(),
+                ));
+            };
+            let order = map_payment_order_row(&order_row)?;
+            if order.wallet_id != input.wallet_id || order.status != "credited" {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Invalid(
+                    "payment order is not refundable for this wallet".to_string(),
+                ));
+            }
+            let refunded_before = order.refunded_amount_usd;
+            let refundable_before = order.refundable_amount_usd;
+            let refunded_after = refunded_before - amount_usd;
+            let refundable_after = refundable_before + amount_usd;
+            if !payment_order_refund_amounts_are_consistent(
+                order.amount_usd,
+                refunded_before,
+                refundable_before,
+            ) || refunded_before < amount_usd
+                || !refunded_after.is_finite()
+                || refunded_after < 0.0
+                || !refundable_after.is_finite()
+                || refundable_after < 0.0
+                || refundable_after > order.amount_usd
+            {
+                tx.commit().await.map_sql_err()?;
+                return Ok(WalletMutationOutcome::Invalid(
+                    "payment order refund amounts are invalid".to_string(),
+                ));
+            }
+            order_amounts = Some((
+                payment_order_id.to_string(),
+                refunded_after,
+                refundable_after,
+            ));
+        }
+
+        let wallet_update = sqlx::query(
             r#"
 UPDATE wallets
 SET balance = ?,
-    total_refunded = MAX(total_refunded - ?, 0),
+    total_refunded = ?,
     updated_at = ?
 WHERE id = ?
 "#,
         )
         .bind(after_recharge)
-        .bind(amount_usd)
+        .bind(after_total_refunded)
         .bind(now)
         .bind(&input.wallet_id)
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
-        let wallet = map_wallet_row(&sqlite_wallet_by_id(&mut tx, &input.wallet_id).await?)?;
+        if wallet_update.rows_affected() != 1 {
+            return Err(DataLayerError::UnexpectedValue(
+                "wallet disappeared during refund recovery".to_string(),
+            ));
+        }
 
         let transaction_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
@@ -2502,7 +4225,7 @@ VALUES (?, ?, 'refund', 'refund_revert', ?, ?, ?, ?, ?, ?, ?, 'refund_request', 
         .bind(&input.wallet_id)
         .bind(amount_usd)
         .bind(before_total)
-        .bind(after_recharge + before_gift)
+        .bind(after_total)
         .bind(before_recharge)
         .bind(after_recharge)
         .bind(before_gift)
@@ -2514,30 +4237,35 @@ VALUES (?, ?, 'refund', 'refund_revert', ?, ?, ?, ?, ?, ?, ?, 'refund_request', 
         .await
         .map_sql_err()?;
 
-        if let Some(payment_order_id) = refund.payment_order_id.as_deref() {
-            sqlx::query(
+        if let Some((payment_order_id, refunded_after, refundable_after)) = order_amounts {
+            let result = sqlx::query(
                 r#"
 UPDATE payment_orders
-SET refunded_amount_usd = refunded_amount_usd - ?,
-    refundable_amount_usd = refundable_amount_usd + ?
+SET refunded_amount_usd = ?,
+    refundable_amount_usd = ?
 WHERE id = ?
 "#,
             )
-            .bind(amount_usd)
-            .bind(amount_usd)
+            .bind(refunded_after)
+            .bind(refundable_after)
             .bind(payment_order_id)
             .execute(&mut *tx)
             .await
             .map_sql_err()?;
+            if result.rows_affected() != 1 {
+                return Err(DataLayerError::UnexpectedValue(
+                    "payment order disappeared during refund recovery".to_string(),
+                ));
+            }
         }
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
 UPDATE refund_requests
 SET status = 'failed',
     failure_reason = ?,
     updated_at = ?
-WHERE id = ? AND wallet_id = ?
+WHERE id = ? AND wallet_id = ? AND status = 'processing'
 "#,
         )
         .bind(&input.reason)
@@ -2547,6 +4275,12 @@ WHERE id = ? AND wallet_id = ?
         .execute(&mut *tx)
         .await
         .map_sql_err()?;
+        if result.rows_affected() != 1 {
+            return Err(DataLayerError::UnexpectedValue(
+                "refund status changed during recovery".to_string(),
+            ));
+        }
+        let wallet = map_wallet_row(&sqlite_wallet_by_id(&mut tx, &input.wallet_id).await?)?;
         let refund = map_refund_row(&sqlite_refund_by_id(&mut tx, &input.refund_id).await?)?;
         tx.commit().await.map_sql_err()?;
         Ok(WalletMutationOutcome::Applied((
@@ -2559,7 +4293,7 @@ WHERE id = ? AND wallet_id = ?
                 reason_code: "refund_revert".to_string(),
                 amount: amount_usd,
                 balance_before: before_total,
-                balance_after: after_recharge + before_gift,
+                balance_after: after_total,
                 recharge_balance_before: before_recharge,
                 recharge_balance_after: after_recharge,
                 gift_balance_before: before_gift,
@@ -2695,15 +4429,31 @@ WHERE id = ? AND wallet_id = ?
         }
         if order
             .expires_at_unix_secs
-            .is_some_and(|value| value < now as u64)
+            .is_some_and(|value| value <= now as u64)
         {
             tx.commit().await.map_sql_err()?;
             return Ok(WalletMutationOutcome::Invalid(
                 "payment order expired".to_string(),
             ));
         }
-
         let order_kind: String = get(&order_row, "order_kind")?;
+        let order_payment_provider: Option<String> = get(&order_row, "payment_provider")?;
+        let order_payment_channel: Option<String> = get(&order_row, "payment_channel")?;
+        if validate_payment_order_credit_amounts(
+            &order_kind,
+            &order.payment_method,
+            order_payment_provider.as_deref(),
+            order_payment_channel.as_deref(),
+            order.amount_usd,
+            order.pay_amount,
+        )
+        .is_err()
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "payment order amount is invalid".to_string(),
+            ));
+        }
         if order_kind == "plan_purchase" {
             let order_user_id: Option<String> = get(&order_row, "user_id")?;
             let Some(user_id) = order_user_id else {
@@ -2793,7 +4543,7 @@ VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
                 .bind(&plan_id)
                 .bind(&input.order_id)
                 .bind(now)
-                .bind(plan_expires_at_unix(&snapshot, now))
+                .bind(plan_expires_at_unix(&snapshot, now)?)
                 .bind(json_string(
                     &entitlements,
                     "user_plan_entitlements.entitlements_snapshot",
@@ -2889,6 +4639,20 @@ WHERE id = ?
 
         let before_recharge = sqlite_real(&wallet_row, "balance")?;
         let before_gift = sqlite_real(&wallet_row, "gift_balance")?;
+        let total_recharged = sqlite_real(&wallet_row, "total_recharged")?;
+        if !before_recharge.is_finite()
+            || !before_gift.is_finite()
+            || before_gift < 0.0
+            || !total_recharged.is_finite()
+            || total_recharged < 0.0
+            || !(total_recharged + order.amount_usd).is_finite()
+            || !(before_recharge + before_gift + order.amount_usd).is_finite()
+        {
+            tx.commit().await.map_sql_err()?;
+            return Ok(WalletMutationOutcome::Invalid(
+                "wallet balance is invalid".to_string(),
+            ));
+        }
         let before_total = before_recharge + before_gift;
         let after_recharge = before_recharge + order.amount_usd;
         sqlx::query(
@@ -2993,9 +4757,19 @@ WHERE id = ?
         &self,
         input: CreateAdminRedeemCodeBatchInput,
     ) -> Result<CreateAdminRedeemCodeBatchResult, DataLayerError> {
+        validate_admin_redeem_code_batch_input(&input).map_err(DataLayerError::InvalidInput)?;
         let now = current_unix_secs_i64();
         let batch_id = uuid::Uuid::new_v4().to_string();
-        let expires_at = input.expires_at_unix_secs.map(|value| value as i64);
+        let expires_at = input
+            .expires_at_unix_secs
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    DataLayerError::InvalidInput(
+                        "redeem code batch expires_at overflow".to_string(),
+                    )
+                })
+            })
+            .transpose()?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
 
         sqlx::query(
@@ -3327,7 +5101,6 @@ LIMIT 1
         let batch_name: String = get(&code_row, "batch_name")?;
         let balance_bucket: String = get(&code_row, "balance_bucket")?;
         let amount_usd = sqlite_real(&code_row, "amount_usd")?;
-        let credits_recharge_balance = redeem_code_credits_recharge_balance(&balance_bucket);
 
         let wallet_row = sqlite_wallet_by_user_id(&mut tx, &input.user_id).await?;
         let wallet_id = if let Some(row) = wallet_row.as_ref() {
@@ -3341,14 +5114,16 @@ LIMIT 1
             uuid::Uuid::new_v4().to_string()
         };
 
-        let (before_recharge, before_gift) = if let Some(row) = wallet_row.as_ref() {
-            (
-                sqlite_real(row, "balance")?,
-                sqlite_real(row, "gift_balance")?,
-            )
-        } else {
-            sqlx::query(
-                r#"
+        let (before_recharge, before_gift, before_total_recharged) =
+            if let Some(row) = wallet_row.as_ref() {
+                (
+                    sqlite_real(row, "balance")?,
+                    sqlite_real(row, "gift_balance")?,
+                    sqlite_real(row, "total_recharged")?,
+                )
+            } else {
+                sqlx::query(
+                    r#"
 INSERT INTO wallets (
   id, user_id, balance, gift_balance, limit_mode, currency, status,
   total_recharged, total_consumed, total_refunded, total_adjusted,
@@ -3356,39 +5131,37 @@ INSERT INTO wallets (
 )
 VALUES (?, ?, 0.0, 0.0, 'finite', 'USD', 'active', 0.0, 0.0, 0.0, 0.0, ?, ?)
 "#,
-            )
-            .bind(&wallet_id)
-            .bind(&input.user_id)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_sql_err()?;
-            (0.0, 0.0)
-        };
-        let after_recharge = if credits_recharge_balance {
-            before_recharge + amount_usd
-        } else {
-            before_recharge
-        };
-        let after_gift = if credits_recharge_balance {
-            before_gift
-        } else {
-            before_gift + amount_usd
-        };
+                )
+                .bind(&wallet_id)
+                .bind(&input.user_id)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+                (0.0, 0.0, 0.0)
+            };
+        let (after_recharge, after_gift, after_total_recharged) = validate_redeem_wallet_credit(
+            &balance_bucket,
+            amount_usd,
+            before_recharge,
+            before_gift,
+            before_total_recharged,
+        )
+        .map_err(DataLayerError::UnexpectedValue)?;
         sqlx::query(
             r#"
 UPDATE wallets
 SET balance = ?,
     gift_balance = ?,
-    total_recharged = total_recharged + ?,
+    total_recharged = ?,
     updated_at = ?
 WHERE id = ?
 "#,
         )
         .bind(after_recharge)
         .bind(after_gift)
-        .bind(amount_usd)
+        .bind(after_total_recharged)
         .bind(now)
         .bind(&wallet_id)
         .execute(&mut *tx)
@@ -3699,34 +5472,14 @@ fn plan_purchase_limit_scope(snapshot: &serde_json::Value) -> &str {
     }
 }
 
-fn plan_replacement_entitlement_types(snapshot: &serde_json::Value) -> Vec<&'static str> {
-    let entitlements = plan_entitlements_snapshot(snapshot);
-    let mut kinds = Vec::new();
-    if entitlement_snapshot_has_type(&entitlements, "daily_quota") {
-        kinds.push("daily_quota");
-    }
-    if entitlement_snapshot_has_type(&entitlements, "membership_group") {
-        kinds.push("membership_group");
-    }
-    kinds
-}
-
-fn entitlement_snapshot_has_type(snapshot: &serde_json::Value, entitlement_type: &str) -> bool {
-    snapshot.as_array().is_some_and(|items| {
-        items
-            .iter()
-            .any(|item| item.get("type").and_then(|value| value.as_str()) == Some(entitlement_type))
-    })
-}
-
 async fn replace_matching_plan_entitlements_sqlite(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     user_id: &str,
     snapshot: &serde_json::Value,
     now: i64,
 ) -> Result<(), DataLayerError> {
-    let replacement_types = plan_replacement_entitlement_types(snapshot);
-    if replacement_types.is_empty() {
+    let incoming_entitlements = plan_entitlements_snapshot(snapshot);
+    if !entitlements_have_replacement_selector(&incoming_entitlements) {
         return Ok(());
     }
 
@@ -3751,9 +5504,8 @@ WHERE user_id = ?
             "user_plan_entitlements.entitlements_snapshot",
         )?
         .unwrap_or_else(|| serde_json::json!([]));
-        let should_replace = replacement_types
-            .iter()
-            .any(|kind| entitlement_snapshot_has_type(&entitlements, kind));
+        let should_replace =
+            entitlements_should_replace_existing(&incoming_entitlements, &entitlements);
         if !should_replace {
             continue;
         }
@@ -3781,22 +5533,18 @@ WHERE id = ?
     Ok(())
 }
 
-fn plan_expires_at_unix(snapshot: &serde_json::Value, starts_at_unix_secs: i64) -> i64 {
-    let duration_value = snapshot
-        .get("duration_value")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(1)
-        .max(1);
-    let days = match snapshot
-        .get("duration_unit")
-        .and_then(|value| value.as_str())
-        .unwrap_or("month")
-    {
-        "day" | "custom" => duration_value,
-        "year" => 365 * duration_value,
-        _ => 30 * duration_value,
-    };
-    starts_at_unix_secs.saturating_add(days.saturating_mul(86_400))
+fn plan_expires_at_unix(
+    snapshot: &serde_json::Value,
+    starts_at_unix_secs: i64,
+) -> Result<i64, DataLayerError> {
+    let days =
+        checked_plan_duration_days_from_snapshot(snapshot).map_err(DataLayerError::InvalidInput)?;
+    let seconds = days.checked_mul(86_400).ok_or_else(|| {
+        DataLayerError::InvalidInput("plan duration exceeds the supported range".to_string())
+    })?;
+    starts_at_unix_secs.checked_add(seconds).ok_or_else(|| {
+        DataLayerError::InvalidInput("plan expiration exceeds the supported range".to_string())
+    })
 }
 
 async fn apply_plan_wallet_credit_sqlite(
@@ -3807,11 +5555,16 @@ async fn apply_plan_wallet_credit_sqlite(
     entitlements: &serde_json::Value,
     now: i64,
 ) -> Result<(), DataLayerError> {
+    validate_plan_wallet_credit_entitlements(entitlements).map_err(DataLayerError::InvalidInput)?;
     let credits = entitlements
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("wallet_credit"))
+        .filter(|item| {
+            item.get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("wallet_credit"))
+        })
         .filter_map(|item| {
             let amount = item.get("amount_usd").and_then(|value| value.as_f64())?;
             if amount <= 0.0 || !amount.is_finite() {
@@ -3821,6 +5574,7 @@ async fn apply_plan_wallet_credit_sqlite(
                 .get("balance_bucket")
                 .and_then(|value| value.as_str())
                 .unwrap_or("gift")
+                .trim()
                 .to_ascii_lowercase();
             Some((amount, bucket))
         })
@@ -3829,7 +5583,7 @@ async fn apply_plan_wallet_credit_sqlite(
         return Ok(());
     }
     let Some(wallet_row) =
-        sqlx::query("SELECT id, status, balance, gift_balance FROM wallets WHERE id = ? LIMIT 1")
+        sqlx::query("SELECT id, status, balance, gift_balance, total_recharged FROM wallets WHERE id = ? LIMIT 1")
             .bind(wallet_id)
             .fetch_optional(&mut **tx)
             .await
@@ -3847,6 +5601,17 @@ async fn apply_plan_wallet_credit_sqlite(
     }
     let mut recharge_balance = sqlite_real(&wallet_row, "balance")?;
     let mut gift_balance = sqlite_real(&wallet_row, "gift_balance")?;
+    let mut total_recharged = sqlite_real(&wallet_row, "total_recharged")?;
+    if !recharge_balance.is_finite()
+        || !gift_balance.is_finite()
+        || gift_balance < 0.0
+        || !total_recharged.is_finite()
+        || total_recharged < 0.0
+    {
+        return Err(DataLayerError::UnexpectedValue(
+            "wallet balance is invalid for plan wallet_credit".to_string(),
+        ));
+    }
     for (amount, bucket) in credits {
         let before_recharge = recharge_balance;
         let before_gift = gift_balance;
@@ -3854,23 +5619,34 @@ async fn apply_plan_wallet_credit_sqlite(
         let credits_recharge = bucket == "recharge";
         if credits_recharge {
             recharge_balance += amount;
+            total_recharged += amount;
         } else {
             gift_balance += amount;
         }
         let after_total = recharge_balance + gift_balance;
+        if !before_total.is_finite()
+            || !recharge_balance.is_finite()
+            || !gift_balance.is_finite()
+            || !total_recharged.is_finite()
+            || !after_total.is_finite()
+        {
+            return Err(DataLayerError::UnexpectedValue(
+                "wallet balance overflow for plan wallet_credit".to_string(),
+            ));
+        }
         sqlx::query(
             r#"
 UPDATE wallets
 SET balance = ?,
     gift_balance = ?,
-    total_recharged = total_recharged + ?,
+    total_recharged = ?,
     updated_at = ?
 WHERE id = ?
             "#,
         )
         .bind(recharge_balance)
         .bind(gift_balance)
-        .bind(if credits_recharge { amount } else { 0.0 })
+        .bind(total_recharged)
         .bind(now)
         .bind(wallet_id)
         .execute(&mut **tx)
@@ -3903,16 +5679,6 @@ VALUES (?, ?, 'recharge', 'plan_wallet_credit', ?, ?, ?, ?, ?, ?, ?, 'payment_or
         .map_sql_err()?;
     }
     Ok(())
-}
-
-fn default_refund_mode_for_payment_method(payment_method: &str) -> &'static str {
-    if matches!(
-        payment_method,
-        "admin_manual" | "card_recharge" | "card_code" | "gift_code"
-    ) {
-        return "offline_payout";
-    }
-    "original_channel"
 }
 
 fn payment_gateway_response_map(
@@ -4115,14 +5881,65 @@ async fn sqlite_payment_order_by_order_no(
 
 async fn sqlite_payment_order_by_gateway_order_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    payment_method: &str,
     gateway_order_id: &str,
 ) -> Result<Option<SqliteRow>, DataLayerError> {
-    let sql = payment_order_select_sql("WHERE gateway_order_id = ? LIMIT 1");
+    let sql = payment_order_select_sql("WHERE payment_method = ? AND gateway_order_id = ? LIMIT 1");
     sqlx::query(&sql)
+        .bind(payment_method)
         .bind(gateway_order_id)
         .fetch_optional(&mut **tx)
         .await
         .map_sql_err()
+}
+
+async fn sqlite_bind_payment_gateway_order_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    order_id: &str,
+    gateway_order_id: &str,
+) -> Result<bool, DataLayerError> {
+    sqlx::query("SAVEPOINT payment_gateway_order_binding")
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    let bind_result = sqlx::query("UPDATE payment_orders SET gateway_order_id = ? WHERE id = ?")
+        .bind(gateway_order_id)
+        .bind(order_id)
+        .execute(&mut **tx)
+        .await;
+    match bind_result {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT payment_gateway_order_binding")
+                .execute(&mut **tx)
+                .await
+                .map_sql_err()?;
+            Ok(true)
+        }
+        Err(error)
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation()) =>
+        {
+            sqlx::query("ROLLBACK TO SAVEPOINT payment_gateway_order_binding")
+                .execute(&mut **tx)
+                .await
+                .map_sql_err()?;
+            sqlx::query("RELEASE SAVEPOINT payment_gateway_order_binding")
+                .execute(&mut **tx)
+                .await
+                .map_sql_err()?;
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK TO SAVEPOINT payment_gateway_order_binding")
+                .execute(&mut **tx)
+                .await;
+            let _ = sqlx::query("RELEASE SAVEPOINT payment_gateway_order_binding")
+                .execute(&mut **tx)
+                .await;
+            Err(DataLayerError::sql(error))
+        }
+    }
 }
 
 fn refund_select_sql(where_clause: &str) -> String {
@@ -4258,7 +6075,7 @@ async fn update_sqlite_payment_callback_failure(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     callback_id: &str,
     input: &ProcessPaymentCallbackInput,
-    payload: &str,
+    _payload: &str,
     error: &str,
 ) -> Result<(), DataLayerError> {
     sqlx::query(
@@ -4268,20 +6085,15 @@ SET signature_valid = ?,
     status = 'failed',
     error_message = ?,
     payload_hash = ?,
-    payload = ?,
-    processed_at = ?,
-    order_no = COALESCE(?, order_no),
-    gateway_order_id = COALESCE(?, gateway_order_id)
+    payload = NULL,
+    processed_at = ?
 WHERE id = ?
 "#,
     )
     .bind(sqlite_bool(input.signature_valid))
     .bind(error)
     .bind(&input.payload_hash)
-    .bind(payload)
     .bind(current_unix_secs_i64())
-    .bind(input.order_no.as_deref())
-    .bind(input.gateway_order_id.as_deref())
     .bind(callback_id)
     .execute(&mut **tx)
     .await
@@ -4293,7 +6105,7 @@ async fn mark_sqlite_payment_callback_processed(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     callback_id: &str,
     input: &ProcessPaymentCallbackInput,
-    payload: &str,
+    _payload: &str,
     order_id: &str,
     order_no: &str,
 ) -> Result<(), DataLayerError> {
@@ -4305,7 +6117,7 @@ SET payment_order_id = ?,
     status = 'processed',
     error_message = NULL,
     payload_hash = ?,
-    payload = ?,
+    payload = NULL,
     processed_at = ?,
     order_no = ?,
     gateway_order_id = COALESCE(?, gateway_order_id)
@@ -4314,7 +6126,6 @@ WHERE id = ?
     )
     .bind(order_id)
     .bind(&input.payload_hash)
-    .bind(payload)
     .bind(current_unix_secs_i64())
     .bind(order_no)
     .bind(input.gateway_order_id.as_deref())
@@ -4394,7 +6205,20 @@ async fn initialize_sqlite_auth_wallet(
     api_key_id: Option<&str>,
     initial_gift_usd: f64,
     unlimited: bool,
-) -> Result<Option<StoredWalletSnapshot>, DataLayerError> {
+) -> Result<Option<(StoredWalletSnapshot, bool)>, DataLayerError> {
+    let owner = user_id
+        .or(api_key_id)
+        .filter(|value| !value.trim().is_empty());
+    if owner.is_none() || (user_id.is_some() && api_key_id.is_some()) {
+        return Err(DataLayerError::InvalidInput(
+            "wallet owner must be exactly one non-empty user or API-key id".to_string(),
+        ));
+    }
+    if !initial_gift_usd.is_finite() {
+        return Err(DataLayerError::InvalidInput(
+            "initial gift amount must be finite".to_string(),
+        ));
+    }
     let gift_amount = if unlimited {
         0.0
     } else {
@@ -4416,8 +6240,77 @@ async fn initialize_sqlite_auth_wallet(
         gift_amount,
         now,
     )?;
-    let mut tx = pool.begin().await.map_sql_err()?;
-    sqlx::query(
+    // Keep the owner lookup and insert in one writer transaction so concurrent
+    // initialization retries cannot mint duplicate wallets or gift entries.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_sql_err()?;
+    let owner_column = if user_id.is_some() {
+        "user_id"
+    } else {
+        "api_key_id"
+    };
+    let owner_value = owner.expect("validated wallet owner");
+
+    // SQLite's baseline schema does not declare owner foreign keys on wallets.
+    // Validate the owner while holding the writer transaction so a wallet (and
+    // its initial gift journal entry) can never be created for a missing auth
+    // record.
+    if let Some(user_id) = user_id {
+        let user_exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if user_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        }
+    } else {
+        let api_key_user_id: Option<String> =
+            sqlx::query_scalar("SELECT user_id FROM api_keys WHERE id = ?")
+                .bind(owner_value)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+        let Some(api_key_user_id) = api_key_user_id else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        };
+        let user_exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+            .bind(&api_key_user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if user_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        }
+        let api_key_exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM api_keys WHERE id = ? AND user_id = ?")
+                .bind(owner_value)
+                .bind(&api_key_user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+        if api_key_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        }
+    }
+
+    let existing_row = sqlx::query(&wallet_select_sql(&format!(
+        "WHERE {owner_column} = ? LIMIT 1"
+    )))
+    .bind(owner_value)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_sql_err()?;
+    if let Some(row) = existing_row {
+        let existing = map_wallet_row(&row)?;
+        tx.commit().await.map_sql_err()?;
+        return Ok(Some((existing, false)));
+    }
+
+    let insert_result = sqlx::query(
         r#"
 INSERT INTO wallets (
   id, user_id, api_key_id, balance, gift_balance, limit_mode, currency,
@@ -4425,6 +6318,7 @@ INSERT INTO wallets (
   created_at, updated_at
 )
 VALUES (?, ?, ?, 0, ?, ?, 'USD', 'active', 0, 0, 0, ?, ?, ?)
+ON CONFLICT DO NOTHING
 "#,
     )
     .bind(&wallet.id)
@@ -4438,6 +6332,26 @@ VALUES (?, ?, ?, 0, ?, ?, 'USD', 'active', 0, 0, 0, ?, ?, ?)
     .execute(&mut *tx)
     .await
     .map_sql_err()?;
+    if insert_result.rows_affected() == 0 {
+        // Another initializer may have won the owner race. If no owner row is
+        // visible, the generated wallet id collided with a different owner.
+        let row = sqlx::query(&wallet_select_sql(&format!(
+            "WHERE {owner_column} = ? LIMIT 1"
+        )))
+        .bind(owner_value)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if let Some(row) = row {
+            let existing = map_wallet_row(&row)?;
+            tx.commit().await.map_sql_err()?;
+            return Ok(Some((existing, false)));
+        }
+        tx.rollback().await.map_sql_err()?;
+        return Err(DataLayerError::InvalidInput(
+            "wallet identifier already belongs to another owner".to_string(),
+        ));
+    }
     if gift_amount > 0.0 {
         let link_id = user_id.or(api_key_id).unwrap_or_default();
         let description = if api_key_id.is_some() {
@@ -4467,8 +6381,34 @@ VALUES (?, ?, 'gift', 'gift_initial', ?, 0, ?, 0, 0, 0, ?, 'system_task', ?, NUL
         .await
         .map_sql_err()?;
     }
+    let row = sqlite_wallet_by_id(&mut tx, &wallet.id).await?;
+    let wallet = map_wallet_row(&row)?;
     tx.commit().await.map_sql_err()?;
-    Ok(Some(wallet))
+    Ok(Some((wallet, true)))
+}
+
+fn sqlite_wallet_recharge_replay_matches(
+    row: &SqliteRow,
+    wallet_id: &str,
+    input: &CreateWalletRechargeOrderInput,
+) -> Result<bool, DataLayerError> {
+    let existing_wallet_id: String = get(row, "wallet_id")?;
+    let pay_currency: Option<String> = get(row, "pay_currency")?;
+    let payment_method: String = get(row, "payment_method")?;
+    let payment_provider: Option<String> = get(row, "payment_provider")?;
+    let payment_channel: Option<String> = get(row, "payment_channel")?;
+    Ok(wallet_recharge_replay_matches(
+        &existing_wallet_id,
+        sqlite_real(row, "amount_usd")?,
+        sqlite_optional_real(row, "pay_amount")?,
+        pay_currency.as_deref(),
+        sqlite_optional_real(row, "exchange_rate")?,
+        &payment_method,
+        payment_provider.as_deref(),
+        payment_channel.as_deref(),
+        wallet_id,
+        input,
+    ))
 }
 
 fn map_payment_order_row(row: &SqliteRow) -> Result<StoredAdminPaymentOrder, DataLayerError> {
@@ -4484,6 +6424,8 @@ fn map_payment_order_row(row: &SqliteRow) -> Result<StoredAdminPaymentOrder, Dat
         refunded_amount_usd: sqlite_real(row, "refunded_amount_usd")?,
         refundable_amount_usd: sqlite_real(row, "refundable_amount_usd")?,
         payment_method: get(row, "payment_method")?,
+        payment_provider: get(row, "payment_provider")?,
+        order_kind: get(row, "order_kind")?,
         gateway_order_id: get(row, "gateway_order_id")?,
         gateway_response: optional_json(
             get(row, "gateway_response")?,

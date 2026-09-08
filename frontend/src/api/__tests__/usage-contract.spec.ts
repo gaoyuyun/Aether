@@ -157,4 +157,29 @@ describe('usageApi contract alignment', () => {
       timeout: 120000,
     })
   })
+
+  it('passes the WebSocket usage type filter to the admin records endpoint', async () => {
+    getMock.mockResolvedValueOnce({
+      data: {
+        records: [],
+        total: 0,
+        limit: 20,
+        offset: 0,
+      },
+    })
+
+    await usageApi.getAllUsageRecords({
+      status: 'websocket',
+      limit: 20,
+      offset: 0,
+    })
+
+    expect(getMock).toHaveBeenCalledWith('/api/admin/usage/records', {
+      params: {
+        status: 'websocket',
+        limit: 20,
+        offset: 0,
+      },
+    })
+  })
 })

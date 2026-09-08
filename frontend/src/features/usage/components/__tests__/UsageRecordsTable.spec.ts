@@ -47,7 +47,15 @@ vi.mock('@/components/ui', async () => {
     TableCell: passthrough('TableCellStub', 'td'),
     Pagination: passthrough('PaginationStub'),
     SortableTableHead: passthrough('SortableTableHeadStub', 'th'),
-    TableFilterMenu: passthrough('TableFilterMenuStub'),
+    TableFilterMenu: defineComponent({
+      name: 'TableFilterMenuStub',
+      props: { options: Array },
+      setup(props) {
+        return () => h('div', { 'data-table-filter-menu': '' },
+          (props.options as Array<{ value: string, label: string }> | undefined)
+            ?.map(option => h('div', { 'data-filter-value': option.value }, option.label)))
+      },
+    }),
   }
 })
 
@@ -366,15 +374,76 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).toContain('gpt-5')
   })
 
-  it('shows WS in the type column for completed WebSocket usage records', () => {
+  it('keeps the type label as WS after Responses detail enriches transport metadata', () => {
     const root = mountUsageRecordsTable([buildRecord({
       is_websocket: true,
+      websocket_transport: 'responses',
       status: 'completed',
     })])
 
     const badges = [...root.querySelectorAll<HTMLElement>('[data-usage-transport="websocket"]')]
     expect(badges.length).toBeGreaterThan(0)
     expect(badges.every(badge => badge.textContent?.trim() === 'WS')).toBe(true)
+    expect(badges.every(badge => badge.title === 'OpenAI Responses WebSocket')).toBe(true)
+  })
+
+  it('falls back to WS when transport metadata is unavailable', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      is_websocket: true,
+      websocket_transport: null,
+      status: 'completed',
+    })])
+
+    const badges = [...root.querySelectorAll<HTMLElement>('[data-usage-transport="websocket"]')]
+    expect(badges.length).toBeGreaterThan(0)
+    expect(badges.every(badge => badge.textContent?.trim() === 'WS')).toBe(true)
+    expect(badges.every(badge => badge.title === 'WebSocket')).toBe(true)
+  })
+
+  it('offers a WebSocket type filter in both filter menus', () => {
+    const root = mountUsageRecordsTable([buildRecord()])
+
+    const labels = [...root.querySelectorAll<HTMLElement>('div')]
+      .filter(element => element.textContent?.trim() === 'WebSocket (WS)')
+    expect(labels.length).toBeGreaterThanOrEqual(2)
+    expect(root.textContent).toContain('HTTP 流式')
+    expect(root.textContent).toContain('HTTP 标准')
+  })
+
+  it('keeps OpenAI Live transport rows under the single WS type without inventing usage', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      is_websocket: true,
+      websocket_transport: 'codex_live_direct',
+      usage_available: false,
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      cost: 0,
+    })])
+
+    const badges = [...root.querySelectorAll<HTMLElement>('[data-usage-transport="websocket"]')]
+    expect(badges.length).toBeGreaterThan(0)
+    expect(badges.every(badge => badge.textContent?.trim() === 'WS')).toBe(true)
+    expect(badges.every(badge => badge.title === 'OpenAI Live 直连 WebSocket')).toBe(true)
+
+    const unavailableTokens = [...root.querySelectorAll<HTMLElement>('[data-usage-unavailable="tokens"]')]
+    const unavailableCosts = [...root.querySelectorAll<HTMLElement>('[data-usage-unavailable="cost"]')]
+    expect(unavailableTokens.length).toBeGreaterThanOrEqual(2)
+    expect(unavailableCosts.length).toBeGreaterThanOrEqual(2)
+    expect(unavailableTokens.every(element => element.textContent?.trim() === '不可用')).toBe(true)
+    expect(unavailableCosts.every(element => element.textContent?.trim() === '不可用')).toBe(true)
+  })
+
+  it('keeps OpenAI Realtime rows under the single WS type in both layouts', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      is_websocket: true,
+      websocket_transport: 'openai_realtime',
+    })])
+
+    const badges = [...root.querySelectorAll<HTMLElement>('[data-usage-transport="websocket"]')]
+    expect(badges.length).toBeGreaterThan(0)
+    expect(badges.every(badge => badge.textContent?.trim() === 'WS')).toBe(true)
+    expect(badges.every(badge => badge.title === 'OpenAI Realtime WebSocket')).toBe(true)
   })
 
   it('shows the final provider to a non-admin user when visibility is enabled', () => {
@@ -605,6 +674,18 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).toContain('Gemini Embedding')
     expect(root.textContent).toContain('Jina Embedding')
     expect(root.textContent).toContain('Doubao Embedding')
+    const liveLabels = [...root.querySelectorAll<HTMLElement>('div')]
+      .filter(element => element.textContent?.trim() === 'OpenAI Live')
+    expect(liveLabels.length).toBeGreaterThanOrEqual(2)
+    expect(root.querySelector('[data-filter-value="codex:live"]')).not.toBeNull()
+  })
+
+  it('does not expose the canonical Codex Live id in row labels or tooltips', () => {
+    const root = mountUsageRecordsTable([buildRecord({ api_format: 'codex:live' })])
+
+    expect(root.textContent).toContain('OpenAI Live')
+    expect(root.textContent).not.toContain('codex:live')
+    expect(root.querySelector('[title="OpenAI Live"]')).not.toBeNull()
   })
 
   it('emits hide unknown toggle changes', () => {

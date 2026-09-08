@@ -244,6 +244,22 @@ mod tests {
             ),
             "/v1beta/models/gemini-3-flash-preview:generateContent?alt=sse&pageSize=10"
         );
+        assert_eq!(
+            sanitize_access_log_path("/v1/live/rtc_secret_opaque?token=hidden"),
+            "/v1/live/{call_id}"
+        );
+        assert_eq!(
+            sanitize_access_log_path(
+                "/v1/realtime?model=gpt-realtime-2.1&api_key=secret&token=hidden"
+            ),
+            "/v1/realtime?model=gpt-realtime-2.1"
+        );
+        assert_eq!(
+            sanitize_access_log_path(
+                "/v1/realtime?intent=quicksilver&call_id=rtc_secret_opaque&model=gpt-realtime-1.5&api_key=secret"
+            ),
+            "/v1/realtime?call_id=%7Bcall_id%7D&model=gpt-realtime-1.5"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

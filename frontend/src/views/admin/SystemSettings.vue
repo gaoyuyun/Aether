@@ -50,12 +50,14 @@
           <ProxyConfigSection
             id="section-proxy"
             :proxy-node-id="systemConfig.system_proxy_node_id"
+            :extra-trusted-dns-hosts-str="extraTrustedDnsHostsStr"
             :online-nodes="proxyNodesStore.onlineNodes"
             :all-nodes="proxyNodesStore.nodes"
             :loading="systemConfigLoading || proxyConfigLoading"
             :has-changes="hasProxyConfigChanges"
             @save="saveProxyConfig"
             @update:proxy-node-id="systemConfig.system_proxy_node_id = $event"
+            @update:extra-trusted-dns-hosts-str="extraTrustedDnsHostsStr = $event"
           />
 
           <!-- 基础配置 -->
@@ -82,9 +84,6 @@
             :registration-privacy-policy-version="systemConfig.registration_privacy_policy_version"
             :auto-delete-expired-keys="systemConfig.auto_delete_expired_keys"
             :enable-format-conversion="systemConfig.enable_format_conversion"
-            :enable-openai-image-sync-heartbeat="systemConfig.enable_openai_image_sync_heartbeat"
-            :enable-standard-text-sync-heartbeat="systemConfig.enable_standard_text_sync_heartbeat"
-            :cyber-continue-failover="systemConfig.cyber_continue_failover"
             :loading="systemConfigLoading || basicConfigLoading"
             :has-changes="hasBasicConfigChanges"
             @save="saveBasicConfig"
@@ -109,9 +108,6 @@
             @update:registration-privacy-policy-version="systemConfig.registration_privacy_policy_version = $event"
             @update:auto-delete-expired-keys="systemConfig.auto_delete_expired_keys = $event"
             @update:enable-format-conversion="systemConfig.enable_format_conversion = $event"
-            @update:enable-openai-image-sync-heartbeat="systemConfig.enable_openai_image_sync_heartbeat = $event"
-            @update:enable-standard-text-sync-heartbeat="systemConfig.enable_standard_text_sync_heartbeat = $event"
-            @update:cyber-continue-failover="systemConfig.cyber_continue_failover = $event"
           />
 
           <!-- 请求记录配置 -->
@@ -359,6 +355,7 @@ const {
   hasCleanupConfigChanges,
   sensitiveHeadersStr,
   turnstileAllowedHostnamesStr,
+  extraTrustedDnsHostsStr,
   loadSystemConfig,
   loadSystemVersion,
   saveSiteInfo,

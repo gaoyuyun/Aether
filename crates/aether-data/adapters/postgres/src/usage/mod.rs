@@ -1,8 +1,9 @@
 use aether_data_contracts::repository::usage::{
-    parse_usage_body_ref, usage_body_ref, ApiKeyLastUsedDelta, ManagementTokenCounterDelta,
-    ProxyNodeCounterDelta, StoredUsageAuditAggregation, StoredUsageAuditSummary,
-    StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
-    StoredUsageCacheAffinityIntervalRow, StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
+    canonical_usage_body_ref_for, parse_usage_body_ref, read_decompressed_usage_json,
+    usage_body_ref, ApiKeyLastUsedDelta, ManagementTokenCounterDelta, ProxyNodeCounterDelta,
+    StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBreakdownSummaryRow,
+    StoredUsageCacheAffinityHitSummary, StoredUsageCacheAffinityIntervalRow,
+    StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
     StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardProviderCount,
     StoredUsageDashboardStatsSummary, StoredUsageDashboardSummary, StoredUsageErrorDistributionRow,
     StoredUsageLeaderboardSummary, StoredUsagePerformancePercentilesRow,
@@ -33,7 +34,7 @@ use sqlx::{
     PgPool, Postgres, QueryBuilder, Row,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use uuid::Uuid;
 
 use crate::{
@@ -43,14 +44,17 @@ use crate::{
 use aether_data_contracts::repository::usage::{
     api_key_usage_contribution, incoming_usage_can_recover_terminal_failure,
     model_usage_contribution, provider_api_key_usage_contribution,
-    strip_deprecated_usage_display_fields, ApiKeyUsageDelta, ModelUsageDelta,
-    PendingUsageCleanupSummary, ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta,
-    ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
-    StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
-    StoredProviderQuotaWindowUsage, StoredProviderUsageSummary, StoredRequestUsageAudit,
-    StoredUsageDailySummary, UpsertUsageRecord, UsageAuditListQuery, UsageCounterFlushSummary,
-    UsageCounterHealthSnapshot, UsageCounterPendingHealthSnapshot, UsageDailyHeatmapQuery,
-    UsageReadRepository, UsageWriteRepository, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
+    sanitize_usage_capture_controls_for_persistence, sanitize_usage_for_persistence,
+    sanitize_usage_request_metadata, strip_deprecated_usage_display_fields,
+    usage_can_recover_terminal_failure, usage_error_category_for_status_code,
+    usage_lifecycle_update_allowed, ApiKeyUsageDelta, ModelUsageDelta, PendingUsageCleanupSummary,
+    ProviderApiKeyUsageContribution, ProviderApiKeyUsageDelta, ProviderApiKeyWindowUsageRequest,
+    ProviderQuotaWindowUsageRequest, StoredProviderApiKeyUsageSummary,
+    StoredProviderApiKeyWindowUsageSummary, StoredProviderQuotaWindowUsage,
+    StoredProviderUsageSummary, StoredRequestUsageAudit, StoredUsageDailySummary,
+    UpsertUsageRecord, UsageAuditListQuery, UsageCounterFlushSummary, UsageCounterHealthSnapshot,
+    UsageCounterPendingHealthSnapshot, UsageDailyHeatmapQuery, UsageReadRepository,
+    UsageWriteRepository, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
     PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
     REQUESTED_REASONING_EFFORT_METADATA_KEY,
 };
@@ -63,9 +67,7 @@ pub mod cleanup;
 // newly captured bodies always spill to usage_body_blobs and resolve through usage_http_audits.
 const MAX_INLINE_USAGE_BODY_BYTES: usize = 0;
 const MAX_SUPPORTED_UNIX_SECS: u64 = 253_402_300_799;
-const FIND_USAGE_BODY_BLOB_BY_REF_SQL: &str =
-    r#"SELECT payload_gzip FROM usage_body_blobs WHERE body_ref = $1 LIMIT 1"#;
-const UPSERT_USAGE_BODY_BLOB_SQL: &str = include_str!("queries/upsert_usage_body_blob_sql.sql");
+const FIND_USAGE_BODY_BLOB_BY_REF_SQL: &str = r#"SELECT payload_gzip FROM usage_body_blobs WHERE body_ref = $1 AND request_id = $2 AND body_field = $3 LIMIT 1"#;
 const DELETE_USAGE_BODY_BLOB_SQL: &str = include_str!("queries/delete_usage_body_blob_sql.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1374,9 +1376,10 @@ SELECT
 FROM "usage" AS u
 WHERE u.request_id = ANY($1)
 "#;
-const UPSERT_USAGE_HTTP_AUDIT_SQL: &str = include_str!("queries/upsert_usage_http_audit_sql.sql");
 const UPSERT_USAGE_ROUTING_SNAPSHOT_SQL: &str =
     include_str!("queries/upsert_usage_routing_snapshot_sql.sql");
+#[cfg(test)]
+const UPSERT_USAGE_HTTP_AUDIT_SQL: &str = include_str!("queries/upsert_usage_http_audit_sql.sql");
 const UPSERT_USAGE_SETTLEMENT_PRICING_SNAPSHOT_SQL: &str =
     include_str!("queries/upsert_usage_settlement_pricing_snapshot_sql.sql");
 
@@ -1420,6 +1423,7 @@ INSERT INTO usage_counter_deltas (
   request_id,
   kind,
   target_id,
+  target_tunnel_generation,
   request_count_delta,
   total_requests_delta,
   success_count_delta,
@@ -1435,7 +1439,7 @@ INSERT INTO usage_counter_deltas (
   removed_last_used_at_unix_secs,
   usage_created_at_unix_secs
 ) VALUES (
-  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
 )
 "#;
 const INSERT_USAGE_COUNTER_DELTAS_PREFIX_SQL: &str = r#"
@@ -1444,6 +1448,7 @@ INSERT INTO usage_counter_deltas (
   request_id,
   kind,
   target_id,
+  target_tunnel_generation,
   request_count_delta,
   total_requests_delta,
   success_count_delta,
@@ -1459,7 +1464,7 @@ INSERT INTO usage_counter_deltas (
   removed_last_used_at_unix_secs,
   usage_created_at_unix_secs
 ) "#;
-const USAGE_COUNTER_DELTA_INSERT_BINDS_PER_ROW: usize = 18;
+const USAGE_COUNTER_DELTA_INSERT_BINDS_PER_ROW: usize = 19;
 const USAGE_COUNTER_DELTA_INSERT_BATCH_SIZE: usize =
     u16::MAX as usize / USAGE_COUNTER_DELTA_INSERT_BINDS_PER_ROW;
 
@@ -1480,6 +1485,7 @@ SELECT
   delta.id,
   delta.kind,
   delta.target_id,
+  delta.target_tunnel_generation,
   delta.request_count_delta,
   delta.total_requests_delta,
   delta.success_count_delta,
@@ -1612,6 +1618,7 @@ SET
   stream_errors = stream_errors + GREATEST($5::bigint, 0),
   updated_at = NOW()
 WHERE id = $1
+  AND tunnel_generation = $6
 "#;
 
 const APPLY_MANAGEMENT_TOKEN_COUNTER_DELTA_SQL: &str = r#"
@@ -1664,6 +1671,21 @@ fn push_postgres_usage_client_family_filter(
     builder
         .push("LOWER(COALESCE(NULLIF(BTRIM(\"usage\".request_metadata->'client_session_affinity'->>'client_family'), ''), NULLIF(BTRIM(\"usage\".request_metadata->>'client_family'), ''))) = ")
         .push_bind(client_family.to_ascii_lowercase());
+}
+
+fn push_postgres_usage_websocket_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+    is_websocket: Option<bool>,
+) {
+    let Some(is_websocket) = is_websocket else {
+        return;
+    };
+
+    push_postgres_usage_where(builder, has_where);
+    builder
+        .push("LOWER(COALESCE(\"usage\".request_metadata->>'websocket_mode', 'false')) = ")
+        .push_bind(if is_websocket { "true" } else { "false" });
 }
 
 fn push_postgres_usage_exclude_unknown_filter(
@@ -1948,7 +1970,6 @@ INSERT INTO "usage" (
 const SELECT_STALE_PENDING_USAGE_BATCH_SQL: &str = r#"
 SELECT
   usage.request_id,
-  usage.status,
   COALESCE(usage_settlement_snapshots.billing_status, usage.billing_status) AS billing_status
 FROM usage
 LEFT JOIN usage_settlement_snapshots
@@ -1977,15 +1998,15 @@ const UPDATE_RECOVERED_STALE_USAGE_SQL: &str = r#"
 UPDATE usage
 SET status = 'completed',
     status_code = 200,
-    error_message = NULL
+    error_message = NULL,
+    error_category = NULL
 WHERE request_id = $1
 "#;
 
 const SELECT_LATEST_FAILED_CANDIDATE_FOR_STALE_REQUESTS_SQL: &str = r#"
 SELECT DISTINCT ON (request_id)
   request_id,
-  status_code,
-  error_message
+  status_code
 FROM request_candidates
 WHERE request_id = ANY($1)
   AND status IN ('failed', 'cancelled')
@@ -1999,8 +2020,9 @@ ORDER BY request_id,
 const UPDATE_FAILED_STALE_USAGE_SQL: &str = r#"
 UPDATE usage
 SET status = 'failed',
-    status_code = $3,
-    error_message = $2
+    status_code = $2,
+    error_message = NULL,
+    error_category = $3
 WHERE request_id = $1
 "#;
 
@@ -2008,10 +2030,11 @@ const UPDATE_FAILED_VOID_STALE_USAGE_SQL: &str = r#"
 WITH updated_usage AS (
     UPDATE usage
     SET status = 'failed',
-        status_code = $4,
-        error_message = $2,
+        status_code = $3,
+        error_message = NULL,
+        error_category = $4,
         billing_status = 'void',
-        finalized_at = $3,
+        finalized_at = $2,
         total_cost_usd = 0,
         request_cost_usd = 0,
         actual_total_cost_usd = 0,
@@ -2024,7 +2047,7 @@ INSERT INTO usage_settlement_snapshots (
     billing_status,
     finalized_at
 )
-SELECT request_id, 'void', $3
+SELECT request_id, 'void', $2
 FROM updated_usage
 ON CONFLICT (request_id)
 DO UPDATE SET
@@ -2048,7 +2071,8 @@ const UPDATE_FAILED_PENDING_CANDIDATES_SQL: &str = r#"
 UPDATE request_candidates
 SET status = 'failed',
     finished_at = $2,
-    error_message = '请求超时（服务器可能已重启）'
+    error_type = 'internal',
+    error_message = NULL
 WHERE request_id = $1
   AND status IN ('pending', 'streaming')
 "#;
@@ -2108,8 +2132,12 @@ impl PreparedPendingUsage {
             ));
         }
 
-        let usage = strip_deprecated_usage_display_fields(usage);
-        let prepared = prepare_usage_upsert_context(&usage)?;
+        // Keep the capture input separate from the accounting row.  The persistence sanitizer
+        // intentionally removes HTTP bodies/headers/states, but the pending batch still needs
+        // those values to populate the canonical audit/blob tables.
+        let capture_usage = usage.clone();
+        let usage = sanitize_usage_for_persistence(usage);
+        let prepared = prepare_usage_upsert_context(&capture_usage)?;
         let input_tokens = usage
             .input_tokens
             .map(to_i32)
@@ -2226,7 +2254,7 @@ impl PreparedFirstByteUsage {
             ));
         }
 
-        let usage = strip_deprecated_usage_display_fields(usage);
+        let usage = sanitize_usage_for_persistence(usage);
         let request_metadata_json = json_bind_text(usage.request_metadata.as_ref())?;
         let response_time_ms = usage.response_time_ms.map(to_i32).transpose()?;
         let first_byte_time_ms = usage.first_byte_time_ms.map(to_i32).transpose()?;
@@ -2262,6 +2290,7 @@ fn partition_first_byte_usages(
     let mut batch_rows = Vec::new();
     let mut fallback_rows = Vec::new();
     for (sequence, usage) in usages.into_iter().enumerate() {
+        let original_usage = usage.clone();
         let prepared = PreparedFirstByteUsage::try_from_usage(usage)?;
         if request_id_counts
             .get(&prepared.usage.request_id)
@@ -2271,7 +2300,10 @@ fn partition_first_byte_usages(
         {
             batch_rows.push(prepared);
         } else {
-            fallback_rows.push((sequence, prepared.usage));
+            // Duplicate rows are replayed through the canonical upsert, which owns the
+            // persistence sanitizer. Keep the original metadata here so replay semantics remain
+            // lossless up to that boundary.
+            fallback_rows.push((sequence, original_usage));
         }
     }
     Ok((batch_rows, fallback_rows))
@@ -2915,8 +2947,14 @@ ORDER BY request_count DESC, "usage".provider_name ASC
     }
 
     pub async fn resolve_body_ref(&self, body_ref: &str) -> Result<Option<Value>, DataLayerError> {
+        let Some((request_id, field)) = parse_usage_body_ref(body_ref) else {
+            return Ok(None);
+        };
+        let canonical_ref = usage_body_ref(&request_id, field);
         let blob_row = sqlx::query(FIND_USAGE_BODY_BLOB_BY_REF_SQL)
-            .bind(body_ref)
+            .bind(&canonical_ref)
+            .bind(&request_id)
+            .bind(field.as_storage_field())
             .fetch_optional(&self.pool)
             .await
             .map_postgres_err()?;
@@ -2926,9 +2964,6 @@ ORDER BY request_count DESC, "usage".provider_name ASC
                 .map_postgres_err()?;
             return inflate_usage_json_value(&payload_gzip).map(Some);
         }
-        let Some((request_id, field)) = parse_usage_body_ref(body_ref) else {
-            return Ok(None);
-        };
         let (inline_column, compressed_column) = usage_body_sql_columns(field);
         let row = sqlx::query(&format!(
             "SELECT {inline_column} AS inline_body, {compressed_column} AS compressed_body FROM \"usage\" WHERE request_id = $1 LIMIT 1"
@@ -2975,8 +3010,10 @@ ORDER BY request_count DESC, "usage".provider_name ASC
         usage: &StoredRequestUsageAudit,
         field: UsageBodyField,
     ) -> Result<Option<Value>, DataLayerError> {
-        let body_ref = usage.body_ref(field);
-        match body_ref {
+        let body_ref = usage
+            .body_ref(field)
+            .and_then(|body_ref| canonical_usage_body_ref_for(body_ref, &usage.request_id, field));
+        match body_ref.as_deref() {
             Some(body_ref) => self.resolve_body_ref(body_ref).await,
             None => Ok(None),
         }
@@ -3097,6 +3134,7 @@ ORDER BY request_count DESC, "usage".provider_name ASC
             has_where = true;
             builder.push("\"usage\".is_stream = ").push_bind(is_stream);
         }
+        push_postgres_usage_websocket_filter(&mut builder, &mut has_where, query.is_websocket);
         if query.error_only {
             builder.push(if has_where { " AND " } else { " WHERE " });
             builder.push(
@@ -3209,6 +3247,7 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             has_where = true;
             builder.push("\"usage\".is_stream = ").push_bind(is_stream);
         }
+        push_postgres_usage_websocket_filter(&mut builder, &mut has_where, query.is_websocket);
         if query.error_only {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -3402,6 +3441,7 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             has_where = true;
             builder.push("\"usage\".is_stream = ").push_bind(is_stream);
         }
+        push_postgres_usage_websocket_filter(&mut builder, &mut has_where, query.is_websocket);
         if query.error_only {
             builder.push(if has_where { " AND " } else { " WHERE " });
             builder.push(
@@ -3503,6 +3543,7 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             has_where = true;
             builder.push("\"usage\".is_stream = ").push_bind(is_stream);
         }
+        push_postgres_usage_websocket_filter(&mut builder, &mut has_where, query.is_websocket);
         if query.error_only {
             builder.push(if has_where { " AND " } else { " WHERE " });
             has_where = true;
@@ -5124,16 +5165,14 @@ ORDER BY date ASC, total_cost_usd DESC, "usage".model ASC, "usage".provider_name
             if let Ok(Some(cutoff_utc)) = self.read_stats_hourly_cutoff().await {
                 let start_utc = dashboard_unix_secs_to_utc(query.created_from_unix_secs);
                 let end_utc = dashboard_unix_secs_to_utc(query.created_until_unix_secs);
-                let split =
-                    split_dashboard_hourly_aggregate_range(start_utc, end_utc, cutoff_utc);
+                let split = split_dashboard_hourly_aggregate_range(start_utc, end_utc, cutoff_utc);
                 if split.aggregate.is_some() {
                     let tz_minutes = chrono::Duration::minutes(i64::from(query.tz_offset_minutes));
                     // Local-day boundaries of the requested window, expressed in
                     // UTC: a local midnight is at `n*24h - tz` in UTC, so map the
                     // requested bounds into local time, day-align, and map back.
                     let local_start = dashboard_utc_midnight(start_utc + tz_minutes) - tz_minutes;
-                    let local_end =
-                        dashboard_next_utc_midnight(end_utc + tz_minutes) - tz_minutes;
+                    let local_end = dashboard_next_utc_midnight(end_utc + tz_minutes) - tz_minutes;
                     // Hours at or after the cutoff are not aggregated yet, so the
                     // hourly segment ends at the local-day boundary that starts
                     // the cutoff's local day; the raw tail rebuilds whole local
@@ -8517,40 +8556,41 @@ ORDER BY "usage".user_id ASC
         usage: UpsertUsageRecord,
     ) -> Result<StoredRequestUsageAudit, DataLayerError> {
         usage.validate()?;
-        let usage = strip_deprecated_usage_display_fields(usage);
-        let prepared = prepare_usage_upsert_context(&usage)?;
+        // `usage` is the sanitized accounting projection; prepare the auxiliary capture and
+        // snapshots from the original event so typed `none` markers can clear prior facts.
+        let capture_usage = usage.clone();
+        let usage = sanitize_usage_for_persistence(usage);
         self.tx_runner
             .run_read_write(|tx| {
-                let PreparedUsageUpsert {
-                    request_headers_json,
-                    provider_request_headers_json,
-                    response_headers_json,
-                    client_response_headers_json,
-                    request_body_storage,
-                    provider_request_body_storage,
-                    response_body_storage,
-                    client_response_body_storage,
-                    http_audit_refs,
-                    http_audit_states,
-                    http_audit_capture_mode,
-                    routing_snapshot,
-                    settlement_pricing_snapshot,
-                    mut request_metadata_value,
-                    mut request_metadata_json,
-                    replace_client_request_body_facts,
-                    replace_provider_request_body_facts,
-                    clear_request_body,
-                    clear_provider_request_body,
-                    clear_response_body,
-                    clear_client_response_body,
-                } = prepared;
                 Box::pin(async move {
                     lock_usage_request_id_in_tx(tx, &usage.request_id).await?;
 
-                    if incoming_usage_can_recover_terminal_failure(
-                        usage.status.as_str(),
-                        usage.billing_status.as_str(),
-                    ) {
+                    let previous_usage =
+                        find_usage_by_request_id_in_tx(tx, &usage.request_id).await?;
+                    if let Some(previous) = previous_usage.as_ref() {
+                        if !usage_lifecycle_update_allowed(
+                            &previous.status,
+                            &previous.billing_status,
+                            previous.updated_at_unix_secs,
+                            previous.finalized_at_unix_secs,
+                            &usage.status,
+                            &usage.billing_status,
+                            usage.updated_at_unix_secs,
+                            usage.finalized_at_unix_secs,
+                        ) {
+                            return Ok(previous.clone());
+                        }
+                    }
+                    let recovers_terminal_failure =
+                        previous_usage.as_ref().is_some_and(|previous| {
+                            usage_can_recover_terminal_failure(
+                                &previous.status,
+                                &previous.billing_status,
+                                &usage.status,
+                                &usage.billing_status,
+                            )
+                        });
+                    if recovers_terminal_failure {
                         sqlx::query(RESET_STALE_VOID_USAGE_SQL)
                             .bind(&usage.request_id)
                             .execute(&mut **tx)
@@ -8563,14 +8603,36 @@ ORDER BY "usage".user_id ASC
                             .map_postgres_err()?;
                     }
 
-                    let previous_usage =
-                        find_usage_by_request_id_in_tx(tx, &usage.request_id).await?;
-                    let capture_update_allowed = usage_capture_update_allowed(
-                        previous_usage
-                            .as_ref()
-                            .map(|stored| (stored.status.as_str(), stored.billing_status.as_str())),
-                        usage.status.as_str(),
-                    );
+                    let PreparedUsageUpsert {
+                        request_headers_json,
+                        provider_request_headers_json,
+                        response_headers_json,
+                        client_response_headers_json,
+                        request_body_storage,
+                        provider_request_body_storage,
+                        response_body_storage,
+                        client_response_body_storage,
+                        http_audit_refs,
+                        http_audit_states,
+                        http_audit_capture_mode,
+                        routing_snapshot,
+                        settlement_pricing_snapshot,
+                        mut request_metadata_value,
+                        mut request_metadata_json,
+                        replace_client_request_body_facts,
+                        replace_provider_request_body_facts,
+                        clear_request_body,
+                        clear_provider_request_body,
+                        clear_response_body,
+                        clear_client_response_body,
+                    } = prepare_usage_upsert_context(&capture_usage)?;
+                    let capture_update_allowed = recovers_terminal_failure
+                        || usage_capture_update_allowed(
+                            previous_usage.as_ref().map(|stored| {
+                                (stored.status.as_str(), stored.billing_status.as_str())
+                            }),
+                            usage.status.as_str(),
+                        );
                     let replace_terminal_snapshots =
                         matches!(usage.status.as_str(), "completed" | "failed" | "cancelled");
                     if capture_update_allowed
@@ -8582,7 +8644,10 @@ ORDER BY "usage".user_id ASC
                         let previous_metadata = previous_usage
                             .as_ref()
                             .and_then(|stored| stored.request_metadata.as_ref());
-                        request_metadata_value = Some(if replace_terminal_snapshots {
+                        let preserve_empty_tombstone = !replace_terminal_snapshots
+                            && (replace_client_request_body_facts
+                                || replace_provider_request_body_facts);
+                        let previous_metadata = if replace_terminal_snapshots {
                             retain_previous_request_audit_metadata(
                                 previous_metadata,
                                 !replace_client_request_body_facts,
@@ -8593,7 +8658,14 @@ ORDER BY "usage".user_id ASC
                                 replace_client_request_body_facts,
                                 replace_provider_request_body_facts,
                             )
-                        });
+                        };
+                        request_metadata_value = Some(
+                            project_usage_request_metadata(
+                                Some(previous_metadata),
+                                preserve_empty_tombstone,
+                            )
+                            .unwrap_or_else(|| Value::Object(Map::new())),
+                        );
                         request_metadata_json = json_bind_text(request_metadata_value.as_ref())?;
                     }
                     let _row = sqlx::query(UPSERT_SQL)
@@ -8984,6 +9056,7 @@ ORDER BY "usage".user_id ASC
         let mut batch_rows = Vec::<(usize, PreparedPendingUsage)>::new();
         let mut fallback_rows = Vec::<(usize, UpsertUsageRecord)>::new();
         for (sequence, usage) in usages.into_iter().enumerate() {
+            let original_usage = usage.clone();
             let prepared = PreparedPendingUsage::try_from_usage(usage)?;
             if request_id_counts
                 .get(&prepared.usage.request_id)
@@ -8993,7 +9066,9 @@ ORDER BY "usage".user_id ASC
             {
                 batch_rows.push((sequence, prepared));
             } else {
-                fallback_rows.push((sequence, prepared.usage));
+                // Preserve capture markers for the canonical fallback; that path performs the
+                // sanitized bind only after preparing the auxiliary audit/blob state.
+                fallback_rows.push((sequence, original_usage));
             }
         }
 
@@ -9598,7 +9673,7 @@ removed_last_used_at_unix_secs, usage_created_at_unix_secs
             ));
         }
 
-        let usage = strip_deprecated_usage_display_fields(usage);
+        let usage = sanitize_usage_for_persistence(usage);
         let request_metadata_json = json_bind_text(usage.request_metadata.as_ref())?;
         let response_time_ms = usage.response_time_ms.map(to_i32).transpose()?;
         let first_byte_time_ms = usage.first_byte_time_ms.map(to_i32).transpose()?;
@@ -9825,9 +9900,13 @@ DO UPDATE SET
     COALESCE(NULLIF(EXCLUDED.updated_at_unix_secs, 0), 0),
     CAST(EXTRACT(EPOCH FROM "usage".created_at) AS BIGINT)
   )
-WHERE "usage".billing_status = 'pending'
+  WHERE "usage".billing_status = 'pending'
   AND "usage".status IN ('pending', 'streaming')
   AND "usage".finalized_at IS NULL
+  AND EXCLUDED.updated_at_unix_secs >= COALESCE(
+    NULLIF("usage".updated_at_unix_secs, 0),
+    CAST(EXTRACT(EPOCH FROM "usage".created_at) AS BIGINT)
+  )
 RETURNING
   request_id,
   provider_api_key_id,
@@ -9886,8 +9965,14 @@ RETURNING
                         apply_provider_monthly_usage_delta_in_tx(tx, provider_id.as_str(), delta)
                             .await?;
                     }
-                    for (node_id, delta) in &aggregates.proxy_nodes {
-                        apply_proxy_node_counter_delta_in_tx(tx, node_id.as_str(), delta).await?;
+                    for ((node_id, tunnel_generation), delta) in &aggregates.proxy_nodes {
+                        apply_proxy_node_counter_delta_in_tx(
+                            tx,
+                            node_id.as_str(),
+                            tunnel_generation.as_str(),
+                            delta,
+                        )
+                        .await?;
                     }
                     for (token_id, delta) in &aggregates.management_tokens {
                         apply_management_token_counter_delta_in_tx(tx, token_id.as_str(), delta)
@@ -10064,17 +10149,50 @@ WHERE provider_id = $1
         if delta.is_noop() {
             return Ok(false);
         }
+        let Some(expected_tunnel_generation) = delta
+            .expected_tunnel_generation
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter(|value| value.len() <= 64)
+            .map(ToOwned::to_owned)
+        else {
+            // Do not turn a bare node id into an implicit current-incarnation
+            // binding. Missing fences are rejected so stale plans fail closed.
+            return Ok(false);
+        };
         let node_id = delta.node_id.trim().to_string();
         let request_id = format!("proxy_node:{node_id}:{}", Uuid::new_v4());
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
+                    // Keep the parent lookup lock-free because flush claims
+                    // outbox rows before updating proxy_nodes. The generation
+                    // is persisted in the outbox row and checked again by the
+                    // flush UPDATE, so id reuse can only retire this delta.
+                    let tunnel_generation: Option<String> = sqlx::query_scalar(
+                        "SELECT tunnel_generation FROM proxy_nodes WHERE id = $1 AND tunnel_generation = $2 LIMIT 1",
+                    )
+                    .bind(&node_id)
+                    .bind(&expected_tunnel_generation)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_postgres_err()?;
+                    let Some(_tunnel_generation) = tunnel_generation
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                    else {
+                        return Ok(false);
+                    };
                     insert_usage_counter_delta_in_tx(
                         tx,
                         UsageCounterDeltaInsert {
                             request_id: &request_id,
                             kind: USAGE_COUNTER_KIND_PROXY_NODE,
                             target_id: &node_id,
+                            target_tunnel_generation: Some(&expected_tunnel_generation),
                             request_count_delta: 0,
                             total_requests_delta: delta.total_requests_delta,
                             success_count_delta: 0,
@@ -10125,6 +10243,7 @@ WHERE provider_id = $1
                             request_id: &request_id,
                             kind: USAGE_COUNTER_KIND_MANAGEMENT_TOKEN,
                             target_id: &token_id,
+                            target_tunnel_generation: None,
                             request_count_delta: delta.usage_count_delta,
                             total_requests_delta: 0,
                             success_count_delta: 0,
@@ -10166,6 +10285,7 @@ WHERE provider_id = $1
                             request_id: &request_id,
                             kind: USAGE_COUNTER_KIND_API_KEY_LAST_USED,
                             target_id: &api_key_id,
+                            target_tunnel_generation: None,
                             request_count_delta: 0,
                             total_requests_delta: 0,
                             success_count_delta: 0,
@@ -10202,7 +10322,7 @@ WHERE provider_id = $1
         &self,
         cutoff_unix_secs: u64,
         now_unix_secs: u64,
-        timeout_minutes: u64,
+        _timeout_minutes: u64,
         batch_size: usize,
     ) -> Result<PendingUsageCleanupSummary, DataLayerError> {
         if batch_size == 0 {
@@ -10255,7 +10375,6 @@ WHERE provider_id = $1
                 .map(|row| {
                     Ok(StalePendingUsageRow {
                         request_id: row.try_get("request_id").map_postgres_err()?,
-                        status: row.try_get("status").map_postgres_err()?,
                         billing_status: row.try_get("billing_status").map_postgres_err()?,
                     })
                 })
@@ -10288,18 +10407,7 @@ WHERE provider_id = $1
                         .try_get::<Option<i32>, _>("status_code")
                         .map_postgres_err()?
                         .and_then(|value| u16::try_from(value).ok());
-                    let error_message = row
-                        .try_get::<Option<String>, _>("error_message")
-                        .map_postgres_err()?
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty());
-                    failed_map.insert(
-                        request_id,
-                        FailedCandidateCleanupInfo {
-                            status_code,
-                            error_message,
-                        },
-                    );
+                    failed_map.insert(request_id, FailedCandidateCleanupInfo { status_code });
                 }
                 (completed, failed_map)
             };
@@ -10322,23 +10430,23 @@ WHERE provider_id = $1
                 }
 
                 let candidate_info = failed_candidate_info.get(&row.request_id);
-                let (status_code, error_message) =
-                    resolve_stale_pending_failure(candidate_info, &row.status, timeout_minutes);
+                let status_code = resolve_stale_pending_status_code(candidate_info);
+                let error_category = usage_error_category_for_status_code(status_code);
                 let status_code_i32 = i32::from(status_code);
                 if row.billing_status == "pending" {
                     sqlx::query(UPDATE_FAILED_VOID_STALE_USAGE_SQL)
                         .bind(&row.request_id)
-                        .bind(&error_message)
                         .bind(now)
                         .bind(status_code_i32)
+                        .bind(error_category)
                         .execute(&mut *tx)
                         .await
                         .map_postgres_err()?;
                 } else {
                     sqlx::query(UPDATE_FAILED_STALE_USAGE_SQL)
                         .bind(&row.request_id)
-                        .bind(&error_message)
                         .bind(status_code_i32)
+                        .bind(error_category)
                         .execute(&mut *tx)
                         .await
                         .map_postgres_err()?;
@@ -10990,33 +11098,17 @@ impl UsageWriteRepository for SqlxUsageReadRepository {
 
 struct StalePendingUsageRow {
     request_id: String,
-    status: String,
     billing_status: String,
 }
 
 struct FailedCandidateCleanupInfo {
     status_code: Option<u16>,
-    error_message: Option<String>,
 }
 
-fn stale_pending_error_message(status: &str, timeout_minutes: u64) -> String {
-    format!("请求超时: 状态 '{status}' 超过 {timeout_minutes} 分钟未完成")
-}
-
-fn resolve_stale_pending_failure(
-    candidate: Option<&FailedCandidateCleanupInfo>,
-    status: &str,
-    timeout_minutes: u64,
-) -> (u16, String) {
-    match candidate {
-        Some(info) => (
-            info.status_code.unwrap_or(502),
-            info.error_message
-                .clone()
-                .unwrap_or_else(|| stale_pending_error_message(status, timeout_minutes)),
-        ),
-        None => (504, stale_pending_error_message(status, timeout_minutes)),
-    }
+fn resolve_stale_pending_status_code(candidate: Option<&FailedCandidateCleanupInfo>) -> u16 {
+    candidate
+        .and_then(|info| info.status_code)
+        .unwrap_or(if candidate.is_some() { 502 } else { 504 })
 }
 
 async fn find_usage_by_request_id_in_tx(
@@ -11186,6 +11278,7 @@ fn prepare_first_byte_provider_contribution_transitions(
                 request_id: &transition.request_id,
                 kind: USAGE_COUNTER_KIND_PROVIDER_API_KEY,
                 target_id: &transition.key_id,
+                target_tunnel_generation: None,
                 request_count_delta: transition.delta.request_count,
                 total_requests_delta: 0,
                 success_count_delta: transition.delta.success_count,
@@ -11530,6 +11623,7 @@ struct UsageCounterDeltaRow {
     id: String,
     kind: String,
     target_id: String,
+    target_tunnel_generation: Option<String>,
     request_count_delta: i64,
     total_requests_delta: i64,
     success_count_delta: i64,
@@ -11567,7 +11661,7 @@ struct UsageCounterDeltaAggregates {
     provider_api_keys: BTreeMap<String, ProviderApiKeyUsageDelta>,
     models: BTreeMap<String, ModelUsageDelta>,
     provider_monthly: BTreeMap<String, Vec<ProviderMonthlyDelta>>,
-    proxy_nodes: BTreeMap<String, ProxyNodeCounterDelta>,
+    proxy_nodes: BTreeMap<(String, String), ProxyNodeCounterDelta>,
     management_tokens: BTreeMap<String, ManagementTokenCounterDelta>,
     api_key_last_used: BTreeMap<String, ApiKeyLastUsedDelta>,
 }
@@ -11657,16 +11751,28 @@ impl UsageCounterDeltaAggregates {
                         });
                 }
                 USAGE_COUNTER_KIND_PROXY_NODE => {
-                    let entry = aggregates
-                        .proxy_nodes
-                        .entry(row.target_id.clone())
-                        .or_insert(ProxyNodeCounterDelta {
+                    let Some(tunnel_generation) = row
+                        .target_tunnel_generation
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                    else {
+                        // Legacy rows without a generation fence are retired
+                        // without applying them to a reused node id.
+                        continue;
+                    };
+                    let aggregate_key = (row.target_id.clone(), tunnel_generation.clone());
+                    let entry = aggregates.proxy_nodes.entry(aggregate_key).or_insert(
+                        ProxyNodeCounterDelta {
                             node_id: row.target_id.clone(),
+                            expected_tunnel_generation: Some(tunnel_generation),
                             total_requests_delta: 0,
                             failed_requests_delta: 0,
                             dns_failures_delta: 0,
                             stream_errors_delta: 0,
-                        });
+                        },
+                    );
                     entry.total_requests_delta += row.total_requests_delta;
                     entry.failed_requests_delta += row.error_count_delta;
                     entry.dns_failures_delta += row.dns_failures_delta;
@@ -11791,6 +11897,7 @@ async fn enqueue_api_key_usage_delta_in_tx(
             request_id,
             kind: USAGE_COUNTER_KIND_API_KEY,
             target_id: api_key_id,
+            target_tunnel_generation: None,
             request_count_delta: 0,
             total_requests_delta: delta.total_requests,
             success_count_delta: 0,
@@ -11825,6 +11932,7 @@ async fn enqueue_model_usage_delta_in_tx(
             request_id,
             kind: USAGE_COUNTER_KIND_MODEL,
             target_id: model,
+            target_tunnel_generation: None,
             request_count_delta: delta.request_count,
             total_requests_delta: 0,
             success_count_delta: 0,
@@ -11864,6 +11972,7 @@ async fn enqueue_provider_api_key_usage_delta_in_tx(
             request_id,
             kind: USAGE_COUNTER_KIND_PROVIDER_API_KEY,
             target_id: key_id,
+            target_tunnel_generation: None,
             request_count_delta: delta.request_count,
             total_requests_delta: 0,
             success_count_delta: delta.success_count,
@@ -11887,6 +11996,7 @@ struct UsageCounterDeltaInsert<'a> {
     request_id: &'a str,
     kind: &'a str,
     target_id: &'a str,
+    target_tunnel_generation: Option<&'a str>,
     request_count_delta: i64,
     total_requests_delta: i64,
     success_count_delta: i64,
@@ -11909,6 +12019,7 @@ struct PreparedUsageCounterDeltaInsert {
     request_id: String,
     kind: String,
     target_id: String,
+    target_tunnel_generation: Option<String>,
     request_count_delta: i64,
     total_requests_delta: i64,
     success_count_delta: i64,
@@ -11960,6 +12071,11 @@ fn prepare_usage_counter_delta_insert(
         request_id: request_id.to_string(),
         kind: input.kind.to_string(),
         target_id: target_id.to_string(),
+        target_tunnel_generation: input
+            .target_tunnel_generation
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
         request_count_delta: input.request_count_delta,
         total_requests_delta: input.total_requests_delta,
         success_count_delta: input.success_count_delta,
@@ -11994,6 +12110,7 @@ async fn insert_usage_counter_delta_in_tx(
         .bind(input.request_id)
         .bind(input.kind)
         .bind(input.target_id)
+        .bind(input.target_tunnel_generation)
         .bind(input.request_count_delta)
         .bind(input.total_requests_delta)
         .bind(input.success_count_delta)
@@ -12026,6 +12143,7 @@ async fn insert_usage_counter_deltas_batch_in_tx(
                 .push_bind(input.request_id.clone())
                 .push_bind(input.kind.clone())
                 .push_bind(input.target_id.clone())
+                .push_bind(input.target_tunnel_generation.clone())
                 .push_bind(input.request_count_delta)
                 .push_bind(input.total_requests_delta)
                 .push_bind(input.success_count_delta)
@@ -12076,6 +12194,9 @@ fn map_usage_counter_delta_row(row: &PgRow) -> Result<UsageCounterDeltaRow, Data
         id: row.try_get::<String, _>("id").map_postgres_err()?,
         kind: row.try_get::<String, _>("kind").map_postgres_err()?,
         target_id: row.try_get::<String, _>("target_id").map_postgres_err()?,
+        target_tunnel_generation: row
+            .try_get::<Option<String>, _>("target_tunnel_generation")
+            .map_postgres_err()?,
         request_count_delta: row
             .try_get::<i64, _>("request_count_delta")
             .map_postgres_err()?,
@@ -12645,9 +12766,10 @@ WHERE provider_id = $1 AND quota_epoch_start = TO_TIMESTAMP($2::double precision
 async fn apply_proxy_node_counter_delta_in_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     node_id: &str,
+    tunnel_generation: &str,
     delta: &ProxyNodeCounterDelta,
 ) -> Result<(), DataLayerError> {
-    if delta.is_noop() || node_id.trim().is_empty() {
+    if delta.is_noop() || node_id.trim().is_empty() || tunnel_generation.trim().is_empty() {
         return Ok(());
     }
 
@@ -12657,6 +12779,7 @@ async fn apply_proxy_node_counter_delta_in_tx(
         .bind(delta.failed_requests_delta)
         .bind(delta.dns_failures_delta)
         .bind(delta.stream_errors_delta)
+        .bind(tunnel_generation)
         .execute(&mut **tx)
         .await
         .map_postgres_err()?;
@@ -13323,9 +13446,23 @@ fn json_bind_text(value: Option<&Value>) -> Result<Option<String>, DataLayerErro
         .transpose()
 }
 
+fn project_usage_request_metadata(
+    value: Option<Value>,
+    preserve_empty_tombstone: bool,
+) -> Option<Value> {
+    let projected = sanitize_usage_request_metadata(value);
+    if preserve_empty_tombstone && projected.is_none() {
+        Some(Value::Object(Map::new()))
+    } else {
+        projected
+    }
+}
+
 fn prepare_usage_upsert_context(
     usage: &UpsertUsageRecord,
 ) -> Result<PreparedUsageUpsert, DataLayerError> {
+    let usage = sanitize_usage_capture_controls_for_persistence(usage.clone());
+    let usage = &usage;
     let replace_client_request_body_facts = request_body_capture_replaces_derived_facts(
         usage.request_body.as_ref(),
         usage.request_body_state,
@@ -13462,6 +13599,14 @@ fn prepare_usage_upsert_context(
             clear_provider_request_body,
         ));
     }
+    // The raw event is used above to build the capture and billing snapshots, but only the
+    // allow-listed metadata may reach the accounting row.  Keep an explicit empty object when a
+    // body `none` marker cleared the last derived fact: PostgreSQL's sparse upsert uses COALESCE
+    // and would otherwise resurrect the previous candidate's provider metadata from NULL.
+    let preserve_empty_metadata_tombstone =
+        (clear_request_body || clear_provider_request_body) && request_metadata_value.is_some();
+    request_metadata_value =
+        project_usage_request_metadata(request_metadata_value, preserve_empty_metadata_tombstone);
     let http_audit_capture_mode = usage_http_audit_capture_mode(
         &http_audit_refs,
         [
@@ -13540,14 +13685,10 @@ fn resolved_read_usage_body_ref(
     http_audit_ref: Option<&str>,
 ) -> Option<String> {
     explicit_ref
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .and_then(|body_ref| canonical_usage_body_ref_for(body_ref, request_id, field))
         .or_else(|| {
             http_audit_ref
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
+                .and_then(|body_ref| canonical_usage_body_ref_for(body_ref, request_id, field))
         })
         .or_else(|| has_compressed_storage.then(|| usage_body_ref(request_id, field)))
         .or_else(|| metadata_usage_body_ref_value(metadata, request_id, field))
@@ -13561,15 +13702,11 @@ fn resolved_write_usage_body_ref(
     http_audit_ref: Option<&str>,
 ) -> Option<String> {
     explicit_ref
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .and_then(|body_ref| canonical_usage_body_ref_for(body_ref, request_id, field))
         .or_else(|| has_compressed_storage.then(|| usage_body_ref(request_id, field)))
         .or_else(|| {
             http_audit_ref
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
+                .and_then(|body_ref| canonical_usage_body_ref_for(body_ref, request_id, field))
         })
 }
 
@@ -13591,11 +13728,7 @@ fn metadata_usage_body_ref_value(
     field: UsageBodyField,
 ) -> Option<String> {
     metadata_ref_value(metadata, field.as_ref_key())
-        .and_then(|value| parse_usage_body_ref(&value))
-        .filter(|(parsed_request_id, parsed_field)| {
-            parsed_request_id == request_id && *parsed_field == field
-        })
-        .map(|(parsed_request_id, parsed_field)| usage_body_ref(&parsed_request_id, parsed_field))
+        .and_then(|body_ref| canonical_usage_body_ref_for(&body_ref, request_id, field))
 }
 
 fn metadata_number_value(
@@ -14156,11 +14289,7 @@ fn usage_json_column(
 }
 
 fn inflate_usage_json_value(bytes: &[u8]) -> Result<Value, DataLayerError> {
-    let mut decoder = GzDecoder::new(bytes);
-    let mut json_bytes = Vec::new();
-    decoder.read_to_end(&mut json_bytes).map_err(|err| {
-        DataLayerError::UnexpectedValue(format!("failed to decompress usage json: {err}"))
-    })?;
+    let json_bytes = read_decompressed_usage_json(GzDecoder::new(bytes))?;
     serde_json::from_slice(&json_bytes).map_err(|err| {
         DataLayerError::UnexpectedValue(format!("failed to parse decompressed usage json: {err}"))
     })
@@ -14332,42 +14461,19 @@ async fn sync_usage_body_blob_storage<'e, E>(
     executor: E,
     request_id: &str,
     field: UsageBodyField,
-    value: Option<&Value>,
-    storage: &UsageBodyStorage,
-    clear_existing: bool,
+    _value: Option<&Value>,
+    _storage: &UsageBodyStorage,
+    _clear_existing: bool,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
     let body_ref = usage_body_ref(request_id, field);
-    if clear_existing {
-        sqlx::query(DELETE_USAGE_BODY_BLOB_SQL)
-            .bind(&body_ref)
-            .execute(executor)
-            .await
-            .map_postgres_err()?;
-        return Ok(());
-    }
-    if let Some(payload_gzip) = storage.detached_blob_bytes.as_ref() {
-        sqlx::query(UPSERT_USAGE_BODY_BLOB_SQL)
-            .bind(&body_ref)
-            .bind(request_id)
-            .bind(field.as_storage_field())
-            .bind(payload_gzip)
-            .execute(executor)
-            .await
-            .map_postgres_err()?;
-        return Ok(());
-    }
-
-    if value.is_some() {
-        sqlx::query(DELETE_USAGE_BODY_BLOB_SQL)
-            .bind(&body_ref)
-            .execute(executor)
-            .await
-            .map_postgres_err()?;
-    }
-
+    sqlx::query(DELETE_USAGE_BODY_BLOB_SQL)
+        .bind(&body_ref)
+        .execute(executor)
+        .await
+        .map_postgres_err()?;
     Ok(())
 }
 
@@ -14376,46 +14482,43 @@ async fn sync_usage_http_audit_storage<'e, E>(
     request_id: &str,
     headers: &UsageHttpAuditHeaders<'_>,
     refs: &UsageHttpAuditRefs,
-    states: &UsageHttpAuditStates,
+    _states: &UsageHttpAuditStates,
     body_capture_mode: &str,
 ) -> Result<(), DataLayerError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    if !headers.any_present()
-        && !refs.any_present()
-        && !states.any_present()
-        && body_capture_mode == "none"
-    {
-        return Ok(());
+    if headers.any_present() || refs.any_present() || body_capture_mode != "none" {
+        return Err(DataLayerError::InvalidInput(
+            "usage HTTP capture persistence is disabled".to_string(),
+        ));
     }
 
-    sqlx::query(UPSERT_USAGE_HTTP_AUDIT_SQL)
-        .bind(request_id)
-        .bind(headers.request_headers_json)
-        .bind(headers.provider_request_headers_json)
-        .bind(headers.response_headers_json)
-        .bind(headers.client_response_headers_json)
-        .bind(refs.request_body_ref.as_deref())
-        .bind(refs.provider_request_body_ref.as_deref())
-        .bind(refs.response_body_ref.as_deref())
-        .bind(refs.client_response_body_ref.as_deref())
-        .bind(usage_body_capture_state_bind_text(
-            states.request_body_state,
-        ))
-        .bind(usage_body_capture_state_bind_text(
-            states.provider_request_body_state,
-        ))
-        .bind(usage_body_capture_state_bind_text(
-            states.response_body_state,
-        ))
-        .bind(usage_body_capture_state_bind_text(
-            states.client_response_body_state,
-        ))
-        .bind(body_capture_mode)
-        .execute(executor)
-        .await
-        .map_postgres_err()?;
+    sqlx::query(
+        r#"
+WITH deleted_audit AS (
+  DELETE FROM usage_http_audits WHERE request_id = $1
+)
+UPDATE usage
+SET request_headers = NULL,
+    request_body = NULL,
+    provider_request_headers = NULL,
+    provider_request_body = NULL,
+    response_headers = NULL,
+    response_body = NULL,
+    client_response_headers = NULL,
+    client_response_body = NULL,
+    request_body_compressed = NULL,
+    provider_request_body_compressed = NULL,
+    response_body_compressed = NULL,
+    client_response_body_compressed = NULL
+WHERE request_id = $1
+"#,
+    )
+    .bind(request_id)
+    .execute(executor)
+    .await
+    .map_postgres_err()?;
 
     Ok(())
 }

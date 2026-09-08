@@ -450,6 +450,124 @@ fn mysql_usage_upsert_guards_candidate_identity_metadata_and_routing_from_late_l
 }
 
 #[tokio::test]
+async fn mysql_stale_terminal_event_is_a_full_transaction_noop_when_url_is_set() {
+    let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!("skipping MySQL stale terminal test because AETHER_TEST_MYSQL_URL is unset");
+        return;
+    };
+
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("mysql test pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("mysql migrations should run");
+    let suffix = unique_suffix();
+    let user_id = format!("stale-user-{suffix}");
+    let api_key_id = format!("stale-api-key-{suffix}");
+    let provider_id = format!("stale-provider-{suffix}");
+    let provider_key_id = format!("stale-provider-key-{suffix}");
+    let request_id = format!("stale-request-{suffix}");
+    seed_stats_targets(&pool, &user_id, &api_key_id, &provider_id, &provider_key_id).await;
+    let repository = MysqlUsageWriteRepository::new(pool.clone());
+
+    let mut newer = sample_usage(
+        &request_id,
+        &user_id,
+        &api_key_id,
+        &provider_id,
+        &provider_key_id,
+        "completed",
+        "pending",
+        2_000,
+    );
+    newer.candidate_id = Some("candidate-new".to_string());
+    newer.route_kind = Some("route-new".to_string());
+    repository
+        .upsert(newer)
+        .await
+        .expect("newer terminal usage should upsert");
+
+    let counter_rows_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_counter_deltas WHERE request_id = ?")
+            .bind(&request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("counter rows should count");
+    let routing_before: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT candidate_id, route_kind FROM usage_routing_snapshots WHERE request_id = ?",
+    )
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("routing snapshot should load");
+    let settlement_before: (String, Option<f64>) = sqlx::query_as(
+        "SELECT billing_status, billing_total_cost_usd FROM usage_settlement_snapshots WHERE request_id = ?",
+    )
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("settlement snapshot should load");
+
+    let mut stale = sample_usage(
+        &request_id,
+        &user_id,
+        &api_key_id,
+        &provider_id,
+        &provider_key_id,
+        "failed",
+        "void",
+        1_999,
+    );
+    stale.status_code = Some(503);
+    stale.total_cost_usd = Some(99.0);
+    stale.actual_total_cost_usd = Some(98.0);
+    stale.candidate_id = Some("candidate-stale".to_string());
+    stale.route_kind = Some("route-stale".to_string());
+    let stored = repository
+        .upsert(stale)
+        .await
+        .expect("stale terminal usage should be ignored");
+
+    assert_eq!(stored.status, "completed");
+    assert_eq!(stored.billing_status, "pending");
+    assert_eq!(stored.status_code, Some(200));
+    assert_eq!(stored.total_cost_usd, 0.5);
+    assert_eq!(stored.routing_candidate_id(), Some("candidate-new"));
+    assert_eq!(stored.routing_route_kind(), Some("route-new"));
+    assert_eq!(stored.updated_at_unix_secs, 2_000);
+
+    let counter_rows_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_counter_deltas WHERE request_id = ?")
+            .bind(&request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("counter rows should count");
+    let routing_after: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT candidate_id, route_kind FROM usage_routing_snapshots WHERE request_id = ?",
+    )
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("routing snapshot should load");
+    let settlement_after: (String, Option<f64>) = sqlx::query_as(
+        "SELECT billing_status, billing_total_cost_usd FROM usage_settlement_snapshots WHERE request_id = ?",
+    )
+    .bind(&request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("settlement snapshot should load");
+    assert_eq!(counter_rows_after, counter_rows_before);
+    assert_eq!(routing_after, routing_before);
+    assert_eq!(settlement_after, settlement_before);
+}
+
+#[tokio::test]
 async fn mysql_usage_write_repository_upserts_and_flushes_counters_when_url_is_set() {
     let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
         .ok()
@@ -767,7 +885,7 @@ async fn mysql_concurrent_same_request_upserts_enqueue_counters_once_when_url_is
 }
 
 #[tokio::test]
-async fn mysql_usage_http_capture_round_trips_when_url_is_set() {
+async fn mysql_usage_http_capture_is_not_persisted_when_url_is_set() {
     let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -813,29 +931,17 @@ async fn mysql_usage_http_capture_round_trips_when_url_is_set() {
         .upsert(rich)
         .await
         .expect("MySQL canonical capture should upsert");
-    assert_eq!(
-        stored.request_headers,
-        Some(serde_json::json!({"x-client": "one"}))
-    );
-    assert_eq!(
-        stored.request_body,
-        Some(serde_json::json!({"request": true}))
-    );
-    assert_eq!(
-        stored.request_body_state,
-        Some(UsageBodyCaptureState::Reference)
-    );
-    assert_eq!(
-        stored.request_body_ref.as_deref(),
-        Some(format!("usage://request/{request_id}/request_body").as_str())
-    );
+    assert!(stored.request_headers.is_none());
+    assert!(stored.request_body.is_none());
+    assert!(stored.request_body_state.is_none());
+    assert!(stored.request_body_ref.is_none());
     let blob_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = ?")
             .bind(&request_id)
             .fetch_one(&pool)
             .await
             .expect("MySQL canonical blobs should count");
-    assert_eq!(blob_count, 2);
+    assert_eq!(blob_count, 0);
     let legacy_body: Option<String> =
         sqlx::query_scalar("SELECT CAST(request_body AS CHAR) FROM `usage` WHERE request_id = ?")
             .bind(&request_id)
@@ -858,8 +964,8 @@ async fn mysql_usage_http_capture_round_trips_when_url_is_set() {
         .upsert(sparse)
         .await
         .expect("MySQL sparse capture should upsert");
-    assert_eq!(sparse_stored.request_headers, stored.request_headers);
-    assert_eq!(sparse_stored.request_body, stored.request_body);
+    assert!(sparse_stored.request_headers.is_none());
+    assert!(sparse_stored.request_body.is_none());
 
     let mut clear = sample_usage(
         &request_id,
@@ -879,11 +985,8 @@ async fn mysql_usage_http_capture_round_trips_when_url_is_set() {
         .expect("MySQL explicit none should clear");
     assert!(cleared.request_body.is_none());
     assert!(cleared.request_body_ref.is_none());
-    assert_eq!(
-        cleared.request_body_state,
-        Some(UsageBodyCaptureState::None)
-    );
-    assert_eq!(cleared.provider_request_body, stored.provider_request_body);
+    assert!(cleared.request_body_state.is_none());
+    assert!(cleared.provider_request_body.is_none());
 }
 
 #[tokio::test]
@@ -1289,16 +1392,27 @@ async fn mysql_usage_cleanup_executes_when_url_is_set() {
         .await
         .expect("MySQL detail cleanup should succeed");
     assert!(summary.body_externalized >= 1);
-    let body_ref: String =
-        sqlx::query_scalar("SELECT request_body_ref FROM usage_http_audits WHERE request_id = ?")
+    let stored_body: Option<String> =
+        sqlx::query_scalar("SELECT CAST(request_body AS CHAR) FROM `usage` WHERE request_id = ?")
             .bind(&request_id)
             .fetch_one(&pool)
             .await
-            .expect("externalized body ref should load");
-    assert_eq!(
-        body_ref,
-        format!("usage://request/{request_id}/request_body")
-    );
+            .expect("purged body should load");
+    assert!(stored_body.is_none());
+    let body_blobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = ?")
+            .bind(&request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("purged body blobs should count");
+    assert_eq!(body_blobs, 0);
+    let body_audits: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_http_audits WHERE request_id = ?")
+            .bind(&request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("purged body refs should count");
+    assert_eq!(body_audits, 0);
 
     let headers_only = UsageCleanupTargets {
         detail_body: false,

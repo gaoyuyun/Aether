@@ -109,6 +109,32 @@ fn classifies_openai_chat_and_responses_separately_from_embedding() {
 }
 
 #[test]
+fn classifies_openai_realtime_only_for_websocket_upgrades() {
+    let websocket_headers = headers(&[
+        ("authorization", "Bearer sk-test"),
+        ("connection", "keep-alive, Upgrade"),
+        ("upgrade", "websocket"),
+    ]);
+    let uri: Uri = "/v1/realtime?model=gpt-realtime"
+        .parse()
+        .expect("uri should parse");
+
+    let decision = classify_control_route(&http::Method::GET, &uri, &websocket_headers)
+        .expect("Realtime WebSocket route should classify");
+    assert_eq!(decision.route_family.as_deref(), Some("openai"));
+    assert_eq!(decision.route_kind.as_deref(), Some("realtime"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("openai:realtime")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+
+    let plain_headers = headers(&[("authorization", "Bearer sk-test")]);
+    assert!(classify_control_route(&http::Method::GET, &uri, &plain_headers).is_none());
+    assert!(classify_control_route(&http::Method::POST, &uri, &websocket_headers).is_none());
+}
+
+#[test]
 fn classifies_openai_image_generation_and_edit_but_not_variation() {
     let headers = headers(&[("authorization", "Bearer sk-test")]);
 

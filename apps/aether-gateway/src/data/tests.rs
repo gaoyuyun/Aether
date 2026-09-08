@@ -312,7 +312,7 @@ async fn data_state_checks_user_uniqueness_through_user_reader() {
         Some("admin@example.com".to_string()),
         true,
         "admin".to_string(),
-        Some(format!("$2b$12${}", "a".repeat(53))),
+        Some("$2b$12$4qL4tdcsFwVaDTw5Ck3xzu8GpNdre56DiNR6Dnw7t6gCXaEnqAe7G".to_string()),
         "admin".to_string(),
         "local".to_string(),
         None,

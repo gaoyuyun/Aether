@@ -29,7 +29,8 @@ pub use backend::{
 };
 pub use config::DataLayerConfig;
 pub use database::{
-    DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_CACHE_MB, DEFAULT_SQLITE_DATABASE_URL,
+    DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_CACHE_MB,
+    DEFAULT_SQLITE_DATABASE_URL,
 };
 pub use error::DataLayerError;
 pub use maintenance::{

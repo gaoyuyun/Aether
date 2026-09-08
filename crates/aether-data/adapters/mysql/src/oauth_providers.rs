@@ -3,7 +3,7 @@ use sqlx::{mysql::MySqlRow, Row};
 
 use aether_data_contracts::repository::oauth_providers::{
     OAuthProviderReadRepository, OAuthProviderWriteRepository, StoredOAuthProviderConfig,
-    UpsertOAuthProviderConfigRecord,
+    UpsertOAuthProviderConfigOutcome, UpsertOAuthProviderConfigRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -115,6 +115,13 @@ WHERE users.is_active = 1
   )
 "#;
 
+const COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL: &str = r#"
+UPDATE oauth_providers
+SET client_secret_encrypted = ?
+WHERE BINARY provider_type = BINARY ?
+  AND BINARY client_secret_encrypted = BINARY ?
+"#;
+
 #[async_trait]
 impl OAuthProviderReadRepository for MysqlOAuthProviderRepository {
     async fn list_oauth_provider_configs(
@@ -158,12 +165,56 @@ impl OAuthProviderReadRepository for MysqlOAuthProviderRepository {
 
 #[async_trait]
 impl OAuthProviderWriteRepository for MysqlOAuthProviderRepository {
-    async fn upsert_oauth_provider_config(
+    async fn upsert_oauth_provider_config_guarded(
         &self,
         record: &UpsertOAuthProviderConfigRecord,
-    ) -> Result<StoredOAuthProviderConfig, DataLayerError> {
+        ldap_exclusive: bool,
+        force_disable: bool,
+        _locked_users_snapshot: usize,
+    ) -> Result<UpsertOAuthProviderConfigOutcome, DataLayerError> {
         record.validate()?;
         let now = now_unix_secs();
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let existing_enabled: Option<bool> = if record.is_enabled || force_disable {
+            None
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT provider_type FROM oauth_providers ORDER BY provider_type FOR UPDATE",
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_sql_err()?;
+            sqlx::query_scalar("SELECT is_enabled FROM oauth_providers WHERE provider_type = ?")
+                .bind(&record.provider_type)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?
+        };
+        if existing_enabled == Some(true) {
+            let row = sqlx::query(COUNT_LOCKED_USERS_IF_PROVIDER_DISABLED_SQL)
+                .bind(&record.provider_type)
+                .bind(&record.provider_type)
+                .bind(ldap_exclusive)
+                .bind(&record.provider_type)
+                .fetch_one(&mut *tx)
+                .await
+                .map_sql_err()?;
+            let affected_count =
+                usize::try_from(row.try_get::<i64, _>("locked_count").map_sql_err()?.max(0))
+                    .map_err(|_| {
+                        DataLayerError::UnexpectedValue(
+                            "oauth_providers.locked_user_count overflowed".to_string(),
+                        )
+                    })?;
+            if affected_count > 0 {
+                tx.rollback().await.map_sql_err()?;
+                return Ok(
+                    UpsertOAuthProviderConfigOutcome::DisableRequiresConfirmation {
+                        affected_count,
+                    },
+                );
+            }
+        }
         sqlx::query(
             r#"
 INSERT INTO oauth_providers (
@@ -228,27 +279,65 @@ ON DUPLICATE KEY UPDATE
         .bind(now as i64)
         .bind(record.client_secret_encrypted.mode_name())
         .bind(record.client_secret_encrypted.value())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
 
-        self.get_provider(&record.provider_type)
-            .await?
-            .ok_or_else(|| {
-                DataLayerError::UnexpectedValue("upserted OAuth provider missing".to_string())
-            })
+        let row = sqlx::query(GET_OAUTH_PROVIDER_CONFIG_SQL)
+            .bind(&record.provider_type)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let provider = map_oauth_provider_row(&row)?;
+        tx.commit().await.map_sql_err()?;
+        Ok(UpsertOAuthProviderConfigOutcome::Upserted(provider))
     }
 
-    async fn delete_oauth_provider_config(
+    async fn compare_and_swap_oauth_provider_client_secret(
         &self,
         provider_type: &str,
+        expected: &str,
+        replacement: &str,
     ) -> Result<bool, DataLayerError> {
-        let result = sqlx::query("DELETE FROM oauth_providers WHERE provider_type = ?")
+        let result = sqlx::query(COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL)
+            .bind(replacement)
             .bind(provider_type)
+            .bind(expected)
             .execute(&self.pool)
             .await
             .map_sql_err()?;
-        Ok(result.rows_affected() > 0)
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn delete_oauth_provider_config_if_unlinked(
+        &self,
+        provider_type: &str,
+        has_links_snapshot: bool,
+    ) -> Result<bool, DataLayerError> {
+        if has_links_snapshot {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let provider_exists: Option<String> = sqlx::query_scalar(
+            "SELECT provider_type FROM oauth_providers WHERE provider_type = ? FOR UPDATE",
+        )
+        .bind(provider_type)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if provider_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        let result = sqlx::query(
+            "DELETE FROM oauth_providers WHERE provider_type = ? AND NOT EXISTS (SELECT 1 FROM user_oauth_links WHERE user_oauth_links.provider_type = oauth_providers.provider_type)",
+        )
+        .bind(provider_type)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(result.rows_affected() == 1)
     }
 }
 
@@ -378,7 +467,16 @@ fn map_oauth_provider_row(row: &MySqlRow) -> Result<StoredOAuthProviderConfig, D
 
 #[cfg(test)]
 mod tests {
-    use super::MysqlOAuthProviderRepository;
+    use super::{MysqlOAuthProviderRepository, COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL};
+
+    #[test]
+    fn client_secret_cas_updates_only_the_secret_column() {
+        assert!(COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL
+            .contains("SET client_secret_encrypted = ?"));
+        assert!(COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL
+            .contains("BINARY client_secret_encrypted = BINARY ?"));
+        assert!(!COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL.contains("updated_at"));
+    }
 
     #[tokio::test]
     async fn repository_builds_from_lazy_pool() {

@@ -32,9 +32,9 @@ pub use mysql::MysqlBackend;
 pub use postgres::PostgresBackend;
 pub use read::DataReadRepositories;
 pub use referrals::{
-    ReferralAdminStats, ReferralDataState, ReferralMutationStatus, ReferralRelationshipListQuery,
-    ReferralRelationshipRecord, ReferralRewardConfig, ReferralRewardListQuery,
-    ReferralRewardRecord, ReferralUserDashboard,
+    ReferralAdminStats, ReferralDataState, ReferralMutationStatus, ReferralReconciliationSummary,
+    ReferralRelationshipListQuery, ReferralRelationshipRecord, ReferralRewardConfig,
+    ReferralRewardListQuery, ReferralRewardRecord, ReferralUserDashboard,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteBackend;
@@ -52,6 +52,11 @@ enum SqlBackendRef<'a> {
     Mysql(&'a MysqlBackend),
     #[cfg(feature = "sqlite")]
     Sqlite(&'a SqliteBackend),
+    // Keep the reference lifetime represented when this crate is built without
+    // any SQL driver features.  The no-driver build still exposes the
+    // maintenance facade, but has no concrete backend variant to carry `'a`.
+    #[cfg(not(any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
+    Disabled(std::marker::PhantomData<&'a ()>),
 }
 
 #[derive(Debug, Clone, Default)]

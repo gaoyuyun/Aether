@@ -37,6 +37,7 @@ const MAX_MOCK_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const BASIS_POINTS: u16 = 10_000;
 const DEFAULT_TIMEOUT_HOLD_MS: u64 = 60_000;
 const REQUEST_SEQUENCE_HEADER: &str = "x-mock-request-sequence";
+const TRUNCATED_STREAM_FLUSH_DELAY: Duration = Duration::from_millis(10);
 
 const RANDOM_DOMAIN_FAULT: u64 = 0x5c32_22f7_27d4_7a6f;
 const RANDOM_DOMAIN_FIRST_BYTE: u64 = 0x087d_89d9_3bc3_15db;
@@ -646,8 +647,10 @@ fn build_chat_sse_response(
             if profile.truncate_after_chunks == Some(0)
                 || profile.truncate_after_chunks == Some(index + 1)
             {
-                // Force Hyper to flush the successful frame before observing the body error.
-                tokio::task::yield_now().await;
+                // Hyper translates body errors into RST_STREAM for HTTP/2. Keep the body
+                // pending briefly so the response headers and successful DATA frame are
+                // written before Hyper observes the error.
+                tokio::time::sleep(TRUNCATED_STREAM_FLUSH_DELAY).await;
                 record_fault(&app, Fault::TruncateStream);
                 yield Err::<Bytes, std::io::Error>(truncated_stream_error());
                 return;
@@ -701,8 +704,10 @@ fn build_responses_sse_response(
             if profile.truncate_after_chunks == Some(0)
                 || profile.truncate_after_chunks == Some(index + 1)
             {
-                // Force Hyper to flush the successful frame before observing the body error.
-                tokio::task::yield_now().await;
+                // Hyper translates body errors into RST_STREAM for HTTP/2. Keep the body
+                // pending briefly so the response headers and successful DATA frame are
+                // written before Hyper observes the error.
+                tokio::time::sleep(TRUNCATED_STREAM_FLUSH_DELAY).await;
                 record_fault(&app, Fault::TruncateStream);
                 yield Err::<Bytes, std::io::Error>(truncated_stream_error());
                 return;

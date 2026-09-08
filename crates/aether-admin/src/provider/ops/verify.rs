@@ -5,6 +5,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Map, Value};
 
 const ADMIN_PROVIDER_OPS_ANYROUTER_XOR_KEY: &str = "3000176000856006061501533003690027800375";
+const ADMIN_PROVIDER_OPS_ANYROUTER_SESSION_PART_MAX_BYTES: usize = 256 * 1024;
 const ADMIN_PROVIDER_OPS_ANYROUTER_UNSBOX_TABLE: [usize; 40] = [
     0xF, 0x23, 0x1D, 0x18, 0x21, 0x10, 0x1, 0x26, 0xA, 0x9, 0x13, 0x1F, 0x28, 0x1B, 0x16, 0x17,
     0x19, 0xD, 0x6, 0xB, 0x27, 0x12, 0x14, 0x8, 0xE, 0x15, 0x20, 0x1A, 0x2, 0x1E, 0x7, 0x4, 0x11,
@@ -32,6 +33,7 @@ pub fn parse_verify_payload(
         "sub2api" => {
             admin_provider_ops_sub2api_verify_payload(status, response_json, updated_credentials)
         }
+        "usage_api" => admin_provider_ops_usage_api_verify_payload(status, response_json),
         _ => admin_provider_ops_generic_verify_payload(status, response_json),
     }
 }
@@ -116,7 +118,16 @@ pub fn admin_provider_ops_anyrouter_parse_session_user_id(cookie_input: &str) ->
 }
 
 fn decode_python_urlsafe_b64(input: &str) -> Option<Vec<u8>> {
-    let normalized = input.trim().replace('-', "+").replace('_', "/");
+    let input = input.trim();
+    let max_encoded_len = ADMIN_PROVIDER_OPS_ANYROUTER_SESSION_PART_MAX_BYTES
+        .saturating_add(2)
+        .checked_div(3)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4);
+    if input.is_empty() || input.len() > max_encoded_len {
+        return None;
+    }
+    let normalized = input.replace('-', "+").replace('_', "/");
     if normalized.is_empty() {
         return None;
     }
@@ -125,7 +136,8 @@ fn decode_python_urlsafe_b64(input: &str) -> Option<Vec<u8>> {
     if remainder != 0 {
         padded.push_str(&"=".repeat(4 - remainder));
     }
-    STANDARD.decode(padded.as_bytes()).ok()
+    let decoded = STANDARD.decode(padded.as_bytes()).ok()?;
+    (decoded.len() <= ADMIN_PROVIDER_OPS_ANYROUTER_SESSION_PART_MAX_BYTES).then_some(decoded)
 }
 
 pub fn admin_provider_ops_verify_failure(message: impl Into<String>) -> Value {
@@ -286,7 +298,7 @@ pub fn admin_provider_ops_verify_headers(
 ) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     match normalize_architecture_id(architecture_id) {
-        "generic_api" => {
+        "generic_api" | "usage_api" => {
             let api_key = credentials
                 .get("api_key")
                 .and_then(Value::as_str)
@@ -404,6 +416,78 @@ pub fn admin_provider_ops_generic_verify_payload(
     )
 }
 
+pub fn admin_provider_ops_usage_api_verify_payload(
+    status: StatusCode,
+    response_json: &Value,
+) -> Value {
+    if status == StatusCode::UNAUTHORIZED {
+        return admin_provider_ops_verify_failure("认证失败：API Key 无效");
+    }
+    if status == StatusCode::FORBIDDEN {
+        return admin_provider_ops_verify_failure("认证失败：API Key 无权查询用量");
+    }
+    if status != StatusCode::OK {
+        return admin_provider_ops_verify_failure(format!("验证失败：HTTP {}", status.as_u16()));
+    }
+
+    let Some(data) = response_json.as_object() else {
+        return admin_provider_ops_verify_failure("响应格式无效");
+    };
+    let is_valid = data
+        .get("is_active")
+        .and_then(Value::as_bool)
+        .or_else(|| data.get("isValid").and_then(Value::as_bool));
+    if is_valid == Some(false) {
+        return admin_provider_ops_verify_failure("API Key 无效或已停用");
+    }
+
+    let quota = data.get("quota").and_then(Value::as_object);
+    let remaining = admin_provider_ops_value_as_f64(data.get("remaining"))
+        .or_else(|| quota.and_then(|quota| admin_provider_ops_value_as_f64(quota.get("remaining"))))
+        .or_else(|| admin_provider_ops_value_as_f64(data.get("balance")));
+    let Some(remaining) = remaining else {
+        return admin_provider_ops_verify_failure("响应缺少余额字段");
+    };
+    let unit = data
+        .get("unit")
+        .and_then(Value::as_str)
+        .or_else(|| quota.and_then(|quota| quota.get("unit").and_then(Value::as_str)))
+        .unwrap_or("USD")
+        .to_string();
+    let plan_name = data
+        .get("planName")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("plan_name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("API Key")
+        .to_string();
+
+    let mut extra = Map::new();
+    extra.insert("unit".to_string(), Value::String(unit));
+    if let Some(value) = data.get("balance") {
+        extra.insert("balance".to_string(), value.clone());
+    }
+    if let Some(value) = data.get("mode") {
+        extra.insert("mode".to_string(), value.clone());
+    }
+    extra.insert(
+        "is_valid".to_string(),
+        Value::Bool(is_valid.unwrap_or(true)),
+    );
+
+    admin_provider_ops_verify_success(
+        admin_provider_ops_verify_user_payload(
+            Some(plan_name.clone()),
+            Some(plan_name),
+            None,
+            Some(remaining),
+            Some(extra),
+        ),
+        None,
+    )
+}
+
 pub fn admin_provider_ops_anyrouter_verify_payload(
     status: StatusCode,
     response_json: &Value,
@@ -437,12 +521,7 @@ fn verify_payload_with_auth_messages(
     {
         response_json.get("data")
     } else if response_json.get("success").and_then(Value::as_bool) == Some(false) {
-        return admin_provider_ops_verify_failure(
-            response_json
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("验证失败"),
-        );
+        return admin_provider_ops_verify_failure("验证失败");
     } else {
         Some(response_json)
     };
@@ -450,17 +529,6 @@ fn verify_payload_with_auth_messages(
     let Some(user_data) = user_data.and_then(admin_provider_ops_json_object) else {
         return admin_provider_ops_verify_failure("响应格式无效");
     };
-
-    let mut extra = Map::new();
-    for (key, value) in user_data {
-        if matches!(
-            key.as_str(),
-            "username" | "display_name" | "email" | "quota" | "used_quota" | "request_count"
-        ) {
-            continue;
-        }
-        extra.insert(key.clone(), value.clone());
-    }
 
     admin_provider_ops_verify_success(
         admin_provider_ops_verify_user_payload_with_usage(
@@ -479,7 +547,7 @@ fn verify_payload_with_auth_messages(
             admin_provider_ops_value_as_f64(user_data.get("quota")),
             admin_provider_ops_value_as_f64(user_data.get("used_quota")),
             admin_provider_ops_value_as_u64(user_data.get("request_count")),
-            Some(extra),
+            None,
         ),
         None,
     )
@@ -504,12 +572,7 @@ pub fn admin_provider_ops_sub2api_verify_payload(
         return admin_provider_ops_verify_failure("响应格式无效");
     };
     if payload.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
-        return admin_provider_ops_verify_failure(
-            payload
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("验证失败"),
-        );
+        return admin_provider_ops_verify_failure("验证失败");
     }
 
     let Some(user_data) = payload.get("data").and_then(Value::as_object) else {
@@ -555,8 +618,10 @@ mod tests {
         admin_provider_ops_anyrouter_compute_acw_sc_v2,
         admin_provider_ops_anyrouter_parse_session_user_id,
         admin_provider_ops_anyrouter_verify_payload,
-        admin_provider_ops_frontend_updated_credentials, admin_provider_ops_sub2api_verify_payload,
-        admin_provider_ops_verify_headers, parse_verify_payload, ADMIN_PROVIDER_OPS_USER_AGENT,
+        admin_provider_ops_frontend_updated_credentials, admin_provider_ops_generic_verify_payload,
+        admin_provider_ops_sub2api_verify_payload, admin_provider_ops_usage_api_verify_payload,
+        admin_provider_ops_verify_headers, parse_verify_payload,
+        ADMIN_PROVIDER_OPS_ANYROUTER_SESSION_PART_MAX_BYTES, ADMIN_PROVIDER_OPS_USER_AGENT,
     };
     use http::StatusCode;
     use reqwest::header::COOKIE;
@@ -588,6 +653,17 @@ mod tests {
             "session=MTIzfGVIaDRlQUpwWkFOcGJuU3F1d0RfVkhsNWVYa0lkWE5sY201aGJXVUdjM1J5YVc1bkRCQUFCV0ZzYVdObHxzaWc=",
         );
         assert_eq!(actual.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn anyrouter_parse_session_user_id_rejects_oversized_encoded_cookie() {
+        let encoded_limit = ADMIN_PROVIDER_OPS_ANYROUTER_SESSION_PART_MAX_BYTES
+            .saturating_add(2)
+            .checked_div(3)
+            .unwrap()
+            .saturating_mul(4);
+        let cookie = format!("session={}", "A".repeat(encoded_limit + 1));
+        assert!(admin_provider_ops_anyrouter_parse_session_user_id(&cookie).is_none());
     }
 
     #[test]
@@ -665,6 +741,57 @@ mod tests {
     }
 
     #[test]
+    fn usage_api_headers_use_bearer_api_key() {
+        let headers = admin_provider_ops_verify_headers(
+            "usage_api",
+            &Map::new(),
+            &Map::from_iter([("api_key".to_string(), json!("example-api-key"))]),
+        )
+        .expect("headers should build");
+
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer example-api-key")
+        );
+    }
+
+    #[test]
+    fn usage_api_verify_payload_reads_remaining_and_plan() {
+        let payload = admin_provider_ops_usage_api_verify_payload(
+            StatusCode::OK,
+            &json!({
+                "remaining": 42.5,
+                "balance": 42.5,
+                "unit": "USD",
+                "isValid": true,
+                "planName": "Example Plan"
+            }),
+        );
+
+        assert_eq!(payload["success"], json!(true));
+        assert_eq!(payload["data"]["username"], json!("Example Plan"));
+        assert_eq!(payload["data"]["quota"], json!(42.5));
+        assert_eq!(payload["data"]["extra"]["unit"], json!("USD"));
+        assert_eq!(payload["data"]["extra"]["is_valid"], json!(true));
+    }
+
+    #[test]
+    fn usage_api_verify_payload_rejects_inactive_key() {
+        let payload = admin_provider_ops_usage_api_verify_payload(
+            StatusCode::OK,
+            &json!({
+                "remaining": 0,
+                "isValid": false
+            }),
+        );
+
+        assert_eq!(payload["success"], json!(false));
+        assert_eq!(payload["message"], json!("API Key 无效或已停用"));
+    }
+
+    #[test]
     fn anyrouter_verify_payload_uses_cookie_auth_messages_and_usage_fields() {
         let payload = admin_provider_ops_anyrouter_verify_payload(
             StatusCode::OK,
@@ -688,6 +815,58 @@ mod tests {
             admin_provider_ops_anyrouter_verify_payload(StatusCode::UNAUTHORIZED, &json!({}));
         assert_eq!(auth_failed["success"], json!(false));
         assert_eq!(auth_failed["message"], json!("Cookie 已失效，请重新配置"));
+    }
+
+    #[test]
+    fn generic_verify_payload_does_not_reflect_upstream_errors_or_unknown_fields() {
+        let failed = admin_provider_ops_generic_verify_payload(
+            StatusCode::OK,
+            &json!({
+                "success": false,
+                "message": "token=upstream-secret https://user:pass@example.com/path?q=secret"
+            }),
+        );
+        assert_eq!(failed["success"], json!(false));
+        assert_eq!(failed["message"], json!("验证失败"));
+
+        let succeeded = admin_provider_ops_generic_verify_payload(
+            StatusCode::OK,
+            &json!({
+                "username": "alice",
+                "quota": 12.5,
+                "access_token": "upstream-secret",
+                "profile": {"private_note": "sensitive"}
+            }),
+        );
+        assert_eq!(succeeded["success"], json!(true));
+        assert_eq!(succeeded["data"]["username"], json!("alice"));
+        assert_eq!(succeeded["data"]["quota"], json!(12.5));
+        assert_eq!(succeeded["data"]["extra"], json!({}));
+        let serialized = succeeded.to_string();
+        assert!(!serialized.contains("upstream-secret"));
+        assert!(!serialized.contains("private_note"));
+    }
+
+    #[test]
+    fn architecture_verify_failures_do_not_reflect_upstream_messages() {
+        let cubence = admin_provider_ops_cubence_verify_payload(
+            StatusCode::OK,
+            &json!({
+                "success": false,
+                "message": "authorization=Bearer upstream-secret"
+            }),
+        );
+        assert_eq!(cubence["message"], json!("验证失败"));
+
+        let sub2api = admin_provider_ops_sub2api_verify_payload(
+            StatusCode::OK,
+            &json!({
+                "code": 500,
+                "message": "cookie=session-secret"
+            }),
+            None,
+        );
+        assert_eq!(sub2api["message"], json!("验证失败"));
     }
 
     #[test]

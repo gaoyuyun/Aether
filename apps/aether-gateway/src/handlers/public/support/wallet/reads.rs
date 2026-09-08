@@ -4,6 +4,7 @@ use super::{
     GatewayError, GatewayPublicRequestContext, Response, WALLET_LEGACY_TIMEZONE,
 };
 use crate::handlers::shared::round_to;
+use aether_data::repository::wallet::stored_timestamp_unix_secs;
 use aether_data_contracts::repository::usage::UsageSettledCostSummaryQuery;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
@@ -322,7 +323,10 @@ pub(super) fn wallet_transaction_payload_from_record(
         "link_id": record.link_id.clone(),
         "operator_id": record.operator_id.clone(),
         "description": record.description.clone(),
-        "created_at": record.created_at_unix_ms.and_then(unix_secs_to_rfc3339),
+        "created_at": record
+            .created_at_unix_ms
+            .map(stored_timestamp_unix_secs)
+            .and_then(unix_secs_to_rfc3339),
     })
 }
 

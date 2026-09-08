@@ -6,6 +6,13 @@ use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+use super::redaction::{
+    admin_restore_secret_safe_body_rules, admin_restore_secret_safe_header_rules,
+    admin_restore_secret_safe_json, admin_restore_secret_safe_proxy, admin_restore_secret_safe_url,
+    admin_secret_safe_body_rules, admin_secret_safe_header_rules, admin_secret_safe_json,
+    admin_secret_safe_proxy, admin_secret_safe_url,
+};
+
 pub fn normalize_endpoint_api_format(api_format: &str) -> String {
     aether_ai_formats::normalize_api_format_alias(api_format)
 }
@@ -213,21 +220,6 @@ mod endpoint_key_count_tests {
     }
 }
 
-fn masked_proxy_value(proxy: Option<&serde_json::Value>) -> serde_json::Value {
-    let Some(proxy) = proxy.and_then(serde_json::Value::as_object) else {
-        return serde_json::Value::Null;
-    };
-    let mut masked = proxy.clone();
-    if masked
-        .get("password")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        masked.insert("password".to_string(), json!("***"));
-    }
-    serde_json::Value::Object(masked)
-}
-
 fn endpoint_timestamp_or_now(value: Option<u64>, now_unix_secs: u64) -> serde_json::Value {
     unix_secs_to_rfc3339(value.unwrap_or(now_unix_secs))
         .map(serde_json::Value::String)
@@ -246,15 +238,15 @@ pub fn build_admin_provider_endpoint_response(
         "provider_id": endpoint.provider_id,
         "provider_name": provider_name,
         "api_format": endpoint.api_format,
-        "base_url": endpoint.base_url,
+        "base_url": admin_secret_safe_url(Some(&endpoint.base_url)),
         "custom_path": endpoint.custom_path,
-        "header_rules": endpoint.header_rules,
-        "body_rules": endpoint.body_rules,
+        "header_rules": admin_secret_safe_header_rules(endpoint.header_rules.as_ref()),
+        "body_rules": admin_secret_safe_body_rules(endpoint.body_rules.as_ref()),
         "max_retries": endpoint.max_retries.unwrap_or(2),
         "is_active": endpoint.is_active,
-        "config": endpoint.config,
-        "proxy": masked_proxy_value(endpoint.proxy.as_ref()),
-        "format_acceptance_config": endpoint.format_acceptance_config,
+        "config": admin_secret_safe_json(endpoint.config.as_ref()),
+        "proxy": admin_secret_safe_proxy(endpoint.proxy.as_ref()),
+        "format_acceptance_config": admin_secret_safe_json(endpoint.format_acceptance_config.as_ref()),
         "total_keys": total_keys,
         "active_keys": active_keys,
         "created_at": endpoint_timestamp_or_now(endpoint.created_at_unix_ms, now_unix_secs),
@@ -342,7 +334,8 @@ where
                 "base_url 必须是字符串".to_string()
             });
         };
-        updated.base_url = base_url.to_string();
+        updated.base_url =
+            admin_restore_secret_safe_url(Some(&existing_endpoint.base_url), base_url);
     }
 
     if contains_field("custom_path") {
@@ -359,7 +352,10 @@ where
             if !header_rules.is_array() {
                 return Err("header_rules 必须是数组或 null".to_string());
             }
-            Some(header_rules.clone())
+            Some(admin_restore_secret_safe_header_rules(
+                existing_endpoint.header_rules.as_ref(),
+                header_rules,
+            ))
         };
     }
 
@@ -373,7 +369,10 @@ where
             if !body_rules.is_array() {
                 return Err("body_rules 必须是数组或 null".to_string());
             }
-            Some(body_rules.clone())
+            Some(admin_restore_secret_safe_body_rules(
+                existing_endpoint.body_rules.as_ref(),
+                body_rules,
+            ))
         };
     }
 
@@ -408,7 +407,10 @@ where
             if !config.is_object() {
                 return Err("config 必须是对象或 null".to_string());
             }
-            Some(config.clone())
+            Some(admin_restore_secret_safe_json(
+                existing_endpoint.config.as_ref(),
+                config,
+            ))
         };
     }
 
@@ -416,26 +418,14 @@ where
         if is_null_field("proxy") {
             updated.proxy = None;
         } else {
-            let Some(mut proxy) = payload
-                .proxy
-                .clone()
-                .and_then(|value| value.as_object().cloned())
-            else {
+            let Some(proxy) = payload.proxy.as_ref().and_then(Value::as_object) else {
                 return Err("proxy 必须是对象或 null".to_string());
             };
-            if !proxy.contains_key("password") {
-                if let Some(old_password) = existing_endpoint
-                    .proxy
-                    .as_ref()
-                    .and_then(Value::as_object)
-                    .and_then(|proxy| proxy.get("password"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                {
-                    proxy.insert("password".to_string(), json!(old_password));
-                }
-            }
-            updated.proxy = Some(Value::Object(proxy));
+            let restored = admin_restore_secret_safe_proxy(
+                existing_endpoint.proxy.as_ref(),
+                &Value::Object(proxy.clone()),
+            );
+            updated.proxy = Some(restored);
         }
     }
 
@@ -449,7 +439,10 @@ where
             if !config.is_object() {
                 return Err("format_acceptance_config 必须是对象或 null".to_string());
             }
-            Some(config.clone())
+            Some(admin_restore_secret_safe_json(
+                existing_endpoint.format_acceptance_config.as_ref(),
+                config,
+            ))
         };
     }
 

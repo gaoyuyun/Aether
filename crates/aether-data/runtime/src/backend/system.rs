@@ -170,9 +170,10 @@ fn should_skip_imported_aggregate(
     match mode {
         AdminSystemUsageAggregateImportMode::Skip => Ok(true),
         AdminSystemUsageAggregateImportMode::Overwrite => Ok(false),
-        AdminSystemUsageAggregateImportMode::Error => Err(DataLayerError::InvalidInput(format!(
-            "{table} aggregate already exists for date_unix_secs={date_unix_secs}"
-        ))),
+        AdminSystemUsageAggregateImportMode::Error
+        | AdminSystemUsageAggregateImportMode::ValidateError => Err(DataLayerError::InvalidInput(
+            format!("{table} aggregate already exists for date_unix_secs={date_unix_secs}"),
+        )),
     }
 }
 

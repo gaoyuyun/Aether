@@ -150,13 +150,16 @@
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="__all__">
-              全部状态
+              全部类型
             </SelectItem>
             <SelectItem value="stream">
-              流式
+              HTTP 流式
             </SelectItem>
             <SelectItem value="standard">
-              标准
+              HTTP 标准
+            </SelectItem>
+            <SelectItem value="websocket">
+              WebSocket (WS)
             </SelectItem>
             <SelectItem value="active">
               活跃
@@ -281,6 +284,7 @@
                 v-else-if="isUsageWebSocket(record)"
                 variant="outline"
                 data-usage-transport="websocket"
+                :title="getWebSocketTransportTitle(record)"
                 class="whitespace-nowrap border-sky-500/50 text-sky-600 dark:text-sky-400 text-[10px] px-1.5 h-4 leading-4 inline-flex items-center flex-shrink-0"
               >
                 WS
@@ -308,9 +312,24 @@
             </div>
           </div>
           <div class="flex flex-col items-end flex-shrink-0">
-            <span class="text-sm text-primary font-semibold leading-5">{{ formatCurrency(record.cost || 0) }}</span>
             <span
-              v-if="showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
+              v-if="record.usage_available !== false && record.usage_pricing_available !== false"
+              class="text-sm text-primary font-semibold leading-5"
+            >{{ formatCurrency(record.cost || 0) }}</span>
+            <span
+              v-else-if="record.usage_available === false"
+              data-usage-unavailable="cost"
+              class="text-sm text-muted-foreground font-medium leading-5"
+              title="上游未提供可验证的 token/费用用量"
+            >不可用</span>
+            <span
+              v-else
+              data-usage-unpriced="cost"
+              class="text-sm text-muted-foreground font-medium leading-5"
+              title="token 用量可验证，但当前计价规则不支持该音频用量分项"
+            >未计价</span>
+            <span
+              v-if="record.usage_available !== false && record.usage_pricing_available !== false && showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
               class="text-[10px] text-muted-foreground"
             >{{ formatCurrency(record.actual_cost) }}</span>
           </div>
@@ -406,10 +425,23 @@
             :title="hasRecordCacheTokens(record) ? getRecordCacheTokensTitle(record) : undefined"
           >
             <span class="text-muted-foreground">Tokens</span>
-            <span class="ml-1">{{ formatTokens(getRecordEffectiveInputTokens(record)) }} / {{ formatTokens(record.output_tokens || 0) }}</span>
-            <template v-if="hasRecordCacheTokens(record)">
+            <span
+              v-if="record.usage_available !== false"
+              class="ml-1"
+            >{{ formatTokens(getRecordEffectiveInputTokens(record)) }} / {{ formatTokens(record.output_tokens || 0) }}</span>
+            <span
+              v-else
+              data-usage-unavailable="tokens"
+              class="ml-1 text-muted-foreground"
+              title="上游未提供可验证的 token/费用用量"
+            >不可用</span>
+            <template v-if="record.usage_available !== false && hasRecordCacheTokens(record)">
               <span class="text-muted-foreground"> | </span>
               <span>{{ formatOptionalTokens(getRecordCacheReadTokens(record)) }} / {{ formatOptionalTokens(getRecordCacheCreationTokens(record)) }}</span>
+            </template>
+            <template v-if="record.usage_available !== false && ((record.input_audio_tokens || 0) > 0 || (record.output_audio_tokens || 0) > 0)">
+              <span class="text-muted-foreground"> | 音频 </span>
+              <span>{{ formatOptionalTokens(record.input_audio_tokens) }} / {{ formatOptionalTokens(record.output_audio_tokens) }}</span>
             </template>
           </span>
         </div>
@@ -837,6 +869,7 @@
               v-else-if="isUsageWebSocket(record)"
               variant="outline"
               data-usage-transport="websocket"
+              :title="getWebSocketTransportTitle(record)"
               class="whitespace-nowrap border-sky-500/50 text-sky-600 dark:text-sky-400"
             >
               WS
@@ -866,6 +899,7 @@
             v-if="isColumnVisible('tokens')"
             class="py-4"
           >
+            <template v-if="record.usage_available !== false">
             <div class="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums">
               <span class="justify-self-end whitespace-nowrap text-right">
                 {{ formatTokens(getRecordEffectiveInputTokens(record)) }}
@@ -898,12 +932,30 @@
                 {{ formatOptionalTokens(getRecordCacheCreationTokens(record)) }}
               </span>
             </div>
+              <div
+                v-if="(record.input_audio_tokens || 0) > 0 || (record.output_audio_tokens || 0) > 0"
+                class="mt-0.5 text-right text-[10px] leading-tight tabular-nums text-muted-foreground"
+              >
+                音频 {{ formatOptionalTokens(record.input_audio_tokens) }} / {{ formatOptionalTokens(record.output_audio_tokens) }}
+              </div>
+            </template>
+            <div
+              v-else
+              data-usage-unavailable="tokens"
+              class="text-right text-xs text-muted-foreground"
+              title="上游未提供可验证的 token/费用用量"
+            >
+              不可用
+            </div>
           </TableCell>
           <TableCell
             v-if="isColumnVisible('cost')"
             class="text-right py-4"
           >
-            <div class="flex flex-col items-end text-xs gap-0.5">
+            <div
+              v-if="record.usage_available !== false && record.usage_pricing_available !== false"
+              class="flex flex-col items-end text-xs gap-0.5"
+            >
               <span class="text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
               <span
                 v-if="showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
@@ -911,6 +963,22 @@
               >
                 {{ formatCurrency(record.actual_cost) }}
               </span>
+            </div>
+            <div
+              v-else-if="record.usage_available === false"
+              data-usage-unavailable="cost"
+              class="text-xs text-muted-foreground"
+              title="上游未提供可验证的 token/费用用量"
+            >
+              不可用
+            </div>
+            <div
+              v-else
+              data-usage-unpriced="cost"
+              class="text-xs text-muted-foreground"
+              title="token 用量可验证，但当前计价规则不支持该音频用量分项"
+            >
+              未计价
             </div>
           </TableCell>
           <TableCell
@@ -1042,6 +1110,7 @@ import { API_FORMAT_ORDER, formatApiFormat } from '@/api/endpoints/types/api-for
 import { formatClientFamily } from '@/features/usage/utils/clientFamily'
 import { formatServiceTierFact } from '../utils/service-tier'
 import { isCyberPolicyError } from '../utils/cyberError'
+import { formatUsageWebSocketTransportTitle as getWebSocketTransportTitle } from '../utils/websocketTransport'
 import type { DateRangeParams, UsageRecord } from '../types'
 import { MultiSelect, TimeRangePicker } from '@/components/common'
 import type { MultiSelectOption } from '@/components/common/MultiSelect.vue'
@@ -1309,9 +1378,10 @@ const apiFormatFilterOptions = computed<FilterOption[]>(() => [
 ])
 
 const statusFilterOptions: FilterOption[] = [
-  { value: '__all__', label: '全部状态' },
-  { value: 'stream', label: '流式' },
-  { value: 'standard', label: '标准' },
+  { value: '__all__', label: '全部类型' },
+  { value: 'stream', label: 'HTTP 流式' },
+  { value: 'standard', label: 'HTTP 标准' },
+  { value: 'websocket', label: 'WebSocket (WS)' },
   { value: 'active', label: '活跃' },
   { value: 'failed', label: '失败' },
   { value: 'cancelled', label: '已取消' },
@@ -1564,7 +1634,7 @@ function getApiFormatTooltip(record: UsageRecord): string {
     return `用户请求格式: ${displayFormat}\n端点原生格式: ${endpointDisplayFormat}\n${conversionType}`
   }
 
-  return record.api_format
+  return displayFormat
 }
 
 // 获取实际使用的模型（优先 target_model，其次列表接口下发的 model_version）

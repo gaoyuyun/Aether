@@ -9,9 +9,11 @@ use sqlx::{
 
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdaptiveStateUpdate, ProviderCatalogKeyAdminCasUpdate,
-    ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
+    ProviderCatalogKeyCredentialsCasUpdate, ProviderCatalogKeyHealthStateUpdate,
+    ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
+    ProviderCatalogProviderConfigCasUpdate, ProviderCatalogProxyCasUpdate,
     ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
     ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
     StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
@@ -605,6 +607,48 @@ WHERE id = ?
         self.reload_provider(&provider.id, "updated").await
     }
 
+    pub async fn compare_and_swap_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.provider_id, "provider catalog provider_id")?;
+        let expected_config =
+            optional_json_to_string(&update.expected_config, "providers.expected_config")?;
+        let config = optional_json_to_string(&update.config, "providers.config")?;
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE providers
+SET config = ?, updated_at = ?
+WHERE id = ?
+  AND config <=> ?
+"#,
+        )
+        .bind(config)
+        .bind(current_unix_secs() as i64)
+        .bind(&update.provider_id)
+        .bind(expected_config)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected == 1)
+    }
+
+    pub async fn compare_and_swap_provider_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.record_id, "provider catalog provider_id")?;
+        compare_and_swap_proxy_json(
+            &self.pool,
+            "SELECT proxy FROM providers WHERE id = ?",
+            "UPDATE providers SET proxy = ?, updated_at = ? WHERE id = ? AND BINARY proxy <=> BINARY ?",
+            update,
+            "providers.proxy",
+        )
+        .await
+    }
+
     pub async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
         validate_non_empty(provider_id, "provider catalog provider_id")?;
         let rows_affected = sqlx::query("DELETE FROM providers WHERE id = ?")
@@ -809,6 +853,21 @@ WHERE id = ?
         self.reload_endpoint(&endpoint.id, "updated").await
     }
 
+    pub async fn compare_and_swap_endpoint_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.record_id, "provider catalog endpoint_id")?;
+        compare_and_swap_proxy_json(
+            &self.pool,
+            "SELECT proxy FROM provider_endpoints WHERE id = ?",
+            "UPDATE provider_endpoints SET proxy = ?, updated_at = ? WHERE id = ? AND BINARY proxy <=> BINARY ?",
+            update,
+            "provider_endpoints.proxy",
+        )
+        .await
+    }
+
     pub async fn delete_endpoint(&self, endpoint_id: &str) -> Result<bool, DataLayerError> {
         validate_non_empty(endpoint_id, "provider catalog endpoint_id")?;
         let rows_affected = sqlx::query("DELETE FROM provider_endpoints WHERE id = ?")
@@ -989,6 +1048,46 @@ WHERE id = ?
             )));
         }
         self.reload_key(&key.id, "updated").await
+    }
+
+    pub async fn compare_and_swap_key_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.record_id, "provider catalog key_id")?;
+        compare_and_swap_proxy_json(
+            &self.pool,
+            "SELECT proxy FROM provider_api_keys WHERE id = ?",
+            "UPDATE provider_api_keys SET proxy = ?, updated_at = ? WHERE id = ? AND BINARY proxy <=> BINARY ?",
+            update,
+            "provider_api_keys.proxy",
+        )
+        .await
+    }
+
+    pub async fn compare_and_swap_key_credentials(
+        &self,
+        update: &ProviderCatalogKeyCredentialsCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.key_id, "provider catalog key_id")?;
+        validate_non_empty(
+            &update.expected_provider_id,
+            "provider catalog expected provider_id",
+        )?;
+        let rows_affected = sqlx::query(
+            "UPDATE provider_api_keys SET api_key = ?, encrypted_key = NULL, auth_config = ? WHERE id = ? AND BINARY provider_id = BINARY ? AND BINARY COALESCE(api_key, encrypted_key) <=> BINARY ? AND BINARY auth_config <=> BINARY ?",
+        )
+        .bind(update.encrypted_api_key.as_deref())
+        .bind(update.encrypted_auth_config.as_deref())
+        .bind(&update.key_id)
+        .bind(&update.expected_provider_id)
+        .bind(update.expected_encrypted_api_key.as_deref())
+        .bind(update.expected_encrypted_auth_config.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected == 1)
     }
 
     pub async fn compare_and_update_key_admin_state(
@@ -1409,51 +1508,18 @@ WHERE id = ?
         Ok(rows_affected > 0)
     }
 
-    pub async fn update_key_oauth_credentials(
-        &self,
-        key_id: &str,
-        encrypted_api_key: &str,
-        encrypted_auth_config: Option<&str>,
-        expires_at_unix_secs: Option<u64>,
-    ) -> Result<bool, DataLayerError> {
-        validate_non_empty(key_id, "provider catalog key_id")?;
-        validate_non_empty(encrypted_api_key, "provider catalog oauth api_key")?;
-        let rows_affected = sqlx::query(
-            r#"
-UPDATE provider_api_keys
-SET api_key = ?, auth_config = ?, expires_at = ?, updated_at = ?
-WHERE id = ?
-"#,
-        )
-        .bind(encrypted_api_key)
-        .bind(encrypted_auth_config)
-        .bind(optional_i64_from_u64(
-            expires_at_unix_secs,
-            "provider_api_keys.expires_at",
-        )?)
-        .bind(current_unix_secs() as i64)
-        .bind(key_id)
-        .execute(&self.pool)
-        .await
-        .map_sql_err()?
-        .rows_affected();
-        Ok(rows_affected > 0)
-    }
-
     pub async fn update_key_oauth_runtime_state(
         &self,
         key_id: &str,
         oauth_invalid_at_unix_secs: Option<u64>,
         oauth_invalid_reason: Option<&str>,
-        encrypted_auth_config_update: Option<&str>,
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, DataLayerError> {
         validate_non_empty(key_id, "provider catalog key_id")?;
         let rows_affected = sqlx::query(
             r#"
 UPDATE provider_api_keys
-SET oauth_invalid_at = ?, oauth_invalid_reason = ?,
-    auth_config = COALESCE(?, auth_config), updated_at = ?
+SET oauth_invalid_at = ?, oauth_invalid_reason = ?, updated_at = ?
 WHERE id = ?
 "#,
         )
@@ -1462,7 +1528,6 @@ WHERE id = ?
             "provider_api_keys.oauth_invalid_at",
         )?)
         .bind(oauth_invalid_reason)
-        .bind(encrypted_auth_config_update)
         .bind(updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64)
         .bind(key_id)
         .execute(&self.pool)
@@ -1810,7 +1875,7 @@ WHERE id = ?
             update.expected_encrypted_auth_config.as_deref()
         {
             builder
-                .push(" AND auth_config <=> ")
+                .push(" AND BINARY auth_config <=> BINARY ")
                 .push_bind(expected_encrypted_auth_config);
         }
         let rows_affected = builder
@@ -1928,7 +1993,7 @@ SET health_by_format = ?, circuit_breaker_by_format = ?, updated_at = ?
 WHERE id = ?
   AND JSON_EXTRACT(health_by_format, '$') <=> CAST(? AS JSON)
   AND JSON_EXTRACT(circuit_breaker_by_format, '$') <=> CAST(? AS JSON)
-  AND (? IS NULL OR auth_config <=> ?)
+  AND (? IS NULL OR BINARY auth_config <=> BINARY ?)
 "#,
         )
         .bind(optional_json_to_string(
@@ -2112,6 +2177,20 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         Self::update_provider(self, provider).await
     }
 
+    async fn compare_and_swap_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_provider_config(self, update).await
+    }
+
+    async fn compare_and_swap_provider_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_provider_proxy(self, update).await
+    }
+
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
         Self::delete_provider(self, provider_id).await
     }
@@ -2147,6 +2226,13 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         Self::update_endpoint(self, endpoint).await
     }
 
+    async fn compare_and_swap_endpoint_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_endpoint_proxy(self, update).await
+    }
+
     async fn delete_endpoint(&self, endpoint_id: &str) -> Result<bool, DataLayerError> {
         Self::delete_endpoint(self, endpoint_id).await
     }
@@ -2163,6 +2249,20 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         key: &StoredProviderCatalogKey,
     ) -> Result<StoredProviderCatalogKey, DataLayerError> {
         Self::update_key(self, key).await
+    }
+
+    async fn compare_and_swap_key_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_key_proxy(self, update).await
+    }
+
+    async fn compare_and_swap_key_credentials(
+        &self,
+        update: &ProviderCatalogKeyCredentialsCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_key_credentials(self, update).await
     }
 
     async fn compare_and_update_key_admin_state(
@@ -2259,29 +2359,11 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
         Self::clear_key_oauth_invalid_marker(self, key_id).await
     }
 
-    async fn update_key_oauth_credentials(
-        &self,
-        key_id: &str,
-        encrypted_api_key: &str,
-        encrypted_auth_config: Option<&str>,
-        expires_at_unix_secs: Option<u64>,
-    ) -> Result<bool, DataLayerError> {
-        Self::update_key_oauth_credentials(
-            self,
-            key_id,
-            encrypted_api_key,
-            encrypted_auth_config,
-            expires_at_unix_secs,
-        )
-        .await
-    }
-
     async fn update_key_oauth_runtime_state(
         &self,
         key_id: &str,
         oauth_invalid_at_unix_secs: Option<u64>,
         oauth_invalid_reason: Option<&str>,
-        encrypted_auth_config_update: Option<&str>,
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, DataLayerError> {
         Self::update_key_oauth_runtime_state(
@@ -2289,7 +2371,6 @@ impl ProviderCatalogWriteRepository for MysqlProviderCatalogReadRepository {
             key_id,
             oauth_invalid_at_unix_secs,
             oauth_invalid_reason,
-            encrypted_auth_config_update,
             updated_at_unix_secs,
         )
         .await
@@ -2558,6 +2639,44 @@ fn optional_json_to_string(
     field_name: &str,
 ) -> Result<Option<String>, DataLayerError> {
     optional_json_ref_to_string(value.as_ref(), field_name)
+}
+
+async fn compare_and_swap_proxy_json(
+    pool: &MysqlPool,
+    select_sql: &'static str,
+    update_sql: &'static str,
+    update: &ProviderCatalogProxyCasUpdate,
+    field_name: &'static str,
+) -> Result<bool, DataLayerError> {
+    // Legacy catalog rows may contain semantically identical JSON with Python-style
+    // whitespace. Comparing a re-serialized serde_json::Value directly to a TEXT column
+    // would make lazy credential migration conflict forever. Compare the parsed value first,
+    // then fence the write against the exact raw bytes that were observed.
+    // Outer None means the row does not exist; inner None is an existing SQL NULL proxy.
+    let observed_raw: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(select_sql)
+        .bind(&update.record_id)
+        .fetch_optional(pool)
+        .await
+        .map_sql_err()?;
+    let Some(observed_raw) = observed_raw else {
+        return Ok(false);
+    };
+    let observed = optional_json_from_string(observed_raw.clone(), field_name)?;
+    if observed != update.expected_proxy {
+        return Ok(false);
+    }
+
+    let replacement = optional_json_to_string(&update.proxy, field_name)?;
+    let rows_affected = sqlx::query(update_sql)
+        .bind(replacement)
+        .bind(current_unix_secs() as i64)
+        .bind(&update.record_id)
+        .bind(observed_raw)
+        .execute(pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+    Ok(rows_affected == 1)
 }
 
 fn build_in_query<'a>(
@@ -3235,11 +3354,11 @@ fn map_key_row(row: &MySqlRow) -> Result<StoredProviderCatalogKey, DataLayerErro
                 )?,
             );
         key.note = row.try_get("note").map_sql_err()?;
-        key.auth_type_by_format = optional_json_from_string(
+        let auth_type_by_format = optional_json_from_string(
             row.try_get("auth_type_by_format").map_sql_err()?,
             "provider_api_keys.auth_type_by_format",
         )?;
-        key.allow_auth_channel_mismatch_formats = optional_json_from_string(
+        let allow_auth_channel_mismatch_formats = optional_json_from_string(
             row.try_get("allow_auth_channel_mismatch_formats")
                 .map_sql_err()?,
             "provider_api_keys.allow_auth_channel_mismatch_formats",
@@ -3305,7 +3424,10 @@ fn map_key_row(row: &MySqlRow) -> Result<StoredProviderCatalogKey, DataLayerErro
             row.try_get("updated_at_unix_secs").map_sql_err()?,
             "provider_api_keys.updated_at",
         )?;
-        Ok::<_, DataLayerError>(key)
+        key.with_auth_channel_policy_fields(
+            auth_type_by_format,
+            allow_auth_channel_mismatch_formats,
+        )
     })?
 }
 
@@ -3337,6 +3459,14 @@ mod tests {
         }
         assert!(sql.contains("binary api_key <=> binary ?"));
         assert!(sql.contains("binary auth_config <=> binary ?"));
+    }
+
+    #[test]
+    fn credential_cas_migrates_legacy_encrypted_key_with_binary_fence() {
+        let source = include_str!("provider_catalog.rs");
+        assert!(source.contains(
+            "SET api_key = ?, encrypted_key = NULL, auth_config = ? WHERE id = ? AND BINARY provider_id = BINARY ? AND BINARY COALESCE(api_key, encrypted_key) <=> BINARY ? AND BINARY auth_config <=> BINARY ?"
+        ));
     }
 
     #[test]

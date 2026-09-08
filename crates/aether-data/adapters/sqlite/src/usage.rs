@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
@@ -11,7 +10,10 @@ use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 use crate::error::SqlResultExt;
 use crate::{sqlite_optional_real, sqlite_real, SqlitePool};
 use aether_data_contracts::repository::usage::{
+    read_decompressed_usage_json, sanitize_usage_capture_controls_for_persistence,
+    sanitize_usage_for_persistence, sanitize_usage_request_metadata,
     strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
+    usage_error_category_for_status_code, usage_lifecycle_update_allowed,
     usage_request_metadata_client_family, PendingUsageCleanupSummary,
     ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
     StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
@@ -602,12 +604,15 @@ const UPSERT_FIRST_BYTE_BATCH_UPDATE_SUFFIX_SQL: &str = r#",
 WHERE "usage".billing_status = 'pending'
   AND "usage".status IN ('pending', 'streaming')
   AND "usage".finalized_at IS NULL
+  AND excluded.updated_at_unix_secs >= COALESCE(
+    NULLIF("usage".updated_at_unix_secs, 0),
+    COALESCE("usage".created_at_unix_ms, 0)
+  )
 "#;
 
 const SELECT_STALE_PENDING_USAGE_BATCH_SQL: &str = r#"
 SELECT
   "usage".request_id,
-  "usage".status,
   COALESCE(usage_settlement_snapshots.billing_status, "usage".billing_status) AS billing_status
 FROM "usage"
 LEFT JOIN usage_settlement_snapshots
@@ -945,6 +950,12 @@ AND LOWER(TRIM(COALESCE(provider_name, ''))) NOT IN ('unknown', 'unknow'))",
             .push("is_stream = ")
             .push_bind(if is_stream { 1_i64 } else { 0_i64 });
     }
+    if let Some(is_websocket) = query.is_websocket {
+        push_sqlite_usage_where(builder, has_where);
+        builder
+            .push("COALESCE(CAST(json_extract(request_metadata, '$.websocket_mode') AS INTEGER), 0) = ")
+            .push_bind(if is_websocket { 1_i64 } else { 0_i64 });
+    }
     if query.error_only {
         push_sqlite_usage_where(builder, has_where);
         builder.push(
@@ -991,6 +1002,7 @@ fn push_sqlite_usage_keyword_filters(
             statuses: query.statuses.clone(),
             exclude_status_codes: query.exclude_status_codes.clone(),
             is_stream: query.is_stream,
+            is_websocket: query.is_websocket,
             error_only: query.error_only,
             limit: None,
             offset: None,
@@ -1373,7 +1385,6 @@ fn sqlite_usage_local_date_expr(tz_offset_minutes: i32) -> String {
     format!("date(created_at_unix_ms + ({offset}), 'unixepoch')")
 }
 
-
 fn sqlite_usage_breakdown_group_expr(group_by: UsageBreakdownGroupBy) -> &'static str {
     match group_by {
         UsageBreakdownGroupBy::Model => "COALESCE(NULLIF(model, ''), 'unknown')",
@@ -1416,11 +1427,7 @@ fn sqlite_usage_body_sql_columns(field: UsageBodyField) -> (&'static str, &'stat
 }
 
 fn inflate_usage_json_value(bytes: &[u8]) -> Result<serde_json::Value, DataLayerError> {
-    let mut decoder = GzDecoder::new(bytes);
-    let mut json_bytes = Vec::new();
-    decoder.read_to_end(&mut json_bytes).map_err(|err| {
-        DataLayerError::UnexpectedValue(format!("failed to decompress usage json: {err}"))
-    })?;
+    let json_bytes = read_decompressed_usage_json(GzDecoder::new(bytes))?;
     serde_json::from_slice(&json_bytes).map_err(|err| {
         DataLayerError::UnexpectedValue(format!("failed to parse decompressed usage json: {err}"))
     })
@@ -1457,7 +1464,7 @@ impl PreparedFirstByteUsage {
             ));
         }
 
-        let usage = strip_deprecated_usage_display_fields(usage);
+        let usage = sanitize_usage_for_persistence(usage);
         let request_metadata_json = usage
             .request_metadata
             .as_ref()
@@ -2540,12 +2547,11 @@ FROM (
     async fn read_hourly_model_provider_cutoff_unix_secs(
         &self,
     ) -> Result<Option<u64>, DataLayerError> {
-        let latest_hour: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(hour_utc) FROM stats_hourly_model_provider",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_sql_err()?;
+        let latest_hour: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(hour_utc) FROM stats_hourly_model_provider")
+                .fetch_one(&self.pool)
+                .await
+                .map_sql_err()?;
         latest_hour
             .map(|value| {
                 u64::try_from(value)
@@ -2622,9 +2628,8 @@ FROM (
         if first_full_local_day_start >= last_local_day_covered_end {
             return Ok((Vec::new(), None));
         }
-        let date_expr = format!(
-            "date((hour_utc / 3600 + ({offset_secs}) / 3600) * 3600, 'unixepoch')"
-        );
+        let date_expr =
+            format!("date((hour_utc / 3600 + ({offset_secs}) / 3600) * 3600, 'unixepoch')");
         let rows = sqlx::query(&format!(
             r#"
 SELECT
@@ -2666,10 +2671,7 @@ ORDER BY date ASC, total_cost_usd DESC, model ASC, provider_name ASC
             .collect::<Result<Vec<_>, DataLayerError>>()?;
         Ok((
             rows,
-            Some((
-                first_full_local_day_start,
-                last_local_day_covered_end,
-            )),
+            Some((first_full_local_day_start, last_local_day_covered_end)),
         ))
     }
 
@@ -3554,10 +3556,7 @@ LEFT JOIN usage_settlement_snapshots AS settlement
         // Hourly coverage hole (fresh deployment before backfill): fall back to
         // the historical raw + imported-daily merge, never worse than before.
         if query.tz_offset_minutes != 0 {
-            if let Some(hourly_cutoff) = self
-                .read_hourly_model_provider_cutoff_unix_secs()
-                .await?
-            {
+            if let Some(hourly_cutoff) = self.read_hourly_model_provider_cutoff_unix_secs().await? {
                 let aligned_from = query.created_from_unix_secs / 3600 * 3600;
                 let aligned_until = query.created_until_unix_secs.div_ceil(3600) * 3600;
                 if hourly_cutoff > aligned_from {
@@ -5146,10 +5145,23 @@ fn usage_current_unix_secs() -> u64 {
         .unwrap_or_default()
 }
 
-fn first_byte_transition_allowed(existing: &StoredRequestUsageAudit) -> bool {
+fn first_byte_transition_allowed(
+    existing: &StoredRequestUsageAudit,
+    incoming: &UpsertUsageRecord,
+) -> bool {
     existing.billing_status == "pending"
         && matches!(existing.status.as_str(), "pending" | "streaming")
         && existing.finalized_at_unix_secs.is_none()
+        && usage_lifecycle_update_allowed(
+            &existing.status,
+            &existing.billing_status,
+            existing.updated_at_unix_secs,
+            existing.finalized_at_unix_secs,
+            &incoming.status,
+            &incoming.billing_status,
+            incoming.updated_at_unix_secs,
+            incoming.finalized_at_unix_secs,
+        )
 }
 
 impl SqliteUsageWriteRepository {
@@ -5186,10 +5198,26 @@ impl SqliteUsageWriteRepository {
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         usage: UpsertUsageRecord,
     ) -> Result<(), DataLayerError> {
-        let mut usage = strip_deprecated_usage_display_fields(usage);
         usage.validate()?;
-        let prepared_capture = http_capture::prepare_usage_http_capture(&mut usage)?;
+        // Auxiliary tables may receive only clear tombstones, never request or response content.
+        let capture_usage = usage.clone();
+        let mut usage = sanitize_usage_for_persistence(usage);
+        usage.validate()?;
         let existing = counters::lock_and_load_usage(tx, &usage.request_id).await?;
+        if existing.as_ref().is_some_and(|existing| {
+            !usage_lifecycle_update_allowed(
+                &existing.status,
+                &existing.billing_status,
+                existing.updated_at_unix_secs,
+                existing.finalized_at_unix_secs,
+                &usage.status,
+                &usage.billing_status,
+                usage.updated_at_unix_secs,
+                usage.finalized_at_unix_secs,
+            )
+        }) {
+            return Ok(());
+        }
         let recovers_terminal_failure = existing.as_ref().is_some_and(|existing| {
             usage_can_recover_terminal_failure(
                 &existing.status,
@@ -5205,13 +5233,18 @@ impl SqliteUsageWriteRepository {
             return Ok(());
         }
 
+        let mut capture_usage = sanitize_usage_capture_controls_for_persistence(capture_usage);
+        let prepared_capture = http_capture::prepare_usage_http_capture(&mut capture_usage)?;
         let capture_update_allowed = recovers_terminal_failure
             || http_capture::capture_update_allowed(existing.as_ref(), &usage.status);
         if capture_update_allowed {
-            http_capture::apply_previous_metadata_tombstones(&mut usage, existing.as_ref());
+            http_capture::apply_previous_metadata_tombstones(&mut capture_usage, existing.as_ref());
+            usage.request_metadata =
+                sanitize_usage_request_metadata(capture_usage.request_metadata.clone());
         }
         let prepared_snapshots = capture_update_allowed
-            .then(|| snapshots::from_usage(&usage))
+            // The control projection preserves safe typed routing and allow-listed billing facts.
+            .then(|| snapshots::from_usage(&capture_usage))
             .transpose()?;
         bind_upsert(sqlx::query(UPSERT_USAGE_SQL), &usage)?
             .execute(&mut **tx)
@@ -5344,7 +5377,7 @@ impl SqliteUsageWriteRepository {
                 before
                     .get(&row.usage.request_id)
                     .and_then(Option::as_ref)
-                    .is_none_or(first_byte_transition_allowed)
+                    .is_none_or(|existing| first_byte_transition_allowed(existing, &row.usage))
             })
             .collect::<Vec<_>>();
         for preserve_existing_format_conversion in [true, false] {
@@ -5374,7 +5407,7 @@ impl SqliteUsageWriteRepository {
             let existing = counters::lock_and_load_usage(&mut tx, &row.usage.request_id).await?;
             if existing
                 .as_ref()
-                .is_some_and(|existing| !first_byte_transition_allowed(existing))
+                .is_some_and(|existing| !first_byte_transition_allowed(existing, &row.usage))
             {
                 continue;
             }
@@ -5621,7 +5654,7 @@ WHERE id = ?
         &self,
         cutoff_unix_secs: u64,
         now_unix_secs: u64,
-        timeout_minutes: u64,
+        _timeout_minutes: u64,
         batch_size: usize,
     ) -> Result<PendingUsageCleanupSummary, DataLayerError> {
         if batch_size == 0 {
@@ -5655,7 +5688,6 @@ WHERE id = ?
                 .map(|row| {
                     Ok(StalePendingUsageRow {
                         request_id: row.try_get("request_id").map_sql_err()?,
-                        status: row.try_get("status").map_sql_err()?,
                         billing_status: row.try_get("billing_status").map_sql_err()?,
                     })
                 })
@@ -5671,7 +5703,8 @@ WHERE id = ?
 UPDATE "usage"
 SET status = 'completed',
     status_code = 200,
-    error_message = NULL
+    error_message = NULL,
+    error_category = NULL
 WHERE request_id = ?
 "#,
                     )
@@ -5699,11 +5732,8 @@ WHERE request_id = ?
 
                 let candidate_info =
                     latest_failed_candidate_sqlite(&mut tx, &row.request_id).await?;
-                let (status_code, error_message) = resolve_stale_pending_failure(
-                    candidate_info.as_ref(),
-                    &row.status,
-                    timeout_minutes,
-                );
+                let status_code = resolve_stale_pending_status_code(candidate_info.as_ref());
+                let error_category = usage_error_category_for_status_code(status_code);
                 let status_code_i64 = i64::from(status_code);
                 if row.billing_status == "pending" {
                     sqlx::query(
@@ -5711,7 +5741,8 @@ WHERE request_id = ?
 UPDATE "usage"
 SET status = 'failed',
     status_code = ?,
-    error_message = ?,
+    error_message = NULL,
+    error_category = ?,
     billing_status = 'void',
     finalized_at = ?,
     total_cost_usd = 0.0,
@@ -5720,7 +5751,7 @@ WHERE request_id = ?
 "#,
                     )
                     .bind(status_code_i64)
-                    .bind(&error_message)
+                    .bind(error_category)
                     .bind(to_i64(now_unix_secs, "usage finalized_at")?)
                     .bind(&row.request_id)
                     .execute(&mut *tx)
@@ -5738,12 +5769,13 @@ WHERE request_id = ?
 UPDATE "usage"
 SET status = 'failed',
     status_code = ?,
-    error_message = ?
+    error_message = NULL,
+    error_category = ?
 WHERE request_id = ?
 "#,
                     )
                     .bind(status_code_i64)
-                    .bind(&error_message)
+                    .bind(error_category)
                     .bind(&row.request_id)
                     .execute(&mut *tx)
                     .await
@@ -5755,7 +5787,8 @@ WHERE request_id = ?
 UPDATE request_candidates
 SET status = 'failed',
     finished_at = ?,
-    error_message = '请求超时（服务器可能已重启）'
+    error_type = 'internal',
+    error_message = NULL
 WHERE request_id = ?
   AND status IN ('pending', 'streaming')
 "#,
@@ -5849,7 +5882,6 @@ WHERE request_id = ?
 
 struct StalePendingUsageRow {
     request_id: String,
-    status: String,
     billing_status: String,
 }
 
@@ -5960,29 +5992,14 @@ DO UPDATE SET
     Ok(())
 }
 
-fn stale_pending_error_message(status: &str, timeout_minutes: u64) -> String {
-    format!("请求超时: 状态 '{status}' 超过 {timeout_minutes} 分钟未完成")
-}
-
 struct FailedCandidateCleanupInfo {
     status_code: Option<u16>,
-    error_message: Option<String>,
 }
 
-fn resolve_stale_pending_failure(
-    candidate: Option<&FailedCandidateCleanupInfo>,
-    status: &str,
-    timeout_minutes: u64,
-) -> (u16, String) {
-    match candidate {
-        Some(info) => (
-            info.status_code.unwrap_or(502),
-            info.error_message
-                .clone()
-                .unwrap_or_else(|| stale_pending_error_message(status, timeout_minutes)),
-        ),
-        None => (504, stale_pending_error_message(status, timeout_minutes)),
-    }
+fn resolve_stale_pending_status_code(candidate: Option<&FailedCandidateCleanupInfo>) -> u16 {
+    candidate
+        .and_then(|info| info.status_code)
+        .unwrap_or(if candidate.is_some() { 502 } else { 504 })
 }
 
 async fn latest_failed_candidate_sqlite(
@@ -5991,7 +6008,7 @@ async fn latest_failed_candidate_sqlite(
 ) -> Result<Option<FailedCandidateCleanupInfo>, DataLayerError> {
     let row = sqlx::query(
         r#"
-SELECT status_code, error_message
+SELECT status_code
 FROM request_candidates
 WHERE request_id = ?
   AND status IN ('failed', 'cancelled')
@@ -6014,15 +6031,7 @@ LIMIT 1
         .try_get::<Option<i64>, _>("status_code")
         .map_sql_err()?
         .and_then(|value| u16::try_from(value).ok());
-    let error_message = row
-        .try_get::<Option<String>, _>("error_message")
-        .map_sql_err()?
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    Ok(Some(FailedCandidateCleanupInfo {
-        status_code,
-        error_message,
-    }))
+    Ok(Some(FailedCandidateCleanupInfo { status_code }))
 }
 
 fn bind_upsert<'q>(

@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use aether_data_contracts::repository::candidate_selection::{
-    StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
+    provider_model_mapping_api_format_covers, StoredMinimalCandidateSelectionRow,
+    StoredProviderModelMapping,
 };
 use aether_data_contracts::DataLayerError;
 use regex::RegexBuilder;
@@ -339,9 +340,9 @@ fn mapping_scope_matches(
     request_operation: Option<&str>,
 ) -> bool {
     let api_format_matches_scope = mapping.api_formats.as_ref().is_none_or(|api_formats| {
-        api_formats
-            .iter()
-            .any(|value| api_format_scope_covers(value, api_format))
+        api_formats.iter().any(|value| {
+            provider_model_mapping_api_format_covers(&row.provider_type, value, api_format)
+        })
     });
     if !api_format_matches_scope {
         return false;
@@ -496,10 +497,6 @@ fn row_has_candidate_model_name(
 
 fn api_format_matches(left: &str, right: &str) -> bool {
     normalize_api_format(left) == normalize_api_format(right)
-}
-
-fn api_format_scope_covers(allowed: &str, requested: &str) -> bool {
-    aether_ai_formats::api_format_permission_covers(allowed, requested)
 }
 
 fn requested_model_name_candidates(
@@ -688,6 +685,56 @@ mod tests {
             "search-only",
             "openai:responses"
         ));
+    }
+
+    #[test]
+    fn codex_live_reuses_only_codex_responses_model_mappings() {
+        let mut row = sample_row("live-client-alias", "gpt-realtime-future");
+        row.provider_type = "codex".to_string();
+        row.endpoint_id = "endpoint-live".to_string();
+        row.endpoint_api_format = "codex:live".to_string();
+        row.key_auth_type = "oauth".to_string();
+        row.key_api_formats = Some(vec!["codex:live".to_string()]);
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "gpt-realtime-future".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:responses".to_string()]),
+            endpoint_ids: Some(vec!["endpoint-live".to_string()]),
+            operations: None,
+        }]);
+
+        assert!(row_supports_requested_model(
+            &row,
+            "live-client-alias",
+            "codex:live"
+        ));
+        assert_eq!(
+            resolve_provider_model_name(&row, "live-client-alias", "codex:live")
+                .map(|resolved| resolved.0),
+            Some("gpt-realtime-future".to_string())
+        );
+
+        let mut wrong_endpoint = row.clone();
+        wrong_endpoint.endpoint_id = "endpoint-other".to_string();
+        assert!(!row_supports_requested_model(
+            &wrong_endpoint,
+            "live-client-alias",
+            "codex:live"
+        ));
+
+        for provider_type in ["openai", "custom"] {
+            let mut non_codex = row.clone();
+            non_codex.provider_type = provider_type.to_string();
+            assert!(!row_supports_requested_model(
+                &non_codex,
+                "live-client-alias",
+                "codex:live"
+            ));
+            assert!(
+                resolve_provider_model_name(&non_codex, "live-client-alias", "codex:live")
+                    .is_none()
+            );
+        }
     }
 
     #[test]

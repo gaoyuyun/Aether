@@ -3,8 +3,12 @@ use sqlx::{sqlite::SqliteRow, Row};
 
 use aether_data_contracts::repository::settlement::{
     finite_wallet_available_usd, plan_finite_wallet_debit, settlement_billable_cost_usd,
-    settlement_billing_status_for_usage_status, SettlementWriteRepository, StoredUsageSettlement,
-    UsageSettlementInput, SETTLEMENT_EPSILON_USD,
+    settlement_billing_status_for_usage_status, validate_wallet_settlement_values,
+    ReconcileUsagePolicyCostInput, ReleaseUsagePolicyRequestAdmissionInput,
+    ReserveUsagePolicyCostInput, ReserveUsagePolicyCostOutcome, ReserveUsagePolicyRequestInput,
+    ReserveUsagePolicyRequestOutcome, SettlementWriteRepository, StoredUsagePolicyCostReservation,
+    StoredUsagePolicyRequestAdmission, StoredUsageSettlement, UsagePolicyCostReservationState,
+    UsagePolicyRequestAdmissionState, UsageSettlementInput, SETTLEMENT_EPSILON_USD,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -167,6 +171,128 @@ impl SqliteSettlementRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+}
+
+fn usage_policy_cost_i64(value: u64, field: &str) -> Result<i64, DataLayerError> {
+    i64::try_from(value)
+        .map_err(|_| DataLayerError::InvalidInput(format!("{field} exceeds the integer range")))
+}
+
+fn usage_policy_cost_u64(value: i64, field: &str) -> Result<u64, DataLayerError> {
+    u64::try_from(value)
+        .map_err(|_| DataLayerError::UnexpectedValue(format!("{field} must not be negative")))
+}
+
+fn usage_policy_request_admission_from_sqlite_row(
+    row: &SqliteRow,
+) -> Result<StoredUsagePolicyRequestAdmission, DataLayerError> {
+    let state: String = row.try_get("state").map_sql_err()?;
+    Ok(StoredUsagePolicyRequestAdmission {
+        request_id: row.try_get("request_id").map_sql_err()?,
+        subject_id: row.try_get("subject_id").map_sql_err()?,
+        event_token: row.try_get("event_token").map_sql_err()?,
+        admitted_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("admitted_at_unix_secs").map_sql_err()?,
+            "usage policy request admitted_at",
+        )?,
+        retain_until_unix_secs: usage_policy_cost_u64(
+            row.try_get("retain_until_unix_secs").map_sql_err()?,
+            "usage policy request retain_until",
+        )?,
+        state: UsagePolicyRequestAdmissionState::parse(&state).ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "unknown usage policy request admission state {state}"
+            ))
+        })?,
+        released_at_unix_secs: row
+            .try_get::<Option<i64>, _>("released_at_unix_secs")
+            .map_sql_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy request released_at"))
+            .transpose()?,
+    })
+}
+
+const FIND_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL: &str = r#"
+SELECT request_id, subject_id, event_token,
+       admitted_at AS admitted_at_unix_secs,
+       retain_until AS retain_until_unix_secs,
+       state, released_at AS released_at_unix_secs
+FROM usage_request_admissions
+WHERE event_token = ?
+"#;
+
+const INSERT_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL: &str = r#"
+INSERT INTO usage_request_admissions (
+  request_id, subject_id, event_token, admitted_at, retain_until,
+  state, released_at, created_at
+) VALUES (?, ?, ?, ?, ?, 'active', NULL, ?)
+ON CONFLICT(event_token) DO NOTHING
+"#;
+
+fn usage_policy_cost_reservation_from_sqlite_row(
+    row: &SqliteRow,
+) -> Result<StoredUsagePolicyCostReservation, DataLayerError> {
+    let state: String = row.try_get("state").map_sql_err()?;
+    Ok(StoredUsagePolicyCostReservation {
+        request_id: row.try_get("request_id").map_sql_err()?,
+        subject_id: row.try_get("subject_id").map_sql_err()?,
+        reservation_token: row.try_get("reservation_token").map_sql_err()?,
+        admitted_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("admitted_at").map_sql_err()?,
+            "usage policy admitted_at",
+        )?,
+        reserved_cost_units: usage_policy_cost_u64(
+            row.try_get("reserved_cost_units").map_sql_err()?,
+            "usage policy reserved_cost_units",
+        )?,
+        actual_cost_units: row
+            .try_get::<Option<i64>, _>("actual_cost_units")
+            .map_sql_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy actual_cost_units"))
+            .transpose()?,
+        state: UsagePolicyCostReservationState::parse(&state).ok_or_else(|| {
+            DataLayerError::UnexpectedValue(format!(
+                "unknown usage policy reservation state {state}"
+            ))
+        })?,
+        reservation_expires_at_unix_secs: usage_policy_cost_u64(
+            row.try_get("reservation_expires_at").map_sql_err()?,
+            "usage policy reservation_expires_at",
+        )?,
+        retain_until_unix_secs: usage_policy_cost_u64(
+            row.try_get("retain_until").map_sql_err()?,
+            "usage policy retain_until",
+        )?,
+        finalized_at_unix_secs: row
+            .try_get::<Option<i64>, _>("finalized_at")
+            .map_sql_err()?
+            .map(|value| usage_policy_cost_u64(value, "usage policy finalized_at"))
+            .transpose()?,
+    })
+}
+
+const FIND_USAGE_POLICY_COST_RESERVATION_SQLITE_SQL: &str = r#"
+SELECT request_id, subject_id, reservation_token, admitted_at,
+       reserved_cost_units, actual_cost_units, state,
+       reservation_expires_at, retain_until, finalized_at
+FROM usage_cost_reservations
+WHERE reservation_token = ?
+"#;
+
+async fn lock_usage_policy_subject_sqlite(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject_id: &str,
+) -> Result<bool, DataLayerError> {
+    let result = sqlx::query("UPDATE users SET updated_at = updated_at WHERE id = ?")
+        .bind(subject_id)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    Ok(result.rows_affected() > 0)
+}
+
+fn usage_policy_subject_missing() -> DataLayerError {
+    DataLayerError::InvalidInput("usage policy subject does not exist".to_string())
 }
 
 fn settlement_from_row(row: &SqliteRow) -> Result<StoredUsageSettlement, DataLayerError> {
@@ -406,6 +532,7 @@ fn daily_quota_usage_date(
 fn daily_quota_grants_from_entitlement(
     entitlement_id: &str,
     entitlements: &serde_json::Value,
+    current_allow_wallet_overage: Option<bool>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<DailyQuotaGrant>, DataLayerError> {
     let mut grants = Vec::new();
@@ -431,13 +558,25 @@ fn daily_quota_grants_from_entitlement(
                     .and_then(serde_json::Value::as_str),
                 now,
             )?,
-            allow_wallet_overage: item
-                .get("allow_wallet_overage")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            allow_wallet_overage: current_allow_wallet_overage.unwrap_or_else(|| {
+                item.get("allow_wallet_overage")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            }),
         });
     }
     Ok(grants)
+}
+
+fn daily_quota_wallet_overage_policy(entitlements: &serde_json::Value) -> Option<bool> {
+    entitlements.as_array()?.iter().find_map(|item| {
+        (item.get("type").and_then(serde_json::Value::as_str) == Some("daily_quota"))
+            .then(|| {
+                item.get("allow_wallet_overage")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .flatten()
+    })
 }
 
 async fn consume_daily_quota_sqlite(
@@ -449,18 +588,29 @@ async fn consume_daily_quota_sqlite(
     wallet_can_overdraft: bool,
     now_unix_secs: i64,
 ) -> Result<DailyQuotaDebitResult, DataLayerError> {
-    if total_cost_usd <= 0.0 {
+    if !total_cost_usd.is_finite() || total_cost_usd < 0.0 {
+        return Err(DataLayerError::InvalidInput(
+            "daily quota settlement cost must be finite and non-negative".to_string(),
+        ));
+    }
+    if total_cost_usd == 0.0 {
         return Ok(DailyQuotaDebitResult::default());
     }
     let rows = sqlx::query(
         r#"
-SELECT id, entitlements_snapshot
+SELECT
+    user_plan_entitlements.id,
+    user_plan_entitlements.entitlements_snapshot,
+    billing_plans.entitlements_json AS plan_entitlements_json
 FROM user_plan_entitlements
-WHERE user_id = ?
-  AND status = 'active'
-  AND starts_at <= ?
-  AND expires_at > ?
-ORDER BY expires_at ASC, created_at ASC, id ASC
+JOIN billing_plans ON billing_plans.id = user_plan_entitlements.plan_id
+WHERE user_plan_entitlements.user_id = ?
+    AND user_plan_entitlements.status = 'active'
+    AND user_plan_entitlements.starts_at <= ?
+    AND user_plan_entitlements.expires_at > ?
+ORDER BY user_plan_entitlements.expires_at ASC,
+                 user_plan_entitlements.created_at ASC,
+                 user_plan_entitlements.id ASC
 "#,
     )
     .bind(user_id)
@@ -480,9 +630,17 @@ ORDER BY expires_at ASC, created_at ASC, id ASC
                     "user_plan_entitlements.entitlements_snapshot invalid json: {err}"
                 ))
             })?;
+        let plan_entitlements_raw: String = row.try_get("plan_entitlements_json").map_sql_err()?;
+        let plan_entitlements = serde_json::from_str::<serde_json::Value>(&plan_entitlements_raw)
+            .map_err(|err| {
+            DataLayerError::UnexpectedValue(format!(
+                "billing_plans.entitlements_json invalid json: {err}"
+            ))
+        })?;
         grants.extend(daily_quota_grants_from_entitlement(
             &entitlement_id,
             &entitlements,
+            daily_quota_wallet_overage_policy(&plan_entitlements),
             now,
         )?);
     }
@@ -508,27 +666,26 @@ WHERE user_entitlement_id = ?
         .fetch_one(&mut **tx)
         .await
         .map_sql_err()?;
+        if !used.is_finite() || used < 0.0 {
+            return Err(DataLayerError::UnexpectedValue(
+                "daily quota usage ledger total is invalid".to_string(),
+            ));
+        }
         let remaining = (grant.daily_quota_usd - used).max(0.0);
         total_remaining += remaining;
+        if !total_remaining.is_finite() {
+            return Err(DataLayerError::UnexpectedValue(
+                "daily quota remaining total overflowed".to_string(),
+            ));
+        }
         grants_with_remaining.push((grant, remaining));
     }
-    if !allow_wallet_overage && total_remaining + 0.000_000_01 < total_cost_usd {
-        return Ok(DailyQuotaDebitResult {
-            debited_usd: 0.0,
-            insufficient: true,
-        });
-    }
-    if allow_wallet_overage
-        && !wallet_can_overdraft
-        && wallet_available_usd.is_some_and(|available| {
-            total_remaining + available + SETTLEMENT_EPSILON_USD < total_cost_usd
-        })
-    {
-        return Ok(DailyQuotaDebitResult {
-            debited_usd: 0.0,
-            insufficient: true,
-        });
-    }
+    let insufficient = (!allow_wallet_overage && total_remaining + 0.000_000_01 < total_cost_usd)
+        || (allow_wallet_overage
+            && !wallet_can_overdraft
+            && wallet_available_usd.is_some_and(|available| {
+                total_remaining + available + SETTLEMENT_EPSILON_USD < total_cost_usd
+            }));
 
     let mut remaining_cost = total_cost_usd;
     let mut debited = 0.0;
@@ -564,12 +721,475 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     }
     Ok(DailyQuotaDebitResult {
         debited_usd: debited,
-        insufficient: false,
+        insufficient,
     })
 }
 
 #[async_trait]
 impl SettlementWriteRepository for SqliteSettlementRepository {
+    async fn reserve_usage_policy_request(
+        &self,
+        input: ReserveUsagePolicyRequestInput,
+    ) -> Result<ReserveUsagePolicyRequestOutcome, DataLayerError> {
+        input.validate()?;
+        let now = now_unix_secs()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        // This no-op update acquires SQLite's single writer slot before any admission reads.
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            return Err(usage_policy_subject_missing());
+        }
+        let existing_row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
+            .bind(&input.event_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if let Some(row) = existing_row.as_ref() {
+            let existing = usage_policy_request_admission_from_sqlite_row(row)?;
+            if existing.request_id != input.request_id || existing.subject_id != input.subject_id {
+                tx.commit().await.map_sql_err()?;
+                return Ok(ReserveUsagePolicyRequestOutcome::Conflict);
+            }
+            if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+                return Err(DataLayerError::InvalidInput(
+                    "usage policy event_token must keep its original admitted_at".to_string(),
+                ));
+            }
+            sqlx::query(
+                "UPDATE usage_request_admissions SET retain_until = MAX(retain_until, ?) WHERE event_token = ?",
+            )
+            .bind(usage_policy_cost_i64(
+                input.retain_until_unix_secs,
+                "usage policy request retain_until",
+            )?)
+            .bind(&input.event_token)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let outcome = match existing.state {
+                UsagePolicyRequestAdmissionState::Active => {
+                    ReserveUsagePolicyRequestOutcome::Allowed
+                }
+                UsagePolicyRequestAdmissionState::Released => {
+                    ReserveUsagePolicyRequestOutcome::AlreadyReleased
+                }
+            };
+            tx.commit().await.map_sql_err()?;
+            return Ok(outcome);
+        }
+
+        for (window_index, window) in input.windows.iter().enumerate() {
+            let used_requests = sqlx::query_scalar::<_, i64>(
+                r#"
+SELECT COUNT(*)
+FROM usage_request_admissions
+WHERE subject_id = ?
+  AND state = 'active'
+  AND admitted_at >= ?
+  AND admitted_at < ?
+                "#,
+            )
+            .bind(&input.subject_id)
+            .bind(usage_policy_cost_i64(
+                window.starts_at_unix_secs,
+                "usage policy request window start",
+            )?)
+            .bind(usage_policy_cost_i64(
+                window.ends_at_unix_secs,
+                "usage policy request window end",
+            )?)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let used_requests =
+                usage_policy_cost_u64(used_requests, "usage policy request used_requests")?;
+            if used_requests >= window.limit_requests {
+                tx.commit().await.map_sql_err()?;
+                return Ok(ReserveUsagePolicyRequestOutcome::Rejected {
+                    window_index,
+                    limit_requests: window.limit_requests,
+                    used_requests,
+                });
+            }
+        }
+
+        let insert_result = sqlx::query(INSERT_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
+            .bind(&input.request_id)
+            .bind(&input.subject_id)
+            .bind(&input.event_token)
+            .bind(usage_policy_cost_i64(
+                input.admitted_at_unix_secs,
+                "usage policy request admitted_at",
+            )?)
+            .bind(usage_policy_cost_i64(
+                input.retain_until_unix_secs,
+                "usage policy request retain_until",
+            )?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if insert_result.rows_affected() == 1 {
+            tx.commit().await.map_sql_err()?;
+            return Ok(ReserveUsagePolicyRequestOutcome::Allowed);
+        }
+
+        // The writer lock above normally makes this branch unreachable for concurrent reserves,
+        // but classify the unique-token race explicitly so future lock changes cannot surface a
+        // raw SQLite constraint error or accidentally reactivate a released tombstone.
+        let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
+            .bind(&input.event_token)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let existing = usage_policy_request_admission_from_sqlite_row(&row)?;
+        if existing.request_id != input.request_id || existing.subject_id != input.subject_id {
+            tx.commit().await.map_sql_err()?;
+            return Ok(ReserveUsagePolicyRequestOutcome::Conflict);
+        }
+        if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+            return Err(DataLayerError::InvalidInput(
+                "usage policy event_token must keep its original admitted_at".to_string(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE usage_request_admissions SET retain_until = MAX(retain_until, ?) WHERE event_token = ?",
+        )
+        .bind(usage_policy_cost_i64(
+            input.retain_until_unix_secs,
+            "usage policy request retain_until",
+        )?)
+        .bind(&input.event_token)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let outcome = match existing.state {
+            UsagePolicyRequestAdmissionState::Active => ReserveUsagePolicyRequestOutcome::Allowed,
+            UsagePolicyRequestAdmissionState::Released => {
+                ReserveUsagePolicyRequestOutcome::AlreadyReleased
+            }
+        };
+        tx.commit().await.map_sql_err()?;
+        Ok(outcome)
+    }
+
+    async fn release_usage_policy_request_admission(
+        &self,
+        input: ReleaseUsagePolicyRequestAdmissionInput,
+    ) -> Result<Option<StoredUsagePolicyRequestAdmission>, DataLayerError> {
+        input.validate()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
+        let row = sqlx::query(FIND_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
+            .bind(&input.event_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(row) = row else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        };
+        let mut admission = usage_policy_request_admission_from_sqlite_row(&row)?;
+        if admission.request_id != input.request_id || admission.subject_id != input.subject_id {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
+        if input.released_at_unix_secs < admission.admitted_at_unix_secs {
+            return Err(DataLayerError::InvalidInput(
+                "usage policy released_at must not precede admitted_at".to_string(),
+            ));
+        }
+        if admission.state == UsagePolicyRequestAdmissionState::Active {
+            sqlx::query(
+                "UPDATE usage_request_admissions SET state = 'released', released_at = ? WHERE event_token = ? AND state = 'active'",
+            )
+            .bind(usage_policy_cost_i64(
+                input.released_at_unix_secs,
+                "usage policy request released_at",
+            )?)
+            .bind(&input.event_token)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            admission.state = UsagePolicyRequestAdmissionState::Released;
+            admission.released_at_unix_secs = Some(input.released_at_unix_secs);
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(admission))
+    }
+
+    async fn cleanup_usage_policy_request_admissions(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        let now = usage_policy_cost_i64(now_unix_secs, "usage policy request cleanup timestamp")?;
+        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let result = sqlx::query(
+            r#"
+DELETE FROM usage_request_admissions
+WHERE rowid IN (
+  SELECT rowid
+  FROM usage_request_admissions
+  WHERE retain_until <= ?
+  ORDER BY retain_until, event_token
+  LIMIT ?
+)
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn reserve_usage_policy_cost(
+        &self,
+        input: ReserveUsagePolicyCostInput,
+    ) -> Result<ReserveUsagePolicyCostOutcome, DataLayerError> {
+        input.validate()?;
+        let now = now_unix_secs()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            return Err(usage_policy_subject_missing());
+        }
+        let existing_row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_SQLITE_SQL)
+            .bind(&input.reservation_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let existing = existing_row
+            .as_ref()
+            .map(usage_policy_cost_reservation_from_sqlite_row)
+            .transpose()?;
+        if let Some(existing) = existing.as_ref() {
+            if existing.request_id != input.request_id || existing.subject_id != input.subject_id {
+                tx.commit().await.map_sql_err()?;
+                return Ok(ReserveUsagePolicyCostOutcome::Conflict);
+            }
+            if existing.state != UsagePolicyCostReservationState::Reserved {
+                tx.commit().await.map_sql_err()?;
+                return Ok(ReserveUsagePolicyCostOutcome::AlreadyTerminal {
+                    state: existing.state,
+                });
+            }
+            if existing.admitted_at_unix_secs != input.admitted_at_unix_secs {
+                return Err(DataLayerError::InvalidInput(
+                    "usage policy reservation_token must keep its original admitted_at".to_string(),
+                ));
+            }
+        }
+
+        let previous_reserved_cost_units = existing
+            .as_ref()
+            .map(|reservation| reservation.reserved_cost_units)
+            .unwrap_or(0);
+        let target_reserved_cost_units =
+            previous_reserved_cost_units.max(input.reserved_cost_units);
+        for (window_index, window) in input.windows.iter().enumerate() {
+            let used_cost_units = sqlx::query_scalar::<_, i64>(
+                r#"
+SELECT COALESCE(SUM(
+  CASE
+    WHEN state = 'finalized' THEN COALESCE(actual_cost_units, 0)
+    WHEN state = 'reserved' AND reservation_expires_at > ? THEN reserved_cost_units
+    ELSE 0
+  END
+), 0)
+FROM usage_cost_reservations
+WHERE subject_id = ?
+  AND admitted_at >= ?
+  AND admitted_at < ?
+  AND reservation_token <> ?
+                "#,
+            )
+            .bind(usage_policy_cost_i64(
+                input.admitted_at_unix_secs,
+                "usage policy admitted_at",
+            )?)
+            .bind(&input.subject_id)
+            .bind(usage_policy_cost_i64(
+                window.starts_at_unix_secs,
+                "usage policy window start",
+            )?)
+            .bind(usage_policy_cost_i64(
+                window.ends_at_unix_secs,
+                "usage policy window end",
+            )?)
+            .bind(&input.reservation_token)
+            .fetch_one(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let used_cost_units =
+                usage_policy_cost_u64(used_cost_units, "usage policy used_cost_units")?;
+            if used_cost_units
+                .checked_add(target_reserved_cost_units)
+                .is_none_or(|total| total > window.limit_cost_units)
+            {
+                tx.commit().await.map_sql_err()?;
+                return Ok(ReserveUsagePolicyCostOutcome::Rejected {
+                    window_index,
+                    limit_cost_units: window.limit_cost_units,
+                    used_cost_units,
+                });
+            }
+        }
+
+        sqlx::query(
+            r#"
+INSERT INTO usage_cost_reservations (
+  request_id, subject_id, reservation_token, admitted_at,
+  reserved_cost_units, actual_cost_units,
+  state, reservation_expires_at, retain_until, finalized_at, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, NULL, 'reserved', ?, ?, NULL, ?, ?)
+ON CONFLICT (reservation_token) DO UPDATE SET
+  reserved_cost_units = MAX(
+    usage_cost_reservations.reserved_cost_units,
+    excluded.reserved_cost_units
+  ),
+  reservation_expires_at = MAX(
+    usage_cost_reservations.reservation_expires_at,
+    excluded.reservation_expires_at
+  ),
+  retain_until = MAX(
+    usage_cost_reservations.retain_until,
+    excluded.retain_until
+  ),
+  updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&input.request_id)
+        .bind(&input.subject_id)
+        .bind(&input.reservation_token)
+        .bind(usage_policy_cost_i64(
+            input.admitted_at_unix_secs,
+            "usage policy admitted_at",
+        )?)
+        .bind(usage_policy_cost_i64(
+            target_reserved_cost_units,
+            "usage policy reserved_cost_units",
+        )?)
+        .bind(usage_policy_cost_i64(
+            input.reservation_expires_at_unix_secs,
+            "usage policy reservation_expires_at",
+        )?)
+        .bind(usage_policy_cost_i64(
+            input.retain_until_unix_secs,
+            "usage policy retain_until",
+        )?)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(ReserveUsagePolicyCostOutcome::Allowed {
+            reserved_cost_units: target_reserved_cost_units,
+            additional_reserved_cost_units: target_reserved_cost_units
+                .saturating_sub(previous_reserved_cost_units),
+        })
+    }
+
+    async fn reconcile_usage_policy_cost(
+        &self,
+        input: ReconcileUsagePolicyCostInput,
+    ) -> Result<Option<StoredUsagePolicyCostReservation>, DataLayerError> {
+        input.validate()?;
+        let now = now_unix_secs()?;
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        if !lock_usage_policy_subject_sqlite(&mut tx, &input.subject_id).await? {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
+        let row = sqlx::query(FIND_USAGE_POLICY_COST_RESERVATION_SQLITE_SQL)
+            .bind(&input.reservation_token)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(row) = row else {
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        };
+        let mut reservation = usage_policy_cost_reservation_from_sqlite_row(&row)?;
+        if reservation.request_id != input.request_id || reservation.subject_id != input.subject_id
+        {
+            // The token selects the row; audit identity must still match before the reservation
+            // can be finalized.
+            tx.commit().await.map_sql_err()?;
+            return Ok(None);
+        }
+        if reservation.state == UsagePolicyCostReservationState::Reserved {
+            sqlx::query(
+                r#"
+UPDATE usage_cost_reservations
+SET state = ?, actual_cost_units = ?, finalized_at = ?, updated_at = ?
+WHERE reservation_token = ?
+  AND request_id = ?
+  AND subject_id = ?
+  AND state = 'reserved'
+                "#,
+            )
+            .bind(input.terminal_state.as_str())
+            .bind(usage_policy_cost_i64(
+                input.actual_cost_units,
+                "usage policy actual_cost_units",
+            )?)
+            .bind(usage_policy_cost_i64(
+                input.finalized_at_unix_secs,
+                "usage policy finalized_at",
+            )?)
+            .bind(now)
+            .bind(&input.reservation_token)
+            .bind(&input.request_id)
+            .bind(&input.subject_id)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+            reservation.state = input.terminal_state;
+            reservation.actual_cost_units = Some(input.actual_cost_units);
+            reservation.finalized_at_unix_secs = Some(input.finalized_at_unix_secs);
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(Some(reservation))
+    }
+
+    async fn cleanup_usage_policy_cost_reservations(
+        &self,
+        now_unix_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, DataLayerError> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+        let now = usage_policy_cost_i64(now_unix_secs, "usage policy cleanup timestamp")?;
+        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let result = sqlx::query(
+            r#"
+DELETE FROM usage_cost_reservations
+WHERE rowid IN (
+  SELECT rowid
+  FROM usage_cost_reservations
+  WHERE retain_until <= ?
+  ORDER BY retain_until, reservation_token
+  LIMIT ?
+)
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() as usize)
+    }
+
     async fn settle_usage(
         &self,
         input: UsageSettlementInput,
@@ -724,7 +1344,7 @@ LIMIT 1
             let wallet_row = if let Some(api_key_id) = api_key_id {
                 sqlx::query(
                     r#"
-SELECT id, balance, gift_balance, limit_mode
+SELECT id, balance, gift_balance, total_consumed, limit_mode
 FROM wallets
 WHERE api_key_id = ?
 LIMIT 1
@@ -744,7 +1364,7 @@ LIMIT 1
                 if let Some(user_id) = input.user_id.as_deref().filter(|value| !value.is_empty()) {
                     sqlx::query(
                         r#"
-SELECT id, balance, gift_balance, limit_mode
+SELECT id, balance, gift_balance, total_consumed, limit_mode
 FROM wallets
 WHERE user_id = ?
 LIMIT 1
@@ -764,14 +1384,20 @@ LIMIT 1
             let wallet_can_overdraft = wallet_row.is_some();
             let wallet_available_usd = match wallet_row.as_ref() {
                 Some(row) => {
+                    let recharge_balance = sqlite_real(row, "balance")?;
+                    let gift_balance = sqlite_real(row, "gift_balance")?;
+                    let total_consumed = sqlite_real(row, "total_consumed")?;
+                    validate_wallet_settlement_values(
+                        recharge_balance,
+                        gift_balance,
+                        total_consumed,
+                        0.0,
+                    )?;
                     let limit_mode: String = row.try_get("limit_mode").map_sql_err()?;
                     if limit_mode.eq_ignore_ascii_case("unlimited") {
                         None
                     } else {
-                        Some(finite_wallet_available_usd(
-                            sqlite_real(row, "balance")?,
-                            sqlite_real(row, "gift_balance")?,
-                        ))
+                        Some(finite_wallet_available_usd(recharge_balance, gift_balance))
                     }
                 }
                 None => Some(0.0),
@@ -852,6 +1478,7 @@ LIMIT 1
                     let wallet_id: String = wallet_row.try_get("id").map_sql_err()?;
                     let before_recharge = sqlite_real(&wallet_row, "balance")?;
                     let before_gift = sqlite_real(&wallet_row, "gift_balance")?;
+                    let total_consumed = sqlite_real(&wallet_row, "total_consumed")?;
                     let limit_mode: String = wallet_row.try_get("limit_mode").map_sql_err()?;
                     let before_total = before_recharge + before_gift;
                     let mut after_recharge = before_recharge;
@@ -865,6 +1492,13 @@ LIMIT 1
                         (after_recharge, after_gift) =
                             debit_plan.after_balances(before_recharge, before_gift);
                     }
+                    let total_consumed_after = total_consumed + wallet_debit_cost_usd;
+                    validate_wallet_settlement_values(
+                        after_recharge,
+                        after_gift,
+                        total_consumed_after,
+                        0.0,
+                    )?;
                     if final_billing_status == "settled" {
                         sqlx::query(
                             r#"
@@ -872,14 +1506,14 @@ UPDATE wallets
 SET
   balance = ?,
   gift_balance = ?,
-  total_consumed = COALESCE(total_consumed, 0) + ?,
+  total_consumed = ?,
   updated_at = ?
 WHERE id = ?
 "#,
                         )
                         .bind(after_recharge)
                         .bind(after_gift)
-                        .bind(wallet_debit_cost_usd)
+                        .bind(total_consumed_after)
                         .bind(updated_at)
                         .bind(&wallet_id)
                         .execute(&mut *tx)
@@ -963,11 +1597,76 @@ WHERE id = ?
 
 #[cfg(test)]
 mod tests {
-    use super::{reconcile_provider_monthly_attempt_sqlite, SqliteSettlementRepository};
-    use crate::run_migrations;
-    use aether_data_contracts::repository::settlement::{
-        SettlementWriteRepository, UsageSettlementInput,
+    #[tokio::test]
+    async fn sqlite_repository_skips_user_billing_but_tracks_provider_cost() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_settlement_rows(&pool).await;
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        let settlement = repository
+            .settle_usage(UsageSettlementInput {
+                request_id: "request-1".to_string(),
+                user_id: Some("user-1".to_string()),
+                api_key_id: None,
+                api_key_is_standalone: false,
+                skip_user_billing: Some(true),
+                skip_plan_billing: Some(true),
+                provider_id: Some("provider-1".to_string()),
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 3.0,
+                actual_total_cost_usd: 6.0,
+                finalized_at_unix_secs: Some(1_234),
+            })
+            .await
+            .expect("settlement should run")
+            .expect("usage should exist");
+
+        assert_eq!(settlement.billing_status, "settled");
+        assert_eq!(settlement.wallet_id, None);
+        assert_eq!(settlement.provider_monthly_used_usd, None);
+
+        let provider_delta: (i64, f64) = sqlx::query_as(
+            r#"
+SELECT COUNT(*), CAST(COALESCE(SUM(total_cost_usd_delta), 0) AS REAL)
+FROM usage_counter_deltas
+WHERE request_id = 'request-1'
+  AND kind = 'provider_monthly'
+  AND target_id = 'provider-1'
+"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("provider delta should load");
+        assert_eq!(provider_delta, (1, 6.0));
+
+        let wallet_total: f64 =
+            sqlx::query_scalar("SELECT balance + gift_balance FROM wallets WHERE id = 'wallet-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("wallet should load");
+        assert_eq!(wallet_total, 12.0);
+    }
+
+    use super::{
+        reconcile_provider_monthly_attempt_sqlite, SqliteSettlementRepository,
+        INSERT_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL,
     };
+    use crate::{run_migrations, SqliteUserReadRepository};
+    use aether_data_contracts::repository::settlement::{
+        ReconcileUsagePolicyCostInput, ReleaseUsagePolicyRequestAdmissionInput,
+        ReserveUsagePolicyCostInput, ReserveUsagePolicyRequestInput, SettlementWriteRepository,
+        UsagePolicyCostReservationState, UsagePolicyCostWindow, UsagePolicyRequestWindow,
+        UsageSettlementInput,
+    };
+    use aether_data_contracts::repository::users::UserReadRepository;
     use sqlx::Row;
     use std::time::Duration;
 
@@ -1304,7 +2003,7 @@ WHERE request_id = 'request-1'
     }
 
     #[tokio::test]
-    async fn sqlite_repository_skips_user_billing_but_tracks_provider_cost() {
+    async fn sqlite_settlement_rejects_corrupt_wallet_before_financial_mutation() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1314,16 +2013,20 @@ WHERE request_id = 'request-1'
             .await
             .expect("sqlite migrations should run");
         seed_settlement_rows(&pool).await;
+        sqlx::query("UPDATE wallets SET balance = ? WHERE id = 'wallet-1'")
+            .bind(f64::INFINITY)
+            .execute(&pool)
+            .await
+            .expect("corrupt wallet fixture should update");
 
-        let repository = SqliteSettlementRepository::new(pool.clone());
-        let settlement = repository
+        let result = SqliteSettlementRepository::new(pool.clone())
             .settle_usage(UsageSettlementInput {
+                skip_user_billing: None,
+                skip_plan_billing: None,
                 request_id: "request-1".to_string(),
                 user_id: Some("user-1".to_string()),
                 api_key_id: None,
                 api_key_is_standalone: false,
-                skip_user_billing: Some(true),
-                skip_plan_billing: Some(true),
                 provider_id: Some("provider-1".to_string()),
                 status: "completed".to_string(),
                 billing_status: "pending".to_string(),
@@ -1331,34 +2034,187 @@ WHERE request_id = 'request-1'
                 actual_total_cost_usd: 6.0,
                 finalized_at_unix_secs: Some(1_234),
             })
-            .await
-            .expect("settlement should run")
-            .expect("usage should exist");
+            .await;
+        assert!(result.is_err());
 
-        assert_eq!(settlement.billing_status, "settled");
-        assert_eq!(settlement.wallet_id, None);
-        assert_eq!(settlement.provider_monthly_used_usd, None);
-
-        let provider_delta: (i64, f64) = sqlx::query_as(
-            r#"
-SELECT COUNT(*), CAST(COALESCE(SUM(total_cost_usd_delta), 0) AS REAL)
-FROM usage_counter_deltas
-WHERE request_id = 'request-1'
-  AND kind = 'provider_monthly'
-  AND target_id = 'provider-1'
-"#,
+        let billing_status: String =
+            sqlx::query_scalar("SELECT billing_status FROM usage WHERE request_id = 'request-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("usage should load");
+        assert_eq!(billing_status, "pending");
+        let settlement_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_settlement_snapshots WHERE request_id = 'request-1'",
         )
         .fetch_one(&pool)
         .await
-        .expect("provider delta should load");
-        assert_eq!(provider_delta, (1, 6.0));
+        .expect("settlement snapshots should count");
+        assert_eq!(settlement_count, 0);
+        let delta_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_counter_deltas WHERE request_id = 'request-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("usage deltas should count");
+        assert_eq!(delta_count, 0);
+    }
 
-        let wallet_total: f64 =
-            sqlx::query_scalar("SELECT balance + gift_balance FROM wallets WHERE id = 'wallet-1'")
-                .fetch_one(&pool)
+    #[tokio::test]
+    async fn request_admission_insert_defensively_preserves_the_existing_token() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        sqlx::query(
+            r#"
+INSERT INTO users (id, username, auth_source, created_at, updated_at)
+VALUES
+  ('defensive-user-1', 'defensive-user-1', 'local', 1, 1),
+  ('defensive-user-2', 'defensive-user-2', 'local', 1, 1)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("usage policy subjects should insert");
+
+        let insert = |request_id: &'static str, subject_id: &'static str| {
+            sqlx::query(INSERT_USAGE_POLICY_REQUEST_ADMISSION_SQLITE_SQL)
+                .bind(request_id)
+                .bind(subject_id)
+                .bind("defensive-event-token")
+                .bind(100_i64)
+                .bind(200_i64)
+                .bind(100_i64)
+        };
+        assert_eq!(
+            insert("defensive-request-1", "defensive-user-1")
+                .execute(&pool)
                 .await
-                .expect("wallet should load");
-        assert_eq!(wallet_total, 12.0);
+                .expect("initial admission should insert")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            insert("defensive-request-2", "defensive-user-2")
+                .execute(&pool)
+                .await
+                .expect("duplicate token should be ignored")
+                .rows_affected(),
+            0
+        );
+        let stored: (String, String, i64) = sqlx::query_as(
+            "SELECT request_id, subject_id, admitted_at FROM usage_request_admissions WHERE event_token = 'defensive-event-token'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("original admission should remain");
+        assert_eq!(
+            stored,
+            (
+                "defensive-request-1".to_string(),
+                "defensive-user-1".to_string(),
+                100,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_user_cascades_usage_policy_ledgers_and_terminal_calls_are_noops() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        sqlx::query(
+            r#"
+INSERT INTO users (id, username, auth_source, created_at, updated_at)
+VALUES ('usage-policy-delete-user', 'usage-policy-delete-user', 'local', 1, 1)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("usage policy user should insert");
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        repository
+            .reserve_usage_policy_request(ReserveUsagePolicyRequestInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                event_token: "usage-policy-delete-event".to_string(),
+                admitted_at_unix_secs: 100,
+                retain_until_unix_secs: 200,
+                windows: vec![UsagePolicyRequestWindow {
+                    starts_at_unix_secs: 50,
+                    ends_at_unix_secs: 200,
+                    limit_requests: 10,
+                }],
+            })
+            .await
+            .expect("request admission should reserve");
+        repository
+            .reserve_usage_policy_cost(ReserveUsagePolicyCostInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                reservation_token: "usage-policy-delete-reservation".to_string(),
+                admitted_at_unix_secs: 100,
+                reserved_cost_units: 1,
+                reservation_expires_at_unix_secs: 150,
+                retain_until_unix_secs: 200,
+                windows: vec![UsagePolicyCostWindow {
+                    window_id: "usage-policy-delete-window".to_string(),
+                    starts_at_unix_secs: 50,
+                    ends_at_unix_secs: 200,
+                    limit_cost_units: 10,
+                }],
+            })
+            .await
+            .expect("cost reservation should reserve");
+
+        assert!(SqliteUserReadRepository::new(pool.clone())
+            .delete_local_auth_user("usage-policy-delete-user")
+            .await
+            .expect("user deletion should succeed"));
+        let ledger_count: i64 = sqlx::query_scalar(
+            r#"
+SELECT
+  (SELECT COUNT(*) FROM usage_request_admissions)
+  + (SELECT COUNT(*) FROM usage_cost_reservations)
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("usage policy ledgers should count");
+        assert_eq!(ledger_count, 0);
+
+        assert!(repository
+            .release_usage_policy_request_admission(ReleaseUsagePolicyRequestAdmissionInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                event_token: "usage-policy-delete-event".to_string(),
+                released_at_unix_secs: 150,
+            },)
+            .await
+            .expect("post-delete release should be a no-op")
+            .is_none());
+        assert!(repository
+            .reconcile_usage_policy_cost(ReconcileUsagePolicyCostInput {
+                request_id: "usage-policy-delete-request".to_string(),
+                subject_id: "usage-policy-delete-user".to_string(),
+                reservation_token: "usage-policy-delete-reservation".to_string(),
+                actual_cost_units: 1,
+                terminal_state: UsagePolicyCostReservationState::Finalized,
+                finalized_at_unix_secs: 150,
+            })
+            .await
+            .expect("post-delete reconciliation should be a no-op")
+            .is_none());
     }
 
     #[tokio::test]
@@ -1513,6 +2369,166 @@ WHERE request_id = 'request-1'
         .await
         .expect("quota ledger should load");
         assert_eq!(quota_used, 6.0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_exhausts_strict_quota_after_actual_cost_overrun() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_quota_covered_settlement_rows(&pool).await;
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        let settlement = repository
+            .settle_usage(UsageSettlementInput {
+                skip_user_billing: None,
+                skip_plan_billing: None,
+                request_id: "request-quota-overrun".to_string(),
+                user_id: Some("user-quota".to_string()),
+                api_key_id: Some("key-quota".to_string()),
+                api_key_is_standalone: false,
+                provider_id: None,
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 12.0,
+                actual_total_cost_usd: 12.0,
+                finalized_at_unix_secs: Some(1_261),
+            })
+            .await
+            .expect("settlement should run")
+            .expect("usage should exist");
+
+        assert_eq!(settlement.billing_status, "insufficient_quota");
+        let quota_used: f64 = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(SUM(amount_usd), 0) AS REAL) FROM entitlement_usage_ledgers WHERE request_id = 'request-quota-overrun'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("quota ledger should load");
+        assert_eq!(quota_used, 10.0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_uses_current_plan_wallet_overage_policy() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_quota_covered_settlement_rows(&pool).await;
+        sqlx::query(
+            r#"
+UPDATE wallets SET balance = 5.0 WHERE id = 'wallet-quota';
+UPDATE billing_plans
+SET entitlements_json = '[{"type":"daily_quota","daily_quota_usd":10.0,"reset_timezone":"Asia/Shanghai","allow_wallet_overage":true}]'
+WHERE id = 'plan-quota';
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("plan overage policy should update");
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        let settlement = repository
+            .settle_usage(UsageSettlementInput {
+                skip_user_billing: None,
+                skip_plan_billing: None,
+                request_id: "request-quota-overrun".to_string(),
+                user_id: Some("user-quota".to_string()),
+                api_key_id: Some("key-quota".to_string()),
+                api_key_is_standalone: false,
+                provider_id: None,
+                status: "completed".to_string(),
+                billing_status: "pending".to_string(),
+                total_cost_usd: 12.0,
+                actual_total_cost_usd: 12.0,
+                finalized_at_unix_secs: Some(1_261),
+            })
+            .await
+            .expect("settlement should run")
+            .expect("usage should exist");
+
+        assert_eq!(settlement.billing_status, "settled");
+        assert_eq!(settlement.wallet_balance_after, Some(3.0));
+        let quota_used: f64 = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(SUM(amount_usd), 0) AS REAL) FROM entitlement_usage_ledgers WHERE request_id = 'request-quota-overrun'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("quota ledger should load");
+        assert_eq!(quota_used, 10.0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_repository_exhausts_strict_quota_across_concurrent_requests() {
+        let database_path = std::env::temp_dir().join(format!(
+            "aether-quota-settlement-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        seed_quota_covered_settlement_rows(&pool).await;
+
+        let repository = SqliteSettlementRepository::new(pool.clone());
+        let input = |request_id: &str| UsageSettlementInput {
+            skip_user_billing: None,
+            skip_plan_billing: None,
+            request_id: request_id.to_string(),
+            user_id: Some("user-quota".to_string()),
+            api_key_id: Some("key-quota".to_string()),
+            api_key_is_standalone: false,
+            provider_id: None,
+            status: "completed".to_string(),
+            billing_status: "pending".to_string(),
+            total_cost_usd: 6.0,
+            actual_total_cost_usd: 6.0,
+            finalized_at_unix_secs: Some(1_262),
+        };
+        let (first, second) = tokio::join!(
+            repository.settle_usage(input("request-quota-race-1")),
+            repository.settle_usage(input("request-quota-race-2")),
+        );
+        let first = first
+            .expect("first settlement should succeed")
+            .expect("first usage should exist");
+        let second = second
+            .expect("second settlement should succeed")
+            .expect("second usage should exist");
+        let mut statuses = [first.billing_status, second.billing_status];
+        statuses.sort();
+        assert_eq!(statuses, ["insufficient_quota", "settled"]);
+
+        let quota_used: f64 = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(SUM(amount_usd), 0) AS REAL) FROM entitlement_usage_ledgers",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("quota ledger should load");
+        assert_eq!(quota_used, 10.0);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(format!("{}-wal", database_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", database_path.display()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1679,13 +2695,15 @@ INSERT INTO wallets (
 INSERT INTO "usage" (
   request_id, user_id, api_key_id, status, billing_status,
   total_cost_usd, actual_total_cost_usd
-) VALUES (
+) VALUES
+    (
   'request-quota-covered', 'user-quota', 'key-quota', 'completed',
   'pending', 3.0, 6.0
-), (
-  'request-plan-disabled', 'user-quota', 'key-quota', 'completed',
-  'pending', 3.0, 6.0
-);
+    ),
+    ('request-plan-disabled', 'user-quota', 'key-quota', 'completed', 'pending', 3.0, 6.0),
+    ('request-quota-overrun', 'user-quota', 'key-quota', 'completed', 'pending', 12.0, 12.0),
+    ('request-quota-race-1', 'user-quota', 'key-quota', 'completed', 'pending', 6.0, 6.0),
+    ('request-quota-race-2', 'user-quota', 'key-quota', 'completed', 'pending', 6.0, 6.0);
 
 INSERT INTO billing_plans (
   id, title, price_amount, price_currency, duration_unit,

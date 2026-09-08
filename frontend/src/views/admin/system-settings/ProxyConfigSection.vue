@@ -40,6 +40,25 @@
         对未单独配置代理的提供商生效，覆盖大模型 API 请求、余额查询、OAuth 刷新等。不影响系统内部接口。
       </p>
     </div>
+    <div class="mt-6 max-w-2xl border-t pt-5">
+      <Label
+        for="extra-trusted-dns-hosts"
+        class="block text-sm font-medium"
+      >
+        额外可信 Fake-IP 域名
+      </Label>
+      <Textarea
+        id="extra-trusted-dns-hosts"
+        :model-value="extraTrustedDnsHostsStr"
+        rows="4"
+        class="mt-1"
+        placeholder="api.example.com\nmodels.example.com"
+        @update:model-value="$emit('update:extraTrustedDnsHostsStr', String($event || ''))"
+      />
+      <p class="mt-1 text-xs text-muted-foreground">
+        每行填写一个精确 hostname；不支持通配符、后缀、端口、路径或 IP。仅允许这些域名返回 198.18.0.0/15 Fake-IP，内置提供商域名不受影响。
+      </p>
+    </div>
   </CardSection>
 </template>
 
@@ -47,6 +66,7 @@
 import { computed } from 'vue'
 import Button from '@/components/ui/button.vue'
 import Label from '@/components/ui/label.vue'
+import Textarea from '@/components/ui/textarea.vue'
 import Select from '@/components/ui/select.vue'
 import SelectTrigger from '@/components/ui/select-trigger.vue'
 import SelectValue from '@/components/ui/select-value.vue'
@@ -64,6 +84,7 @@ interface ProxyNode {
 
 const props = defineProps<{
   proxyNodeId: string | null
+  extraTrustedDnsHostsStr: string
   onlineNodes: ProxyNode[]
   allNodes: ProxyNode[]
   loading: boolean
@@ -73,6 +94,7 @@ const props = defineProps<{
 defineEmits<{
   save: []
   'update:proxyNodeId': [value: string | null]
+  'update:extraTrustedDnsHostsStr': [value: string]
 }>()
 
 const selectableNodes = computed(() => {

@@ -1,7 +1,8 @@
 use aether_data_contracts::repository::billing::StoredBillingModelContext;
 use aether_data_contracts::repository::usage::{
     extract_provider_cache_ttl_minutes_from_metadata, resolve_provider_cache_ttl_minutes,
-    resolve_provider_service_tier_from_request_capture,
+    resolve_provider_service_tier_from_request_capture, USAGE_AVAILABLE_METADATA_KEY,
+    USAGE_PRICING_AVAILABLE_METADATA_KEY,
 };
 use aether_data_contracts::DataLayerError;
 use aether_usage_runtime::{UsageEvent, UsageEventType};
@@ -48,6 +49,31 @@ pub async fn enrich_usage_event_with_billing(
     data: &dyn BillingModelContextLookup,
     event: &mut UsageEvent,
 ) -> Result<(), DataLayerError> {
+    // Session transports such as Codex Live expose lifecycle telemetry but no
+    // authoritative token/cost object. Do not run request-based pricing with
+    // zero default tokens: that would turn "unknown" into a fabricated charge.
+    if usage_is_explicitly_unavailable(event) {
+        event.data.input_tokens = None;
+        event.data.output_tokens = None;
+        event.data.total_tokens = None;
+        event.data.cache_creation_input_tokens = None;
+        event.data.cache_creation_ephemeral_5m_input_tokens = None;
+        event.data.cache_creation_ephemeral_1h_input_tokens = None;
+        event.data.cache_read_input_tokens = None;
+        event.data.cache_creation_cost_usd = None;
+        event.data.cache_read_cost_usd = None;
+        event.data.total_cost_usd = None;
+        event.data.actual_total_cost_usd = None;
+        return Ok(());
+    }
+    // Some protocols expose authoritative token totals with dimensions that
+    // Aether's pricing schema cannot safely express yet (Realtime audio is the
+    // first example). Preserve those tokens for observability, but never apply
+    // ordinary text token prices to them.
+    if usage_pricing_is_explicitly_unavailable(event) {
+        clear_usage_costs(event);
+        return Ok(());
+    }
     if matches!(
         event.event_type,
         UsageEventType::Pending | UsageEventType::Streaming
@@ -139,6 +165,35 @@ pub async fn enrich_usage_event_with_billing(
         apply_billing_computation(event, &pricing, computation)?;
     }
     Ok(())
+}
+
+fn usage_is_explicitly_unavailable(event: &UsageEvent) -> bool {
+    event
+        .data
+        .request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(USAGE_AVAILABLE_METADATA_KEY))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+fn usage_pricing_is_explicitly_unavailable(event: &UsageEvent) -> bool {
+    event
+        .data
+        .request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(USAGE_PRICING_AVAILABLE_METADATA_KEY))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+fn clear_usage_costs(event: &mut UsageEvent) {
+    event.data.cache_creation_cost_usd = None;
+    event.data.cache_read_cost_usd = None;
+    event.data.total_cost_usd = None;
+    event.data.actual_total_cost_usd = None;
 }
 
 fn billing_model_lookup_names(data: &aether_usage_runtime::UsageEventData) -> Vec<&str> {
@@ -432,6 +487,75 @@ fn build_settlement_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn authoritative_realtime_audio_tokens_are_visible_but_not_text_priced() {
+        let lookup = TestLookup {
+            name_context: None,
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-realtime-audio",
+            UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                provider_id: Some("provider-realtime".to_string()),
+                model: "gpt-realtime".to_string(),
+                input_tokens: Some(120),
+                output_tokens: Some(40),
+                total_tokens: Some(160),
+                request_metadata: Some(json!({
+                    "usage_available": true,
+                    "usage_pricing_available": false,
+                })),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("unsupported audio pricing should not fail enrichment");
+
+        assert_eq!(event.data.input_tokens, Some(120));
+        assert_eq!(event.data.output_tokens, Some(40));
+        assert_eq!(event.data.total_tokens, Some(160));
+        assert_eq!(event.data.total_cost_usd, None);
+        assert_eq!(event.data.actual_total_cost_usd, None);
+    }
+
+    #[tokio::test]
+    async fn unmetered_session_audit_does_not_fabricate_tokens_or_request_cost() {
+        let lookup = TestLookup {
+            name_context: None,
+            model_id_context: None,
+        };
+        let mut event = UsageEvent::new(
+            UsageEventType::Completed,
+            "req-live-unmetered",
+            UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                provider_id: Some("provider-live".to_string()),
+                model: "gpt-live".to_string(),
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                total_tokens: Some(0),
+                total_cost_usd: Some(0.0),
+                actual_total_cost_usd: Some(0.0),
+                request_metadata: Some(json!({"usage_available": false})),
+                ..UsageEventData::default()
+            },
+        );
+
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .expect("unmetered session audit should be accepted");
+
+        assert_eq!(event.data.input_tokens, None);
+        assert_eq!(event.data.output_tokens, None);
+        assert_eq!(event.data.total_tokens, None);
+        assert_eq!(event.data.total_cost_usd, None);
+        assert_eq!(event.data.actual_total_cost_usd, None);
+    }
+
     use aether_data_contracts::repository::billing::StoredBillingModelContext;
     use aether_data_contracts::repository::usage::UsageBodyCaptureState;
     use aether_usage_runtime::{UsageEvent, UsageEventData, UsageEventType};

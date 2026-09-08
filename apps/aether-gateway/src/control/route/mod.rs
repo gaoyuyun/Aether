@@ -11,7 +11,7 @@ mod oauth;
 mod public_support;
 
 use super::auth::{
-    resolve_control_decision_auth, resolve_gateway_credential_carrier,
+    resolve_control_decision_auth_with_trusted_auth, resolve_gateway_credential_carrier,
     ControlDecisionAuthResolution, GatewayCredentialCarrier,
 };
 use super::{GatewayAdminPrincipalContext, GatewayControlAuthContext, GatewayLocalAuthRejection};
@@ -176,6 +176,17 @@ pub(crate) async fn resolve_control_route(
     headers: &http::HeaderMap,
     trace_id: &str,
 ) -> Result<Option<GatewayControlDecision>, GatewayError> {
+    resolve_control_route_with_trusted_auth(state, method, uri, headers, trace_id, cfg!(test)).await
+}
+
+pub(crate) async fn resolve_control_route_with_trusted_auth(
+    state: &AppState,
+    method: &http::Method,
+    uri: &Uri,
+    headers: &http::HeaderMap,
+    trace_id: &str,
+    trusted_auth_verified: bool,
+) -> Result<Option<GatewayControlDecision>, GatewayError> {
     let Some(mut decision) = classify_control_route(method, uri, headers) else {
         return Ok(None);
     };
@@ -185,7 +196,16 @@ pub(crate) async fn resolve_control_route(
             crate::system_features::ModelDirectivePolicySnapshot::load(state).await;
     }
 
-    match resolve_control_decision_auth(state, headers, uri, trace_id, decision).await? {
+    match resolve_control_decision_auth_with_trusted_auth(
+        state,
+        headers,
+        uri,
+        trace_id,
+        decision,
+        trusted_auth_verified,
+    )
+    .await?
+    {
         ControlDecisionAuthResolution::Resolved(decision) => Ok(Some(decision)),
     }
 }
@@ -212,7 +232,7 @@ pub(crate) fn classify_control_route(
     .or_else(|| oauth::classify_oauth_route(method, &normalized_path))
     .or_else(|| admin::classify_admin_route(method, &normalized_path))
     .or_else(|| internal::classify_internal_route(method, &normalized_path))
-    .or_else(|| ai::classify_ai_public_route(method, &normalized_path, headers))?;
+    .or_else(|| ai::classify_ai_public_route(method, &normalized_path, uri.query(), headers))?;
 
     let mut decision = classified.into_decision(normalized_path);
     if let Some(signature) = decision.auth_endpoint_signature.as_deref() {

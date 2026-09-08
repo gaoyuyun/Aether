@@ -69,6 +69,7 @@ pub(crate) use self::family::{
     LocalSameFormatProviderFamily, LocalSameFormatProviderSpec,
 };
 pub(crate) use self::family::{
+    maybe_build_pinned_stream_local_same_format_provider_decision_payload,
     maybe_build_stream_local_same_format_provider_decision_payload,
     maybe_build_sync_local_same_format_provider_decision_payload,
 };

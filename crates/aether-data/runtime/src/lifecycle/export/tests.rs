@@ -1,16 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{
-    build_import_plan, decode_jsonl, encode_jsonl, export_mysql_core_jsonl, export_mysql_jsonl,
-    export_postgres_core_jsonl, export_sqlite_core_jsonl, filter_import_payload,
-    import_mysql_jsonl, import_postgres_jsonl, import_sqlite_jsonl, mysql_core_export_domains,
-    normalize_imported_binary, normalize_imported_integer_timestamp,
-    normalize_postgres_import_payload, postgres_bytea_json_value, postgres_core_export_domains,
-    sqlite_core_export_domains, sqlite_schema_copy_insert_sql, DataExportManifest,
-    DataExportRecord, DataImportPlan, ExportDomain, ExportRow, PostgresImportColumn,
-    SchemaCopyColumn, SchemaCopyTable, SqliteCopyColumn, AUXILIARY_TABLES,
+    build_import_plan, deactivate_imported_credentials, decode_jsonl, decode_jsonl_with_limits,
+    encode_jsonl, export_mysql_core_jsonl, export_mysql_jsonl, export_postgres_core_jsonl,
+    export_sqlite_core_jsonl, filter_import_payload, import_mysql_jsonl, import_postgres_jsonl,
+    import_sqlite_jsonl, mysql_core_export_domains, normalize_imported_binary,
+    normalize_imported_integer_timestamp, normalize_postgres_import_payload,
+    postgres_bytea_json_value, postgres_core_export_domains, sqlite_core_export_domains,
+    sqlite_schema_copy_insert_sql, DataExportManifest, DataExportRecord, DataImportPlan,
+    ExportDomain, ExportRow, PostgresImportColumn, SchemaCopyColumn, SchemaCopyTable,
+    SqliteCopyColumn, AUXILIARY_TABLES,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::lifecycle::migrate::{
@@ -183,6 +184,25 @@ not-json"#,
         .expect_err("bad json should fail");
 
     assert!(err.to_string().contains("line 2"));
+}
+
+#[test]
+fn jsonl_rejects_input_and_record_limits_before_materializing_rows() {
+    let oversized = "x".repeat(11);
+    let err = decode_jsonl_with_limits(&oversized, 10, 100, 10)
+        .expect_err("input byte limit should be enforced");
+    assert!(err.to_string().contains("10 byte input limit"));
+
+    let manifest = r#"{"record_type":"manifest","manifest":{"format_version":1,"created_at_unix_secs":1,"source_driver":null,"domains":[]}}"#;
+    let err = decode_jsonl_with_limits(manifest, usize::MAX, 10, 10)
+        .expect_err("line byte limit should be enforced");
+    assert!(err.to_string().contains("byte line limit"));
+
+    let row = r#"{"record_type":"manifest","manifest":{"format_version":1,"created_at_unix_secs":1,"source_driver":null,"domains":[]}}"#;
+    let input = format!("{row}\n{row}\n");
+    let err = decode_jsonl_with_limits(&input, usize::MAX, usize::MAX, 1)
+        .expect_err("record limit should be enforced");
+    assert!(err.to_string().contains("1 record limit"));
 }
 
 #[test]
@@ -411,6 +431,231 @@ fn mysql_and_sqlite_import_payloads_ignore_unknown_null_columns() {
         filtered,
         serde_json::Map::from_iter([("id".to_string(), json!("user-1"))])
     );
+}
+
+#[test]
+fn imported_identity_credentials_are_replaced_with_disabled_tombstones() {
+    let columns = BTreeSet::from([
+        "password_hash".to_string(),
+        "key_hash".to_string(),
+        "key_encrypted".to_string(),
+        "status".to_string(),
+        "is_active".to_string(),
+        "is_locked".to_string(),
+        "token_hash".to_string(),
+        "refresh_token_hash".to_string(),
+        "prev_refresh_token_hash".to_string(),
+        "revoked_at".to_string(),
+        "revoke_reason".to_string(),
+    ]);
+
+    let mut user =
+        serde_json::Map::from_iter([("password_hash".to_string(), json!("$2b$12$backup-hash"))]);
+    deactivate_imported_credentials("users", &mut user, |column| columns.contains(column));
+    assert_ne!(user["password_hash"], json!("$2b$12$backup-hash"));
+    assert!(user["password_hash"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("$aether-import-revoked$")));
+
+    let mut api_key = serde_json::Map::from_iter([
+        ("key_hash".to_string(), json!("backup-key-hash")),
+        ("key_encrypted".to_string(), json!("backup-ciphertext")),
+        ("is_active".to_string(), json!(true)),
+        ("is_locked".to_string(), json!(false)),
+        ("status".to_string(), json!("active")),
+    ]);
+    deactivate_imported_credentials("api_keys", &mut api_key, |column| columns.contains(column));
+    assert_ne!(api_key["key_hash"], json!("backup-key-hash"));
+    assert_eq!(api_key["key_encrypted"], Value::Null);
+    assert_eq!(api_key["is_active"], json!(false));
+    assert_eq!(api_key["is_locked"], json!(true));
+    assert_eq!(api_key["status"], json!("disabled"));
+
+    let mut token = serde_json::Map::from_iter([
+        ("token_hash".to_string(), json!("backup-token-hash")),
+        ("is_active".to_string(), json!(true)),
+    ]);
+    deactivate_imported_credentials("management_tokens", &mut token, |column| {
+        columns.contains(column)
+    });
+    assert_ne!(token["token_hash"], json!("backup-token-hash"));
+    assert_eq!(token["is_active"], json!(false));
+
+    let mut session = serde_json::Map::from_iter([
+        (
+            "refresh_token_hash".to_string(),
+            json!("backup-refresh-hash"),
+        ),
+        (
+            "prev_refresh_token_hash".to_string(),
+            json!("backup-previous-hash"),
+        ),
+        ("revoked_at".to_string(), Value::Null),
+        ("revoke_reason".to_string(), Value::Null),
+    ]);
+    deactivate_imported_credentials("user_sessions", &mut session, |column| {
+        columns.contains(column)
+    });
+    assert_ne!(session["refresh_token_hash"], json!("backup-refresh-hash"));
+    assert_eq!(session["prev_refresh_token_hash"], Value::Null);
+    assert!(session["revoked_at"].as_i64().is_some());
+    assert_eq!(
+        session["revoke_reason"],
+        json!("imported_credentials_revoked")
+    );
+}
+
+#[test]
+fn imported_proxy_nodes_receive_a_new_offline_tunnel_generation() {
+    let columns = BTreeSet::from([
+        "tunnel_generation".to_string(),
+        "tunnel_connected".to_string(),
+        "status".to_string(),
+        "active_connections".to_string(),
+    ]);
+    let mut node = serde_json::Map::from_iter([
+        (
+            "tunnel_generation".to_string(),
+            json!("backup-tunnel-generation"),
+        ),
+        ("tunnel_connected".to_string(), json!(true)),
+        ("status".to_string(), json!("online")),
+        ("active_connections".to_string(), json!(42)),
+        (
+            "proxy_metadata".to_string(),
+            json!({"tunnel_security": {"encryption_key": "preserved-psk"}}),
+        ),
+    ]);
+
+    deactivate_imported_credentials("public.proxy_nodes", &mut node, |column| {
+        columns.contains(column)
+    });
+
+    let generation = node["tunnel_generation"]
+        .as_str()
+        .expect("imported node generation should be a string");
+    assert_ne!(generation, "backup-tunnel-generation");
+    assert!(uuid::Uuid::parse_str(generation).is_ok());
+    assert_eq!(node["tunnel_connected"], json!(false));
+    assert_eq!(node["status"], json!("offline"));
+    assert_eq!(node["active_connections"], json!(0));
+    assert_eq!(
+        node["proxy_metadata"]["tunnel_security"]["encryption_key"],
+        json!("preserved-psk")
+    );
+}
+
+#[tokio::test]
+async fn sqlite_import_rotates_proxy_node_generations_and_clears_online_state() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::query(
+        r#"
+INSERT INTO proxy_nodes (
+  id, tunnel_generation, name, ip, port, status, active_connections,
+  tunnel_mode, tunnel_connected, proxy_metadata, created_at, updated_at
+) VALUES (
+  'import-existing-node', 'target-live-generation', 'existing node', '127.0.0.1',
+  8080, 'online', 9, 1, 1, '{"target":"metadata"}', 1, 1
+)
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("existing proxy node should insert");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::ProxyNodes],
+        )),
+        DataExportRecord::row(
+            ExportDomain::ProxyNodes,
+            "import-existing-node",
+            json!({
+                "id": "import-existing-node",
+                "tunnel_generation": "backup-stale-generation",
+                "name": "restored existing node",
+                "ip": "127.0.0.1",
+                "port": 8080,
+                "status": "online",
+                "active_connections": 42,
+                "tunnel_mode": true,
+                "tunnel_connected": true,
+                "proxy_metadata": {
+                    "tunnel_security": {"encryption_key": "preserved-psk"}
+                },
+                "created_at": 1,
+                "updated_at": 2
+            }),
+        ),
+        DataExportRecord::row(
+            ExportDomain::ProxyNodes,
+            "import-legacy-node",
+            json!({
+                "id": "import-legacy-node",
+                "name": "legacy backup node",
+                "ip": "127.0.0.2",
+                "port": 8081,
+                "status": "online",
+                "active_connections": 7,
+                "tunnel_mode": true,
+                "tunnel_connected": true,
+                "created_at": 1,
+                "updated_at": 2
+            }),
+        ),
+    ])
+    .expect("proxy node import fixture should encode");
+
+    assert_eq!(
+        import_sqlite_jsonl(&pool, &encoded)
+            .await
+            .expect("proxy nodes should import"),
+        2
+    );
+
+    let restored = sqlx::query_as::<_, (String, String, bool, i32, Option<String>)>(
+        r#"
+SELECT tunnel_generation, status, tunnel_connected, active_connections, proxy_metadata
+FROM proxy_nodes
+WHERE id = 'import-existing-node'
+"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("restored proxy node should load");
+    assert_ne!(restored.0, "target-live-generation");
+    assert_ne!(restored.0, "backup-stale-generation");
+    assert!(uuid::Uuid::parse_str(&restored.0).is_ok());
+    assert_eq!(restored.1, "offline");
+    assert!(!restored.2);
+    assert_eq!(restored.3, 0);
+    assert_eq!(
+        restored
+            .4
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value["tunnel_security"]["encryption_key"]
+                .as_str()
+                .map(str::to_string)),
+        Some("preserved-psk".to_string())
+    );
+
+    let legacy_generation: String = sqlx::query_scalar(
+        "SELECT tunnel_generation FROM proxy_nodes WHERE id = 'import-legacy-node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy imported proxy node should load");
+    assert!(uuid::Uuid::parse_str(&legacy_generation).is_ok());
 }
 
 #[test]
@@ -644,6 +889,548 @@ async fn sqlite_import_rolls_back_rows_after_late_failure() {
 }
 
 #[tokio::test]
+async fn sqlite_users_import_fails_closed_for_oauth_email_verification() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::Users],
+        )),
+        DataExportRecord::row(
+            ExportDomain::Users,
+            "oauth-user",
+            json!({
+                "id": "oauth-user",
+                "email": "oauth@example.test",
+                "email_verified": true,
+                "username": "oauth-user",
+                "role": "user",
+                "auth_source": "oauth",
+                "created_at": 1,
+                "updated_at": 1
+            }),
+        ),
+        DataExportRecord::row(
+            ExportDomain::Users,
+            "local-user",
+            json!({
+                "id": "local-user",
+                "email": "local@example.test",
+                "email_verified": true,
+                "username": "local-user",
+                "role": "user",
+                "auth_source": "local",
+                "created_at": 1,
+                "updated_at": 1
+            }),
+        ),
+    ])
+    .expect("users fixture should encode");
+
+    assert_eq!(
+        import_sqlite_jsonl(&pool, &encoded)
+            .await
+            .expect("users-only staged restore should succeed without OAuth links"),
+        2
+    );
+    let verification =
+        sqlx::query_as::<_, (String, i64)>("SELECT id, email_verified FROM users ORDER BY id ASC")
+            .fetch_all(&pool)
+            .await
+            .expect("verification state should load");
+    assert_eq!(
+        verification,
+        vec![("local-user".to_string(), 1), ("oauth-user".to_string(), 0)]
+    );
+}
+
+#[tokio::test]
+async fn sqlite_users_and_providers_can_restore_before_oauth_links() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::Users, ExportDomain::OAuthProviders],
+        )),
+        DataExportRecord::row(
+            ExportDomain::Users,
+            "oauth-user",
+            json!({
+                "id": "oauth-user",
+                "email": "oauth@example.test",
+                "email_verified": true,
+                "username": "oauth-user",
+                "role": "user",
+                "auth_source": "oauth",
+                "created_at": 1,
+                "updated_at": 1
+            }),
+        ),
+        DataExportRecord::row(
+            ExportDomain::OAuthProviders,
+            "linuxdo",
+            json!({
+                "provider_type": "linuxdo",
+                "display_name": "Linux.do",
+                "client_id": "client",
+                "redirect_uri": "https://gateway.example.test/oauth/callback",
+                "frontend_callback_url": "https://app.example.test/auth/callback",
+                "is_enabled": true,
+                "created_at": 1,
+                "updated_at": 1
+            }),
+        ),
+    ])
+    .expect("staged identity fixture should encode");
+
+    assert_eq!(
+        import_sqlite_jsonl(&pool, &encoded)
+            .await
+            .expect("users and Providers should restore before links"),
+        2
+    );
+    let email_verified: i64 =
+        sqlx::query_scalar("SELECT email_verified FROM users WHERE id = 'oauth-user'")
+            .fetch_one(&pool)
+            .await
+            .expect("staged OAuth user should load");
+    assert_eq!(email_verified, 0);
+}
+
+#[tokio::test]
+async fn sqlite_oauth_link_import_rolls_back_without_enabled_login_binding() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::raw_sql(
+        r#"
+INSERT INTO users (
+  id, email, email_verified, username, role, auth_source,
+  is_active, is_deleted, created_at, updated_at
+) VALUES (
+  'oauth-user', 'oauth@example.test', 0, 'oauth-user', 'user', 'oauth',
+  1, 0, 1, 1
+);
+INSERT INTO oauth_providers (
+  provider_type, display_name, client_id, redirect_uri, frontend_callback_url,
+  is_enabled, created_at, updated_at
+) VALUES (
+  'linuxdo', 'Linux.do', 'client', 'https://gateway.example.test/oauth/callback',
+  'https://app.example.test/auth/callback', 0, 1, 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("OAuth fixtures should seed");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::UserOAuthLinks],
+        )),
+        DataExportRecord::row(
+            ExportDomain::UserOAuthLinks,
+            "link-disabled",
+            json!({
+                "id": "link-disabled",
+                "user_id": "oauth-user",
+                "provider_type": "linuxdo",
+                "provider_user_id": "subject-1",
+                "linked_at": 1
+            }),
+        ),
+    ])
+    .expect("OAuth link fixture should encode");
+
+    let err = import_sqlite_jsonl(&pool, &encoded)
+        .await
+        .expect_err("disabled-only OAuth binding should fail");
+    assert!(err
+        .to_string()
+        .contains("without an enabled identity binding"));
+    let link_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_oauth_links")
+        .fetch_one(&pool)
+        .await
+        .expect("rolled-back OAuth link count should load");
+    assert_eq!(link_count, 0);
+}
+
+#[tokio::test]
+async fn sqlite_oauth_provider_import_rolls_back_if_it_removes_last_enabled_binding() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::raw_sql(
+        r#"
+INSERT INTO users (
+  id, email, email_verified, username, role, auth_source,
+  is_active, is_deleted, created_at, updated_at
+) VALUES (
+  'oauth-user', 'oauth@example.test', 0, 'oauth-user', 'user', 'oauth',
+  1, 0, 1, 1
+);
+INSERT INTO oauth_providers (
+  provider_type, display_name, client_id, redirect_uri, frontend_callback_url,
+  is_enabled, created_at, updated_at
+) VALUES (
+  'linuxdo', 'Linux.do', 'client', 'https://gateway.example.test/oauth/callback',
+  'https://app.example.test/auth/callback', 1, 1, 1
+);
+INSERT INTO user_oauth_links (
+  id, user_id, provider_type, provider_user_id, linked_at
+) VALUES (
+  'existing-link', 'oauth-user', 'linuxdo', 'subject-1', 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("OAuth fixtures should seed");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::OAuthProviders],
+        )),
+        DataExportRecord::row(
+            ExportDomain::OAuthProviders,
+            "linuxdo",
+            json!({
+                "provider_type": "linuxdo",
+                "display_name": "Linux.do disabled",
+                "client_id": "client",
+                "redirect_uri": "https://gateway.example.test/oauth/callback",
+                "frontend_callback_url": "https://app.example.test/auth/callback",
+                "is_enabled": false,
+                "created_at": 1,
+                "updated_at": 2
+            }),
+        ),
+    ])
+    .expect("disabled Provider fixture should encode");
+
+    let err = import_sqlite_jsonl(&pool, &encoded)
+        .await
+        .expect_err("disabling the last OAuth login method should fail");
+    assert!(err
+        .to_string()
+        .contains("without an enabled identity binding"));
+    let provider = sqlx::query_as::<_, (String, i64)>(
+        "SELECT display_name, is_enabled FROM oauth_providers WHERE provider_type = 'linuxdo'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("rolled-back Provider should load");
+    assert_eq!(provider, ("Linux.do".to_string(), 1));
+}
+
+#[tokio::test]
+async fn sqlite_oauth_link_reassignment_rolls_back_if_old_owner_loses_last_binding() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::raw_sql(
+        r#"
+INSERT INTO users (id, username, role, auth_source, created_at, updated_at) VALUES
+  ('oauth-owner', 'oauth-owner', 'user', 'oauth', 1, 1),
+  ('local-target', 'local-target', 'user', 'local', 1, 1);
+INSERT INTO oauth_providers (
+  provider_type, display_name, client_id, redirect_uri, frontend_callback_url,
+  is_enabled, created_at, updated_at
+) VALUES (
+  'linuxdo', 'Linux.do', 'client', 'https://gateway.example.test/oauth/callback',
+  'https://app.example.test/auth/callback', 1, 1, 1
+);
+INSERT INTO user_oauth_links (
+  id, user_id, provider_type, provider_user_id, linked_at
+) VALUES (
+  'reassigned-link', 'oauth-owner', 'linuxdo', 'subject-1', 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("OAuth reassignment fixtures should seed");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::UserOAuthLinks],
+        )),
+        DataExportRecord::row(
+            ExportDomain::UserOAuthLinks,
+            "reassigned-link",
+            json!({
+                "id": "reassigned-link",
+                "user_id": "local-target",
+                "provider_type": "linuxdo",
+                "provider_user_id": "subject-1",
+                "linked_at": 2
+            }),
+        ),
+    ])
+    .expect("OAuth reassignment fixture should encode");
+
+    let err = import_sqlite_jsonl(&pool, &encoded)
+        .await
+        .expect_err("taking the old owner's last OAuth binding should fail");
+    assert!(err
+        .to_string()
+        .contains("without an enabled identity binding"));
+    let owner: String =
+        sqlx::query_scalar("SELECT user_id FROM user_oauth_links WHERE id = 'reassigned-link'")
+            .fetch_one(&pool)
+            .await
+            .expect("rolled-back OAuth link should load");
+    assert_eq!(owner, "oauth-owner");
+}
+
+#[tokio::test]
+async fn sqlite_oauth_link_import_ignores_unrelated_legacy_identity_damage() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::raw_sql(
+        r#"
+INSERT INTO users (id, username, role, auth_source, created_at, updated_at) VALUES
+  ('broken-oauth', 'broken-oauth', 'user', 'oauth', 1, 1),
+  ('local-user', 'local-user', 'user', 'local', 1, 1);
+INSERT INTO oauth_providers (
+  provider_type, display_name, client_id, redirect_uri, frontend_callback_url,
+  is_enabled, created_at, updated_at
+) VALUES (
+  'linuxdo', 'Linux.do', 'client', 'https://gateway.example.test/oauth/callback',
+  'https://app.example.test/auth/callback', 1, 1, 1
+);
+INSERT INTO user_oauth_links (
+  id, user_id, provider_type, provider_user_id, linked_at
+) VALUES (
+  'legacy-orphan', 'missing-user', 'missing-provider', 'legacy-subject', 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy damaged identity fixtures should seed");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::UserOAuthLinks],
+        )),
+        DataExportRecord::row(
+            ExportDomain::UserOAuthLinks,
+            "valid-link",
+            json!({
+                "id": "valid-link",
+                "user_id": "local-user",
+                "provider_type": "linuxdo",
+                "provider_user_id": "valid-subject",
+                "linked_at": 1
+            }),
+        ),
+    ])
+    .expect("valid OAuth link fixture should encode");
+
+    assert_eq!(
+        import_sqlite_jsonl(&pool, &encoded)
+            .await
+            .expect("unrelated legacy damage must not block a valid scoped import"),
+        1
+    );
+    let valid_link_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_oauth_links WHERE id = 'valid-link'")
+            .fetch_one(&pool)
+            .await
+            .expect("valid OAuth link count should load");
+    assert_eq!(valid_link_count, 1);
+}
+
+#[tokio::test]
+async fn sqlite_oauth_link_import_rejects_duplicate_identity_in_legacy_schema() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::raw_sql(
+        r#"
+DROP INDEX uq_user_oauth_links_provider_user;
+INSERT INTO users (id, username, role, auth_source, created_at, updated_at) VALUES
+  ('local-a', 'local-a', 'user', 'local', 1, 1),
+  ('local-b', 'local-b', 'user', 'local', 1, 1);
+INSERT INTO oauth_providers (
+  provider_type, display_name, client_id, redirect_uri, frontend_callback_url,
+  is_enabled, created_at, updated_at
+) VALUES (
+  'linuxdo', 'Linux.do', 'client', 'https://gateway.example.test/oauth/callback',
+  'https://app.example.test/auth/callback', 1, 1, 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy schema fixture should seed");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::UserOAuthLinks],
+        )),
+        DataExportRecord::row(
+            ExportDomain::UserOAuthLinks,
+            "link-a",
+            json!({
+                "id": "link-a",
+                "user_id": "local-a",
+                "provider_type": "linuxdo",
+                "provider_user_id": "same-subject",
+                "linked_at": 1
+            }),
+        ),
+        DataExportRecord::row(
+            ExportDomain::UserOAuthLinks,
+            "link-b",
+            json!({
+                "id": "link-b",
+                "user_id": "local-b",
+                "provider_type": "linuxdo",
+                "provider_user_id": "same-subject",
+                "linked_at": 1
+            }),
+        ),
+    ])
+    .expect("duplicate identity fixture should encode");
+
+    let err = import_sqlite_jsonl(&pool, &encoded)
+        .await
+        .expect_err("duplicate provider identity should fail");
+    assert!(err.to_string().contains("more than once"));
+    let link_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_oauth_links")
+        .fetch_one(&pool)
+        .await
+        .expect("rolled-back OAuth link count should load");
+    assert_eq!(link_count, 0);
+}
+
+#[tokio::test]
+async fn sqlite_oauth_link_import_rejects_duplicate_user_provider_in_legacy_schema() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite migrations should run");
+    sqlx::raw_sql(
+        r#"
+DROP INDEX uq_user_oauth_links_user_provider;
+INSERT INTO users (id, username, role, auth_source, created_at, updated_at)
+VALUES ('local-user', 'local-user', 'user', 'local', 1, 1);
+INSERT INTO oauth_providers (
+  provider_type, display_name, client_id, redirect_uri, frontend_callback_url,
+  is_enabled, created_at, updated_at
+) VALUES (
+  'linuxdo', 'Linux.do', 'client', 'https://gateway.example.test/oauth/callback',
+  'https://app.example.test/auth/callback', 1, 1, 1
+);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy schema fixture should seed");
+
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::UserOAuthLinks],
+        )),
+        DataExportRecord::row(
+            ExportDomain::UserOAuthLinks,
+            "link-a",
+            json!({
+                "id": "link-a",
+                "user_id": "local-user",
+                "provider_type": "linuxdo",
+                "provider_user_id": "subject-a",
+                "linked_at": 1
+            }),
+        ),
+        DataExportRecord::row(
+            ExportDomain::UserOAuthLinks,
+            "link-b",
+            json!({
+                "id": "link-b",
+                "user_id": "local-user",
+                "provider_type": "linuxdo",
+                "provider_user_id": "subject-b",
+                "linked_at": 1
+            }),
+        ),
+    ])
+    .expect("duplicate user-provider fixture should encode");
+
+    let err = import_sqlite_jsonl(&pool, &encoded)
+        .await
+        .expect_err("duplicate user provider should fail");
+    assert!(err.to_string().contains("more than once"));
+    let link_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_oauth_links")
+        .fetch_one(&pool)
+        .await
+        .expect("rolled-back OAuth link count should load");
+    assert_eq!(link_count, 0);
+}
+
+#[tokio::test]
 async fn sqlite_core_export_reads_migrated_database_rows() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -697,6 +1484,24 @@ INSERT INTO usage_routing_snapshots (
 VALUES (
   'request-1', 'candidate-1', 2, 'provider-1',
   'endpoint-1', 'provider-key-1', '1970-01-01T00:00:01Z', '1970-01-01T00:00:02Z'
+);
+INSERT INTO usage_cost_reservations (
+  request_id, subject_id, reservation_token, admitted_at,
+  reserved_cost_units, state, reservation_expires_at, retain_until,
+  created_at, updated_at
+)
+VALUES (
+  'request-1', 'user-1', 'reservation-1', 1,
+  500, 'reserved', 2, 3,
+  1, 1
+);
+INSERT INTO usage_request_admissions (
+  request_id, subject_id, event_token, admitted_at,
+  retain_until, state, created_at
+)
+VALUES (
+  'request-1', 'user-1', 'admission-1', 1,
+  3, 'active', 1
 );
 "#,
         )
@@ -761,6 +1566,19 @@ VALUES (
         .any(|row| row.payload["__table"] == "usage_routing_snapshots"
             && row.payload["candidate_id"] == "candidate-1"
             && row.payload["selected_provider_id"] == "provider-1"));
+    assert!(import_plan
+        .rows(ExportDomain::Auxiliary)
+        .iter()
+        .any(|row| row.payload["__table"] == "usage_cost_reservations"
+            && row.payload["reservation_token"] == "reservation-1"
+            && row.payload["reserved_cost_units"] == 500
+            && row.payload["state"] == "reserved"));
+    assert!(import_plan
+        .rows(ExportDomain::Auxiliary)
+        .iter()
+        .any(|row| row.payload["__table"] == "usage_request_admissions"
+            && row.payload["event_token"] == "admission-1"
+            && row.payload["state"] == "active"));
 
     let target_pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -775,12 +1593,17 @@ VALUES (
         .expect("sqlite import should load exported rows");
     assert_eq!(imported, 22);
 
-    let imported_api_key =
-        sqlx::query_as::<_, (String,)>("SELECT key_encrypted FROM api_keys WHERE id = 'api-key-1'")
+    let imported_api_key = sqlx::query_as::<_, (String, Option<String>, bool, bool, String)>(
+        "SELECT key_hash, key_encrypted, is_active, is_locked, status FROM api_keys WHERE id = 'api-key-1'",
+    )
             .fetch_one(&target_pool)
             .await
             .expect("imported api key should load");
-    assert_eq!(imported_api_key.0, "ciphertext-1");
+    assert_ne!(imported_api_key.0, "hash-1");
+    assert_eq!(imported_api_key.1, None);
+    assert!(!imported_api_key.2);
+    assert!(imported_api_key.3);
+    assert_eq!(imported_api_key.4, "disabled");
 
     let imported_usage = sqlx::query_as::<_, (String, i64, String)>(
         "SELECT request_id, created_at_unix_ms, typeof(created_at_unix_ms) FROM \"usage\" WHERE request_id = 'request-1'",
@@ -848,6 +1671,36 @@ WHERE request_id = 'request-1'
         ("candidate-1".to_string(), 2, "provider-1".to_string())
     );
 
+    let imported_reservation = sqlx::query_as::<_, (String, i64, String)>(
+        r#"
+SELECT subject_id, reserved_cost_units, state
+FROM usage_cost_reservations
+WHERE reservation_token = 'reservation-1'
+"#,
+    )
+    .fetch_one(&target_pool)
+    .await
+    .expect("imported usage cost reservation should load");
+    assert_eq!(
+        imported_reservation,
+        ("user-1".to_string(), 500, "reserved".to_string())
+    );
+
+    let imported_admission = sqlx::query_as::<_, (String, String, Option<i64>)>(
+        r#"
+SELECT subject_id, state, released_at
+FROM usage_request_admissions
+WHERE event_token = 'admission-1'
+"#,
+    )
+    .fetch_one(&target_pool)
+    .await
+    .expect("imported usage request admission should load");
+    assert_eq!(
+        imported_admission,
+        ("user-1".to_string(), "active".to_string(), None)
+    );
+
     if let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -875,13 +1728,17 @@ WHERE request_id = 'request-1'
             .expect("postgres import should load exported rows");
         assert_eq!(imported, 22);
 
-        let imported_api_key = sqlx::query_as::<_, (String,)>(
-            "SELECT key_encrypted FROM api_keys WHERE id = 'api-key-1'",
+        let imported_api_key = sqlx::query_as::<_, (String, Option<String>, bool, bool, String)>(
+            "SELECT key_hash, key_encrypted, is_active, is_locked, status FROM api_keys WHERE id = 'api-key-1'",
         )
         .fetch_one(&postgres_pool)
         .await
         .expect("imported postgres api key should load");
-        assert_eq!(imported_api_key.0, "ciphertext-1");
+        assert_ne!(imported_api_key.0, "hash-1");
+        assert_eq!(imported_api_key.1, None);
+        assert!(!imported_api_key.2);
+        assert!(imported_api_key.3);
+        assert_eq!(imported_api_key.4, "disabled");
     }
 }
 
@@ -1108,12 +1965,15 @@ async fn postgres_core_export_reads_migrated_database_rows_when_url_is_set() {
     assert_eq!(imported, import_plan_row_count(&import_plan));
 
     let imported_api_key =
-        sqlx::query_as::<_, (String,)>("SELECT key_encrypted FROM api_keys WHERE id = $1")
+        sqlx::query_as::<_, (Option<String>,)>("SELECT key_encrypted FROM api_keys WHERE id = $1")
             .bind(&api_key_id)
             .fetch_one(&target_pool)
             .await
             .expect("imported sqlite api key should load");
-    assert_eq!(imported_api_key.0, "ciphertext-1");
+    assert_eq!(
+        imported_api_key.0, None,
+        "cross-driver imports must revoke recoverable API-key ciphertext"
+    );
     let imported_global_model_timestamps = sqlx::query_as::<_, (i64, i64, String, String)>(
         "SELECT created_at, updated_at, typeof(created_at), typeof(updated_at) FROM global_models WHERE id = ?",
     )
@@ -1321,13 +2181,18 @@ async fn mysql_core_export_reads_migrated_database_rows_when_url_is_set() {
         .expect("mysql import should be idempotent");
     assert!(imported >= 6);
 
-    let imported_api_key =
-        sqlx::query_as::<_, (String,)>("SELECT key_encrypted FROM api_keys WHERE id = ?")
-            .bind(&api_key_id)
-            .fetch_one(&pool)
-            .await
-            .expect("imported mysql api key should load");
-    assert_eq!(imported_api_key.0, "ciphertext-1");
+    let imported_api_key = sqlx::query_as::<_, (String, Option<String>, bool, bool, String)>(
+        "SELECT key_hash, key_encrypted, is_active, is_locked, status FROM api_keys WHERE id = ?",
+    )
+    .bind(&api_key_id)
+    .fetch_one(&pool)
+    .await
+    .expect("imported mysql api key should load");
+    assert_ne!(imported_api_key.0, "hash-1");
+    assert_eq!(imported_api_key.1, None);
+    assert!(!imported_api_key.2);
+    assert!(imported_api_key.3);
+    assert_eq!(imported_api_key.4, "disabled");
 }
 
 fn unique_suffix() -> String {

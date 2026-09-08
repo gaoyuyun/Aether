@@ -1,5 +1,5 @@
 import type { EndpointHealthDetail } from '@/api/endpoints'
-import { compareApiFormats } from '@/api/endpoints/types/api-format'
+import { compareApiFormats, formatApiFormat } from '@/api/endpoints/types/api-format'
 import { defaultLocale, translateLegacyText, type Locale } from '@/i18n/messages'
 
 // 端点状态枚举
@@ -32,11 +32,29 @@ export function isEndpointAvailable(endpoint: EndpointHealthDetail): boolean {
   return getEndpointStatus(endpoint) === 'available'
 }
 
+function getEndpointHealthScore(endpoint: EndpointHealthDetail): number | null {
+  const score = endpoint.health_score
+  if (!isEndpointAvailable(endpoint) || typeof score !== 'number' || !Number.isFinite(score)) {
+    return null
+  }
+  return Math.min(1, Math.max(0, score))
+}
+
+export function getEndpointHealthLabel(endpoint: EndpointHealthDetail): string {
+  const score = getEndpointHealthScore(endpoint)
+  return score === null ? '-' : `${(score * 100).toFixed(0)}%`
+}
+
+export function getEndpointHealthBarWidth(endpoint: EndpointHealthDetail): string {
+  const score = getEndpointHealthScore(endpoint)
+  return score === null ? '100%' : `${Math.max(score * 100, 5)}%`
+}
+
 /**
  * 根据健康分数获取颜色
  */
 export function getHealthScoreColor(score: number | undefined | null): string {
-  if (score === undefined || score === null) {
+  if (score === undefined || score === null || !Number.isFinite(score)) {
     return 'bg-muted-foreground/40'
   }
   if (score >= 0.8) return 'bg-green-500'
@@ -48,17 +66,14 @@ export function getHealthScoreColor(score: number | undefined | null): string {
  * 端点不可用时进度条颜色
  */
 export function getEndpointDotColor(endpoint: EndpointHealthDetail): string {
-  if (!isEndpointAvailable(endpoint)) {
-    return 'bg-muted-foreground/40'
-  }
-  return getHealthScoreColor(endpoint.health_score)
+  return getHealthScoreColor(getEndpointHealthScore(endpoint))
 }
 
 /**
  * 端点提示文本
  */
 export function getEndpointTooltip(endpoint: EndpointHealthDetail, locale: Locale = defaultLocale): string {
-  const format = endpoint.api_format
+  const format = formatApiFormat(endpoint.api_format)
   const status = getEndpointStatus(endpoint)
   const t = (value: string) => translateLegacyText(value, locale)
 
@@ -70,8 +85,8 @@ export function getEndpointTooltip(endpoint: EndpointHealthDetail, locale: Local
     case 'keys_disabled':
       return `${format}: ${t('无可用密钥')}`
     case 'available': {
-      const score = endpoint.health_score
-      if (score === undefined || score === null) {
+      const score = getEndpointHealthScore(endpoint)
+      if (score === null) {
         return `${format}: ${t('暂无健康数据')}`
       }
       return `${format}: ${t('健康度')} ${(score * 100).toFixed(0)}%`

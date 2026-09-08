@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aether_ai_serving::{
     run_ai_attempt_loop, AiAttemptExecutionOutcome, AiAttemptLoopOutcome, AiAttemptLoopPort,
     AiAttemptRetryScope, AiExecutionAttempt,
 };
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
-use aether_runtime::ConcurrencyPermit;
+use aether_runtime::{AdmissionPermit, ConcurrencyPermit};
 use aether_scheduler_core::{
     parse_request_candidate_report_context, SchedulerRequestCandidateStatusUpdate,
 };
@@ -29,7 +30,8 @@ use crate::execution_runtime::{
     UpstreamExecutionGateProvider, UPSTREAM_EXECUTION_GATE_NAME,
 };
 use crate::executor::{
-    build_local_execution_exhaustion, mark_deferred_upstream_response, LocalExecutionRequestOutcome,
+    attach_deferred_usage_context, build_local_execution_exhaustion,
+    mark_deferred_upstream_response, LocalExecutionRequestOutcome,
 };
 use crate::handlers::shared::provider_pool::release_admin_provider_pool_key_lease;
 use crate::log_ids::short_request_id;
@@ -54,6 +56,17 @@ const UPSTREAM_EXECUTION_GATE_HOLD_STREAM_RESPONSE_ENV: &str =
 const UPSTREAM_EXECUTION_GATE_STREAM_HOLD_MODE_ENV: &str =
     "AETHER_GATEWAY_UPSTREAM_EXECUTION_GATE_STREAM_HOLD_MODE";
 
+#[derive(Clone, Debug)]
+pub(crate) struct BackgroundAdmissionPermit {
+    _permit: AdmissionPermit,
+}
+
+impl BackgroundAdmissionPermit {
+    pub(crate) fn new(permit: AdmissionPermit) -> Self {
+        Self { _permit: permit }
+    }
+}
+
 fn attach_redaction_execution_candidate(response: &mut Response<Body>, candidate_id: Option<&str>) {
     if let Some(candidate_id) = candidate_id
         .map(str::trim)
@@ -76,7 +89,7 @@ pub(crate) async fn execute_sync_plan_and_reports<T>(
 where
     T: AiExecutionAttempt + Send + Sync + 'static,
 {
-    let transfer_tracker = ProviderTransferTracker::default();
+    let transfer_tracker = ProviderTransferTracker::for_request(parts);
     execute_sync_plan_and_reports_with_transfer_tracker(
         state,
         parts,
@@ -133,7 +146,17 @@ where
             plan_kind,
             transfer_tracker,
         };
-        match run_ai_attempt_loop(&port, plan_and_reports).await? {
+        let loop_result = run_ai_attempt_loop(&port, plan_and_reports).await;
+        if loop_result.is_err() {
+            release_active_plan_usage_policy_cost_best_effort(
+                state,
+                decision,
+                transfer_tracker,
+                "candidate_loop_error",
+            )
+            .await;
+        }
+        match loop_result? {
             AiAttemptLoopOutcome::Responded(response) => {
                 Ok(LocalExecutionRequestOutcome::responded(response))
             }
@@ -166,7 +189,7 @@ where
     T: AiExecutionAttempt + Send + Sync + 'static,
     S: LocalExecutionAttemptSource<T>,
 {
-    let transfer_tracker = ProviderTransferTracker::default();
+    let transfer_tracker = ProviderTransferTracker::for_request(parts);
     execute_sync_attempt_source_with_transfer_tracker(
         state,
         parts,
@@ -211,7 +234,7 @@ where
             plan_kind,
             transfer_tracker,
         };
-        run_dynamic_attempt_loop(
+        let loop_result = run_dynamic_attempt_loop(
             &port,
             &mut source,
             trace_id,
@@ -220,7 +243,17 @@ where
                 .frontdoor_runtime_guards
                 .local_execution_planning_timeout,
         )
-        .await
+        .await;
+        if loop_result.is_err() {
+            release_active_plan_usage_policy_cost_best_effort(
+                state,
+                decision,
+                transfer_tracker,
+                "dynamic_candidate_loop_error",
+            )
+            .await;
+        }
+        loop_result
     }
     .instrument(span)
     .await
@@ -259,6 +292,10 @@ where
         Ok(())
     }
 
+    async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
+        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
+    }
+
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {
         record_provider_transfer_attempt_failed(
             self.state,
@@ -276,22 +313,73 @@ where
         attempt: &T,
     ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
         let plan = attempt.execution_plan();
-        let report_context = attempt.report_context();
-        if let Some(response) = execution_plan_balance_capacity_response(
+        let report_context = attach_plan_usage_reservation_token(
+            attempt.report_context(),
+            self.transfer_tracker.usage_policy_reservation_token(),
+        );
+        let balance_response = execution_plan_balance_capacity_response(
             self.state,
             self.trace_id,
             self.decision,
             plan,
             report_context.as_ref(),
         )
+        .await;
+        let balance_response = match balance_response {
+            Ok(response) => response,
+            Err(error) => {
+                release_plan_usage_policy_cost_best_effort(
+                    self.state,
+                    self.decision,
+                    plan,
+                    self.transfer_tracker,
+                    "balance_capacity_error",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        if let Some(response) = balance_response {
+            release_plan_usage_policy_cost_best_effort(
+                self.state,
+                self.decision,
+                plan,
+                self.transfer_tracker,
+                "balance_capacity_rejected",
+            )
+            .await;
+            return Ok(AiAttemptExecutionOutcome::Responded(response));
+        }
+        prewarm_direct_reqwest_candidate_client(plan);
+        let _permit = match acquire_upstream_execution_gate(self.state, self.trace_id).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                release_plan_usage_policy_cost_best_effort(
+                    self.state,
+                    self.decision,
+                    plan,
+                    self.transfer_tracker,
+                    "upstream_admission_error",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        if let Some(response) = execution_plan_cost_capacity_response(
+            self.state,
+            self.trace_id,
+            self.decision,
+            plan,
+            report_context.as_ref(),
+            self.transfer_tracker,
+        )
         .await?
         {
             return Ok(AiAttemptExecutionOutcome::Responded(response));
         }
-        prewarm_direct_reqwest_candidate_client(plan);
-        let _permit = acquire_upstream_execution_gate(self.state, self.trace_id).await?;
         let upstream_execution_gate_held_started_at = std::time::Instant::now();
-        let mut execution = execute_execution_runtime_sync_with_retry_scope(
+        let deferred_report_context = report_context.clone();
+        let execution = execute_execution_runtime_sync_with_retry_scope(
             self.state,
             self.parts.uri.path(),
             plan.clone(),
@@ -301,19 +389,39 @@ where
             attempt.report_kind(),
             report_context,
         )
-        .await?;
+        .await;
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                release_plan_usage_policy_cost_best_effort(
+                    self.state,
+                    self.decision,
+                    plan,
+                    self.transfer_tracker,
+                    "sync_execution_error",
+                )
+                .await;
+                return Err(error);
+            }
+        };
         observe_gateway_stage_ms(
             "upstream_execution_gate_held",
             upstream_execution_gate_held_started_at
                 .elapsed()
                 .as_millis() as u64,
         );
+        let mut execution = execution;
         match &mut execution {
-            AiAttemptExecutionOutcome::Responded(response)
-            | AiAttemptExecutionOutcome::Retry {
+            AiAttemptExecutionOutcome::Responded(response) => {
+                attach_redaction_execution_candidate(response, plan.candidate_id.as_deref());
+            }
+            AiAttemptExecutionOutcome::Retry {
                 fallback_response: Some(response),
                 ..
-            } => attach_redaction_execution_candidate(response, plan.candidate_id.as_deref()),
+            } => {
+                attach_redaction_execution_candidate(response, plan.candidate_id.as_deref());
+                attach_deferred_usage_context(response, plan, deferred_report_context.as_ref());
+            }
             AiAttemptExecutionOutcome::Retry {
                 fallback_response: None,
                 ..
@@ -345,10 +453,16 @@ where
             model_name = last_plan.model_name.as_deref().unwrap_or("-"),
             "candidate loop exhausted local sync candidates"
         );
-        Ok(
-            build_local_execution_exhaustion(self.state, &last_plan, last_report_context.as_ref())
-                .await,
+        Ok(build_local_execution_exhaustion(
+            self.state,
+            &last_plan,
+            attach_plan_usage_reservation_token(
+                last_report_context,
+                self.transfer_tracker.usage_policy_reservation_token(),
+            )
+            .as_ref(),
         )
+        .await)
     }
 }
 
@@ -415,8 +529,19 @@ where
             decision,
             plan_kind,
             transfer_tracker,
+            request_first_byte_started_at: Instant::now(),
         };
-        match run_ai_attempt_loop(&port, plan_and_reports).await? {
+        let loop_result = run_ai_attempt_loop(&port, plan_and_reports).await;
+        if loop_result.is_err() {
+            release_active_plan_usage_policy_cost_best_effort(
+                state,
+                decision,
+                transfer_tracker,
+                "candidate_loop_error",
+            )
+            .await;
+        }
+        match loop_result? {
             AiAttemptLoopOutcome::Responded(response) => {
                 Ok(LocalExecutionRequestOutcome::responded(response))
             }
@@ -489,8 +614,9 @@ where
             decision,
             plan_kind,
             transfer_tracker,
+            request_first_byte_started_at: Instant::now(),
         };
-        run_dynamic_attempt_loop(
+        let loop_result = run_dynamic_attempt_loop(
             &port,
             &mut source,
             trace_id,
@@ -499,7 +625,17 @@ where
                 .frontdoor_runtime_guards
                 .local_execution_planning_timeout,
         )
-        .await
+        .await;
+        if loop_result.is_err() {
+            release_active_plan_usage_policy_cost_best_effort(
+                state,
+                decision,
+                transfer_tracker,
+                "dynamic_candidate_loop_error",
+            )
+            .await;
+        }
+        loop_result
     }
     .instrument(span)
     .await
@@ -537,6 +673,49 @@ struct ProviderTransferStateTracker {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderTransferTracker {
     state: std::sync::Arc<tokio::sync::Mutex<ProviderTransferStateTracker>>,
+    usage_policy_reservation: Option<crate::plan_usage_policy::PlanUsageReservationContext>,
+    usage_policy_reservation_plan:
+        std::sync::Arc<std::sync::Mutex<Option<aether_contracts::ExecutionPlan>>>,
+    usage_policy_cost_reserved: std::sync::Arc<AtomicBool>,
+    _background_admission_permit: Option<BackgroundAdmissionPermit>,
+}
+
+impl ProviderTransferTracker {
+    pub(crate) fn for_request(parts: &http::request::Parts) -> Self {
+        let background_admission_permit =
+            parts.extensions.get::<BackgroundAdmissionPermit>().cloned();
+        let usage_policy_reservation = parts
+            .extensions
+            .get::<crate::plan_usage_policy::PlanUsageReservationContext>()
+            .cloned();
+        Self {
+            state: Default::default(),
+            usage_policy_reservation,
+            usage_policy_reservation_plan: Default::default(),
+            usage_policy_cost_reserved: Default::default(),
+            _background_admission_permit: background_admission_permit,
+        }
+    }
+
+    fn usage_policy_reservation_token(&self) -> Option<&str> {
+        self.usage_policy_reservation
+            .as_ref()
+            .map(crate::plan_usage_policy::PlanUsageReservationContext::token)
+    }
+
+    fn record_usage_policy_reservation_plan(&self, plan: &aether_contracts::ExecutionPlan) {
+        *self
+            .usage_policy_reservation_plan
+            .lock()
+            .expect("usage policy reservation plan lock") = Some(plan.clone());
+    }
+
+    fn usage_policy_reservation_plan(&self) -> Option<aether_contracts::ExecutionPlan> {
+        self.usage_policy_reservation_plan
+            .lock()
+            .expect("usage policy reservation plan lock")
+            .clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -799,18 +978,31 @@ where
 {
     let mut last_attempted = None;
     let mut fallback_response = None;
+    // A same-key retry derived after a candidate-scoped failure runs before
+    // the source is asked for the next candidate.
+    let mut pending_same_key_retry: Option<Attempt> = None;
 
     loop {
-        let next_started_at = std::time::Instant::now();
-        let next_attempt =
-            next_execution_attempt_with_timeout(source, trace_id, plan_kind, planning_timeout)
+        let attempt = match pending_same_key_retry.take() {
+            Some(attempt) => attempt,
+            None => {
+                let next_started_at = std::time::Instant::now();
+                let next_attempt = next_execution_attempt_with_timeout(
+                    source,
+                    trace_id,
+                    plan_kind,
+                    planning_timeout,
+                )
                 .await?;
-        observe_gateway_stage_ms(
-            "stream_candidate_next",
-            next_started_at.elapsed().as_millis() as u64,
-        );
-        let Some(attempt) = next_attempt else {
-            break;
+                observe_gateway_stage_ms(
+                    "stream_candidate_next",
+                    next_started_at.elapsed().as_millis() as u64,
+                );
+                let Some(attempt) = next_attempt else {
+                    break;
+                };
+                attempt
+            }
         };
         if port.should_skip_attempt(&attempt).await? {
             let provider_id = attempt.execution_plan().provider_id.clone();
@@ -853,6 +1045,9 @@ where
                         Box::new(attempt.execution_plan().clone()),
                         attempt.report_context(),
                     ));
+                }
+                if scope == AiAttemptRetryScope::Candidate {
+                    pending_same_key_retry = port.next_same_key_retry(&attempt).await?;
                 }
                 apply_attempt_retry_scope(source, &attempt, scope).await?;
             }
@@ -941,6 +1136,10 @@ struct StreamAttemptLoopPort<'a> {
     decision: &'a GatewayControlDecision,
     plan_kind: &'a str,
     transfer_tracker: &'a ProviderTransferTracker,
+    /// All candidates in one downstream stream request share this origin.
+    /// Without it every retry receives a fresh full first-byte timeout and a
+    /// 30-second provider timeout can accumulate into a 60-120 second stall.
+    request_first_byte_started_at: Instant,
 }
 
 #[async_trait]
@@ -967,6 +1166,10 @@ where
         Ok(())
     }
 
+    async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
+        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
+    }
+
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {
         record_provider_transfer_attempt_failed(
             self.state,
@@ -984,7 +1187,10 @@ where
         attempt: &T,
     ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
         let plan = attempt.execution_plan();
-        let report_context = attempt.report_context();
+        let report_context = attach_plan_usage_reservation_token(
+            attempt.report_context(),
+            self.transfer_tracker.usage_policy_reservation_token(),
+        );
         let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
             .and_then(|context| context.candidate_index)
             .map(|value| value.to_string())
@@ -1003,35 +1209,49 @@ where
             candidate_index = candidate_index.as_str(),
             "candidate loop attempting stream execution candidate"
         );
-        if let Some(response) = execution_plan_balance_capacity_response(
+        let balance_response = execution_plan_balance_capacity_response(
             self.state,
             self.trace_id,
             self.decision,
             plan,
             report_context.as_ref(),
         )
-        .await?
-        {
+        .await;
+        let balance_response = match balance_response {
+            Ok(response) => response,
+            Err(error) => {
+                release_plan_usage_policy_cost_best_effort(
+                    self.state,
+                    self.decision,
+                    plan,
+                    self.transfer_tracker,
+                    "balance_capacity_error",
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        if let Some(response) = balance_response {
+            release_plan_usage_policy_cost_best_effort(
+                self.state,
+                self.decision,
+                plan,
+                self.transfer_tracker,
+                "balance_capacity_rejected",
+            )
+            .await;
             return Ok(AiAttemptExecutionOutcome::Responded(response));
         }
         prewarm_direct_reqwest_candidate_client(plan);
-        // The attempt owns the canonical report context. Borrow it for the
-        // watchdog; only third-party/synthesized attempts using the default
-        // trait implementation need an owned fallback clone.
-        let watchdog_report_context_owned = if attempt.report_context_ref().is_none() {
-            report_context.clone()
-        } else {
-            None
-        };
-        let watchdog_report_context = attempt
-            .report_context_ref()
-            .or(watchdog_report_context_owned.as_ref());
+        let watchdog_report_context_owned = report_context.clone();
+        let watchdog_report_context = watchdog_report_context_owned.as_ref();
         let execution_state = self.state.clone();
         let execution_trace_id = self.trace_id.to_string();
         let execution_plan_kind = self.plan_kind.to_string();
         let execution_decision = self.decision.clone();
         let execution_report_kind = attempt.report_kind();
         let execution_plan = plan.clone();
+        let execution_transfer_tracker = self.transfer_tracker.clone();
         let stop_on_transport_errors = matches!(
             resolve_local_transport_failover_analysis_for_attempt(
                 self.state,
@@ -1049,8 +1269,21 @@ where
             self.plan_kind,
             plan,
             watchdog_report_context,
+            self.request_first_byte_started_at,
             stop_on_transport_errors,
             move || async move {
+                if let Some(response) = execution_plan_cost_capacity_response(
+                    &execution_state,
+                    execution_trace_id.as_str(),
+                    &execution_decision,
+                    &execution_plan,
+                    report_context.as_ref(),
+                    &execution_transfer_tracker,
+                )
+                .await?
+                {
+                    return Ok(AiAttemptExecutionOutcome::Responded(response));
+                }
                 execute_execution_runtime_stream_with_retry_scope(
                     &execution_state,
                     execution_plan,
@@ -1063,7 +1296,21 @@ where
                 .await
             },
         )
-        .await?;
+        .await;
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                release_plan_usage_policy_cost_best_effort(
+                    self.state,
+                    self.decision,
+                    plan,
+                    self.transfer_tracker,
+                    "stream_execution_error",
+                )
+                .await;
+                return Err(error);
+            }
+        };
         let mut execution = match execution {
             StreamCandidateWatchdogOutcome::TransportTimeout => {
                 AiAttemptExecutionOutcome::Responded(
@@ -1076,7 +1323,7 @@ where
                         http::StatusCode::GATEWAY_TIMEOUT.as_u16(),
                         "local_stream_candidate_watchdog_timeout",
                         stream_candidate_watchdog_timeout_message(),
-                        watchdog_started_at.elapsed().as_millis() as u64,
+                        self.request_first_byte_started_at.elapsed().as_millis() as u64,
                     )
                     .await?,
                 )
@@ -1084,11 +1331,16 @@ where
             StreamCandidateWatchdogOutcome::Executed(execution) => execution,
         };
         match &mut execution {
-            AiAttemptExecutionOutcome::Responded(response)
-            | AiAttemptExecutionOutcome::Retry {
+            AiAttemptExecutionOutcome::Responded(response) => {
+                attach_redaction_execution_candidate(response, plan.candidate_id.as_deref());
+            }
+            AiAttemptExecutionOutcome::Retry {
                 fallback_response: Some(response),
                 ..
-            } => attach_redaction_execution_candidate(response, plan.candidate_id.as_deref()),
+            } => {
+                attach_redaction_execution_candidate(response, plan.candidate_id.as_deref());
+                attach_deferred_usage_context(response, plan, watchdog_report_context);
+            }
             AiAttemptExecutionOutcome::Retry {
                 fallback_response: None,
                 ..
@@ -1120,10 +1372,16 @@ where
             model_name = last_plan.model_name.as_deref().unwrap_or("-"),
             "candidate loop exhausted local stream candidates"
         );
-        Ok(
-            build_local_execution_exhaustion(self.state, &last_plan, last_report_context.as_ref())
-                .await,
+        Ok(build_local_execution_exhaustion(
+            self.state,
+            &last_plan,
+            attach_plan_usage_reservation_token(
+                last_report_context,
+                self.transfer_tracker.usage_policy_reservation_token(),
+            )
+            .as_ref(),
         )
+        .await)
     }
 }
 
@@ -1134,6 +1392,47 @@ fn prewarm_direct_reqwest_candidate_client(plan: &aether_contracts::ExecutionPla
         "direct_reqwest_client_prewarm",
         started_at.elapsed().as_millis() as u64,
     );
+}
+
+fn attach_plan_usage_reservation_token(
+    report_context: Option<serde_json::Value>,
+    reservation_token: Option<&str>,
+) -> Option<serde_json::Value> {
+    match (report_context, reservation_token) {
+        (Some(serde_json::Value::Object(mut context)), Some(reservation_token)) => {
+            context.insert(
+                "plan_usage_reservation_token".to_string(),
+                serde_json::Value::String(reservation_token.to_string()),
+            );
+            context.insert(
+                aether_data_contracts::repository::usage::PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY
+                    .to_string(),
+                serde_json::Value::Bool(false),
+            );
+            Some(serde_json::Value::Object(context))
+        }
+        (Some(serde_json::Value::Object(mut context)), None) => {
+            context.remove("plan_usage_reservation_token");
+            context.remove(
+                aether_data_contracts::repository::usage::PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY,
+            );
+            Some(serde_json::Value::Object(context))
+        }
+        (_, Some(reservation_token)) => {
+            let mut context = serde_json::Map::new();
+            context.insert(
+                "plan_usage_reservation_token".to_string(),
+                serde_json::Value::String(reservation_token.to_string()),
+            );
+            context.insert(
+                aether_data_contracts::repository::usage::PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY
+                    .to_string(),
+                serde_json::Value::Bool(false),
+            );
+            Some(serde_json::Value::Object(context))
+        }
+        (report_context, None) => report_context,
+    }
 }
 
 async fn execution_plan_balance_capacity_response(
@@ -1168,6 +1467,121 @@ async fn execution_plan_balance_capacity_response(
     )?;
     attach_redaction_execution_candidate(&mut response, plan.candidate_id.as_deref());
     Ok(Some(response))
+}
+
+async fn execution_plan_cost_capacity_response(
+    state: &AppState,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan: &aether_contracts::ExecutionPlan,
+    report_context: Option<&serde_json::Value>,
+    transfer_tracker: &ProviderTransferTracker,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    let outcome = match crate::plan_usage_policy::reserve_admitted_http_plan_usage_policy_cost(
+        state,
+        decision,
+        plan,
+        report_context,
+        transfer_tracker.usage_policy_reservation.as_ref(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            release_plan_usage_policy_cost_best_effort(
+                state,
+                decision,
+                plan,
+                transfer_tracker,
+                "reservation_error",
+            )
+            .await;
+            mark_unused_local_candidate(state, plan, report_context).await;
+            return Err(err);
+        }
+    };
+    let rejection = match outcome {
+        crate::plan_usage_policy::PlanUsageCostReservationOutcome::NotRequired => return Ok(None),
+        crate::plan_usage_policy::PlanUsageCostReservationOutcome::Reserved => {
+            transfer_tracker.record_usage_policy_reservation_plan(plan);
+            transfer_tracker
+                .usage_policy_cost_reserved
+                .store(true, Ordering::Release);
+            return Ok(None);
+        }
+        crate::plan_usage_policy::PlanUsageCostReservationOutcome::Rejected(rejection) => rejection,
+    };
+    release_plan_usage_policy_cost_best_effort(
+        state,
+        decision,
+        plan,
+        transfer_tracker,
+        "reservation_rejected",
+    )
+    .await;
+    mark_unused_local_candidate(state, plan, report_context).await;
+    let mut response = crate::api::response::build_local_plan_usage_limited_response(
+        trace_id,
+        Some(decision),
+        &rejection,
+    )?;
+    attach_redaction_execution_candidate(&mut response, plan.candidate_id.as_deref());
+    Ok(Some(response))
+}
+
+async fn release_plan_usage_policy_cost_best_effort(
+    state: &AppState,
+    decision: &GatewayControlDecision,
+    plan: &aether_contracts::ExecutionPlan,
+    transfer_tracker: &ProviderTransferTracker,
+    reason: &'static str,
+) {
+    if !transfer_tracker
+        .usage_policy_cost_reserved
+        .swap(false, Ordering::AcqRel)
+    {
+        return;
+    }
+    if let Err(error) = crate::plan_usage_policy::release_plan_usage_policy_cost(
+        state,
+        decision,
+        plan,
+        transfer_tracker
+            .usage_policy_reservation_token()
+            .expect("a reserved plan cost always has a reservation token"),
+        current_unix_ms() / 1_000,
+    )
+    .await
+    {
+        warn!(
+            event_name = "plan_usage_cost_reservation_release_failed",
+            log_type = "ops",
+            request_id = %plan.request_id,
+            candidate_id = ?plan.candidate_id,
+            reservation_token = transfer_tracker
+                .usage_policy_reservation_token()
+                .unwrap_or("-"),
+            reason,
+            error = ?error,
+            "gateway failed to release plan usage cost reservation after terminal capacity failure"
+        );
+        transfer_tracker
+            .usage_policy_cost_reserved
+            .store(true, Ordering::Release);
+    }
+}
+
+async fn release_active_plan_usage_policy_cost_best_effort(
+    state: &AppState,
+    decision: &GatewayControlDecision,
+    transfer_tracker: &ProviderTransferTracker,
+    reason: &'static str,
+) {
+    let Some(plan) = transfer_tracker.usage_policy_reservation_plan() else {
+        return;
+    };
+    release_plan_usage_policy_cost_best_effort(state, decision, &plan, transfer_tracker, reason)
+        .await;
 }
 
 pub(crate) async fn mark_unused_local_candidates<T>(state: &AppState, remaining: Vec<T>)
@@ -1370,6 +1784,7 @@ async fn execute_stream_candidate_with_watchdog<Fut>(
     plan_kind: &str,
     plan: &aether_contracts::ExecutionPlan,
     report_context: Option<&serde_json::Value>,
+    request_first_byte_started_at: Instant,
     stop_on_transport_errors: bool,
     execute: impl FnOnce() -> Fut,
 ) -> Result<StreamCandidateWatchdogOutcome, GatewayError>
@@ -1379,6 +1794,7 @@ where
         > + Send,
 {
     let timeout_duration = resolve_stream_candidate_watchdog_timeout(plan, report_context);
+    let candidate_budget_ms = u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
     let candidate_started_at = std::time::Instant::now();
     let candidate_started_unix_ms = current_unix_ms();
     let permit = match acquire_upstream_execution_gate(state, trace_id).await {
@@ -1452,6 +1868,10 @@ where
     let outcome = match execution_result {
         Some(result) => result.map(StreamCandidateWatchdogOutcome::Executed),
         None => {
+            // The abandoned attempt is dropped when this function returns.
+            // Claim its settlement before that so its cancellation guard does
+            // not race the watchdog rows written just below.
+            watchdog_progress.mark_abandoned();
             let finished_at_unix_ms = current_unix_ms();
             let request_id = short_request_id(plan.request_id.as_str());
             let provider_name = plan.provider_name.as_deref().unwrap_or("-");
@@ -1461,6 +1881,10 @@ where
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
             let timeout_ms = u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
+            let request_elapsed_ms = request_first_byte_started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
             record_local_request_candidate_status(
                 state,
                 plan,
@@ -1489,6 +1913,8 @@ where
                 model_name,
                 candidate_index = candidate_index.as_str(),
                 timeout_ms,
+                candidate_budget_ms,
+                request_elapsed_ms,
                 "gateway local stream candidate watchdog timed out"
             );
             if stop_on_transport_errors {
@@ -1707,10 +2133,20 @@ pub(crate) async fn mark_unused_local_candidate_items<T, FPlan, FContext>(
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
 
-    use aether_contracts::{ExecutionPlan, ExecutionTimeouts, RequestBody};
+    use aether_contracts::{
+        ExecutionPlan, ExecutionResult, ExecutionTimeouts, RequestBody, ResponseBody,
+    };
+    use aether_data::repository::settlement::{
+        InMemorySettlementRepository, ReserveUsagePolicyCostInput, ReserveUsagePolicyCostOutcome,
+        SettlementWriteRepository, UsagePolicyCostReservationState, UsagePolicyCostWindow,
+    };
+    use aether_data_contracts::repository::billing::{
+        BillingReadRepository, StoredBillingModelContext, UserPlanEntitlementRecord,
+    };
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, UpsertRequestCandidateRecord,
     };
+    use aether_data_contracts::DataLayerError;
     use async_trait::async_trait;
     use serde_json::json;
     use tokio::sync::{Mutex, Notify};
@@ -1785,6 +2221,83 @@ mod tests {
 
         async fn drain_execution_attempts(&mut self) -> Result<Vec<()>, GatewayError> {
             Ok(Vec::new())
+        }
+
+        async fn skip_credential(&mut self, _key_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn skip_endpoint(&mut self, _endpoint_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn skip_provider(&mut self, _provider_id: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct CostReservationBillingRepository {
+        model_context: StoredBillingModelContext,
+        entitlement: UserPlanEntitlementRecord,
+    }
+
+    #[async_trait]
+    impl BillingReadRepository for CostReservationBillingRepository {
+        async fn find_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _global_model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            Ok(Some(self.model_context.clone()))
+        }
+
+        async fn find_model_context_by_model_id(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _model_id: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            Ok(Some(self.model_context.clone()))
+        }
+
+        async fn list_user_plan_entitlements(
+            &self,
+            user_id: &str,
+        ) -> Result<Option<Vec<UserPlanEntitlementRecord>>, DataLayerError> {
+            Ok(Some(
+                (self.entitlement.user_id == user_id)
+                    .then(|| self.entitlement.clone())
+                    .into_iter()
+                    .collect(),
+            ))
+        }
+    }
+
+    struct PlanningErrorAfterFirstSyncAttemptSource {
+        first: Option<crate::ai_serving::AiSyncAttempt>,
+    }
+
+    #[async_trait]
+    impl LocalExecutionAttemptSource<crate::ai_serving::AiSyncAttempt>
+        for PlanningErrorAfterFirstSyncAttemptSource
+    {
+        async fn next_execution_attempt(
+            &mut self,
+        ) -> Result<Option<crate::ai_serving::AiSyncAttempt>, GatewayError> {
+            match self.first.take() {
+                Some(first) => Ok(Some(first)),
+                None => Err(GatewayError::Internal(
+                    "synthetic next-candidate planning failure".to_string(),
+                )),
+            }
+        }
+
+        async fn drain_execution_attempts(
+            &mut self,
+        ) -> Result<Vec<crate::ai_serving::AiSyncAttempt>, GatewayError> {
+            Ok(self.first.take().into_iter().collect())
         }
 
         async fn skip_credential(&mut self, _key_id: &str) -> Result<(), GatewayError> {
@@ -2264,6 +2777,190 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn dynamic_sync_planning_error_releases_reserved_http_plan_cost() {
+        let now_unix_secs = current_unix_ms() / 1_000;
+        let request_id = "req-http-reservation-planning-error";
+        let subject_id = "user-http-reservation-planning-error";
+        let settlement = Arc::new(InMemorySettlementRepository::default());
+        let billing = Arc::new(CostReservationBillingRepository {
+            model_context: StoredBillingModelContext::new(
+                "provider-1".to_string(),
+                None,
+                Some("key-1".to_string()),
+                None,
+                None,
+                "global-model-1".to_string(),
+                "gpt-5".to_string(),
+                None,
+                Some(0.25),
+                None,
+                Some("model-1".to_string()),
+                Some("gpt-5".to_string()),
+                None,
+                None,
+                None,
+            )
+            .expect("billing context should build"),
+            entitlement: UserPlanEntitlementRecord {
+                id: "ent-http-reservation-planning-error".to_string(),
+                user_id: subject_id.to_string(),
+                plan_id: "plan-http-reservation-planning-error".to_string(),
+                payment_order_id: "order-http-reservation-planning-error".to_string(),
+                status: "active".to_string(),
+                starts_at_unix_secs: now_unix_secs.saturating_sub(60),
+                expires_at_unix_secs: now_unix_secs.saturating_add(3_600),
+                entitlements_snapshot: json!([{
+                    "type": "usage_policy",
+                    "rules": [{
+                        "metric": "actual_cost_usd",
+                        "window": {"kind": "rolling", "seconds": 3_600},
+                        "limit": 10.0
+                    }]
+                }]),
+                created_at_unix_secs: now_unix_secs.saturating_sub(60),
+                updated_at_unix_secs: now_unix_secs.saturating_sub(60),
+            },
+        });
+        let data = crate::data::GatewayDataState::with_billing_reader_for_tests(billing)
+            .with_settlement_writer_for_tests(settlement.clone());
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data)
+            .with_usage_runtime_for_tests(crate::usage::UsageRuntimeConfig {
+                enabled: true,
+                ..crate::usage::UsageRuntimeConfig::default()
+            })
+            .with_execution_runtime_sync_override_for_tests(|plan| {
+                Ok(ExecutionResult {
+                    request_id: plan.request_id.clone(),
+                    candidate_id: plan.candidate_id.clone(),
+                    status_code: http::StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    headers: Default::default(),
+                    response_observation: None,
+                    body: Some(ResponseBody {
+                        json_body: Some(json!({"error": {"message": "retry elsewhere"}})),
+                        body_bytes_b64: None,
+                    }),
+                    telemetry: None,
+                    error: None,
+                })
+            });
+
+        let mut decision = GatewayControlDecision::synthetic(
+            "/v1/chat/completions",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        decision.auth_context = Some(crate::control::GatewayControlAuthContext {
+            user_id: subject_id.to_string(),
+            api_key_id: "api-key-http-reservation-planning-error".to_string(),
+            username: None,
+            api_key_name: None,
+            balance_remaining: None,
+            access_allowed: true,
+            user_rate_limit: None,
+            api_key_rate_limit: None,
+            api_key_is_standalone: false,
+            admin_bypass_limits: false,
+            local_rejection: None,
+            allowed_models: None,
+            ip_rules: None,
+            verified_api_key_hash: None,
+        });
+        let admission = crate::plan_usage_policy::check_and_acquire_http_plan_usage_policy(
+            &state,
+            Some(&decision),
+            request_id,
+            now_unix_secs.saturating_mul(1_000),
+        )
+        .await
+        .expect("HTTP plan admission should succeed");
+        let reservation = admission
+            .reservation_context
+            .expect("cost policy should freeze a reservation context");
+        let reservation_token = reservation.token().to_string();
+        let admitted_at_unix_secs = reservation.admitted_at_unix_secs();
+
+        let mut request = http::Request::builder()
+            .uri("/v1/chat/completions")
+            .body(())
+            .expect("request should build");
+        request.extensions_mut().insert(reservation);
+        let (parts, _) = request.into_parts();
+        let mut plan = test_plan(None);
+        plan.request_id = request_id.to_string();
+        plan.candidate_id = Some("cand-http-reservation-planning-error".to_string());
+        plan.provider_id = "provider-1".to_string();
+        plan.endpoint_id = "endpoint-1".to_string();
+        plan.key_id = "key-1".to_string();
+        plan.client_api_format = "openai:chat".to_string();
+        plan.provider_api_format = "openai:chat".to_string();
+        plan.model_name = Some("gpt-5".to_string());
+        plan.stream = false;
+        plan.body = RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16
+        }));
+        let source = PlanningErrorAfterFirstSyncAttemptSource {
+            first: Some(crate::ai_serving::AiSyncAttempt {
+                plan,
+                report_kind: None,
+                report_context: Some(json!({
+                    "candidate_index": 0,
+                    "retry_index": 0,
+                    "model_id": "model-1",
+                    "global_model_name": "gpt-5"
+                })),
+            }),
+        };
+
+        let error = execute_sync_attempt_source::<crate::ai_serving::AiSyncAttempt, _>(
+            &state,
+            &parts,
+            "trace-http-reservation-planning-error",
+            &decision,
+            "openai_chat_sync",
+            source,
+        )
+        .await
+        .expect_err("second candidate planning should fail");
+        assert!(matches!(
+            error,
+            GatewayError::Internal(message)
+                if message == "synthetic next-candidate planning failure"
+        ));
+
+        let probe = settlement
+            .reserve_usage_policy_cost(ReserveUsagePolicyCostInput {
+                request_id: request_id.to_string(),
+                subject_id: subject_id.to_string(),
+                reservation_token,
+                admitted_at_unix_secs,
+                reserved_cost_units: 1,
+                reservation_expires_at_unix_secs: admitted_at_unix_secs.saturating_add(86_400),
+                retain_until_unix_secs: admitted_at_unix_secs.saturating_add(32 * 86_400),
+                windows: vec![UsagePolicyCostWindow {
+                    window_id: "release-state-probe".to_string(),
+                    starts_at_unix_secs: admitted_at_unix_secs.saturating_sub(1),
+                    ends_at_unix_secs: admitted_at_unix_secs.saturating_add(1),
+                    limit_cost_units: 1_000_000_000,
+                }],
+            })
+            .await
+            .expect("reservation state probe should succeed");
+        assert_eq!(
+            probe,
+            ReserveUsagePolicyCostOutcome::AlreadyTerminal {
+                state: UsagePolicyCostReservationState::Released,
+            }
+        );
+    }
+
     fn test_report_context() -> serde_json::Value {
         json!({
             "request_id": "req_watchdog",
@@ -2273,6 +2970,91 @@ mod tests {
             "user_id": "user_1",
             "api_key_id": "api_key_1",
         })
+    }
+
+    #[test]
+    fn request_tracker_preserves_server_reservation_identity_across_clones() {
+        let mut request = http::Request::new(());
+        let gate = aether_runtime::ConcurrencyGate::new("image_heartbeat_request", 1);
+        let admission = AdmissionPermit::from(gate.try_acquire().expect("request admission"));
+        request
+            .extensions_mut()
+            .insert(BackgroundAdmissionPermit::new(admission.clone()));
+        request.extensions_mut().insert(
+            crate::plan_usage_policy::PlanUsageReservationContext::for_test(
+                "user-1",
+                "server-token",
+                12_345,
+                crate::plan_usage_policy::EffectivePlanUsagePolicy::default(),
+            ),
+        );
+        let (parts, _) = request.into_parts();
+
+        let tracker = ProviderTransferTracker::for_request(&parts);
+        let cloned = tracker.clone();
+
+        let reservation = tracker
+            .usage_policy_reservation
+            .as_ref()
+            .expect("request reservation snapshot");
+        let cloned_reservation = cloned
+            .usage_policy_reservation
+            .as_ref()
+            .expect("cloned reservation snapshot");
+        assert_eq!(reservation.admitted_at_unix_secs(), 12_345);
+        assert_eq!(reservation.subject_id(), "user-1");
+        assert_eq!(reservation.token(), "server-token");
+        assert_eq!(cloned_reservation.token(), "server-token");
+        assert!(std::ptr::eq(
+            reservation.policy(),
+            cloned_reservation.policy()
+        ));
+
+        drop((parts, admission, tracker));
+        assert_eq!(gate.snapshot().in_flight, 1);
+        assert!(
+            gate.try_acquire().is_err(),
+            "image heartbeat tracker clone should retain request admission"
+        );
+        drop(cloned);
+        assert_eq!(gate.snapshot().in_flight, 0);
+    }
+
+    #[test]
+    fn server_reservation_token_overrides_report_context_value() {
+        let context = attach_plan_usage_reservation_token(
+            Some(json!({
+                "candidate_index": 2,
+                "plan_usage_reservation_token": "client-controlled-token"
+            })),
+            Some("server-token"),
+        )
+        .expect("reservation context");
+
+        assert_eq!(context["candidate_index"], 2);
+        assert_eq!(context["plan_usage_reservation_token"], "server-token");
+        assert_eq!(context["plan_usage_reservation_deferred"], false);
+    }
+
+    #[test]
+    fn missing_reservation_does_not_create_or_propagate_a_token() {
+        let request = http::Request::new(());
+        let (parts, _) = request.into_parts();
+        let tracker = ProviderTransferTracker::for_request(&parts);
+        assert!(tracker.usage_policy_reservation.is_none());
+        assert!(tracker.usage_policy_reservation_token().is_none());
+
+        let original = json!({
+            "candidate_index": 2,
+            "plan_usage_reservation_token": "untrusted-seed-token",
+            "plan_usage_reservation_deferred": true
+        });
+        let expected = json!({"candidate_index": 2});
+        assert_eq!(
+            attach_plan_usage_reservation_token(Some(original), None),
+            Some(expected)
+        );
+        assert_eq!(attach_plan_usage_reservation_token(None, None), None);
     }
 
     #[test]
@@ -2419,6 +3201,7 @@ mod tests {
                 "claude_cli_stream",
                 &plan,
                 Some(&report_context),
+                Instant::now(),
                 false,
                 || async {
                     mark_stream_candidate_watchdog_upstream_started();
@@ -2460,6 +3243,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_candidate_retry_does_not_reset_an_expired_request_first_byte_budget() {
+        let writer = Arc::new(TestRequestCandidateWriter::default());
+        let plan = test_plan(Some(ExecutionTimeouts {
+            first_byte_ms: Some(250),
+            ..ExecutionTimeouts::default()
+        }));
+        let report_context = test_report_context();
+        // Stand in for earlier candidates having already consumed the request's
+        // complete first-byte budget. A per-candidate watchdog would wait a new
+        // 250 ms here; the shared absolute deadline must settle immediately.
+        let request_first_byte_started_at = Instant::now() - Duration::from_millis(300);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            execute_stream_candidate_with_watchdog(
+                writer.as_ref(),
+                "trace_watchdog_shared_budget",
+                "claude_cli_stream",
+                &plan,
+                Some(&report_context),
+                request_first_byte_started_at,
+                false,
+                || {
+                    std::future::pending::<
+                        Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError>,
+                    >()
+                },
+            ),
+        )
+        .await
+        .expect("an expired request-level first-byte budget must not restart per candidate");
+
+        assert!(matches!(
+            result,
+            Ok(StreamCandidateWatchdogOutcome::Executed(
+                AiAttemptExecutionOutcome::Retry {
+                    scope: AiAttemptRetryScope::Candidate,
+                    fallback_response: None,
+                }
+            ))
+        ));
+        let records = writer.records.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].error_type.as_deref(),
+            Some("local_stream_candidate_watchdog_timeout")
+        );
+    }
+
+    #[tokio::test]
     async fn stream_candidate_watchdog_can_stop_on_transport_error() {
         let writer = Arc::new(TestRequestCandidateWriter::default());
         let plan = test_plan(Some(ExecutionTimeouts {
@@ -2474,6 +3307,7 @@ mod tests {
             "claude_cli_stream",
             &plan,
             Some(&report_context),
+            Instant::now(),
             true,
             || async {
                 mark_stream_candidate_watchdog_upstream_started();
@@ -2513,6 +3347,7 @@ mod tests {
             "claude_cli_stream",
             &plan,
             Some(&report_context),
+            Instant::now(),
             true,
             || async {
                 mark_stream_candidate_watchdog_upstream_started();
@@ -2641,6 +3476,7 @@ mod tests {
             "claude_cli_stream",
             &plan,
             Some(&report_context),
+            Instant::now(),
             true,
             || async {
                 Err(GatewayError::UpstreamUnavailable {
@@ -2680,6 +3516,7 @@ mod tests {
             "claude_cli_stream",
             &plan,
             Some(&report_context),
+            Instant::now(),
             false,
             || async {
                 panic!("execute future should not run while upstream execution gate is saturated")
@@ -2727,6 +3564,7 @@ mod tests {
             "claude_cli_stream",
             &plan,
             Some(&report_context),
+            Instant::now(),
             false,
             || async {
                 Err(GatewayError::AdmissionTimeout {

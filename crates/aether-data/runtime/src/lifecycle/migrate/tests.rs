@@ -23,7 +23,8 @@ use super::{
     prepare_database_for_startup,
 };
 use crate::lifecycle::bootstrap::postgres::{
-    snapshot_migrations as empty_database_snapshot_migrations, EMPTY_DATABASE_SNAPSHOT_SQL,
+    snapshot_migrations as empty_database_snapshot_migrations,
+    EMPTY_DATABASE_SNAPSHOT_CUTOFF_VERSION, EMPTY_DATABASE_SNAPSHOT_SQL,
 };
 
 #[derive(Debug)]
@@ -164,6 +165,30 @@ impl ManagedPostgresServer {
             let _ = child.wait();
         }
     }
+}
+
+/// A clean PostgreSQL database is bootstrapped from the schema snapshot first;
+/// migrations after the privacy/security frontier are intentionally left
+/// pending so their data-preserving changes still execute. Exercise the same
+/// prepare-then-run sequence used by gateway startup before asserting that the
+/// database is current.
+async fn prepare_and_apply_clean_postgres_database(pool: &PgPool) {
+    let pending = prepare_database_for_startup(pool)
+        .await
+        .expect("clean database bootstrap should succeed");
+    if !pending.is_empty() {
+        super::run_migrations(pool)
+            .await
+            .expect("pending PostgreSQL migrations should apply");
+    }
+
+    let pending = prepare_database_for_startup(pool)
+        .await
+        .expect("PostgreSQL startup preparation should re-check migrations");
+    assert!(
+        pending.is_empty(),
+        "clean PostgreSQL database should be current after migrations: {pending:?}"
+    );
 }
 
 fn local_postgres_tests_required() -> bool {
@@ -412,7 +437,13 @@ fn empty_database_snapshot_covers_current_cutoff_versions() {
             20260720000000,
             20260727000000,
             20260731000000,
+            20260814000000,
             20260815000000,
+            20260815000100,
+            20260816010000,
+            20260821000000,
+            20260821120000,
+            20260821130000,
         ]
     );
 }
@@ -490,6 +521,9 @@ fn portable_driver_migrations_create_the_postgres_table_set() {
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())
         .flat_map(|migration| create_table_names(migration.sql.as_ref()))
+        // SQLite rebuilds tables to add foreign keys. These staging tables are
+        // renamed to the canonical table names before the migration finishes.
+        .filter(|table| !table.ends_with("_with_user_fk"))
         .collect::<BTreeSet<_>>();
 
     assert_eq!(mysql_tables, postgres_tables, "MySQL table set drifted");
@@ -1031,6 +1065,149 @@ fn worker_boot_cleanup_migration_is_enabled_for_every_driver() {
     }
 }
 
+const UNPUBLISHED_LEGACY_DATA_REWRITE_MIGRATION_VERSIONS: &[i64] = &[
+    20260822000000,
+    20260822010000,
+    20260822020000,
+    20260827000000,
+    20260827010000,
+    20260827020000,
+    20260827030000,
+    20260829000000,
+    20260903010000,
+];
+
+#[test]
+fn unpublished_legacy_data_rewrite_migrations_are_absent_for_every_driver() {
+    for (driver, migrator) in [
+        ("postgres", &POSTGRES_MIGRATOR),
+        ("mysql", &super::mysql::MIGRATOR),
+        ("sqlite", &super::sqlite::MIGRATOR),
+    ] {
+        for version in UNPUBLISHED_LEGACY_DATA_REWRITE_MIGRATION_VERSIONS {
+            assert!(
+                migrator
+                    .iter()
+                    .all(|migration| migration.version != *version),
+                "{driver} must not embed unpublished legacy rewrite migration {version}"
+            );
+        }
+    }
+}
+
+#[test]
+fn deleted_user_history_schema_decoupling_does_not_rewrite_history() {
+    const VERSION: i64 = 20260827050000;
+
+    for (driver, migrator) in [
+        ("postgres", &POSTGRES_MIGRATOR),
+        ("mysql", &super::mysql::MIGRATOR),
+        ("sqlite", &super::sqlite::MIGRATOR),
+    ] {
+        let migration = migrator
+            .iter()
+            .find(|migration| migration.version == VERSION)
+            .unwrap_or_else(|| panic!("{driver} user-history schema migration should be embedded"));
+        let sql = migration
+            .sql
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_uppercase();
+        for history_rewrite in ["UPDATE ", "DELETE ", "TRUNCATE ", "REPLACE ", "MERGE "] {
+            assert!(
+                !sql
+                    .split(';')
+                    .any(|statement| statement.trim_start().starts_with(history_rewrite)),
+                "{driver} user-history schema migration rewrites legacy rows with {history_rewrite}"
+            );
+        }
+    }
+
+    let postgres_migration = POSTGRES_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == VERSION)
+        .expect("postgres user-history schema migration should be embedded");
+    for constraint in [
+        "request_candidates_user_id_fkey",
+        "video_tasks_user_id_fkey",
+        "usage_user_id_fkey",
+        "stats_user_daily_user_id_fkey",
+        "stats_user_summary_user_id_fkey",
+        "stats_user_daily_model_user_id_fkey",
+        "stats_user_daily_provider_user_id_fkey",
+        "stats_user_daily_api_format_user_id_fkey",
+        "stats_user_daily_model_provider_user_id_fkey",
+        "stats_user_daily_cost_savings_user_id_fkey",
+        "stats_user_daily_cost_savings_provider_user_id_fkey",
+        "stats_user_daily_cost_savings_model_user_id_fkey",
+        "stats_user_daily_cost_savings_model_provider_user_id_fkey",
+        "stats_hourly_user_model_user_id_fkey",
+        "user_model_usage_counts_user_id_fkey",
+        "request_candidates_api_key_id_fkey",
+        "video_tasks_api_key_id_fkey",
+        "usage_api_key_id_fkey",
+        "stats_daily_api_key_api_key_id_fkey",
+        "audit_logs_user_id_fkey",
+        "payment_orders_user_id_fkey",
+        "refund_requests_user_id_fkey",
+        "wallet_transactions_operator_id_fkey",
+        "wallets_user_id_fkey",
+        "wallets_api_key_id_fkey",
+        "user_plan_entitlements_user_id_fkey",
+        "entitlement_usage_ledgers_user_id_fkey",
+        "user_referrals_inviter_user_id_fkey",
+        "user_referrals_invitee_user_id_fkey",
+        "referral_rewards_inviter_user_id_fkey",
+        "referral_rewards_invitee_user_id_fkey",
+    ] {
+        assert!(
+            postgres_migration
+                .sql
+                .contains(&format!("DROP CONSTRAINT IF EXISTS {constraint}")),
+            "postgres migration must decouple {constraint}"
+        );
+    }
+
+    let mysql_migration = super::mysql::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == VERSION)
+        .expect("mysql user-history schema migration should be embedded");
+    for constraint in [
+        "user_plan_entitlements_user_id_fkey",
+        "entitlement_usage_ledgers_user_id_fkey",
+        "user_referrals_inviter_user_id_fkey",
+        "user_referrals_invitee_user_id_fkey",
+        "referral_rewards_inviter_user_id_fkey",
+        "referral_rewards_invitee_user_id_fkey",
+    ] {
+        assert!(
+            mysql_migration.sql.contains(constraint),
+            "mysql migration must decouple {constraint}"
+        );
+    }
+
+    let sqlite_migration = super::sqlite::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == VERSION)
+        .expect("sqlite user-history schema migration should be embedded");
+    for table in [
+        "user_plan_entitlements",
+        "entitlement_usage_ledgers",
+        "user_referrals",
+        "referral_rewards",
+    ] {
+        assert!(
+            sqlite_migration
+                .sql
+                .contains(&format!("ALTER TABLE {table} RENAME TO")),
+            "sqlite migration must rebuild {table} without the legacy user foreign key"
+        );
+    }
+}
+
 #[test]
 fn postgres_allows_duplicate_manual_proxy_endpoints() {
     const VERSION: i64 = 20260815000000;
@@ -1090,11 +1267,25 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260725030000,
             20260727000000,
             20260731000000,
+            20260814000000,
+            20260815000000,
             20260815010000,
             20260816000000,
+            20260816010000,
             20260817000000,
+            20260817010000,
             20260817020000,
+            20260821000000,
+            20260821120000,
+            20260821130000,
+            20260827040000,
+            20260827050000,
+            20260831000000,
+            20260831010000,
+            20260831030000,
+            20260903000000,
             20260906000000,
+            20260908000000,
         ]
     );
     assert_eq!(
@@ -1130,13 +1321,170 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260725040000,
             20260727000000,
             20260731000000,
+            20260814000000,
+            20260815000000,
             20260815010000,
             20260816000000,
+            20260816010000,
             20260817000000,
             20260817020000,
+            20260821000000,
+            20260821120000,
+            20260821130000,
+            20260827050000,
+            20260831000000,
+            20260831010000,
+            20260831030000,
+            20260903000000,
             20260906000000,
+            20260908000000,
         ]
     );
+}
+
+#[tokio::test]
+async fn sqlite_gateway_order_uniqueness_migration_rejects_historical_duplicates() {
+    const VERSION: i64 = 20260821120000;
+
+    let pool = SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    let mut connection = pool.acquire().await.expect("sqlite connection should open");
+    connection
+        .ensure_migrations_table()
+        .await
+        .expect("migration table should be created");
+    for migration in super::sqlite::MIGRATOR
+        .iter()
+        .filter(|migration| migration.version < VERSION)
+    {
+        connection
+            .apply(migration)
+            .await
+            .expect("pre-uniqueness migration should apply");
+    }
+    drop(connection);
+
+    query(
+        r#"
+INSERT INTO wallets (
+  id, user_id, balance, gift_balance, limit_mode, currency, status,
+  total_recharged, total_consumed, total_refunded, total_adjusted,
+  created_at, updated_at
+) VALUES
+  ('duplicate-wallet-a', 'duplicate-user-a', 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, 1, 1),
+  ('duplicate-wallet-b', 'duplicate-user-b', 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, 1, 1);
+
+INSERT INTO payment_orders (
+  id, order_no, wallet_id, user_id, amount_usd, refunded_amount_usd,
+  refundable_amount_usd, payment_method, gateway_order_id, status, created_at
+) VALUES
+  ('duplicate-order-a', 'duplicate-no-a', 'duplicate-wallet-a', 'duplicate-user-a', 1, 0, 0, ' EPAY ', 'duplicate-gateway-id', 'pending', 1),
+  ('duplicate-order-b', 'duplicate-no-b', 'duplicate-wallet-b', 'duplicate-user-b', 1, 0, 0, 'epay', 'duplicate-gateway-id', 'pending', 1);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("historical duplicate fixtures should insert");
+
+    let migration = super::sqlite::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == VERSION)
+        .expect("gateway-order uniqueness migration should be embedded");
+    let error = sqlx::raw_sql(migration.sql.as_ref())
+        .execute(&pool)
+        .await
+        .expect_err("historical financial duplicates must block migration");
+    assert!(error.to_string().to_ascii_lowercase().contains("unique"));
+
+    let order_count: i64 = query_scalar(
+        "SELECT COUNT(*) FROM payment_orders WHERE gateway_order_id = 'duplicate-gateway-id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("duplicate financial records should remain intact");
+    assert_eq!(order_count, 2);
+}
+
+#[tokio::test]
+async fn sqlite_gateway_order_uniqueness_migration_normalizes_legacy_payment_methods() {
+    const VERSION: i64 = 20260821120000;
+
+    let pool = SqlitePool::connect("sqlite::memory:")
+        .await
+        .expect("sqlite pool should connect");
+    let mut connection = pool.acquire().await.expect("sqlite connection should open");
+    connection
+        .ensure_migrations_table()
+        .await
+        .expect("migration table should be created");
+    for migration in super::sqlite::MIGRATOR
+        .iter()
+        .filter(|migration| migration.version < VERSION)
+    {
+        connection
+            .apply(migration)
+            .await
+            .expect("pre-uniqueness migration should apply");
+    }
+    drop(connection);
+
+    query(
+        r#"
+INSERT INTO wallets (
+  id, user_id, balance, gift_balance, limit_mode, currency, status,
+  total_recharged, total_consumed, total_refunded, total_adjusted,
+  created_at, updated_at
+) VALUES ('legacy-method-wallet', 'legacy-method-user', 0, 0, 'finite', 'USD', 'active', 0, 0, 0, 0, 1, 1);
+
+INSERT INTO payment_orders (
+  id, order_no, wallet_id, user_id, amount_usd, refunded_amount_usd,
+  refundable_amount_usd, payment_method, gateway_order_id, status, created_at
+) VALUES ('legacy-method-order', 'legacy-method-no', 'legacy-method-wallet', 'legacy-method-user', 1, 0, 0, ' EPAY ', 'CaseSensitiveTxn', 'pending', 1);
+
+INSERT INTO payment_callbacks (
+  id, payment_method, callback_key, signature_valid, status, created_at
+) VALUES ('legacy-method-callback', ' EPAY ', 'legacy-method-key', 0, 'received', 1);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy payment methods should insert");
+
+    let migration = super::sqlite::MIGRATOR
+        .iter()
+        .find(|migration| migration.version == VERSION)
+        .expect("gateway-order uniqueness migration should be embedded");
+    sqlx::raw_sql(migration.sql.as_ref())
+        .execute(&pool)
+        .await
+        .expect("non-conflicting legacy payment methods should normalize");
+
+    let order_method: String =
+        query_scalar("SELECT payment_method FROM payment_orders WHERE id = 'legacy-method-order'")
+            .fetch_one(&pool)
+            .await
+            .expect("normalized order should load");
+    let callback_method: String = query_scalar(
+        "SELECT payment_method FROM payment_callbacks WHERE id = 'legacy-method-callback'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("normalized callback should load");
+    assert_eq!(order_method, "epay");
+    assert_eq!(callback_method, "epay");
+
+    query(
+        r#"
+INSERT INTO payment_orders (
+  id, order_no, wallet_id, user_id, amount_usd, refunded_amount_usd,
+  refundable_amount_usd, payment_method, gateway_order_id, status, created_at
+) VALUES ('case-sensitive-order', 'case-sensitive-no', 'legacy-method-wallet', 'legacy-method-user', 1, 0, 0, 'epay', 'casesensitivetxn', 'pending', 1);
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("case-distinct opaque gateway identifiers should remain distinct");
 }
 
 #[tokio::test]
@@ -2190,6 +2538,8 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
     assert_eq!(
         pending_versions,
         vec![
+            20260403000000,
+            20260406000000,
             20260410000000,
             20260413020000,
             20260413030000,
@@ -2242,11 +2592,26 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260720000000,
             20260727000000,
             20260731000000,
+            20260814000000,
             20260815000000,
+            20260815000100,
             20260815010000,
             20260816000000,
+            20260816010000,
             20260817000000,
             20260817020000,
+            20260821000000,
+            20260821120000,
+            20260821130000,
+            20260827040000,
+            20260827050000,
+            20260831000000,
+            20260831010000,
+            20260831030000,
+            20260901000000,
+            20260903000000,
+            20260906000000,
+            20260908000000,
         ]
     );
 }
@@ -2263,21 +2628,17 @@ fn pending_migrations_from_applied_keeps_post_snapshot_incrementals_pending() {
         .collect::<Vec<_>>();
 
     let pending = pending_migrations_from_applied(&applied);
-
-    let pending_versions = pending
+    let expected = all_up_migrations()
         .into_iter()
-        .map(|migration| migration.version)
+        .filter(|migration| migration.version > EMPTY_DATABASE_SNAPSHOT_CUTOFF_VERSION
+            || super::super::bootstrap::postgres::FORK_POST_SNAPSHOT_MIGRATIONS.contains(&migration.version))
         .collect::<Vec<_>>();
-    assert_eq!(
-        pending_versions,
-        vec![
-            20260815010000,
-            20260816000000,
-            20260817000000,
-            20260817020000,
-        ],
-        "data and schema migrations added after the empty database snapshot must remain pending"
-    );
+
+    assert_eq!(pending, expected);
+    assert!(pending
+        .iter()
+        .all(|migration| migration.version > EMPTY_DATABASE_SNAPSHOT_CUTOFF_VERSION
+            || super::super::bootstrap::postgres::FORK_POST_SNAPSHOT_MIGRATIONS.contains(&migration.version)));
 }
 
 #[tokio::test]
@@ -2840,14 +3201,7 @@ async fn prepare_database_for_startup_bootstraps_clean_database() {
     let pool = PgPool::connect(server.database_url())
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-
-    assert!(
-        pending.is_empty(),
-        "fresh databases should not report pending migrations after startup preparation"
-    );
+    prepare_and_apply_clean_postgres_database(&pool).await;
     assert!(table_exists(&pool, "users")
         .await
         .expect("users lookup should succeed"));
@@ -2875,9 +3229,8 @@ async fn prepare_database_for_startup_bootstraps_clean_database() {
         .expect("migration count query should succeed");
     assert_eq!(
         applied_count,
-        empty_database_snapshot_migrations(&POSTGRES_MIGRATOR)
-            .expect("baseline migrations should resolve")
-            .len() as i64
+        all_up_migrations().len() as i64,
+        "fresh database should record the snapshot and every post-snapshot migration"
     );
 }
 
@@ -2893,13 +3246,7 @@ async fn postgres_request_candidates_preserve_deleted_api_key_identity() {
     let pool = PgPool::connect(server.database_url())
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(
-        pending.is_empty(),
-        "clean database bootstrap should not leave pending migrations: {pending:?}"
-    );
+    prepare_and_apply_clean_postgres_database(&pool).await;
 
     query(
         r#"
@@ -3014,8 +3361,8 @@ INSERT INTO public.usage (
     .await
     .expect("daily stats API key name snapshot should be readable");
     assert_eq!(
-        stats_api_key_name.as_deref(),
-        Some("Deleted API Key Snapshot")
+        stats_api_key_name, None,
+        "deleting an API key must anonymize its historical name while preserving its ID"
     );
 
     query(
@@ -3112,13 +3459,7 @@ async fn postgres_expired_api_key_cleanup_preserves_historical_identity() {
     let pool = PgPool::connect(database_url)
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(
-        pending.is_empty(),
-        "clean database bootstrap should not leave pending migrations: {pending:?}"
-    );
+    prepare_and_apply_clean_postgres_database(&pool).await;
 
     query(
         r#"
@@ -3276,13 +3617,7 @@ async fn postgres_api_key_leaderboard_user_filter_preserves_aggregate_history() 
     let pool = PgPool::connect(database_url)
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(
-        pending.is_empty(),
-        "clean database bootstrap should not leave pending migrations: {pending:?}"
-    );
+    prepare_and_apply_clean_postgres_database(&pool).await;
 
     query(
         r#"
@@ -3602,10 +3937,7 @@ async fn postgres_usage_billing_facts_total_tokens_counts_cached_input_once() {
     let pool = PgPool::connect(server.database_url())
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(pending.is_empty());
+    prepare_and_apply_clean_postgres_database(&pool).await;
 
     let legacy_view_migration = POSTGRES_MIGRATOR
         .iter()
@@ -3805,10 +4137,7 @@ async fn postgres_migrations_repair_invalid_concurrent_cleanup_index() {
     let pool = PgPool::connect(server.database_url())
         .await
         .expect("pool should connect");
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("clean database bootstrap should succeed");
-    assert!(pending.is_empty());
+    prepare_and_apply_clean_postgres_database(&pool).await;
 
     query("DROP INDEX CONCURRENTLY public.idx_usage_legacy_body_ref_cleanup_created_at")
         .execute(&pool)
@@ -3898,14 +4227,7 @@ async fn prepare_database_for_startup_bootstraps_when_only_unrelated_public_tabl
         .await
         .expect("fixture table should be created");
 
-    let pending = prepare_database_for_startup(&pool)
-        .await
-        .expect("startup preparation should tolerate unrelated public tables");
-
-    assert!(
-        pending.is_empty(),
-        "unrelated public tables should not block baseline bootstrap on first startup"
-    );
+    prepare_and_apply_clean_postgres_database(&pool).await;
     assert!(table_exists(&pool, "vendor_bootstrap_marker")
         .await
         .expect("fixture table lookup should succeed"));

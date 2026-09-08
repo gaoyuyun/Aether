@@ -9,11 +9,15 @@ use wreq::ws::message::Message as WreqWsMessage;
 
 use super::adapter::ResponsesWebSocketRelayDirective;
 use super::client::{adapter_drain_ready, forward_client_message, RelayDisposition};
+use super::continuation::{
+    ResponsesWebSocketContinuationRecord, ResponsesWebSocketContinuationRegistry,
+};
 use super::frame::{encode_opaque_websocket_event, ParsedResponsesWebSocketFrame};
 use super::lifecycle::{
     await_pending_adapter_observation, finalize_active_turn, queue_turn_finalization,
     settle_turn_finalization, spawn_bounded_adapter_observation, PreviousAttemptSettled,
 };
+use super::plan_admission::terminate_responses_websocket_for_plan_permit_loss;
 use super::quota::{
     detach_exhausted_upstream, is_usage_limit_error_event, mark_active_response_retry_unsafe,
     observe_active_response_rebind_safety, retry_active_turn_after_quota_exhaustion,
@@ -26,6 +30,7 @@ use super::state::BoundResponsesConnection;
 use super::turn::{
     ResponsesProviderAttempt, ResponsesWebSocketTurnObservation, ResponsesWebSocketTurnOutcome,
 };
+use super::turn_state::LogicalTurn;
 use super::upstream::{close_bound_upstream, receive_optional_upstream};
 use crate::handlers::proxy::websocket::ingress::WebSocketRequestContext;
 use crate::handlers::proxy::websocket::session::{
@@ -38,6 +43,7 @@ use crate::handlers::proxy::websocket::transport::{
 use crate::AppState;
 
 const LOG_TARGET: &str = "aether_gateway::handlers::proxy::responses_ws";
+const CONTINUATION_REGISTRATION_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 写客户端 socket 失败时记录的投递失败原因。刻意不说「客户端在终态前断开」：
 /// 供应商的终态可能已经到达，只是最后一跳没送出去。
@@ -139,6 +145,19 @@ pub(super) async fn relay_bound_connection(
                         ).await;
                         break;
                     }
+                    RelayDisposition::PlanUsagePermitLost => {
+                        warn!(
+                            event_name = "responses_websocket_plan_usage_concurrency_lost_before_send",
+                            log_type = "ops",
+                            transport = WEBSOCKET_LOG_TRANSPORT,
+                            websocket = true,
+                            trace_id = %context.trace_id,
+                            "gateway stopped a Responses WebSocket turn before its upstream send after the subscription plan concurrency lease became unhealthy"
+                        );
+                        close_bound_upstream(bound).await;
+                        terminate_responses_websocket_for_plan_permit_loss(client_socket).await;
+                        break;
+                    }
                     RelayDisposition::UpstreamError(code) => {
                         warn!(
                             event_name = "responses_websocket_upstream_send_failed",
@@ -207,6 +226,55 @@ pub(super) async fn relay_bound_connection(
                     }
                     _ => None,
                 };
+                if parsed_upstream_frame
+                    .as_ref()
+                    .is_some_and(ParsedResponsesWebSocketFrame::carries_stream_id)
+                {
+                    // The session currently owns only the implicit default
+                    // lane. Reject a provider-side named identity before the
+                    // adapter, usage observer, continuation cache, PII
+                    // restorer, or logical-turn state can attribute an
+                    // interleaved event to the sole default-lane attempt.
+                    let policy = fatal_relay_policy(
+                        FatalRelaySignal::UnexpectedUpstreamStreamId,
+                    );
+                    let frame = parsed_upstream_frame
+                        .as_ref()
+                        .expect("the stream-id guard requires a parsed frame");
+                    warn!(
+                        event_name = "responses_websocket_unexpected_upstream_stream_id",
+                        log_type = "ops",
+                        transport = WEBSOCKET_LOG_TRANSPORT,
+                        websocket = true,
+                        trace_id = %context.trace_id,
+                        event_type = %frame.event_type_for_log(),
+                        frame_bytes = frame.raw_text().len(),
+                        chunked = frame.is_chunked(),
+                        "gateway rejected a named-lane provider event on a default-lane Responses WebSocket"
+                    );
+                    finalize_active_turn(
+                        bound,
+                        state,
+                        ResponsesWebSocketTurnOutcome::upstream_receive_failed(),
+                    )
+                    .await;
+                    send_responses_websocket_error(
+                        client_socket,
+                        policy.status_code,
+                        "server_error",
+                        policy.error_code,
+                        policy.client_message,
+                    )
+                    .await;
+                    close_bound_upstream(bound).await;
+                    close_client_socket(
+                        client_socket,
+                        policy.close_code,
+                        policy.close_reason,
+                    )
+                    .await;
+                    break;
+                }
                 let parsed_upstream_event = parsed_upstream_frame
                     .as_ref()
                     .map(ParsedResponsesWebSocketFrame::event);
@@ -300,6 +368,46 @@ pub(super) async fn relay_bound_connection(
                     Some(ResponsesWebSocketTurnObservation::Terminal(outcome)) => Some(outcome),
                     _ => None,
                 };
+                if let Some(frame) = parsed_upstream_frame.as_ref() {
+                    if let Some(response_id) = evicted_default_lane_continuation_response_id(
+                        bound.turn_state.logical(),
+                        frame,
+                    ) {
+                        // A 4xx/5xx continuation terminal evicts the referenced
+                        // ID from the provider's implicit default-lane cache.
+                        // Do not keep claiming local ownership and replay it.
+                        bound
+                            .continuation_response_ids
+                            .forget_connection_local(response_id);
+                    }
+                    if let Some(response_id) = connection_local_terminal_response_id(
+                        bound.turn_state.logical(),
+                        frame,
+                    ) {
+                        // Remember every successful response on this physical
+                        // socket, including store=false responses that exist
+                        // only in the provider's connection-local cache.
+                        bound
+                            .continuation_response_ids
+                            .remember_connection_local(response_id);
+                    }
+                    if let Some(registration) =
+                        prepare_persisted_continuation_registration(bound, context, frame)
+                    {
+                        if let Some(response_id) =
+                            register_persisted_continuation_before_terminal_delivery(
+                            state,
+                            context,
+                            registration,
+                        )
+                            .await
+                        {
+                            bound
+                                .continuation_response_ids
+                                .remember_persisted(response_id.as_str());
+                        }
+                    }
+                }
                 if matches!(&upstream_message, WreqWsMessage::Text(_))
                     && parsed_upstream_frame.is_none()
                 {
@@ -375,18 +483,33 @@ pub(super) async fn relay_bound_connection(
                             )
                             .await
                         }
-                        None => PreviousAttemptSettled::nothing_to_settle(),
+                        None => Some(PreviousAttemptSettled::nothing_to_settle()),
                     };
                     // Planning and binding a replacement carries the complete
                     // scheduler/provider state machine. Keep that large future
                     // off the relay task's stack; the default Tokio/test worker
                     // stack is otherwise easy to exhaust on this rare branch.
-                    if Box::pin(retry_active_turn_after_quota_exhaustion(
-                        bound, state, context, settled,
-                    ))
-                    .await
-                    {
-                        continue;
+                    if let Some(settled) = settled {
+                        match Box::pin(retry_active_turn_after_quota_exhaustion(
+                            bound, state, context, settled,
+                        ))
+                        .await
+                        {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(()) => {
+                                finalize_active_turn(
+                                    bound,
+                                    state,
+                                    ResponsesWebSocketTurnOutcome::connection_admission_lost(),
+                                )
+                                .await;
+                                close_bound_upstream(bound).await;
+                                terminate_responses_websocket_for_plan_permit_loss(client_socket)
+                                    .await;
+                                break;
+                            }
+                        }
                     }
                     // 重试失败。旧 attempt 已经结算，logical turn 仍停在
                     // Replanning，所以后面分支里的 end() / finalize_active_turn
@@ -437,27 +560,32 @@ pub(super) async fn relay_bound_connection(
                 let mut relay_serialization_failed = false;
                 match relay_directive {
                     Some(ResponsesWebSocketRelayDirective::ForwardOriginal) => {
-                        let restored = parsed_upstream_frame
-                            .as_ref()
-                            .and_then(|frame| {
-                                bound
-                                    .redaction_restorer
-                                    .restore_provider_frame_text(frame.event())
-                            });
-                        let client_frame = match restored {
-                            Some(text) => AxumWsMessage::Text(text.into()),
-                            None => upstream_message_to_client(upstream_message.clone()),
-                        };
-                        match send_client_message(client_socket, client_frame).await {
-                            Ok(()) => {
-                                if let (Some(turn), Some(frame)) = (
-                                    bound.turn_state.attempt_mut(),
-                                    parsed_upstream_frame.as_ref(),
-                                ) {
-                                    turn.capture_client_frame(frame.event());
-                                }
+                        let client_frame = match parsed_upstream_frame.as_ref().map(|frame| {
+                            bound
+                                .redaction_restorer
+                                .restore_provider_frame_text(frame.event())
+                        }) {
+                            Some(Ok(Some(text))) => Some(AxumWsMessage::Text(text.into())),
+                            Some(Ok(None)) | None => {
+                                Some(upstream_message_to_client(upstream_message.clone()))
                             }
-                            Err(error) => relay_send_error = Some(error),
+                            Some(Err(_)) => {
+                                relay_serialization_failed = true;
+                                None
+                            }
+                        };
+                        if let Some(client_frame) = client_frame {
+                            match send_client_message(client_socket, client_frame).await {
+                                Ok(()) => {
+                                    if let (Some(turn), Some(frame)) = (
+                                        bound.turn_state.attempt_mut(),
+                                        parsed_upstream_frame.as_ref(),
+                                    ) {
+                                        turn.capture_client_frame(frame.event());
+                                    }
+                                }
+                                Err(error) => relay_send_error = Some(error),
+                            }
                         }
                     }
                     Some(ResponsesWebSocketRelayDirective::ForwardEvents(events)) => {
@@ -466,14 +594,18 @@ pub(super) async fn relay_bound_connection(
                                 .redaction_restorer
                                 .restore_provider_frame_text(event)
                             {
-                                Some(restored) => restored,
-                                None => match encode_opaque_websocket_event(event) {
+                                Ok(Some(restored)) => restored,
+                                Ok(None) => match encode_opaque_websocket_event(event) {
                                     Ok(encoded) => encoded,
                                     Err(_) => {
                                         relay_serialization_failed = true;
                                         break;
                                     }
                                 },
+                                Err(_) => {
+                                    relay_serialization_failed = true;
+                                    break;
+                                }
                             };
                             match send_client_message(
                                 client_socket,
@@ -605,6 +737,203 @@ pub(super) async fn relay_bound_connection(
     }
 }
 
+struct PendingContinuationRegistration {
+    user_id: String,
+    api_key_id: String,
+    response_id: String,
+    record: ResponsesWebSocketContinuationRecord,
+}
+
+fn prepare_persisted_continuation_registration(
+    bound: &BoundResponsesConnection,
+    context: &WebSocketRequestContext,
+    frame: &ParsedResponsesWebSocketFrame<'_>,
+) -> Option<PendingContinuationRegistration> {
+    let logical = bound.turn_state.logical();
+    let Some(response_id) = persistable_terminal_response_id(logical, frame).map(str::to_string)
+    else {
+        return None;
+    };
+    let logical = logical.expect("a persistable terminal requires an active logical turn");
+    let Some(auth_context) = logical
+        .turn_control
+        .as_ref()
+        .and_then(|control| control.decision.auth_context.as_ref())
+    else {
+        warn!(
+            event_name = "responses_websocket_continuation_registration_skipped",
+            log_type = "ops",
+            transport = WEBSOCKET_LOG_TRANSPORT,
+            websocket = true,
+            trace_id = %context.trace_id,
+            reason = "missing_live_auth_context",
+            "gateway did not register a persisted Responses continuation"
+        );
+        return None;
+    };
+    let Some(pinned_candidate) =
+        crate::ai_serving::ResponsesWebSocketPinnedCandidate::from_decision(
+            &bound.decision_template,
+        )
+    else {
+        warn!(
+            event_name = "responses_websocket_continuation_registration_skipped",
+            log_type = "ops",
+            transport = WEBSOCKET_LOG_TRANSPORT,
+            websocket = true,
+            trace_id = %context.trace_id,
+            reason = "missing_binding_identity",
+            "gateway did not register a persisted Responses continuation"
+        );
+        return None;
+    };
+    let record = match ResponsesWebSocketContinuationRecord::from_binding(
+        pinned_candidate,
+        bound.client_model.as_str(),
+        bound.provider_model.as_str(),
+        &bound.binding_identity,
+        &bound.body_normalization,
+        bound.redaction_restorer.has_sessions(),
+        bound.responses_lite_static_config.clone(),
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(
+                event_name = "responses_websocket_continuation_registration_skipped",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                provider_id = %bound.decision_template.provider_id.as_deref().unwrap_or("-"),
+                endpoint_id = %bound.decision_template.endpoint_id.as_deref().unwrap_or("-"),
+                key_id = %bound.decision_template.key_id.as_deref().unwrap_or("-"),
+                reason = error.kind(),
+                "gateway could not build a persisted Responses continuation record"
+            );
+            return None;
+        }
+    };
+    Some(PendingContinuationRegistration {
+        user_id: auth_context.user_id.clone(),
+        api_key_id: auth_context.api_key_id.clone(),
+        response_id,
+        record,
+    })
+}
+
+fn persistable_terminal_response_id<'a>(
+    logical: Option<&LogicalTurn>,
+    frame: &'a ParsedResponsesWebSocketFrame<'_>,
+) -> Option<&'a str> {
+    let logical = logical?;
+    // `provider_store` is derived from the final framed provider event. False
+    // or absent is ZDR/connection-local and must never create a 24-hour KV
+    // record, even if the provider happens to return an ID.
+    if !logical.provider_store {
+        return None;
+    }
+    connection_local_terminal_response_id(Some(logical), frame)
+}
+
+fn connection_local_terminal_response_id<'a>(
+    logical: Option<&LogicalTurn>,
+    frame: &'a ParsedResponsesWebSocketFrame<'_>,
+) -> Option<&'a str> {
+    logical?;
+    frame.continuation_response_id()
+}
+
+fn evicted_default_lane_continuation_response_id<'a>(
+    logical: Option<&'a LogicalTurn>,
+    frame: &ParsedResponsesWebSocketFrame<'_>,
+) -> Option<&'a str> {
+    let logical = logical?;
+    let terminal = frame.terminal()?;
+    if terminal.status_code < 400 || terminal.cancelled {
+        return None;
+    }
+    logical
+        .client_event
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .filter(|response_id| !response_id.trim().is_empty())
+}
+
+async fn register_persisted_continuation_before_terminal_delivery(
+    state: &AppState,
+    context: &WebSocketRequestContext,
+    registration: PendingContinuationRegistration,
+) -> Option<String> {
+    let PendingContinuationRegistration {
+        user_id,
+        api_key_id,
+        response_id,
+        record,
+    } = registration;
+    let registry = ResponsesWebSocketContinuationRegistry::new(state.runtime_state.as_ref());
+    match tokio::time::timeout(
+        CONTINUATION_REGISTRATION_TIMEOUT,
+        registry.register(
+            user_id.as_str(),
+            api_key_id.as_str(),
+            response_id.as_str(),
+            &record,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            debug!(
+                event_name = "responses_websocket_continuation_registered",
+                log_type = "event",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                user_id = %user_id,
+                api_key_id = %api_key_id,
+                provider_id = %record.pinned_candidate().provider_id(),
+                endpoint_id = %record.pinned_candidate().endpoint_id(),
+                key_id = %record.pinned_candidate().key_id(),
+                client_model = %record.client_model(),
+                provider_model = %record.provider_model(),
+                "gateway registered a persisted Responses continuation before terminal delivery"
+            );
+            Some(response_id)
+        }
+        Ok(Err(error)) => {
+            warn!(
+                event_name = "responses_websocket_continuation_registration_failed",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                provider_id = %record.pinned_candidate().provider_id(),
+                endpoint_id = %record.pinned_candidate().endpoint_id(),
+                key_id = %record.pinned_candidate().key_id(),
+                reason = error.kind(),
+                "gateway failed to register a persisted Responses continuation"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                event_name = "responses_websocket_continuation_registration_failed",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                provider_id = %record.pinned_candidate().provider_id(),
+                endpoint_id = %record.pinned_candidate().endpoint_id(),
+                key_id = %record.pinned_candidate().key_id(),
+                reason = "timeout",
+                timeout_ms = CONTINUATION_REGISTRATION_TIMEOUT.as_millis() as u64,
+                "gateway timed out registering a persisted Responses continuation"
+            );
+            None
+        }
+    }
+}
+
 pub(super) async fn wait_for_connection_permit_loss(
     permit: Option<&aether_runtime::AdmissionPermit>,
 ) {
@@ -619,5 +948,81 @@ pub(super) async fn wait_for_connection_permit_loss(
         if !permit.is_healthy() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        connection_local_terminal_response_id, evicted_default_lane_continuation_response_id,
+        persistable_terminal_response_id, LogicalTurn, ParsedResponsesWebSocketFrame,
+    };
+
+    #[test]
+    fn cross_connection_registration_requires_explicit_store_true_and_a_success_terminal() {
+        let completed = ParsedResponsesWebSocketFrame::parse(
+            r#"{"type":"response.completed","response":{"id":"resp_persisted"}}"#,
+        )
+        .expect("valid completed event");
+        let failed = ParsedResponsesWebSocketFrame::parse(
+            r#"{"type":"response.failed","response":{"id":"resp_failed"}}"#,
+        )
+        .expect("valid failed event");
+
+        let omitted_or_false = LogicalTurn::new(
+            json!({"type": "response.create", "store": false}),
+            1,
+            "logical-local".to_string(),
+        );
+        assert_eq!(
+            persistable_terminal_response_id(Some(&omitted_or_false), &completed),
+            None,
+            "store=false or an omitted provider-side store must remain connection-local"
+        );
+        assert_eq!(persistable_terminal_response_id(None, &completed), None);
+        assert_eq!(
+            connection_local_terminal_response_id(Some(&omitted_or_false), &completed),
+            Some("resp_persisted"),
+            "store=false continuations remain valid on the same physical socket"
+        );
+        assert_eq!(
+            connection_local_terminal_response_id(None, &completed),
+            None
+        );
+
+        let persisted = LogicalTurn::new(
+            json!({"type": "response.create", "store": true}),
+            1,
+            "logical-persisted".to_string(),
+        )
+        .with_provider_store(true);
+        assert_eq!(
+            persistable_terminal_response_id(Some(&persisted), &completed),
+            Some("resp_persisted")
+        );
+        assert_eq!(
+            persistable_terminal_response_id(Some(&persisted), &failed),
+            None,
+            "a failed terminal must never establish cross-connection ownership"
+        );
+
+        let continuation = LogicalTurn::new(
+            json!({
+                "type": "response.create",
+                "previous_response_id": "resp_parent"
+            }),
+            2,
+            "logical-continuation".to_string(),
+        );
+        assert_eq!(
+            evicted_default_lane_continuation_response_id(Some(&continuation), &failed),
+            Some("resp_parent")
+        );
+        assert_eq!(
+            evicted_default_lane_continuation_response_id(Some(&continuation), &completed),
+            None
+        );
     }
 }

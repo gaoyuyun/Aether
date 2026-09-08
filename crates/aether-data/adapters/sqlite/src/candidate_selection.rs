@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use aether_data_contracts::repository::candidate_selection::{
-    MinimalCandidateSelectionReadRepository, StoredApiFormatCandidateRowsQuery,
-    StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateOrder,
-    StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
-    StoredProviderModelMapping, StoredRequestedModelCandidateRowsQuery,
+    provider_model_mapping_api_format_covers, MinimalCandidateSelectionReadRepository,
+    StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow,
+    StoredPoolKeyCandidateOrder, StoredPoolKeyCandidateRowsByKeyIdsQuery,
+    StoredPoolKeyCandidateRowsQuery, StoredProviderModelMapping,
+    StoredRequestedModelCandidateRowsQuery,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -605,7 +606,7 @@ fn push_key_auth_channel_sql_filter(
     );
     builder.push_bind(api_format.clone());
     builder.push(
-        r#" IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
+        r#" IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image', 'codex:live')
     )
     OR (
       LOWER(TRIM(p.provider_type)) = 'chatgpt_web'
@@ -945,9 +946,9 @@ fn mapping_scope_matches(
     api_format: &str,
 ) -> bool {
     mapping.api_formats.as_ref().is_none_or(|formats| {
-        formats
-            .iter()
-            .any(|value| api_format_scope_covers(value, api_format))
+        formats.iter().any(|value| {
+            provider_model_mapping_api_format_covers(&row.provider_type, value, api_format)
+        })
     }) && mapping.endpoint_ids.as_ref().is_none_or(|endpoint_ids| {
         endpoint_ids
             .iter()
@@ -968,6 +969,7 @@ fn key_auth_channel_matches(row: &CandidateSelectionRow, api_format: &str) -> bo
                         | "openai:responses:compact"
                         | "openai:search"
                         | "openai:image"
+                        | "codex:live"
                 )
         }
         "chatgpt_web" => {
@@ -1068,12 +1070,12 @@ fn map_candidate_selection_row(row: &SqliteRow) -> Result<CandidateSelectionRow,
             key_name: row.try_get("key_name").map_sql_err()?,
             key_auth_type: row.try_get("key_auth_type").map_sql_err()?,
             key_is_active: row.try_get("key_is_active").map_sql_err()?,
-            key_api_formats: parse_string_list(
-                parse_json(row.try_get("key_api_formats").ok().flatten())?,
+            key_api_formats: parse_stored_key_policy_string_list(
+                row.try_get("key_api_formats").map_sql_err()?,
                 "provider_api_keys.api_formats",
             )?,
-            key_allowed_models: parse_string_list(
-                parse_json(row.try_get("key_allowed_models").ok().flatten())?,
+            key_allowed_models: parse_stored_key_policy_string_list(
+                row.try_get("key_allowed_models").map_sql_err()?,
                 "provider_api_keys.allowed_models",
             )?,
             key_capabilities: parse_json(row.try_get("key_capabilities").ok().flatten())?,
@@ -1130,6 +1132,82 @@ fn parse_string_list(
         return Ok(None);
     };
     parse_string_list_value(&value, field_name)
+}
+
+fn parse_stored_key_policy_string_list(
+    raw: Option<String>,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, DataLayerError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&raw).map_err(|err| {
+        DataLayerError::UnexpectedValue(format!("{field_name} contains invalid JSON: {err}"))
+    })?;
+    parse_key_policy_string_list_value(&value, field_name)
+}
+
+fn parse_key_policy_string_list_value(
+    value: &serde_json::Value,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, DataLayerError> {
+    match value {
+        serde_json::Value::Null => Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} contains JSON null; use SQL NULL for an unset policy"
+        ))),
+        serde_json::Value::Array(array) => {
+            parse_key_policy_string_list_array(array, field_name).map(Some)
+        }
+        serde_json::Value::String(raw) => parse_embedded_key_policy_string_list(raw, field_name),
+        _ => Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} is not a JSON array"
+        ))),
+    }
+}
+
+fn parse_embedded_key_policy_string_list(
+    raw: &str,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, DataLayerError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} contains an empty string"
+        )));
+    }
+    if raw.eq_ignore_ascii_case("null") {
+        return Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} contains stringified JSON null; use SQL NULL for an unset policy"
+        )));
+    }
+
+    if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(raw) {
+        return parse_key_policy_string_list_value(&decoded, field_name);
+    }
+
+    Ok(Some(vec![raw.to_string()]))
+}
+
+fn parse_key_policy_string_list_array(
+    array: &[serde_json::Value],
+    field_name: &str,
+) -> Result<Vec<String>, DataLayerError> {
+    let mut items = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(item) = item.as_str() else {
+            return Err(DataLayerError::UnexpectedValue(format!(
+                "{field_name} contains a non-string item"
+            )));
+        };
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(DataLayerError::UnexpectedValue(format!(
+                "{field_name} contains an empty item"
+            )));
+        }
+        items.push(item.to_string());
+    }
+    Ok(items)
 }
 
 fn parse_string_list_value(
@@ -1326,10 +1404,6 @@ fn api_format_matches(left: &str, right: &str) -> bool {
     aether_ai_formats::api_format_alias_matches(left, right)
 }
 
-fn api_format_scope_covers(allowed: &str, requested: &str) -> bool {
-    aether_ai_formats::api_format_permission_covers(allowed, requested)
-}
-
 fn sql_match_aliases(api_formats: &[String]) -> Vec<String> {
     api_formats
         .iter()
@@ -1340,6 +1414,7 @@ fn sql_match_aliases(api_formats: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
+        parse_stored_key_policy_string_list, provider_model_mapping_api_format_covers,
         push_key_auth_channel_sql_filter, push_pool_key_order, vertex_key_auth_channel_matches,
         ExactPageAccumulator, SqliteMinimalCandidateSelectionReadRepository,
         REQUESTED_MODEL_RAW_SCAN_LIMIT,
@@ -1378,6 +1453,66 @@ mod tests {
         assert!(!vertex_clause.contains("claude:messages"));
         assert!(vertex_clause.contains("gemini:generate_content"));
         assert!(vertex_clause.contains("gemini:embedding"));
+    }
+
+    #[test]
+    fn malformed_key_policy_never_degrades_to_unrestricted() {
+        for raw in ["null", "\"null\"", "\"\"", "[\"openai:chat\",null]"] {
+            assert!(parse_stored_key_policy_string_list(
+                Some(raw.to_string()),
+                "provider_api_keys.api_formats",
+            )
+            .is_err());
+        }
+        assert_eq!(
+            parse_stored_key_policy_string_list(
+                Some("[\"openai:chat\"]".to_string()),
+                "provider_api_keys.api_formats",
+            )
+            .expect("valid key policy should parse"),
+            Some(vec!["openai:chat".to_string()])
+        );
+    }
+
+    #[test]
+    fn codex_auth_sql_allows_live_for_oauth_keys() {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT 1 WHERE 1 = 1");
+        push_key_auth_channel_sql_filter(&mut builder, "codex:live");
+        let sql = builder.sql();
+        let codex_clause = sql
+            .split_once("LOWER(TRIM(p.provider_type)) = 'codex'")
+            .and_then(|(_, suffix)| {
+                suffix.split_once("LOWER(TRIM(p.provider_type)) = 'chatgpt_web'")
+            })
+            .map(|(clause, _)| clause)
+            .expect("Codex auth clause should exist");
+
+        assert!(codex_clause.contains("LOWER(TRIM(pak.auth_type)) = 'oauth'"));
+        assert!(codex_clause.contains("'codex:live'"));
+    }
+
+    #[test]
+    fn sqlite_mapping_scope_keeps_legacy_responses_compatibility_codex_only() {
+        assert!(provider_model_mapping_api_format_covers(
+            "codex",
+            "openai:responses",
+            "codex:live"
+        ));
+        assert!(!provider_model_mapping_api_format_covers(
+            "openai",
+            "openai:responses",
+            "codex:live"
+        ));
+        assert!(!provider_model_mapping_api_format_covers(
+            "custom",
+            "openai:responses",
+            "codex:live"
+        ));
+        assert!(!provider_model_mapping_api_format_covers(
+            "codex",
+            "openai:chat",
+            "codex:live"
+        ));
     }
 
     #[test]

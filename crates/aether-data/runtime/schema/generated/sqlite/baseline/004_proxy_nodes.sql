@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS proxy_nodes (
     id TEXT PRIMARY KEY NOT NULL,
+    tunnel_generation TEXT NOT NULL,
     name TEXT NOT NULL,
     ip TEXT NOT NULL,
     port INTEGER NOT NULL,
@@ -30,7 +31,8 @@ CREATE TABLE IF NOT EXISTS proxy_nodes (
     failed_requests INTEGER NOT NULL DEFAULT 0,
     dns_failures INTEGER NOT NULL DEFAULT 0,
     stream_errors INTEGER NOT NULL DEFAULT 0,
-    proxy_metadata TEXT
+    proxy_metadata TEXT,
+    UNIQUE (ip, port)
 );
 
 CREATE TABLE IF NOT EXISTS proxy_node_events (

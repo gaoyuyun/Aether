@@ -3,7 +3,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use tokio::net::TcpStream;
@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::http;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
+use crate::config::aether_url_for_log;
 use crate::egress_proxy::{
     connect_target_via_proxy, IpFamily, ProxyConnectOptions, UpstreamProxyConfig,
 };
@@ -22,8 +23,10 @@ use aether_contracts::tunnel::{
     TUNNEL_PROTOCOL_VERSION_HEADER,
 };
 use aether_contracts::tunnel_security::{
-    SecureFrameCodec, TunnelSecurityRole, TUNNEL_SECURITY_HEADER, TUNNEL_SECURITY_NON_TLS_REQUIRED,
-    TUNNEL_SECURITY_SESSION_HEADER,
+    sign_tunnel_security_handshake_for_generation, SecureFrameCodec, TunnelSecurityRole,
+    TUNNEL_GENERATION_HEADER, TUNNEL_SECURITY_HEADER, TUNNEL_SECURITY_NON_TLS_REQUIRED,
+    TUNNEL_SECURITY_PROOF_NONCE_HEADER, TUNNEL_SECURITY_PROOF_SIGNATURE_HEADER,
+    TUNNEL_SECURITY_PROOF_TIMESTAMP_HEADER, TUNNEL_SECURITY_SESSION_HEADER,
 };
 
 use super::{dispatcher, heartbeat, writer};
@@ -48,7 +51,7 @@ pub async fn connect_and_run(
     drain: watch::Receiver<bool>,
 ) -> Result<TunnelOutcome, anyhow::Error> {
     let ws_url = build_tunnel_url(server);
-    debug!(url = %ws_url, conn = conn_idx, "connecting tunnel");
+    debug!(url = %aether_url_for_log(&ws_url), conn = conn_idx, "connecting tunnel");
 
     // Build WebSocket request with auth headers
     let mut request = ws_url.clone().into_client_request()?;
@@ -67,19 +70,38 @@ pub async fn connect_and_run(
     );
     let node_id = server.node_id.read().unwrap().clone();
     insert_ascii_header(headers, "X-Node-Id", &node_id, "node_id")?;
-    let security_session = uuid::Uuid::new_v4().simple().to_string();
-    if server.tunnel_security == crate::config::TunnelSecurity::NonTlsRequired {
-        headers.insert(
-            TUNNEL_SECURITY_HEADER,
-            http::HeaderValue::from_static(TUNNEL_SECURITY_NON_TLS_REQUIRED),
-        );
-        insert_ascii_header(
-            headers,
-            TUNNEL_SECURITY_SESSION_HEADER,
-            &security_session,
-            "tunnel security session",
-        )?;
-    }
+    insert_ascii_header(
+        headers,
+        TUNNEL_GENERATION_HEADER,
+        &server.tunnel_generation,
+        "tunnel_generation",
+    )?;
+    let security_session =
+        if server.tunnel_security == crate::config::TunnelSecurity::NonTlsRequired {
+            let key = server
+                .tunnel_encryption_key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("secure tunnel requires tunnel_encryption_key"))?;
+            let session = uuid::Uuid::new_v4().simple().to_string();
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| anyhow::anyhow!("system clock is before the Unix epoch"))?
+                .as_secs();
+            insert_tunnel_security_handshake_headers(
+                headers,
+                key,
+                &node_id,
+                &server.tunnel_generation,
+                &session,
+                CURRENT_TUNNEL_PROTOCOL_VERSION,
+                timestamp,
+                &nonce,
+            )?;
+            session
+        } else {
+            String::new()
+        };
     // Use dynamic node_name (may be updated by remote config) instead of
     // the static server.node_name, so that remote name changes take effect
     // on the next reconnect.
@@ -449,9 +471,10 @@ async fn connect_direct_tunnel_tcp(
     port: u16,
     ip_family: IpFamily,
 ) -> io::Result<TcpStream> {
-    let resolved = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|err| io::Error::other(format!("tunnel DNS failed: {err}")))?;
+    let resolved =
+        aether_http::lookup_host_with_limits(host, port, aether_http::DEFAULT_DNS_LOOKUP_TIMEOUT)
+            .await
+            .map_err(|err| io::Error::other(format!("tunnel DNS failed: {err}")))?;
     let addrs = filter_socket_addrs(resolved, ip_family);
 
     if addrs.is_empty() {
@@ -540,6 +563,61 @@ fn insert_ascii_header(
     Ok(())
 }
 
+// The handshake transcript has a fixed set of wire fields. Keep the explicit
+// arguments and ordering so the client remains interoperable with existing
+// tunnel servers.
+#[allow(clippy::too_many_arguments)]
+fn insert_tunnel_security_handshake_headers(
+    headers: &mut http::HeaderMap,
+    key: &str,
+    node_id: &str,
+    tunnel_generation: &str,
+    session: &str,
+    protocol_version: u8,
+    timestamp_unix_secs: u64,
+    nonce: &str,
+) -> anyhow::Result<()> {
+    let signature = sign_tunnel_security_handshake_for_generation(
+        key,
+        node_id,
+        tunnel_generation,
+        TUNNEL_SECURITY_NON_TLS_REQUIRED,
+        session,
+        protocol_version,
+        timestamp_unix_secs,
+        nonce,
+    )?;
+    headers.insert(
+        TUNNEL_SECURITY_HEADER,
+        http::HeaderValue::from_static(TUNNEL_SECURITY_NON_TLS_REQUIRED),
+    );
+    insert_ascii_header(
+        headers,
+        TUNNEL_SECURITY_SESSION_HEADER,
+        session,
+        "tunnel security session",
+    )?;
+    insert_ascii_header(
+        headers,
+        TUNNEL_SECURITY_PROOF_TIMESTAMP_HEADER,
+        &timestamp_unix_secs.to_string(),
+        "tunnel security proof timestamp",
+    )?;
+    insert_ascii_header(
+        headers,
+        TUNNEL_SECURITY_PROOF_NONCE_HEADER,
+        nonce,
+        "tunnel security proof nonce",
+    )?;
+    insert_ascii_header(
+        headers,
+        TUNNEL_SECURITY_PROOF_SIGNATURE_HEADER,
+        &signature,
+        "tunnel security proof signature",
+    )?;
+    Ok(())
+}
+
 fn insert_node_name_headers(headers: &mut http::HeaderMap, node_name: &str) -> anyhow::Result<()> {
     if node_name.is_ascii() {
         return insert_ascii_header(headers, "X-Node-Name", node_name, "node_name");
@@ -619,5 +697,47 @@ mod tests {
             .decode(encoded)
             .expect("encoded value should decode");
         assert_eq!(decoded, "日本节点".as_bytes());
+    }
+
+    #[test]
+    fn tunnel_security_headers_include_verifiable_psk_proof() {
+        let key = base64::engine::general_purpose::STANDARD.encode([7_u8; 32]);
+        let mut headers = http::HeaderMap::new();
+        insert_tunnel_security_handshake_headers(
+            &mut headers,
+            &key,
+            "node-1",
+            "generation-1",
+            "0123456789abcdef0123456789abcdef",
+            CURRENT_TUNNEL_PROTOCOL_VERSION,
+            1_700_000_000,
+            "abcdef0123456789abcdef0123456789",
+        )
+        .expect("security proof headers");
+
+        let signature = headers[TUNNEL_SECURITY_PROOF_SIGNATURE_HEADER]
+            .to_str()
+            .expect("signature header");
+        assert_eq!(
+            headers[TUNNEL_SECURITY_HEADER],
+            TUNNEL_SECURITY_NON_TLS_REQUIRED
+        );
+        assert_eq!(
+            headers[TUNNEL_SECURITY_PROOF_TIMESTAMP_HEADER],
+            "1700000000"
+        );
+        assert!(
+            aether_contracts::tunnel_security::verify_tunnel_security_handshake_for_generation(
+                &key,
+                "node-1",
+                "generation-1",
+                TUNNEL_SECURITY_NON_TLS_REQUIRED,
+                "0123456789abcdef0123456789abcdef",
+                CURRENT_TUNNEL_PROTOCOL_VERSION,
+                1_700_000_000,
+                "abcdef0123456789abcdef0123456789",
+                signature,
+            )
+        );
     }
 }

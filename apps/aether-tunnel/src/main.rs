@@ -226,7 +226,7 @@ mod tests {
         let (config, tunnel_security) = parse_config_and_security(&[
             "aether-tunnel",
             "--aether-url",
-            "http://example.com",
+            "http://127.0.0.1:8084",
             "--management-token",
             "ae_test",
             "--node-name",
@@ -252,7 +252,7 @@ mod tests {
         let (config, tunnel_security) = parse_config_and_security(&[
             "aether-tunnel",
             "--aether-url",
-            "http://example.com",
+            "http://127.0.0.1:8084",
             "--management-token",
             "ae_test",
             "--node-name",

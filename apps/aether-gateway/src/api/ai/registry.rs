@@ -1,6 +1,9 @@
+use std::net::SocketAddr;
+
 use axum::body::Body;
-use axum::extract::Request;
-use axum::http::{header, HeaderValue, Response, StatusCode};
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode, Uri};
 use axum::routing::{any, get, post};
 use axum::Router;
 
@@ -8,7 +11,7 @@ use super::{aliyun, claude, doubao, gemini, jina, openai};
 use crate::api::response::build_local_http_error_response_with_request_path;
 use crate::headers::extract_or_generate_trace_id;
 use crate::{
-    handlers::proxy::{proxy_request, responses_websocket},
+    handlers::proxy::{live_websocket, proxy_request, realtime_websocket, responses_websocket},
     state::AppState,
     GatewayError,
 };
@@ -22,6 +25,8 @@ const AI_POST_ROUTE_PATTERNS: &[&str] = &[
     "/v1/rerank",
     "/v1/responses",
     "/v1/responses/compact",
+    "/v1/live",
+    "/v1/realtime/calls",
     "/v1/alpha/search",
     "/v1/images/generations",
     "/v1/images/edits",
@@ -57,10 +62,14 @@ pub(crate) fn mount_ai_routes(mut router: Router<AppState>) -> Router<AppState> 
     for path in AI_POST_ROUTE_PATTERNS {
         router = if *path == "/v1/responses" {
             router.route(path, get(responses_websocket).post(proxy_request))
+        } else if *path == "/v1/live" {
+            router.route(path, get(live_websocket).post(proxy_request))
         } else {
             router.route(path, post(proxy_request))
         };
     }
+    router = router.route("/v1/live/{call_id}", get(live_websocket));
+    router = router.route("/v1/realtime", get(dispatch_realtime_websocket));
     for path in CLAUDE_POST_ROUTE_PATTERNS {
         router = router.route(
             path,
@@ -71,6 +80,61 @@ pub(crate) fn mount_ai_routes(mut router: Router<AppState>) -> Router<AppState> 
         router = router.route(path, any(proxy_request));
     }
     router
+}
+
+async fn dispatch_realtime_websocket(
+    State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response<Body>, GatewayError> {
+    if realtime_query_is_codex_live(uri.query(), &headers) {
+        live_websocket(State(state), ConnectInfo(remote_addr), ws, headers, uri).await
+    } else {
+        realtime_websocket(State(state), ConnectInfo(remote_addr), ws, headers, uri).await
+    }
+}
+
+fn realtime_query_is_codex_live(query: Option<&str>, headers: &HeaderMap) -> bool {
+    let mut has_call_id = false;
+    let mut has_live_intent = false;
+    let mut duplicate_or_conflicting_intent = false;
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        if key.eq_ignore_ascii_case("call_id") {
+            has_call_id = true;
+        } else if key.eq_ignore_ascii_case("intent") {
+            if has_live_intent || !value.eq_ignore_ascii_case("quicksilver") {
+                duplicate_or_conflicting_intent = true;
+            }
+            has_live_intent = true;
+        }
+    }
+    if has_live_intent {
+        return !duplicate_or_conflicting_intent;
+    }
+    // `call_id` is part of the ordinary OpenAI Realtime WebRTC sideband
+    // contract too. Without Codex's explicit v1 intent it must remain on the
+    // generic Realtime handler instead of being authorized as `codex:live`.
+    if has_call_id {
+        return false;
+    }
+    // Realtime v2 has no intent selector. A malformed or conflicting intent
+    // must not be reclassified as v2 merely because a Codex originator is
+    // present.
+    let has_model = url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .any(|(key, value)| key.eq_ignore_ascii_case("model") && !value.trim().is_empty());
+    let Some(originator) = crate::headers::header_value_str(headers, "originator") else {
+        return false;
+    };
+    has_model
+        && originator.split_whitespace().next().is_some_and(|value| {
+            value.eq_ignore_ascii_case("codex_cli_rs")
+                || value.to_ascii_lowercase().starts_with("codex_cli_rs/")
+                || value.eq_ignore_ascii_case("codex_work_desktop")
+                || value.eq_ignore_ascii_case("codex_work_web")
+                || value.eq_ignore_ascii_case("codex_work_mobile")
+        })
 }
 
 async fn claude_method_not_allowed(request: Request) -> Result<Response<Body>, GatewayError> {
@@ -128,7 +192,72 @@ pub(crate) fn admin_default_body_rules_for_signature(
 
 #[cfg(test)]
 mod tests {
-    use super::{admin_endpoint_signature_parts, public_api_format_local_path};
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::{
+        admin_endpoint_signature_parts, public_api_format_local_path, realtime_query_is_codex_live,
+        AI_POST_ROUTE_PATTERNS,
+    };
+
+    #[test]
+    fn registers_and_dispatches_realtime_live_aliases() {
+        assert!(AI_POST_ROUTE_PATTERNS.contains(&"/v1/realtime/calls"));
+        let no_headers = HeaderMap::new();
+        assert!(realtime_query_is_codex_live(
+            Some("intent=quicksilver&call_id=rtc_opaque"),
+            &no_headers
+        ));
+        assert!(realtime_query_is_codex_live(
+            Some("intent=quicksilver&c%61ll_id=rtc_encoded"),
+            &no_headers
+        ));
+        assert!(!realtime_query_is_codex_live(
+            Some("c%61ll_id=rtc_encoded"),
+            &no_headers
+        ));
+        assert!(!realtime_query_is_codex_live(None, &no_headers));
+        assert!(!realtime_query_is_codex_live(Some("call_id="), &no_headers));
+        assert!(!realtime_query_is_codex_live(
+            Some("call_id=%20"),
+            &no_headers
+        ));
+        assert!(realtime_query_is_codex_live(
+            Some("intent=quicksilver&model=gpt-realtime-1.5"),
+            &no_headers
+        ));
+        assert!(!realtime_query_is_codex_live(
+            Some("model=gpt-realtime-1.5"),
+            &no_headers
+        ));
+        assert!(!realtime_query_is_codex_live(
+            Some("intent=other&model=gpt-realtime-1.5"),
+            &no_headers
+        ));
+        assert!(!realtime_query_is_codex_live(
+            Some("intent=quicksilver&intent=other&model=gpt-realtime-1.5"),
+            &no_headers
+        ));
+        let mut codex_v2_headers = HeaderMap::new();
+        codex_v2_headers.insert("originator", HeaderValue::from_static("codex_work_desktop"));
+        assert!(realtime_query_is_codex_live(
+            Some("model=gpt-live-1-codex"),
+            &codex_v2_headers
+        ));
+        assert!(!realtime_query_is_codex_live(
+            Some("call_id=rtc_ordinary&model=gpt-live-1-codex"),
+            &codex_v2_headers
+        ));
+        assert!(!realtime_query_is_codex_live(
+            Some("call_id=rtc_one&call_id=rtc_two"),
+            &codex_v2_headers
+        ));
+        let mut ordinary_headers = HeaderMap::new();
+        ordinary_headers.insert("originator", HeaderValue::from_static("openai-python"));
+        assert!(!realtime_query_is_codex_live(
+            Some("model=gpt-realtime-1.5"),
+            &ordinary_headers
+        ));
+    }
 
     #[test]
     fn supports_data_api_endpoint_signatures_and_public_paths() {
@@ -156,6 +285,8 @@ mod tests {
             ),
             ("openai:rerank", "openai", "rerank", "/v1/rerank"),
             ("openai:search", "openai", "search", "/v1/alpha/search"),
+            ("openai:realtime", "openai", "realtime", "/v1/realtime"),
+            ("codex:live", "codex", "live", "/v1/live"),
             ("jina:rerank", "jina", "rerank", "/v1/rerank"),
         ] {
             assert_eq!(

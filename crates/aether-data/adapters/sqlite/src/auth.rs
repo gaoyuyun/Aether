@@ -3,9 +3,9 @@ use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, Transaction};
 
 use aether_data_contracts::repository::auth::{
     AuthApiKeyExportSummary, AuthApiKeyLookupKey, AuthApiKeyReadRepository,
-    AuthApiKeyWriteRepository, CreateStandaloneApiKeyRecord, CreateUserApiKeyRecord,
-    StandaloneApiKeyExportListQuery, StoredAuthApiKeyExportRecord, StoredAuthApiKeySnapshot,
-    UpdateStandaloneApiKeyBasicRecord, UpdateUserApiKeyBasicRecord,
+    AuthApiKeyWriteRepository, CompareAndSwapAuthApiKeyCiphertext, CreateStandaloneApiKeyRecord,
+    CreateUserApiKeyRecord, StandaloneApiKeyExportListQuery, StoredAuthApiKeyExportRecord,
+    StoredAuthApiKeySnapshot, UpdateStandaloneApiKeyBasicRecord, UpdateUserApiKeyBasicRecord,
 };
 use aether_data_contracts::DataLayerError;
 
@@ -68,6 +68,21 @@ SELECT
   api_keys.is_standalone
 FROM api_keys
 "#;
+
+const SQLITE_ANONYMIZE_API_KEY_HISTORY_SQL: &[&str] = &[
+    "UPDATE request_candidates SET api_key_name = NULL WHERE api_key_id = ?",
+    "UPDATE video_tasks SET api_key_name = NULL WHERE api_key_id = ?",
+    "UPDATE usage SET api_key_name = NULL WHERE api_key_id = ?",
+    "UPDATE stats_daily_api_key SET api_key_name = NULL WHERE api_key_id = ?",
+    "UPDATE audit_logs SET description = 'deleted API key event', ip_address = NULL, user_agent = NULL, event_metadata = NULL, error_message = NULL WHERE api_key_id = ?",
+    "UPDATE wallet_transactions SET description = NULL WHERE wallet_id IN (SELECT id FROM wallets WHERE api_key_id = ?)",
+    "UPDATE payment_callbacks SET payload = NULL, error_message = NULL WHERE EXISTS (SELECT 1 FROM payment_orders AS history_order JOIN wallets AS history_wallet ON history_wallet.id = history_order.wallet_id WHERE history_wallet.api_key_id = ? AND (history_order.id = payment_callbacks.payment_order_id OR (payment_callbacks.order_no IS NOT NULL AND history_order.order_no = payment_callbacks.order_no)))",
+    "UPDATE payment_orders SET gateway_response = NULL WHERE wallet_id IN (SELECT id FROM wallets WHERE api_key_id = ?)",
+    "UPDATE refund_requests SET reason = NULL, payout_reference = NULL, payout_proof = NULL, failure_reason = NULL WHERE wallet_id IN (SELECT id FROM wallets WHERE api_key_id = ?)",
+];
+
+const SQLITE_DELETE_API_KEY_DEPENDENTS_SQL: &[&str] =
+    &["DELETE FROM api_key_provider_mappings WHERE api_key_id = ?"];
 
 #[derive(Debug, Clone)]
 pub struct SqliteAuthApiKeyReadRepository {
@@ -136,7 +151,21 @@ impl SqliteAuthApiKeyReadRepository {
         record: CreateApiKeyInsertRecord,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
         let now = current_unix_secs();
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let owner_exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM users WHERE id = ? AND is_deleted = 0")
+                .bind(&record.user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+        if owner_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        }
         sqlx::query(
             r#"
 INSERT INTO api_keys (
@@ -146,16 +175,7 @@ INSERT INTO api_keys (
   total_requests, total_tokens, total_cost_usd, is_standalone,
   created_at, updated_at
 )
-VALUES (
-  ?, ?, ?, ?, ?,
-  ?, ?, ?, ?,
-  ?, ?,
-  ?, ?,
-  ?, ?, ?,
-  ?, ?, ?,
-  ?,
-  ?, ?
-)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&record.api_key_id)
@@ -391,6 +411,7 @@ impl AuthApiKeyReadRepository for SqliteAuthApiKeyReadRepository {
         if user_ids.is_empty() {
             return Ok(AuthApiKeyExportSummary::default());
         }
+        let now_unix_secs = i64_from_u64(now_unix_secs, "api_keys.summary_now")?;
 
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
@@ -399,7 +420,7 @@ SELECT
   SUM(CASE WHEN is_active = 1 AND (expires_at IS NULL OR expires_at >=
 "#,
         );
-        builder.push_bind(now_unix_secs as i64);
+        builder.push_bind(now_unix_secs);
         builder.push(
             r#") THEN 1 ELSE 0 END) AS active
 FROM api_keys
@@ -528,77 +549,41 @@ WHERE id = ?
         &self,
         record: UpdateUserApiKeyBasicRecord,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
-        let now = current_unix_secs() as i64;
-        let feature_settings = match &record.feature_settings {
-            Some(inner) => inner.clone(),
-            None => None,
-        };
-        let mut tx = self.pool.begin().await.map_sql_err()?;
-        sqlx::query(
+        self.update_user_api_key_basic_scoped(record, false).await
+    }
+
+    async fn compare_and_swap_api_key_ciphertext(
+        &self,
+        mutation: &CompareAndSwapAuthApiKeyCiphertext,
+    ) -> Result<bool, DataLayerError> {
+        let result = sqlx::query(
             r#"
 UPDATE api_keys
-SET name = COALESCE(?, name),
-    rate_limit = COALESCE(?, rate_limit),
-    concurrent_limit = COALESCE(?, concurrent_limit),
-    ip_rules = CASE WHEN ? THEN ? ELSE ip_rules END,
-    allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
-    allowed_api_formats = CASE WHEN ? THEN ? ELSE allowed_api_formats END,
-    allowed_models = CASE WHEN ? THEN ? ELSE allowed_models END,
-    feature_settings = CASE WHEN ? THEN ? ELSE feature_settings END,
-    updated_at = ?
-WHERE id = ?
-  AND user_id = ?
-  AND is_standalone = 0
+SET key_encrypted = ?
+WHERE CAST(id AS BLOB) = CAST(? AS BLOB)
+  AND CAST(user_id AS BLOB) = CAST(? AS BLOB)
+  AND CAST(key_hash AS BLOB) = CAST(? AS BLOB)
+  AND is_standalone = ?
+  AND CAST(key_encrypted AS BLOB) = CAST(? AS BLOB)
 "#,
         )
-        .bind(record.name.as_deref())
-        .bind(record.rate_limit)
-        .bind(record.concurrent_limit)
-        .bind(record.ip_rules.is_some())
-        .bind(json_string_from_nested_string_list(
-            &record.ip_rules,
-            "api_keys.ip_rules",
-        )?)
-        .bind(record.allowed_providers.is_some())
-        .bind(json_string_from_nested_string_list(
-            &record.allowed_providers,
-            "api_keys.allowed_providers",
-        )?)
-        .bind(record.allowed_api_formats.is_some())
-        .bind(json_string_from_nested_string_list(
-            &record.allowed_api_formats,
-            "api_keys.allowed_api_formats",
-        )?)
-        .bind(record.allowed_models.is_some())
-        .bind(json_string_from_nested_string_list(
-            &record.allowed_models,
-            "api_keys.allowed_models",
-        )?)
-        .bind(record.feature_settings.is_some())
-        .bind(optional_json_to_string(
-            &feature_settings,
-            "api_keys.feature_settings",
-        )?)
-        .bind(now)
-        .bind(&record.api_key_id)
-        .bind(&record.user_id)
-        .execute(&mut *tx)
+        .bind(&mutation.key_encrypted)
+        .bind(&mutation.api_key_id)
+        .bind(&mutation.user_id)
+        .bind(&mutation.key_hash)
+        .bind(mutation.is_standalone)
+        .bind(&mutation.expected_key_encrypted)
+        .execute(&self.pool)
         .await
         .map_sql_err()?;
-        let Some(updated) = self
-            .reload_export_by_id_in_transaction(
-                &mut tx,
-                &record.api_key_id,
-                Some(&record.user_id),
-                false,
-            )
-            .await?
-        else {
-            tx.rollback().await.map_sql_err()?;
-            return Ok(None);
-        };
-        tx.commit().await.map_sql_err()?;
-        Ok(Some(updated))
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn update_user_api_key_basic_if_unlocked(
+        &self,
+        record: UpdateUserApiKeyBasicRecord,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        self.update_user_api_key_basic_scoped(record, true).await
     }
 
     async fn update_standalone_api_key_basic(
@@ -610,7 +595,9 @@ WHERE id = ?
         sqlx::query(
             r#"
 UPDATE api_keys
-SET name = COALESCE(?, name),
+SET key_encrypted = CASE WHEN ? THEN ? ELSE key_encrypted END,
+    name = CASE WHEN ? THEN ? ELSE name END,
+    force_capabilities = CASE WHEN ? THEN ? ELSE force_capabilities END,
     rate_limit = CASE WHEN ? THEN ? ELSE rate_limit END,
     concurrent_limit = CASE WHEN ? THEN ? ELSE concurrent_limit END,
     allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
@@ -624,7 +611,15 @@ WHERE id = ?
   AND is_standalone = 1
 "#,
         )
+        .bind(record.key_encrypted_present)
+        .bind(record.key_encrypted.as_deref())
+        .bind(record.name_present)
         .bind(record.name.as_deref())
+        .bind(record.force_capabilities.is_some())
+        .bind(optional_json_to_string(
+            &record.force_capabilities.clone().flatten(),
+            "api_keys.force_capabilities",
+        )?)
         .bind(record.rate_limit_present)
         .bind(record.rate_limit)
         .bind(record.concurrent_limit_present)
@@ -672,13 +667,147 @@ WHERE id = ?
         Ok(Some(updated))
     }
 
+    async fn restore_api_key_if_matches(
+        &self,
+        expected: &StoredAuthApiKeyExportRecord,
+        restored: &StoredAuthApiKeyExportRecord,
+    ) -> Result<bool, DataLayerError> {
+        if restored.api_key_id != expected.api_key_id
+            || restored.user_id != expected.user_id
+            || restored.key_hash != expected.key_hash
+            || restored.is_standalone != expected.is_standalone
+        {
+            return Ok(false);
+        }
+
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let select_sql = format!("{EXPORT_COLUMNS} WHERE api_keys.id = ? LIMIT 1");
+        let row = sqlx::query(&select_sql)
+            .bind(&expected.api_key_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+        let Some(row) = row else {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        };
+        let current = map_auth_api_key_export_row(&row)?;
+        if current != *expected {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+
+        let result = sqlx::query(
+            r#"
+UPDATE api_keys
+SET key_encrypted = ?,
+    name = ?,
+    allowed_providers = ?,
+    allowed_api_formats = ?,
+    allowed_models = ?,
+    ip_rules = ?,
+    rate_limit = ?,
+    concurrent_limit = ?,
+    force_capabilities = ?,
+    feature_settings = ?,
+    is_active = ?,
+    expires_at = ?,
+    auto_delete_on_expiry = ?,
+    total_requests = ?,
+    total_tokens = ?,
+    total_cost_usd = ?,
+    last_used_at = ?,
+    updated_at = ?
+WHERE id = ?
+  AND user_id = ?
+  AND key_hash = ?
+  AND is_standalone = ?
+"#,
+        )
+        .bind(restored.key_encrypted.as_deref())
+        .bind(restored.name.as_deref())
+        .bind(json_string_from_string_list(
+            restored.allowed_providers.as_ref(),
+            "api_keys.allowed_providers",
+        )?)
+        .bind(json_string_from_string_list(
+            restored.allowed_api_formats.as_ref(),
+            "api_keys.allowed_api_formats",
+        )?)
+        .bind(json_string_from_string_list(
+            restored.allowed_models.as_ref(),
+            "api_keys.allowed_models",
+        )?)
+        .bind(json_string_from_string_list(
+            restored.ip_rules.as_ref(),
+            "api_keys.ip_rules",
+        )?)
+        .bind(restored.rate_limit)
+        .bind(restored.concurrent_limit)
+        .bind(optional_json_to_string(
+            &restored.force_capabilities,
+            "api_keys.force_capabilities",
+        )?)
+        .bind(optional_json_to_string(
+            &restored.feature_settings,
+            "api_keys.feature_settings",
+        )?)
+        .bind(restored.is_active)
+        .bind(optional_i64_from_u64(
+            restored.expires_at_unix_secs,
+            "api_keys.expires_at",
+        )?)
+        .bind(restored.auto_delete_on_expiry)
+        .bind(i64_from_u64(
+            restored.total_requests,
+            "api_keys.total_requests",
+        )?)
+        .bind(i64_from_u64(
+            restored.total_tokens,
+            "api_keys.total_tokens",
+        )?)
+        .bind(restored.total_cost_usd)
+        .bind(optional_i64_from_u64(
+            restored.last_used_at_unix_secs,
+            "api_keys.last_used_at",
+        )?)
+        .bind(current_unix_secs() as i64)
+        .bind(&restored.api_key_id)
+        .bind(&restored.user_id)
+        .bind(&restored.key_hash)
+        .bind(restored.is_standalone)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(true)
+    }
+
     async fn set_user_api_key_active(
         &self,
         user_id: &str,
         api_key_id: &str,
         is_active: bool,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
-        self.set_active(api_key_id, Some(user_id), is_active, false)
+        self.set_active(api_key_id, Some(user_id), is_active, false, false)
+            .await
+    }
+
+    async fn set_user_api_key_active_if_unlocked(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        is_active: bool,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        self.set_active(api_key_id, Some(user_id), is_active, false, true)
             .await
     }
 
@@ -687,7 +816,8 @@ WHERE id = ?
         api_key_id: &str,
         is_active: bool,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
-        self.set_active(api_key_id, None, is_active, true).await
+        self.set_active(api_key_id, None, is_active, true, false)
+            .await
     }
 
     async fn set_user_api_key_locked(
@@ -722,35 +852,23 @@ WHERE id = ?
         api_key_id: &str,
         allowed_providers: Option<Vec<String>>,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
-        let mut tx = self.pool.begin().await.map_sql_err()?;
-        sqlx::query(
-            r#"
-UPDATE api_keys
-SET allowed_providers = ?, updated_at = ?
-WHERE id = ?
-  AND user_id = ?
-  AND is_standalone = 0
-"#,
+        self.set_user_api_key_allowed_providers_scoped(
+            user_id,
+            api_key_id,
+            allowed_providers,
+            false,
         )
-        .bind(json_string_from_string_list(
-            allowed_providers.as_ref(),
-            "api_keys.allowed_providers",
-        )?)
-        .bind(current_unix_secs() as i64)
-        .bind(api_key_id)
-        .bind(user_id)
-        .execute(&mut *tx)
         .await
-        .map_sql_err()?;
-        let Some(updated) = self
-            .reload_export_by_id_in_transaction(&mut tx, api_key_id, Some(user_id), false)
-            .await?
-        else {
-            tx.rollback().await.map_sql_err()?;
-            return Ok(None);
-        };
-        tx.commit().await.map_sql_err()?;
-        Ok(Some(updated))
+    }
+
+    async fn set_user_api_key_allowed_providers_if_unlocked(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        allowed_providers: Option<Vec<String>>,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        self.set_user_api_key_allowed_providers_scoped(user_id, api_key_id, allowed_providers, true)
+            .await
     }
 
     async fn set_user_api_key_force_capabilities(
@@ -759,26 +877,28 @@ WHERE id = ?
         api_key_id: &str,
         force_capabilities: Option<serde_json::Value>,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
-        sqlx::query(
-            r#"
-UPDATE api_keys
-SET force_capabilities = ?, updated_at = ?
-WHERE id = ?
-  AND user_id = ?
-  AND is_standalone = 0
-"#,
+        self.set_user_api_key_force_capabilities_scoped(
+            user_id,
+            api_key_id,
+            force_capabilities,
+            false,
         )
-        .bind(optional_json_to_string(
-            &force_capabilities,
-            "api_keys.force_capabilities",
-        )?)
-        .bind(current_unix_secs() as i64)
-        .bind(api_key_id)
-        .bind(user_id)
-        .execute(&self.pool)
         .await
-        .map_sql_err()?;
-        self.reload_export_by_id(api_key_id).await
+    }
+
+    async fn set_user_api_key_force_capabilities_if_unlocked(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        force_capabilities: Option<serde_json::Value>,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        self.set_user_api_key_force_capabilities_scoped(
+            user_id,
+            api_key_id,
+            force_capabilities,
+            true,
+        )
+        .await
     }
 
     async fn set_user_api_key_feature_settings(
@@ -787,26 +907,18 @@ WHERE id = ?
         api_key_id: &str,
         feature_settings: Option<serde_json::Value>,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
-        sqlx::query(
-            r#"
-UPDATE api_keys
-SET feature_settings = ?, updated_at = ?
-WHERE id = ?
-  AND user_id = ?
-  AND is_standalone = 0
-"#,
-        )
-        .bind(optional_json_to_string(
-            &feature_settings,
-            "api_keys.feature_settings",
-        )?)
-        .bind(current_unix_secs() as i64)
-        .bind(api_key_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await
-        .map_sql_err()?;
-        self.reload_export_by_id(api_key_id).await
+        self.set_user_api_key_feature_settings_scoped(user_id, api_key_id, feature_settings, false)
+            .await
+    }
+
+    async fn set_user_api_key_feature_settings_if_unlocked(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        feature_settings: Option<serde_json::Value>,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        self.set_user_api_key_feature_settings_scoped(user_id, api_key_id, feature_settings, true)
+            .await
     }
 
     async fn set_api_key_usage_totals(
@@ -816,6 +928,11 @@ WHERE id = ?
         total_tokens: u64,
         total_cost_usd: f64,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        if !total_cost_usd.is_finite() {
+            return Err(DataLayerError::InvalidInput(
+                "api_keys.total_cost_usd is not finite".to_string(),
+            ));
+        }
         sqlx::query(
             r#"
 UPDATE api_keys
@@ -826,8 +943,8 @@ SET total_requests = ?,
 WHERE id = ?
 "#,
         )
-        .bind(total_requests as i64)
-        .bind(total_tokens as i64)
+        .bind(i64_from_u64(total_requests, "api_keys.total_requests")?)
+        .bind(i64_from_u64(total_tokens, "api_keys.total_tokens")?)
         .bind(total_cost_usd)
         .bind(current_unix_secs() as i64)
         .bind(api_key_id)
@@ -842,11 +959,21 @@ WHERE id = ?
         user_id: &str,
         api_key_id: &str,
     ) -> Result<bool, DataLayerError> {
-        self.delete_api_key(api_key_id, Some(user_id), false).await
+        self.delete_api_key(api_key_id, Some(user_id), false, false)
+            .await
+    }
+
+    async fn delete_user_api_key_if_unlocked(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        self.delete_api_key(api_key_id, Some(user_id), false, true)
+            .await
     }
 
     async fn delete_standalone_api_key(&self, api_key_id: &str) -> Result<bool, DataLayerError> {
-        self.delete_api_key(api_key_id, None, true).await
+        self.delete_api_key(api_key_id, None, true, false).await
     }
 
     async fn set_standalone_api_key_feature_settings(
@@ -876,12 +1003,94 @@ WHERE id = ?
 }
 
 impl SqliteAuthApiKeyReadRepository {
+    async fn update_user_api_key_basic_scoped(
+        &self,
+        record: UpdateUserApiKeyBasicRecord,
+        require_unlocked: bool,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let result = sqlx::query(
+            r#"
+UPDATE api_keys
+SET key_encrypted = CASE WHEN ? THEN ? ELSE key_encrypted END,
+    name = CASE WHEN ? THEN ? ELSE name END,
+    rate_limit = CASE WHEN ? THEN ? ELSE rate_limit END,
+    concurrent_limit = CASE WHEN ? THEN ? ELSE concurrent_limit END,
+    ip_rules = CASE WHEN ? THEN ? ELSE ip_rules END,
+    allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
+    allowed_api_formats = CASE WHEN ? THEN ? ELSE allowed_api_formats END,
+    allowed_models = CASE WHEN ? THEN ? ELSE allowed_models END,
+    feature_settings = CASE WHEN ? THEN ? ELSE feature_settings END,
+    updated_at = ?
+WHERE id = ?
+  AND user_id = ?
+  AND is_standalone = 0
+  AND (? = 0 OR is_locked = 0)
+"#,
+        )
+        .bind(record.key_encrypted_present)
+        .bind(record.key_encrypted.as_deref())
+        .bind(record.name_present)
+        .bind(record.name.as_deref())
+        .bind(record.rate_limit_present)
+        .bind(record.rate_limit)
+        .bind(record.concurrent_limit_present)
+        .bind(record.concurrent_limit)
+        .bind(record.ip_rules.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.ip_rules,
+            "api_keys.ip_rules",
+        )?)
+        .bind(record.allowed_providers.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_providers,
+            "api_keys.allowed_providers",
+        )?)
+        .bind(record.allowed_api_formats.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_api_formats,
+            "api_keys.allowed_api_formats",
+        )?)
+        .bind(record.allowed_models.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.allowed_models,
+            "api_keys.allowed_models",
+        )?)
+        .bind(record.feature_settings.is_some())
+        .bind(optional_json_to_string(
+            &record.feature_settings.clone().flatten(),
+            "api_keys.feature_settings",
+        )?)
+        .bind(current_unix_secs() as i64)
+        .bind(&record.api_key_id)
+        .bind(&record.user_id)
+        .bind(require_unlocked)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(None);
+        }
+        let updated = self
+            .reload_export_by_id_in_transaction(
+                &mut tx,
+                &record.api_key_id,
+                Some(&record.user_id),
+                false,
+            )
+            .await?;
+        tx.commit().await.map_sql_err()?;
+        Ok(updated)
+    }
+
     async fn set_active(
         &self,
         api_key_id: &str,
         user_id: Option<&str>,
         is_active: bool,
         is_standalone: bool,
+        require_unlocked: bool,
     ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
         let mut builder = QueryBuilder::<Sqlite>::new("UPDATE api_keys SET is_active = ");
         builder
@@ -895,7 +1104,115 @@ impl SqliteAuthApiKeyReadRepository {
         if let Some(user_id) = user_id {
             builder.push(" AND user_id = ").push_bind(user_id);
         }
-        builder.build().execute(&self.pool).await.map_sql_err()?;
+        if require_unlocked {
+            builder.push(" AND is_locked = ").push_bind(false);
+        }
+        let result = builder.build().execute(&self.pool).await.map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.reload_export_by_id(api_key_id).await
+    }
+
+    async fn set_user_api_key_allowed_providers_scoped(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        allowed_providers: Option<Vec<String>>,
+        require_unlocked: bool,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let result = sqlx::query(
+            r#"
+UPDATE api_keys
+SET allowed_providers = ?, updated_at = ?
+WHERE id = ?
+  AND user_id = ?
+  AND is_standalone = 0
+  AND (? = 0 OR is_locked = 0)
+"#,
+        )
+        .bind(json_string_from_string_list(
+            allowed_providers.as_ref(),
+            "api_keys.allowed_providers",
+        )?)
+        .bind(current_unix_secs() as i64)
+        .bind(api_key_id)
+        .bind(user_id)
+        .bind(require_unlocked)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.reload_export_by_id(api_key_id).await
+    }
+
+    async fn set_user_api_key_force_capabilities_scoped(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        force_capabilities: Option<serde_json::Value>,
+        require_unlocked: bool,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let result = sqlx::query(
+            r#"
+UPDATE api_keys
+SET force_capabilities = ?, updated_at = ?
+WHERE id = ?
+  AND user_id = ?
+  AND is_standalone = 0
+  AND (? = 0 OR is_locked = 0)
+"#,
+        )
+        .bind(optional_json_to_string(
+            &force_capabilities,
+            "api_keys.force_capabilities",
+        )?)
+        .bind(current_unix_secs() as i64)
+        .bind(api_key_id)
+        .bind(user_id)
+        .bind(require_unlocked)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.reload_export_by_id(api_key_id).await
+    }
+
+    async fn set_user_api_key_feature_settings_scoped(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        feature_settings: Option<serde_json::Value>,
+        require_unlocked: bool,
+    ) -> Result<Option<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let result = sqlx::query(
+            r#"
+UPDATE api_keys
+SET feature_settings = ?, updated_at = ?
+WHERE id = ?
+  AND user_id = ?
+  AND is_standalone = 0
+  AND (? = 0 OR is_locked = 0)
+"#,
+        )
+        .bind(optional_json_to_string(
+            &feature_settings,
+            "api_keys.feature_settings",
+        )?)
+        .bind(current_unix_secs() as i64)
+        .bind(api_key_id)
+        .bind(user_id)
+        .bind(require_unlocked)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
         self.reload_export_by_id(api_key_id).await
     }
 
@@ -904,22 +1221,80 @@ impl SqliteAuthApiKeyReadRepository {
         api_key_id: &str,
         user_id: Option<&str>,
         is_standalone: bool,
+        require_unlocked: bool,
     ) -> Result<bool, DataLayerError> {
-        let mut builder = QueryBuilder::<Sqlite>::new("DELETE FROM api_keys WHERE id = ");
-        builder
-            .push_bind(api_key_id)
-            .push(" AND is_standalone = ")
-            .push_bind(is_standalone);
-        if let Some(user_id) = user_id {
-            builder.push(" AND user_id = ").push_bind(user_id);
-        }
-        let rows_affected = builder
-            .build()
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let matching_api_key = if let Some(user_id) = user_id {
+            if require_unlocked {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM api_keys WHERE id = ? AND user_id = ? AND is_standalone = 0 AND is_locked = 0",
+                )
+                .bind(api_key_id)
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
             .await
             .map_sql_err()?
-            .rows_affected();
-        Ok(rows_affected > 0)
+            } else {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM api_keys WHERE id = ? AND user_id = ? AND is_standalone = 0",
+                )
+                .bind(api_key_id)
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?
+            }
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM api_keys WHERE id = ? AND is_standalone = 1",
+            )
+            .bind(api_key_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?
+        };
+        if matching_api_key.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE wallets SET status = 'disabled', updated_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE api_key_id = ? AND status <> 'disabled'",
+        )
+        .bind(api_key_id)
+        .execute(&mut *tx)
+        .await
+        .map_sql_err()?;
+        for sql in SQLITE_ANONYMIZE_API_KEY_HISTORY_SQL {
+            sqlx::query(sql)
+                .bind(api_key_id)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+        }
+        for sql in SQLITE_DELETE_API_KEY_DEPENDENTS_SQL {
+            sqlx::query(sql)
+                .bind(api_key_id)
+                .execute(&mut *tx)
+                .await
+                .map_sql_err()?;
+        }
+        let result = sqlx::query("DELETE FROM api_keys WHERE id = ? AND is_standalone = ?")
+            .bind(api_key_id)
+            .bind(is_standalone)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        tx.commit().await.map_sql_err()?;
+        Ok(true)
     }
 }
 
@@ -943,6 +1318,7 @@ async fn summarize_api_keys(
     is_standalone: bool,
     now_unix_secs: u64,
 ) -> Result<AuthApiKeyExportSummary, DataLayerError> {
+    let now_unix_secs = i64_from_u64(now_unix_secs, "api_keys.summary_now")?;
     let row = sqlx::query(
         r#"
 SELECT
@@ -952,7 +1328,7 @@ FROM api_keys
 WHERE is_standalone = ?
 "#,
     )
-    .bind(now_unix_secs as i64)
+    .bind(now_unix_secs)
     .bind(is_standalone)
     .fetch_one(pool)
     .await
@@ -1161,6 +1537,7 @@ mod tests {
         UpdateStandaloneApiKeyBasicRecord, UpdateUserApiKeyBasicRecord,
     };
     use serde_json::json;
+    use sqlx::Row;
 
     #[tokio::test]
     async fn sqlite_repository_reads_auth_api_key_contract_views() {
@@ -1247,6 +1624,31 @@ mod tests {
         seed_auth_user(&pool).await;
 
         let repository = SqliteAuthApiKeyReadRepository::new(pool);
+        let missing_owner_key = repository
+            .create_user_api_key(CreateUserApiKeyRecord {
+                user_id: "missing-user".to_string(),
+                api_key_id: "key-missing-owner".to_string(),
+                key_hash: "hash-missing-owner".to_string(),
+                key_encrypted: Some("enc-missing-owner".to_string()),
+                name: Some("Missing Owner".to_string()),
+                allowed_providers: None,
+                allowed_api_formats: None,
+                allowed_models: None,
+                ip_rules: None,
+                rate_limit: 100,
+                concurrent_limit: None,
+                force_capabilities: None,
+                feature_settings: None,
+                is_active: true,
+                expires_at_unix_secs: None,
+                auto_delete_on_expiry: false,
+                total_requests: 0,
+                total_tokens: 0,
+                total_cost_usd: 0.0,
+            })
+            .await
+            .expect("missing-owner creation should resolve");
+        assert!(missing_owner_key.is_none());
         let user_key = repository
             .create_user_api_key(CreateUserApiKeyRecord {
                 user_id: "user-1".to_string(),
@@ -1278,9 +1680,18 @@ mod tests {
             Some(json!({"chat_pii_redaction": {"enabled": true}}))
         );
         assert_eq!(user_key.total_tokens, 42);
+        assert_eq!(
+            user_key.feature_settings,
+            Some(json!({"chat_pii_redaction": {"enabled": true}}))
+        );
 
         let wrong_owner_update = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                key_encrypted: None,
+                key_encrypted_present: false,
+                name_present: true,
+                rate_limit_present: false,
+                concurrent_limit_present: false,
                 user_id: "user-other".to_string(),
                 api_key_id: "key-created-user".to_string(),
                 name: Some("must-not-apply".to_string()),
@@ -1331,31 +1742,43 @@ mod tests {
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created-user".to_string(),
+                key_encrypted: Some("enc-user-rotated".to_string()),
+                key_encrypted_present: true,
                 name: Some("Updated User".to_string()),
+                name_present: true,
                 rate_limit: Some(150),
+                rate_limit_present: true,
                 concurrent_limit: Some(6),
+                concurrent_limit_present: true,
                 ip_rules: Some(Some(vec!["10.0.0.0/24".to_string()])),
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
-                feature_settings: None,
+                feature_settings: Some(Some(json!({"compact": true}))),
             })
             .await
             .expect("user key should update")
             .expect("user key should reload");
         assert_eq!(updated_user_key.name, Some("Updated User".to_string()));
+        assert_eq!(
+            updated_user_key.key_encrypted.as_deref(),
+            Some("enc-user-rotated")
+        );
         assert_eq!(updated_user_key.concurrent_limit, Some(6));
         assert_eq!(
-            updated_user_key.allowed_providers,
-            Some(vec!["openai".to_string()])
-        );
-        assert_eq!(
             updated_user_key.feature_settings,
-            Some(json!({"chat_pii_redaction": {"enabled": true}}))
+            Some(json!({"compact": true}))
         );
 
+        // Rollback can explicitly restore nullable values, while a present zero remains a
+        // meaningful rate limit rather than being treated as an omitted field.
         let cleared_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                key_encrypted: None,
+                key_encrypted_present: false,
+                name_present: false,
+                rate_limit_present: false,
+                concurrent_limit_present: false,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created-user".to_string(),
                 name: None,
@@ -1375,6 +1798,11 @@ mod tests {
 
         let denied_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                key_encrypted: None,
+                key_encrypted_present: false,
+                name_present: false,
+                rate_limit_present: false,
+                concurrent_limit_present: false,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created-user".to_string(),
                 name: None,
@@ -1399,6 +1827,11 @@ mod tests {
 
         let restricted_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                key_encrypted: None,
+                key_encrypted_present: false,
+                name_present: false,
+                rate_limit_present: false,
+                concurrent_limit_present: false,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created-user".to_string(),
                 name: None,
@@ -1429,6 +1862,54 @@ mod tests {
             restricted_user_key.feature_settings,
             Some(json!({"chat_pii_redaction": {"enabled": false}}))
         );
+        let cleared_user_key = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                allowed_providers: None,
+                allowed_api_formats: None,
+                allowed_models: None,
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created-user".to_string(),
+                key_encrypted: None,
+                key_encrypted_present: true,
+                name: None,
+                name_present: true,
+                rate_limit: None,
+                rate_limit_present: true,
+                concurrent_limit: None,
+                concurrent_limit_present: true,
+                ip_rules: None,
+                feature_settings: None,
+            })
+            .await
+            .expect("nullable values should clear")
+            .expect("user key should remain");
+        assert!(cleared_user_key.key_encrypted.is_none());
+        assert!(cleared_user_key.name.is_none());
+        assert!(cleared_user_key.rate_limit.is_none());
+        assert!(cleared_user_key.concurrent_limit.is_none());
+
+        let zero_rate_limit = repository
+            .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                allowed_providers: None,
+                allowed_api_formats: None,
+                allowed_models: None,
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created-user".to_string(),
+                key_encrypted: None,
+                key_encrypted_present: false,
+                name: None,
+                name_present: false,
+                rate_limit: Some(0),
+                rate_limit_present: true,
+                concurrent_limit: None,
+                concurrent_limit_present: false,
+                ip_rules: None,
+                feature_settings: None,
+            })
+            .await
+            .expect("zero rate limit should persist")
+            .expect("user key should remain");
+        assert_eq!(zero_rate_limit.rate_limit, Some(0));
 
         assert!(repository
             .set_user_api_key_locked("user-1", "key-created-user", true)
@@ -1441,12 +1922,93 @@ mod tests {
             .expect("snapshot should exist");
         assert!(snapshot.api_key_is_locked);
 
+        assert!(repository
+            .update_user_api_key_basic_if_unlocked(UpdateUserApiKeyBasicRecord {
+                allowed_providers: None,
+                allowed_api_formats: None,
+                allowed_models: None,
+                user_id: "user-1".to_string(),
+                api_key_id: "key-created-user".to_string(),
+                key_encrypted: None,
+                key_encrypted_present: false,
+                name: Some("must-not-change".to_string()),
+                name_present: true,
+                rate_limit: None,
+                rate_limit_present: false,
+                concurrent_limit: None,
+                concurrent_limit_present: false,
+                ip_rules: None,
+                feature_settings: Some(Some(json!({"must_not_change": true}))),
+            })
+            .await
+            .expect("locked basic update should resolve")
+            .is_none());
+        assert!(repository
+            .set_user_api_key_active_if_unlocked("user-1", "key-created-user", false)
+            .await
+            .expect("locked status update should resolve")
+            .is_none());
+        assert!(repository
+            .set_user_api_key_allowed_providers_if_unlocked(
+                "user-1",
+                "key-created-user",
+                Some(vec!["must-not-change".to_string()]),
+            )
+            .await
+            .expect("locked provider update should resolve")
+            .is_none());
+        assert!(repository
+            .set_user_api_key_force_capabilities_if_unlocked(
+                "user-1",
+                "key-created-user",
+                Some(json!({"must_not_change": true})),
+            )
+            .await
+            .expect("locked capability update should resolve")
+            .is_none());
+        assert!(repository
+            .set_user_api_key_feature_settings_if_unlocked(
+                "user-1",
+                "key-created-user",
+                Some(json!({"must_not_change": true})),
+            )
+            .await
+            .expect("locked feature update should resolve")
+            .is_none());
+        assert!(!repository
+            .delete_user_api_key_if_unlocked("user-1", "key-created-user")
+            .await
+            .expect("locked delete should resolve"));
+
+        let unchanged = repository
+            .reload_export_by_id("key-created-user")
+            .await
+            .expect("locked key should reload")
+            .expect("locked key should still exist");
+        assert_ne!(unchanged.name.as_deref(), Some("must-not-change"));
+        assert!(unchanged.is_active);
+        assert_ne!(
+            unchanged.allowed_providers,
+            Some(vec!["must-not-change".to_string()])
+        );
+        assert_ne!(
+            unchanged.force_capabilities,
+            Some(json!({"must_not_change": true}))
+        );
+        assert_eq!(unchanged.feature_settings, Some(json!({"compact": true})));
+
         let active_user_key = repository
             .set_user_api_key_active("user-1", "key-created-user", false)
             .await
             .expect("active flag should update")
             .expect("user key should reload");
         assert!(!active_user_key.is_active);
+
+        assert!(repository
+            .set_user_api_key_active("wrong-owner", "key-created-user", true)
+            .await
+            .expect("wrong-owner status update should resolve")
+            .is_none());
 
         let provider_updated = repository
             .set_user_api_key_allowed_providers(
@@ -1517,7 +2079,11 @@ mod tests {
         let standalone = repository
             .update_standalone_api_key_basic(UpdateStandaloneApiKeyBasicRecord {
                 api_key_id: "key-created-standalone".to_string(),
+                key_encrypted: Some("enc-standalone-rotated".to_string()),
+                key_encrypted_present: true,
                 name: Some("Updated Standalone".to_string()),
+                name_present: true,
+                force_capabilities: None,
                 rate_limit_present: true,
                 rate_limit: Some(20),
                 concurrent_limit_present: true,
@@ -1535,6 +2101,10 @@ mod tests {
             .expect("standalone key should update")
             .expect("standalone key should reload");
         assert_eq!(standalone.name, Some("Updated Standalone".to_string()));
+        assert_eq!(
+            standalone.key_encrypted.as_deref(),
+            Some("enc-standalone-rotated")
+        );
         assert_eq!(standalone.allowed_providers, None);
         assert_eq!(
             standalone.allowed_api_formats,
@@ -1558,6 +2128,250 @@ mod tests {
             .delete_user_api_key("user-1", "key-created-user")
             .await
             .expect("user key should delete"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_api_key_delete_is_owner_scoped_and_preserves_anonymized_facts() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        sqlx::raw_sql(
+            r#"
+INSERT INTO users (
+  id, username, role, auth_source, is_active, is_deleted, created_at, updated_at
+) VALUES
+  ('key-owner', 'key-owner', 'user', 'local', 1, 0, 1, 1),
+  ('other-owner', 'other-owner', 'user', 'local', 1, 0, 1, 1);
+
+INSERT INTO api_keys (
+  id, user_id, key_hash, name, is_standalone, created_at, updated_at
+) VALUES (
+  'key-to-delete', 'key-owner', 'key-to-delete-hash', 'private key name', 0, 1, 1
+);
+
+INSERT INTO wallets (
+  id, api_key_id, balance, gift_balance, status, created_at, updated_at
+) VALUES (
+  'key-wallet', 'key-to-delete', 12, 3, 'active', 1, 1
+);
+
+INSERT INTO request_candidates (
+  id, request_id, user_id, api_key_id, username, api_key_name,
+  candidate_index, status, created_at
+) VALUES (
+  'key-history-row', 'key-candidate-request', 'key-owner', 'key-to-delete',
+  'key-owner', 'private key name', 0, 'success', 1
+);
+
+INSERT INTO video_tasks (
+  id, request_id, user_id, api_key_id, username, api_key_name, created_at, updated_at
+) VALUES (
+  'key-history-row', 'key-video-request', 'key-owner', 'key-to-delete',
+  'key-owner', 'private key name', 1, 1
+);
+
+INSERT INTO usage (
+  request_id, id, user_id, api_key_id, username, api_key_name
+) VALUES (
+  'key-usage-request', 'key-history-row', 'key-owner', 'key-to-delete',
+  'key-owner', 'private key name'
+);
+
+INSERT INTO stats_daily_api_key (
+  id, api_key_id, date, api_key_name, created_at, updated_at
+) VALUES (
+  'key-history-row', 'key-to-delete', 1, 'private key name', 1, 1
+);
+
+INSERT INTO audit_logs (
+  id, event_type, api_key_id, description, ip_address, user_agent,
+  event_metadata, error_message, created_at
+) VALUES (
+  'key-audit', 'key_event', 'key-to-delete', 'private description',
+  '192.0.2.20', 'private agent', '{"private":true}', 'private error', 1
+);
+
+INSERT INTO api_key_provider_mappings (
+  id, api_key_id, provider_id, created_at, updated_at
+) VALUES (
+  'key-mapping', 'key-to-delete', 'provider-1', 1, 1
+);
+
+INSERT INTO payment_orders (
+  id, order_no, wallet_id, amount_usd, payment_method,
+  gateway_response, status, created_at
+) VALUES (
+  'key-order', 'key-order-no', 'key-wallet', 12, 'test',
+  '{"customer_email":"key@example.com"}', 'credited', 1
+);
+
+INSERT INTO payment_callbacks (
+  id, payment_order_id, payment_method, callback_key, order_no,
+  payload_hash, signature_valid, status, payload, error_message, created_at
+) VALUES (
+  'key-callback', 'key-order', 'test', 'key-callback-key', 'key-order-no',
+  'key-payload-hash', 1, 'processed',
+  '{"customer_email":"key@example.com"}', 'private callback error', 1
+);
+"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("API key deletion fixtures should insert");
+
+        let repository = SqliteAuthApiKeyReadRepository::new(pool.clone());
+        assert!(!repository
+            .delete_user_api_key("other-owner", "key-to-delete")
+            .await
+            .expect("wrong-owner delete should resolve"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM wallets WHERE id = 'key-wallet'",)
+                .fetch_one(&pool)
+                .await
+                .expect("wallet status should load"),
+            "active"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT api_key_name FROM request_candidates WHERE id = 'key-history-row'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("candidate key name should load"),
+            "private key name"
+        );
+
+        assert!(repository
+            .delete_user_api_key("key-owner", "key-to-delete")
+            .await
+            .expect("owner-scoped delete should succeed"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM api_keys WHERE id = 'key-to-delete'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("API key count should load"),
+            0
+        );
+
+        let wallet = sqlx::query("SELECT api_key_id, status FROM wallets WHERE id = 'key-wallet'")
+            .fetch_one(&pool)
+            .await
+            .expect("wallet fact should remain");
+        assert_eq!(
+            wallet
+                .try_get::<Option<String>, _>("api_key_id")
+                .expect("wallet API key id should decode")
+                .as_deref(),
+            Some("key-to-delete")
+        );
+        assert_eq!(
+            wallet
+                .try_get::<String, _>("status")
+                .expect("wallet status should decode"),
+            "disabled"
+        );
+
+        for table in [
+            "request_candidates",
+            "video_tasks",
+            "usage",
+            "stats_daily_api_key",
+        ] {
+            let row = sqlx::query(&format!(
+                "SELECT api_key_id, api_key_name FROM {table} WHERE id = 'key-history-row'",
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{table} fact should remain: {error}"));
+            assert_eq!(
+                row.try_get::<String, _>("api_key_id")
+                    .expect("history API key id should decode"),
+                "key-to-delete",
+                "{table} API key id must remain stable"
+            );
+            assert_eq!(
+                row.try_get::<Option<String>, _>("api_key_name")
+                    .expect("history API key name should decode"),
+                None,
+                "{table} API key name must be removed"
+            );
+        }
+
+        let audit = sqlx::query(
+            "SELECT api_key_id, description, ip_address, user_agent, event_metadata, error_message FROM audit_logs WHERE id = 'key-audit'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("audit fact should remain");
+        assert_eq!(
+            audit
+                .try_get::<Option<String>, _>("api_key_id")
+                .expect("audit API key id should decode")
+                .as_deref(),
+            Some("key-to-delete")
+        );
+        assert_eq!(
+            audit
+                .try_get::<String, _>("description")
+                .expect("audit description should decode"),
+            "deleted API key event"
+        );
+        for column in [
+            "ip_address",
+            "user_agent",
+            "event_metadata",
+            "error_message",
+        ] {
+            assert_eq!(
+                audit
+                    .try_get::<Option<String>, _>(column)
+                    .unwrap_or_else(|error| panic!("audit {column} should decode: {error}")),
+                None,
+                "audit {column} must be removed"
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM api_key_provider_mappings WHERE id = 'key-mapping'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("mapping count should load"),
+            0
+        );
+
+        let order_gateway_response: Option<String> = sqlx::query_scalar(
+            "SELECT gateway_response FROM payment_orders WHERE id = 'key-order'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("payment order should remain");
+        assert_eq!(order_gateway_response, None);
+        let callback = sqlx::query(
+            "SELECT payload, error_message FROM payment_callbacks WHERE id = 'key-callback'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("payment callback should remain");
+        assert_eq!(
+            callback
+                .try_get::<Option<String>, _>("payload")
+                .expect("callback payload should decode"),
+            None
+        );
+        assert_eq!(
+            callback
+                .try_get::<Option<String>, _>("error_message")
+                .expect("callback error should decode"),
+            None
+        );
     }
 
     async fn seed_auth_api_key_rows(pool: &sqlx::SqlitePool) {

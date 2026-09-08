@@ -29,8 +29,8 @@ use crate::ai_serving::planner::standard::{
     apply_deepseek_tool_call_thinking_compat, build_cross_format_openai_chat_request_body,
     build_cross_format_openai_chat_upstream_url, build_local_openai_chat_request_body,
     build_local_openai_chat_upstream_url, codex_model_capabilities_for_transport,
-    openai_provider_request_contract_failure_extra_data, request_body_build_failure_extra_data,
-    request_conversion_failure_extra_data,
+    openai_provider_request_contract_failure_extra_data, openai_responses_reasoning_replay_policy,
+    request_body_build_failure_extra_data, request_conversion_failure_extra_data,
 };
 use crate::ai_serving::transport::antigravity::is_antigravity_provider_transport;
 use crate::ai_serving::transport::auth::resolve_local_openai_bearer_auth;
@@ -140,7 +140,7 @@ fn finalize_openai_chat_provider_request_body(
         mapped_model,
         source_model,
     );
-    crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities(
+    crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
         provider_request_body,
         crate::ai_serving::OpenAiProviderRequestFinalization {
             source_api_format: "openai:chat",
@@ -156,6 +156,11 @@ fn finalize_openai_chat_provider_request_body(
             ),
         },
         codex_model_capabilities.as_ref(),
+        openai_responses_reasoning_replay_policy(
+            transport.provider.provider_type.as_str(),
+            transport.endpoint.base_url.as_str(),
+            mapped_model,
+        ),
     )
     .err()
     .map(|violation| {
@@ -206,6 +211,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         body_json,
         &input.auth_context,
         "openai:chat",
+        crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
         candidate_id,
     )
     .await?;
@@ -2179,7 +2185,7 @@ mod tests {
             client_surface: None,
             gateway_credential_carrier: None,
             client_session_affinity: None,
-            original_client_session_id: None,
+            provider_outbound_context: None,
             routing_policy: None,
             routing_trace_seed: None,
             routing_context: None,
@@ -2349,6 +2355,23 @@ mod tests {
         eligible
     }
 
+    fn sample_custom_deepseek_responses_transport() -> GatewayProviderTransportSnapshot {
+        let mut transport = sample_gemini_cli_transport();
+        transport.provider.name = "deepseek".to_string();
+        transport.provider.provider_type = "custom".to_string();
+        transport.endpoint.api_format = "openai:responses".to_string();
+        transport.endpoint.api_family = Some("openai".to_string());
+        transport.endpoint.endpoint_kind = Some("responses".to_string());
+        transport.endpoint.base_url = "https://api.deepseek.com/v1".to_string();
+        transport.endpoint.custom_path = None;
+        transport.key.api_formats = Some(vec!["openai:responses".to_string()]);
+        transport.key.auth_type = "bearer".to_string();
+        transport.key.decrypted_api_key = "test-api-key".to_string();
+        transport.key.decrypted_auth_config = None;
+        transport.key.upstream_metadata = None;
+        transport
+    }
+
     fn sample_custom_directive_input() -> LocalOpenAiChatDecisionInput {
         let mut input = sample_input();
         input.requested_model = "gpt-5.6-sol-high".to_string();
@@ -2372,6 +2395,58 @@ mod tests {
                 })),
             );
         input
+    }
+
+    #[test]
+    fn responses_shaped_chat_request_preserves_deepseek_opaque_reasoning_at_finalization() {
+        let reasoning_items = (0..66)
+            .map(|index| {
+                json!({
+                    "type": "reasoning",
+                    "encrypted_content": format!("opaque-deepseek-state-{index}"),
+                    "content": [{
+                        "type": "reasoning_text",
+                        "text": format!("provider thinking state {index}")
+                    }],
+                    "future_capability": {"preserve": true}
+                })
+            })
+            .collect::<Vec<_>>();
+        let original_body = json!({
+            "model": "deepseek-v4-flash",
+            "input": reasoning_items
+        });
+        let transport = sample_custom_deepseek_responses_transport();
+        let mut provider_body = build_cross_format_openai_chat_request_body(
+            &original_body,
+            "deepseek-v4-flash",
+            "custom",
+            "openai:responses",
+            false,
+            false,
+            None,
+            None,
+            &http::HeaderMap::new(),
+            false,
+        )
+        .expect("Responses-shaped chat request should build");
+
+        assert!(finalize_openai_chat_provider_request_body(
+            &mut provider_body,
+            None,
+            "openai:responses",
+            false,
+            false,
+            &original_body,
+            &transport,
+            "deepseek-v4-flash",
+        )
+        .is_none());
+        let input = provider_body["input"].as_array().expect("provider input");
+        assert_eq!(input.len(), 66);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(input[0]["future_capability"]["preserve"], true);
     }
 
     fn sample_alias_max_directive_input() -> LocalOpenAiChatDecisionInput {
@@ -2668,7 +2743,7 @@ mod tests {
                 .provider_request_headers
                 .get("x-client-version")
                 .map(String::as_str),
-            Some("1.2.3")
+            Some("4.3.0")
         );
         assert_eq!(
             payload
@@ -2688,7 +2763,7 @@ mod tests {
         assert_eq!(payload.provider_request_body["model"], "gemini-2.5-pro");
         assert_eq!(
             payload.provider_request_body["userAgent"],
-            "antigravity/cli/1.0.16 (aidev_client; os_type=linux; arch=arm64; auth_method=consumer)"
+            "vscode/1.X.X (Antigravity/4.3.0)"
         );
         assert_eq!(payload.provider_request_body["requestType"], "agent");
         assert!(payload.provider_request_body.get("contents").is_none());

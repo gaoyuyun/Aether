@@ -134,6 +134,7 @@ const STANDARD_UPSTREAM_WEBSOCKET_ERRORS: UpstreamWebSocketErrorCodes =
     UpstreamWebSocketErrorCodes {
         upstream_url_missing: "responses_upstream_url_missing",
         upstream_url_invalid: "responses_upstream_url_invalid",
+        frontdoor_self_loop: "responses_websocket_frontdoor_self_loop",
         headers_invalid: "responses_websocket_headers_invalid",
         client_build_failed: "responses_websocket_client_build_failed",
         proxy_invalid: "responses_websocket_proxy_invalid",
@@ -214,6 +215,10 @@ mod tests {
         assert_eq!(
             adapter.upstream_errors().handshake_failed,
             "responses_websocket_handshake_failed"
+        );
+        assert_eq!(
+            adapter.upstream_errors().frontdoor_self_loop,
+            "responses_websocket_frontdoor_self_loop"
         );
     }
 

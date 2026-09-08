@@ -670,6 +670,12 @@ AND LOWER(TRIM(COALESCE(`usage`.provider_name, ''))) NOT IN ('unknown', 'unknow'
         push_where(builder, has_where);
         builder.push("`usage`.is_stream = ").push_bind(is_stream);
     }
+    if let Some(is_websocket) = query.is_websocket {
+        push_where(builder, has_where);
+        builder
+            .push("COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.websocket_mode')), 'false') = ")
+            .push_bind(if is_websocket { "true" } else { "false" });
+    }
     if query.error_only {
         push_where(builder, has_where);
         builder.push(
@@ -700,6 +706,7 @@ fn push_keyword_filters(
             statuses: query.statuses.clone(),
             exclude_status_codes: query.exclude_status_codes.clone(),
             is_stream: query.is_stream,
+            is_websocket: query.is_websocket,
             error_only: query.error_only,
             limit: None,
             offset: None,
@@ -894,5 +901,39 @@ mod tests {
         assert!(query
             .sql()
             .contains("LOWER(COALESCE(`usage`.api_key_name, '')) LIKE ?"));
+    }
+
+    #[test]
+    fn websocket_filter_is_applied_to_list_and_keyword_queries() {
+        let mut list_query = QueryBuilder::<MySql>::new(USAGE_COLUMNS);
+        let mut has_where = false;
+        push_list_filters(
+            &mut list_query,
+            &UsageAuditListQuery {
+                is_websocket: Some(true),
+                ..UsageAuditListQuery::default()
+            },
+            &mut has_where,
+        )
+        .expect("WebSocket list query should build");
+        assert!(list_query
+            .sql()
+            .contains("JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.websocket_mode'))"));
+
+        let mut keyword_query = QueryBuilder::<MySql>::new(USAGE_COLUMNS);
+        let mut has_where = false;
+        push_keyword_filters(
+            &mut keyword_query,
+            &UsageAuditKeywordSearchQuery {
+                is_websocket: Some(true),
+                keywords: vec!["live".to_string()],
+                ..UsageAuditKeywordSearchQuery::default()
+            },
+            &mut has_where,
+        )
+        .expect("WebSocket keyword query should build");
+        assert!(keyword_query
+            .sql()
+            .contains("JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.websocket_mode'))"));
     }
 }

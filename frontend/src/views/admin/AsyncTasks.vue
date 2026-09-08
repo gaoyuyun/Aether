@@ -933,11 +933,10 @@ const filterStatus = ref('all')
 const filterModel = ref('')
 const showDetail = ref(false)
 const selectedTask = ref<AsyncTaskDetail | null>(null)
-const videoObjectUrls = ref<Record<string, string>>({})
-const videoLoadsInFlight = new Set<string>()
-const videoLoadFailures = new Set<string>()
 const detailAutoRefresh = ref(false)
 let detailRefreshInterval: ReturnType<typeof setInterval> | null = null
+const authenticatedVideoUrls = ref<Record<string, string>>({})
+let authenticatedVideoLoadGeneration = 0
 const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hidden)
 let overviewRefreshInFlight = false
 
@@ -1032,10 +1031,10 @@ async function refreshOverview() {
 // 打开任务详情
 async function openTaskDetail(task: AsyncTaskItem) {
   try {
-    releaseVideoObjectUrls()
-    selectedTask.value = await asyncTasksApi.getDetail(task.id)
+    const detail = await asyncTasksApi.getDetail(task.id)
+    selectedTask.value = detail
     showDetail.value = true
-    void prepareTaskVideo(selectedTask.value)
+    await loadAuthenticatedVideo(detail)
   } catch (error: unknown) {
     toast({
       title: '获取任务详情失败',
@@ -1049,8 +1048,9 @@ async function openTaskDetail(task: AsyncTaskItem) {
 async function refreshTaskDetail() {
   if (!selectedTask.value) return
   try {
-    selectedTask.value = await asyncTasksApi.getDetail(selectedTask.value.id)
-    void prepareTaskVideo(selectedTask.value)
+    const detail = await asyncTasksApi.getDetail(selectedTask.value.id)
+    selectedTask.value = detail
+    await loadAuthenticatedVideo(detail)
   } catch (error: unknown) {
     toast({
       title: '刷新失败',
@@ -1099,8 +1099,8 @@ function stopDetailAutoRefresh() {
 // 关闭详情抽屉
 function closeDetail() {
   stopDetailAutoRefresh()
+  clearAuthenticatedVideoUrls()
   showDetail.value = false
-  releaseVideoObjectUrls()
   selectedTask.value = null
 }
 
@@ -1236,43 +1236,54 @@ function formatFileSize(bytes: number | null): string {
   return `${size.toFixed(unitIndex > 0 ? 2 : 0)} ${units[unitIndex]}`
 }
 
-function videoNeedsAuthenticatedProxy(originalUrl: string): boolean {
-  return originalUrl.includes('generativelanguage.googleapis.com')
+function authenticatedVideoKey(taskId: string, originalUrl: string): string {
+  return `${taskId}\n${originalUrl}`
 }
 
-async function prepareTaskVideo(task: AsyncTaskDetail): Promise<void> {
-  const urls = [task.video_url, ...(task.video_urls || [])]
-    .filter((url): url is string => Boolean(url))
-  if (!urls.some(videoNeedsAuthenticatedProxy)) return
-  if (videoObjectUrls.value[task.id] || videoLoadsInFlight.has(task.id) || videoLoadFailures.has(task.id)) return
-
-  videoLoadsInFlight.add(task.id)
+function requiresAuthenticatedVideoProxy(originalUrl: string): boolean {
   try {
-    const blob = await asyncTasksApi.getVideo(task.id)
-    const objectUrl = URL.createObjectURL(blob)
-    videoObjectUrls.value = { ...videoObjectUrls.value, [task.id]: objectUrl }
-  } catch (error) {
-    videoLoadFailures.add(task.id)
-    log.warn('Failed to load authenticated task video', error)
-  } finally {
-    videoLoadsInFlight.delete(task.id)
+    return new URL(originalUrl).hostname === 'generativelanguage.googleapis.com'
+  } catch {
+    return false
   }
 }
 
-function releaseVideoObjectUrls() {
-  for (const objectUrl of Object.values(videoObjectUrls.value)) {
+function clearAuthenticatedVideoUrls() {
+  authenticatedVideoLoadGeneration += 1
+  for (const objectUrl of Object.values(authenticatedVideoUrls.value)) {
     URL.revokeObjectURL(objectUrl)
   }
-  videoObjectUrls.value = {}
-  videoLoadsInFlight.clear()
-  videoLoadFailures.clear()
+  authenticatedVideoUrls.value = {}
 }
 
-// 需要上游凭据的视频只使用已认证请求产生的本地 Object URL。
+async function loadAuthenticatedVideo(task: AsyncTaskDetail) {
+  const candidates = [task.video_url, ...(task.video_urls || [])]
+    .filter((value): value is string => Boolean(value && requiresAuthenticatedVideoProxy(value)))
+  if (candidates.length === 0) return
+
+  const generation = ++authenticatedVideoLoadGeneration
+  try {
+    const blob = await asyncTasksApi.getVideoBlob(task.id)
+    if (generation !== authenticatedVideoLoadGeneration || selectedTask.value?.id !== task.id) {
+      return
+    }
+    const objectUrl = URL.createObjectURL(blob)
+    const next = { ...authenticatedVideoUrls.value }
+    for (const originalUrl of candidates) {
+      next[authenticatedVideoKey(task.id, originalUrl)] = objectUrl
+    }
+    authenticatedVideoUrls.value = next
+  } catch (error) {
+    log.error('Failed to load authenticated video preview', error)
+  }
+}
+
+// 获取视频 URL（需要认证的 Google URL 使用 Bearer 请求后的临时 Blob URL）
 function getVideoUrl(taskId: string, originalUrl: string): string {
-  return videoNeedsAuthenticatedProxy(originalUrl)
-    ? videoObjectUrls.value[taskId] || ''
-    : originalUrl
+  if (requiresAuthenticatedVideoProxy(originalUrl)) {
+    return authenticatedVideoUrls.value[authenticatedVideoKey(taskId, originalUrl)] || ''
+  }
+  return originalUrl
 }
 
 // 计算时间差
@@ -1385,7 +1396,7 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   stopAutoRefresh()
   stopDetailAutoRefresh()
-  releaseVideoObjectUrls()
+  clearAuthenticatedVideoUrls()
   clearTimeout(filterTimeout)
 })
 </script>

@@ -2,27 +2,127 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::path::PathBuf;
+use std::fs;
+#[cfg(unix)]
+use std::io::Write;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::{body::Body, extract::Request};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use hyper::body::Incoming;
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as HyperServerBuilder,
     service::TowerToHyperService,
 };
 use tower::{Service as _, ServiceExt as _};
 use tracing::{debug, info, warn};
 
+/// Coordinates the connection-level deadline that covers protocol detection and
+/// the first request header block. Hyper's HTTP/1 timer starts only after the
+/// auto protocol detector has finished, while HTTP/2 has no equivalent header
+/// timer. Keeping this gate outside the parser closes that initial gap without
+/// imposing a deadline on request or response bodies.
+#[derive(Clone)]
+struct GatewayFirstRequestGate {
+    seen: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl GatewayFirstRequestGate {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn mark_seen(&self) {
+        if !self.seen.swap(true, Ordering::Release) {
+            self.notify.notify_one();
+        }
+    }
+
+    fn is_seen(&self) -> bool {
+        self.seen.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone)]
+struct GatewayFirstRequestService<S> {
+    inner: S,
+    gate: GatewayFirstRequestGate,
+}
+
+impl<S, Request> tower::Service<Request> for GatewayFirstRequestService<S>
+where
+    S: tower::Service<Request>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        self.gate.mark_seen();
+        self.inner.call(request)
+    }
+}
+
+/// Drive one Hyper connection while enforcing the deadline for its first
+/// request. This is kept generic so the timeout behavior can be regression
+/// tested independently from the listener and application state.
+async fn drive_gateway_connection<F, E>(
+    connection: F,
+    first_request_gate: GatewayFirstRequestGate,
+    first_request_timeout: std::time::Duration,
+) -> Result<(), E>
+where
+    F: std::future::Future<Output = Result<(), E>>,
+{
+    if first_request_gate.is_seen() {
+        return connection.await;
+    }
+
+    let mut connection = Box::pin(connection);
+    let first_request_timeout = tokio::time::sleep(first_request_timeout);
+    tokio::pin!(first_request_timeout);
+    let first_request_notified = first_request_gate.notify.notified();
+    tokio::pin!(first_request_notified);
+
+    tokio::select! {
+        result = &mut connection => result,
+        _ = &mut first_request_timeout => {
+            if first_request_gate.is_seen() {
+                (&mut connection).await
+            } else {
+                tracing::debug!(
+                    "gateway connection closed before the first request header completed"
+                );
+                Ok(())
+            }
+        }
+        _ = &mut first_request_notified => (&mut connection).await,
+    }
+}
+
 use aether_crypto::warm_python_fernet_secret;
 use aether_data::lifecycle::export::{
     copy_database_records, export_database_jsonl, import_database_jsonl, DataCopyOptions,
-    ExportDomain,
+    ExportDomain, MAX_JSONL_INPUT_BYTES,
 };
 use aether_data::{
-    DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_CACHE_MB, DEFAULT_SQLITE_DATABASE_URL,
+    DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_CACHE_MB,
+    DEFAULT_SQLITE_DATABASE_URL,
 };
 use aether_gateway::{
     attach_static_frontend, build_router_with_state,
@@ -38,6 +138,28 @@ use aether_runtime_state::{
     RedisClientConfig, RuntimeSemaphoreConfig, RuntimeState, RuntimeStateBackendMode,
     RuntimeStateConfig,
 };
+
+const MIN_GATEWAY_DATA_ENCRYPTION_KEY_BYTES: usize = 32;
+const INSECURE_GATEWAY_DATA_ENCRYPTION_KEYS: &[&str] = &[
+    "change-this-to-another-secure-random-string",
+    "change-this-to-a-secure-random-string",
+    "dev-encryption-key-do-not-use-in-production",
+];
+
+fn validate_gateway_data_encryption_key(value: Option<&str>) -> Result<(), &'static str> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if value.len() < MIN_GATEWAY_DATA_ENCRYPTION_KEY_BYTES {
+        return Err("gateway data encryption key must contain at least 32 bytes");
+    }
+    if INSECURE_GATEWAY_DATA_ENCRYPTION_KEYS.contains(&value) {
+        return Err(
+            "gateway data encryption key must not use a published example or development value",
+        );
+    }
+    Ok(())
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum VideoTaskTruthSourceArg {
@@ -76,6 +198,29 @@ enum DatabaseDriverArg {
     Sqlite,
     Mysql,
     Postgres,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DatabaseModeArg {
+    Auto,
+    VerifyOnly,
+}
+
+fn resolve_database_mode(
+    configured: Option<DatabaseModeArg>,
+    legacy_auto_prepare: Option<bool>,
+) -> DatabaseModeArg {
+    if let Some(configured) = configured {
+        return configured;
+    }
+    if let Some(legacy_auto_prepare) = legacy_auto_prepare {
+        return if legacy_auto_prepare {
+            DatabaseModeArg::Auto
+        } else {
+            DatabaseModeArg::VerifyOnly
+        };
+    }
+    DatabaseModeArg::Auto
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -281,6 +426,18 @@ const MAX_GATEWAY_LISTENER_SHARDS: usize = 64;
 const DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 16_384;
 const MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 200;
 const MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1_000_000;
+// These limits protect the connection parser from slow-header and header-bomb
+// attacks. They apply to request metadata only and do not cap body size or
+// HTTP/2 stream concurrency.
+const DEFAULT_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS: u64 = 30_000;
+const MIN_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS: u64 = 1_000;
+const MAX_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_GATEWAY_HTTP_HEADER_MAX_BYTES: usize = 64 * 1024;
+const MIN_GATEWAY_HTTP_HEADER_MAX_BYTES: usize = 8 * 1024;
+const MAX_GATEWAY_HTTP_HEADER_MAX_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_GATEWAY_HTTP_MAX_HEADERS: usize = 256;
+const MIN_GATEWAY_HTTP_MAX_HEADERS: usize = 16;
+const MAX_GATEWAY_HTTP_MAX_HEADERS: usize = 4_096;
 const AUTO_GATEWAY_REQUESTS_PER_CPU: usize = 1_024;
 const MIN_AUTO_GATEWAY_REQUEST_CONCURRENCY: usize = 512;
 const MAX_AUTO_GATEWAY_REQUEST_CONCURRENCY: usize = 65_536;
@@ -541,51 +698,81 @@ fn automatic_sql_pool_config_for_parallelism(
 
 #[derive(ClapArgs, Debug, Clone)]
 struct GatewayDataArgs {
-    #[arg(long, env = "AETHER_DATABASE_DRIVER")]
+    #[arg(long, env = "AETHER_DATABASE_DRIVER", global = true)]
     database_driver: Option<DatabaseDriverArg>,
 
-    #[arg(long, env = "AETHER_DATABASE_URL")]
+    #[arg(long, env = "AETHER_DATABASE_URL", global = true)]
     database_url: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_URL")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_URL", global = true)]
     postgres_url: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_ENCRYPTION_KEY")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_ENCRYPTION_KEY", global = true)]
     encryption_key: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_URL")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_URL", global = true)]
     redis_url: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_KEY_PREFIX")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_KEY_PREFIX", global = true)]
     redis_key_prefix: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_MIN_CONNECTIONS")]
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_DATA_POSTGRES_MIN_CONNECTIONS",
+        global = true
+    )]
     postgres_min_connections: Option<u32>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_MAX_CONNECTIONS")]
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_DATA_POSTGRES_MAX_CONNECTIONS",
+        global = true
+    )]
     postgres_max_connections: Option<u32>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_ACQUIRE_TIMEOUT_MS")]
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_DATA_POSTGRES_ACQUIRE_TIMEOUT_MS",
+        global = true
+    )]
     postgres_acquire_timeout_ms: Option<u64>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_IDLE_TIMEOUT_MS")]
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_DATA_POSTGRES_IDLE_TIMEOUT_MS",
+        global = true
+    )]
     postgres_idle_timeout_ms: Option<u64>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_MAX_LIFETIME_MS")]
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_DATA_POSTGRES_MAX_LIFETIME_MS",
+        global = true
+    )]
     postgres_max_lifetime_ms: Option<u64>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_STATEMENT_CACHE_CAPACITY")]
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_DATA_POSTGRES_STATEMENT_CACHE_CAPACITY",
+        global = true
+    )]
     postgres_statement_cache_capacity: Option<usize>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_REQUIRE_SSL",
-        default_value_t = false
+        default_value_t = false,
+        global = true
     )]
     postgres_require_ssl: bool,
 }
 
 impl GatewayDataArgs {
+    fn validate_encryption_key(&self) -> Result<(), std::io::Error> {
+        validate_gateway_data_encryption_key(self.effective_encryption_key().as_deref())
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))
+    }
+
     fn effective_database_driver(&self) -> Option<DatabaseDriver> {
         self.database_driver.map(Into::into).or_else(|| {
             self.database_url
@@ -1104,7 +1291,9 @@ struct GatewayRateLimitArgs {
     #[arg(long, env = "RPM_KEY_TTL_SECONDS", default_value_t = 120)]
     key_ttl_seconds: u64,
 
-    #[arg(long, env = "RATE_LIMIT_FAIL_OPEN", default_value_t = true)]
+    /// Explicitly allow requests when the shared RPM backend is unavailable.
+    /// Keep the secure fail-closed behavior as the production default.
+    #[arg(long, env = "RATE_LIMIT_FAIL_OPEN", default_value_t = false)]
     fail_open: bool,
 }
 
@@ -1148,15 +1337,32 @@ enum DataCommand {
     Import(DataImportArgs),
     /// Copy persistent SQL data directly between two databases without a JSONL file.
     Copy(DataCopyArgs),
+    /// Inspect or prepare the configured database.
+    Db(DatabaseCommandArgs),
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct DatabaseCommandArgs {
+    #[command(subcommand)]
+    command: DatabaseCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum DatabaseCommand {
+    /// Show whether schema migrations and data backfills are current.
+    Status,
+    /// Apply pending schema migrations and data backfills.
+    Prepare,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
 struct DataExportArgs {
-    #[command(flatten)]
-    data: GatewayDataArgs,
-
     #[arg(long)]
     output: PathBuf,
+
+    /// Atomically replace an existing regular output owned by the current user.
+    #[arg(long)]
+    overwrite: bool,
 
     #[arg(long, value_enum, value_delimiter = ',')]
     domains: Vec<ExportDomainArg>,
@@ -1164,9 +1370,6 @@ struct DataExportArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 struct DataImportArgs {
-    #[command(flatten)]
-    data: GatewayDataArgs,
-
     #[arg(long)]
     input: PathBuf,
 }
@@ -1179,11 +1382,21 @@ struct DataCopyArgs {
     #[arg(long)]
     source_url: String,
 
+    /// Permit a cleartext source connection for a non-loopback database.
+    /// Leave unset to require TLS for remote MySQL/Postgres URLs.
+    #[arg(long)]
+    source_allow_insecure: bool,
+
     #[arg(long, value_enum)]
     target_driver: DatabaseDriverArg,
 
     #[arg(long)]
     target_url: String,
+
+    /// Permit a cleartext target connection for a non-loopback database.
+    /// Leave unset to require TLS for remote MySQL/Postgres URLs.
+    #[arg(long)]
+    target_allow_insecure: bool,
 
     #[arg(long, value_enum, value_delimiter = ',')]
     domains: Vec<ExportDomainArg>,
@@ -1260,6 +1473,30 @@ struct Args {
     )]
     http2_max_concurrent_streams: u32,
 
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS",
+        default_value_t = DEFAULT_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS
+    )]
+    /// Maximum time allowed to receive one complete HTTP request header block.
+    http_header_read_timeout_ms: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_HTTP_HEADER_MAX_BYTES",
+        default_value_t = DEFAULT_GATEWAY_HTTP_HEADER_MAX_BYTES
+    )]
+    /// Maximum HTTP request header bytes (HTTP/2 uses decompressed list size).
+    http_header_max_bytes: usize,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_HTTP_MAX_HEADERS",
+        default_value_t = DEFAULT_GATEWAY_HTTP_MAX_HEADERS
+    )]
+    /// Maximum number of HTTP/1 request header fields.
+    http_max_headers: usize,
+
     /// 容器内健康检查入口：根据当前 bind 端口探测本地 /health。
     #[arg(long, hide = true, default_value_t = false)]
     healthcheck: bool,
@@ -1288,18 +1525,25 @@ struct Args {
     )]
     node_role: NodeRoleArg,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, hide = true, default_value_t = false)]
     migrate: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, hide = true, default_value_t = false)]
     apply_backfills: bool,
 
+    /// Database startup policy. Defaults to auto when neither this nor the legacy setting is set.
+    #[arg(long, env = "AETHER_GATEWAY_DATABASE_MODE", value_enum)]
+    database_mode: Option<DatabaseModeArg>,
+
+    /// Legacy compatibility switch. Prefer --database-mode.
     #[arg(
         long,
         env = "AETHER_GATEWAY_AUTO_PREPARE_DATABASE",
-        default_value_t = false
+        hide = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
     )]
-    auto_prepare_database: bool,
+    auto_prepare_database: Option<bool>,
 
     /// Path to frontend static files directory (SPA). When set, the gateway
     /// serves the frontend directly without nginx.
@@ -1409,6 +1653,10 @@ struct Args {
 }
 
 impl Args {
+    fn effective_database_mode(&self) -> DatabaseModeArg {
+        resolve_database_mode(self.database_mode, self.auto_prepare_database)
+    }
+
     fn effective_runtime_backend(
         &self,
         database: Option<&SqlDatabaseConfig>,
@@ -1479,15 +1727,7 @@ impl Args {
     }
 
     fn runtime_config(&self) -> Result<ServiceRuntimeConfig, std::io::Error> {
-        let default_log_filter = if self.command.is_some()
-            || self.migrate
-            || self.apply_backfills
-            || self.auto_prepare_database
-        {
-            "aether_gateway=info,aether_data=info"
-        } else {
-            "aether_gateway=info"
-        };
+        let default_log_filter = "aether_gateway=info,aether_data=info";
         let config = self
             .logging
             .apply_to_runtime_config(ServiceRuntimeConfig::new(
@@ -1557,6 +1797,24 @@ fn gateway_http2_max_concurrent_streams(streams: u32) -> u32 {
     )
 }
 
+fn gateway_http_header_read_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.clamp(
+        MIN_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS,
+        MAX_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS,
+    )
+}
+
+fn gateway_http_header_max_bytes(bytes: usize) -> usize {
+    bytes.clamp(
+        MIN_GATEWAY_HTTP_HEADER_MAX_BYTES,
+        MAX_GATEWAY_HTTP_HEADER_MAX_BYTES,
+    )
+}
+
+fn gateway_http_max_headers(headers: usize) -> usize {
+    headers.clamp(MIN_GATEWAY_HTTP_MAX_HEADERS, MAX_GATEWAY_HTTP_MAX_HEADERS)
+}
+
 fn gateway_listener(
     bind_addr: std::net::SocketAddr,
     backlog: i32,
@@ -1608,14 +1866,29 @@ async fn serve_gateway_router(
     listeners: Vec<tokio::net::TcpListener>,
     router: axum::Router,
     http2_max_concurrent_streams: u32,
+    http_header_read_timeout_ms: u64,
+    http_header_max_bytes: usize,
+    http_max_headers: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let http2_max_concurrent_streams =
         gateway_http2_max_concurrent_streams(http2_max_concurrent_streams);
+    let http_header_read_timeout_ms =
+        gateway_http_header_read_timeout_ms(http_header_read_timeout_ms);
+    let http_header_max_bytes = gateway_http_header_max_bytes(http_header_max_bytes);
+    let http_max_headers = gateway_http_max_headers(http_max_headers);
     let mut servers = tokio::task::JoinSet::new();
     for listener in listeners {
         let router = router.clone();
         servers.spawn(async move {
-            serve_gateway_listener(listener, router, http2_max_concurrent_streams).await
+            serve_gateway_listener(
+                listener,
+                router,
+                http2_max_concurrent_streams,
+                http_header_read_timeout_ms,
+                http_header_max_bytes,
+                http_max_headers,
+            )
+            .await
         });
     }
     if let Some(result) = servers.join_next().await {
@@ -1631,6 +1904,9 @@ async fn serve_gateway_listener(
     listener: tokio::net::TcpListener,
     router: axum::Router,
     http2_max_concurrent_streams: u32,
+    http_header_read_timeout_ms: u64,
+    http_header_max_bytes: usize,
+    http_max_headers: usize,
 ) -> Result<(), std::io::Error> {
     let mut make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
     loop {
@@ -1640,19 +1916,49 @@ async fn serve_gateway_listener(
             .await
             .unwrap_or_else(|err| match err {})
             .map_request(|req: Request<Incoming>| req.map(Body::new));
-        let hyper_service = TowerToHyperService::new(tower_service);
+        let first_request_gate = GatewayFirstRequestGate::new();
+        let hyper_service = TowerToHyperService::new(GatewayFirstRequestService {
+            inner: tower_service,
+            gate: first_request_gate.clone(),
+        });
         let io = TokioIo::new(io);
 
         tokio::spawn(async move {
             let mut builder = HyperServerBuilder::new(TokioExecutor::new());
+            // Hyper's HTTP/1 header timer is opt-in when using the custom
+            // connection builder. Configure both protocol parsers explicitly:
+            // HTTP/1 gets a slow-header deadline and bounded parser buffer;
+            // HTTP/2 gets a decompressed header-list limit. The timer is
+            // connection metadata protection and does not affect request body
+            // streaming or the configured stream concurrency.
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(std::time::Duration::from_millis(
+                    http_header_read_timeout_ms,
+                ))
+                .max_buf_size(http_header_max_bytes)
+                .max_headers(http_max_headers);
             builder.http2().enable_connect_protocol();
             builder
                 .http2()
-                .max_concurrent_streams(http2_max_concurrent_streams);
-            if let Err(err) = builder
-                .serve_connection_with_upgrades(io, hyper_service)
-                .await
-            {
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(http2_max_concurrent_streams)
+                .max_header_list_size(u32::try_from(http_header_max_bytes).unwrap_or(u32::MAX));
+
+            // The auto builder reads the HTTP/2 preface before Hyper's H1
+            // header timer starts, and H2 has no header-read timer of its own.
+            // Race the whole connection until the first valid request reaches
+            // the service so a peer cannot hold a socket open while dribbling
+            // protocol bytes or an initial header block. Once the gate opens,
+            // request and response bodies remain fully streaming.
+            let connection_result = drive_gateway_connection(
+                builder.serve_connection_with_upgrades(io, hyper_service),
+                first_request_gate,
+                std::time::Duration::from_millis(http_header_read_timeout_ms),
+            )
+            .await;
+            if let Err(err) = connection_result {
                 tracing::trace!(error = ?err, "gateway connection closed with error");
             }
         });
@@ -1673,6 +1979,7 @@ async fn run_healthcheck(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = resolve_healthcheck_url(app_port)?;
     reqwest::Client::builder()
+        .no_proxy()
         .timeout(std::time::Duration::from_millis(
             healthcheck_timeout_ms.max(1),
         ))
@@ -1790,7 +2097,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if let Some(command) = args.command.as_ref() {
         init_service_runtime(args.runtime_config()?)?;
-        return run_data_command(command).await;
+        // Data export/import can decrypt and persist sensitive credentials;
+        // apply the same encryption-key policy as the normal gateway path
+        // before touching the selected database.
+        if matches!(command, DataCommand::Export(_) | DataCommand::Import(_)) {
+            args.data.validate_encryption_key()?;
+        }
+        return run_data_command(command, &args.data).await;
     }
     if args.migrate {
         init_service_runtime(args.runtime_config()?)?;
@@ -1822,6 +2135,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_redis_url.as_deref(),
         runtime_backend,
     )?;
+    args.data.validate_encryption_key()?;
     let data_config = args.data.to_config();
     let isolate_background_database = args.node_role.isolates_background_database();
     let background_database_config = if isolate_background_database {
@@ -2094,7 +2408,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         execution_runtime_configured = state.execution_runtime_configured(),
         "aether-gateway data layer configured"
     );
-    prepare_database_startup_requirements(&state, args.auto_prepare_database).await?;
+    prepare_database_startup_requirements(&state, args.effective_database_mode()).await?;
     state.warm_database_pools().await?;
     let reset_stale_proxy_nodes = state.reset_stale_proxy_node_tunnel_statuses().await?;
     if reset_stale_proxy_nodes > 0 {
@@ -2104,6 +2418,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     state.bootstrap_admin_from_env().await?;
+    match state.ensure_system_default_routing_group().await {
+        Ok(Some(group)) => {
+            info!(
+                group_id = %group.id,
+                group_name = %group.name,
+                "created system default routing group from routing strategy defaults"
+            );
+        }
+        Ok(None) => {}
+        Err(err) => return Err(err.into()),
+    }
     match state.prewarm_chat_pii_redaction_runtime_config().await {
         Ok(enabled) => {
             info!(
@@ -2117,6 +2442,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "failed to prewarm chat pii redaction runtime config"
             );
         }
+    }
+    match state.prewarm_execution_extra_trusted_dns_hosts().await {
+        Ok(_) => info!("prewarmed execution Fake-IP DNS allowlist"),
+        Err(err) => warn!(error = %err, "failed to prewarm execution Fake-IP DNS allowlist"),
     }
     match prewarm_direct_h2c_sender_cache_from_env_for_startup().await {
         Ok(Some(report)) => {
@@ -2193,19 +2522,90 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "aether-gateway ready"
     );
 
-    serve_gateway_router(listeners, router, args.http2_max_concurrent_streams).await?;
+    serve_gateway_router(
+        listeners,
+        router,
+        args.http2_max_concurrent_streams,
+        args.http_header_read_timeout_ms,
+        args.http_header_max_bytes,
+        args.http_max_headers,
+    )
+    .await?;
     if let Some(background_tasks) = background_tasks {
         background_tasks.shutdown().await;
     }
     Ok(())
 }
 
-async fn run_data_command(command: &DataCommand) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_data_command(
+    command: &DataCommand,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        DataCommand::Export(args) => run_data_export(args).await,
-        DataCommand::Import(args) => run_data_import(args).await,
+        DataCommand::Export(args) => run_data_export(args, data).await,
+        DataCommand::Import(args) => run_data_import(args, data).await,
         DataCommand::Copy(args) => run_data_copy(args).await,
+        DataCommand::Db(args) => run_database_command(args, data).await,
     }
+}
+
+async fn run_database_command(
+    args: &DatabaseCommandArgs,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        DatabaseCommand::Status => run_database_status(data).await,
+        DatabaseCommand::Prepare => run_database_prepare(data).await,
+    }
+}
+
+fn database_maintenance_state(
+    data: &GatewayDataArgs,
+) -> Result<(DatabaseDriver, AppState), Box<dyn std::error::Error>> {
+    let database = required_sql_database_config(data)?;
+    let driver = database.driver;
+    let state = AppState::new()?.with_data_config(data.to_config())?;
+    Ok((driver, state))
+}
+
+async fn run_database_status(data: &GatewayDataArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let (driver, state) = database_maintenance_state(data)?;
+    let pending_migrations = state
+        .pending_database_migrations()
+        .await?
+        .unwrap_or_default();
+
+    if let Some(next) = pending_migrations.first() {
+        println!("database {driver}: preparation required");
+        println!("pending migrations: {}", pending_migrations.len());
+        println!("next migration: {} ({})", next.version, next.description);
+        println!("pending backfills: not checked until migrations are current");
+        println!("run `aether-gateway db prepare`");
+        return Ok(());
+    }
+
+    let pending_backfills = state
+        .pending_database_backfills()
+        .await?
+        .unwrap_or_default();
+    if let Some(next) = pending_backfills.first() {
+        println!("database {driver}: preparation required");
+        println!("pending migrations: 0");
+        println!("pending backfills: {}", pending_backfills.len());
+        println!("next backfill: {} ({})", next.version, next.description);
+        println!("run `aether-gateway db prepare`");
+        return Ok(());
+    }
+
+    println!("database {driver}: ready (schema and backfills are current)");
+    Ok(())
+}
+
+async fn run_database_prepare(data: &GatewayDataArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let (driver, state) = database_maintenance_state(data)?;
+    prepare_database_startup_requirements(&state, DatabaseModeArg::Auto).await?;
+    println!("database {driver}: ready (schema and backfills are current)");
+    Ok(())
 }
 
 fn required_sql_database_config(
@@ -2234,14 +2634,17 @@ fn current_unix_secs() -> Result<u64, std::time::SystemTimeError> {
         .as_secs())
 }
 
-async fn run_data_export(args: &DataExportArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let database = required_sql_database_config(&args.data)?;
+async fn run_data_export(
+    args: &DataExportArgs,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database = required_sql_database_config(data)?;
     let driver = database.driver;
     let domains = requested_export_domains(args);
     let created_at_unix_secs = current_unix_secs()?;
     let encoded = export_database_jsonl(database, domains, created_at_unix_secs).await?;
 
-    tokio::fs::write(&args.output, encoded.as_bytes()).await?;
+    write_atomic_private_export(&args.output, encoded.as_bytes(), args.overwrite)?;
     info!(
         driver = %driver,
         output = %args.output.display(),
@@ -2257,10 +2660,290 @@ async fn run_data_export(args: &DataExportArgs) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-async fn run_data_import(args: &DataImportArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let database = required_sql_database_config(&args.data)?;
+fn write_atomic_private_export(path: &Path, bytes: &[u8], overwrite: bool) -> io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (path, bytes, overwrite);
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private atomic database exports currently require Unix filesystem checks",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "export path must name a file")
+        })?;
+        let input_parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = open_private_export_directory(input_parent)?;
+        let output_name = CString::new(file_name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "export path must not contain an embedded NUL byte",
+            )
+        })?;
+
+        // Check the target through the already-open parent directory. The
+        // later renameat/linkat calls use that same descriptor, so replacing a
+        // writable ancestor cannot redirect the export to another directory.
+        if let Some(stat) = private_export_stat_at(&parent, &output_name)? {
+            let effective_uid = unsafe { libc::geteuid() };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                || stat.st_uid != effective_uid
+                || stat.st_nlink != 1
+            {
+                return Err(io::Error::other(
+                    "export output must be a regular, single-link file owned by the current user",
+                ));
+            }
+            if !overwrite {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "export output already exists; pass --overwrite to replace it",
+                ));
+            }
+        }
+
+        let temporary_name = CString::new(format!(
+            ".aether-data-export-{}-{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .expect("generated temporary export name cannot contain NUL");
+        // O_EXCL + O_NOFOLLOW makes creation of the temporary file independent
+        // of any attacker-controlled directory entry with the same name.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                temporary_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+        let result = (|| -> io::Result<()> {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+
+            if overwrite {
+                // renameat replaces the directory entry and never dereferences
+                // a destination symlink. No attacker-selected file is opened
+                // or truncated even if the target changed after the check.
+                private_export_rename_at(&parent, &temporary_name, &output_name)?;
+            } else {
+                private_export_link_at(&parent, &temporary_name, &output_name).map_err(
+                    |error| {
+                        if error.kind() == io::ErrorKind::AlreadyExists {
+                            io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "export output already exists; pass --overwrite to replace it",
+                            )
+                        } else {
+                            error
+                        }
+                    },
+                )?;
+                private_export_unlink_at(&parent, &temporary_name)?;
+            }
+            parent.sync_all()
+        })();
+        if result.is_err() {
+            let _ = private_export_unlink_at(&parent, &temporary_name);
+        }
+        result
+    }
+}
+
+#[cfg(unix)]
+fn open_private_export_directory(path: &Path) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    // Walk one component at a time and retain the final descriptor. We allow
+    // trusted system symlink components (for example macOS `/var`), but
+    // validate the directory reached by every open before continuing. The
+    // descriptor remains pinned even if the symlink is exchanged later.
+    let mut directory = fs::File::open(if path.is_absolute() { "/" } else { "." })?;
+    validate_private_export_directory_fd(&directory, path)?;
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "export path must not contain '..' components",
+                ))
+            }
+            Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "export path uses an unsupported prefix",
+                ))
+            }
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "export directory path must not contain an embedded NUL byte",
+            )
+        })?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let next = unsafe { fs::File::from_raw_fd(descriptor) };
+        validate_private_export_directory_fd(&next, path)?;
+        directory = next;
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn validate_private_export_directory_fd(
+    directory: &fs::File,
+    display_path: &Path,
+) -> io::Result<()> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd;
+
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let effective_uid = unsafe { libc::geteuid() };
+    let mode = stat.st_mode;
+    if mode & libc::S_IFMT != libc::S_IFDIR
+        || (stat.st_uid != effective_uid && stat.st_uid != 0)
+        || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+    {
+        return Err(io::Error::other(format!(
+            "export output directory '{}' has unsafe ownership or permissions",
+            display_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn private_export_stat_at(
+    parent: &fs::File,
+    name: &std::ffi::CStr,
+) -> io::Result<Option<libc::stat>> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd;
+
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(Some(unsafe { stat.assume_init() }));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+fn private_export_link_at(
+    parent: &fs::File,
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe {
+        libc::linkat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn private_export_rename_at(
+    parent: &fs::File,
+    source: &std::ffi::CStr,
+    destination: &std::ffi::CStr,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn private_export_unlink_at(parent: &fs::File, name: &std::ffi::CStr) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+async fn run_data_import(
+    args: &DataImportArgs,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database = required_sql_database_config(data)?;
     let driver = database.driver;
-    let input = tokio::fs::read_to_string(&args.input).await?;
+    let input_path = args.input.clone();
+    let input = tokio::task::spawn_blocking(move || read_data_import_input(&input_path)).await??;
     let imported = import_database_jsonl(database, &input).await?;
 
     info!(
@@ -2278,10 +2961,225 @@ async fn run_data_import(args: &DataImportArgs) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// Read a CLI JSONL import through a descriptor that cannot be redirected by a
+/// later path replacement. The parser itself also enforces these limits, but
+/// bounding the file read first prevents an oversized input from being held in
+/// memory before validation starts.
+fn read_data_import_input(path: &Path) -> io::Result<String> {
+    read_data_import_input_with_limit(path, MAX_JSONL_INPUT_BYTES)
+}
+
+fn read_data_import_input_with_limit(path: &Path, limit: usize) -> io::Result<String> {
+    let mut file = open_data_import_file(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "data import input '{}' must be a regular file",
+                path.display()
+            ),
+        ));
+    }
+
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    if metadata.len() > limit_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "data import input '{}' exceeds the {} byte limit",
+                path.display(),
+                limit
+            ),
+        ));
+    }
+
+    // A file can grow after metadata() returns. Reading one extra byte catches
+    // that race without allowing the input buffer to exceed the configured
+    // parser budget.
+    let read_limit = limit.saturating_add(1);
+    // Do not reserve the whole metadata length: sparse or concurrently grown
+    // files can advertise a huge size while containing little data, and a
+    // single capacity reservation would otherwise become a local DoS vector.
+    const MAX_INITIAL_IMPORT_READ_CAPACITY: usize = 8 * 1024 * 1024;
+    let initial_capacity = usize::try_from(metadata.len())
+        .unwrap_or(limit)
+        .min(limit)
+        .min(MAX_INITIAL_IMPORT_READ_CAPACITY);
+    let mut bytes = Vec::with_capacity(initial_capacity.min(read_limit));
+    // Read in fixed-size chunks instead of `read_to_end`: the latter may use a
+    // file's attacker-controlled size hint to reserve a large buffer before
+    // the limit check runs. Reserve only the exact next chunk so capacity
+    // stays close to the configured `limit + 1` budget.
+    let mut chunk = [0_u8; 32 * 1024];
+    while bytes.len() < read_limit {
+        let remaining = read_limit - bytes.len();
+        let chunk_len = remaining.min(chunk.len());
+        let read = file.read(&mut chunk[..chunk_len])?;
+        if read == 0 {
+            break;
+        }
+        bytes.try_reserve_exact(read).map_err(|error| {
+            io::Error::other(format!(
+                "data import input buffer allocation failed: {error}"
+            ))
+        })?;
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "data import input '{}' exceeds the {} byte limit",
+                path.display(),
+                limit
+            ),
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "data import input '{}' is not valid UTF-8: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn open_data_import_file(path: &Path) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "data import input path must name a file",
+        )
+    })?;
+    let input_parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Keep the directory descriptor alive through openat. This prevents a
+    // concurrent rename of an ancestor from changing which directory is used.
+    let parent = open_private_export_directory(input_parent)?;
+    let file_name = CString::new(file_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "data import input path must not contain an embedded NUL byte",
+        )
+    })?;
+
+    // O_NONBLOCK is important even though imports require regular files:
+    // opening a FIFO without it can block before fstat has a chance to reject
+    // the special file. O_NOFOLLOW makes the final path component race-free.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "data import input '{}' must not be a symbolic link",
+                    path.display()
+                ),
+            ));
+        }
+        return Err(error);
+    }
+
+    // SAFETY: openat returned a new descriptor owned by this function; no
+    // other owner exists and File closes it on every return path.
+    Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(not(unix))]
+fn open_data_import_file(path: &Path) -> io::Result<fs::File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "data import input '{}' must not be a symbolic link",
+                path.display()
+            ),
+        ));
+    }
+    fs::OpenOptions::new().read(true).open(path)
+}
+
+fn copy_database_host_is_literal_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(address) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match address {
+        std::net::IpAddr::V4(address) => address.is_loopback(),
+        std::net::IpAddr::V6(address) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+    }
+}
+
+fn copy_database_url_is_literal_loopback(
+    driver: DatabaseDriver,
+    url: &str,
+    label: &str,
+) -> Result<bool, io::Error> {
+    // Parse with the same SQLx driver that will open the pool. This preserves
+    // query-parameter overrides such as PostgreSQL `host`/`hostaddr` and
+    // MySQL/PostgreSQL Unix `socket` paths, which URL authority inspection
+    // alone would miss.
+    match driver {
+        DatabaseDriver::Postgres => {
+            let options = url
+                .parse::<sqlx::postgres::PgConnectOptions>()
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{label} database URL is invalid: {error}"),
+                    )
+                })?;
+            Ok(options.get_socket().is_some()
+                || copy_database_host_is_literal_loopback(options.get_host()))
+        }
+        DatabaseDriver::Mysql => {
+            let options = url
+                .parse::<sqlx::mysql::MySqlConnectOptions>()
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{label} database URL is invalid: {error}"),
+                    )
+                })?;
+            Ok(options.get_socket().is_some()
+                || copy_database_host_is_literal_loopback(options.get_host()))
+        }
+        DatabaseDriver::Sqlite => Ok(false),
+    }
+}
+
 fn copy_database_config(
     driver: DatabaseDriverArg,
     url: &str,
     label: &str,
+    allow_insecure: bool,
 ) -> Result<SqlDatabaseConfig, Box<dyn std::error::Error>> {
     let url = url.trim();
     if url.is_empty() {
@@ -2292,19 +3190,39 @@ fn copy_database_config(
         .into());
     }
     let driver = DatabaseDriver::from(driver);
+    // A loopback exception preserves the existing local-development workflow,
+    // while every named/remote SQL host defaults to an encrypted connection.
+    // `allow_insecure` is deliberately endpoint-specific so a local source
+    // does not silently downgrade a remote target (or vice versa).
+    let literal_loopback = if driver == DatabaseDriver::Sqlite {
+        false
+    } else {
+        copy_database_url_is_literal_loopback(driver, url, label)?
+    };
+    let require_ssl = driver != DatabaseDriver::Sqlite && !allow_insecure && !literal_loopback;
     Ok(SqlDatabaseConfig::new(
         driver,
         url,
         SqlPoolConfig {
-            require_ssl: false,
+            require_ssl,
             ..SqlPoolConfig::default()
         },
     )?)
 }
 
 async fn run_data_copy(args: &DataCopyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let source = copy_database_config(args.source_driver, &args.source_url, "source")?;
-    let target = copy_database_config(args.target_driver, &args.target_url, "target")?;
+    let source = copy_database_config(
+        args.source_driver,
+        &args.source_url,
+        "source",
+        args.source_allow_insecure,
+    )?;
+    let target = copy_database_config(
+        args.target_driver,
+        &args.target_url,
+        "target",
+        args.target_allow_insecure,
+    )?;
     let source_driver = source.driver;
     let target_driver = target.driver;
     let domains = requested_domains(&args.domains);
@@ -2348,6 +3266,7 @@ async fn run_explicit_migrations(args: &Args) -> Result<(), Box<dyn std::error::
         );
     }
 
+    args.data.validate_encryption_key()?;
     let state = AppState::new()?.with_data_config(args.data.to_config())?;
     let pending = state
         .pending_database_migrations()
@@ -2384,6 +3303,7 @@ async fn run_explicit_backfills(args: &Args) -> Result<(), Box<dyn std::error::E
             "AETHER_DATABASE_DRIVER/AETHER_DATABASE_URL, AETHER_GATEWAY_DATA_POSTGRES_URL, or DATABASE_URL is required when running --apply-backfills",
         )
     })?;
+    args.data.validate_encryption_key()?;
     let state = AppState::new()?.with_data_config(args.data.to_config())?;
     ensure_database_schema_is_current(&state).await?;
 
@@ -2418,17 +3338,15 @@ async fn run_explicit_backfills(args: &Args) -> Result<(), Box<dyn std::error::E
 
 async fn prepare_database_startup_requirements(
     state: &AppState,
-    auto_prepare_database: bool,
+    database_mode: DatabaseModeArg,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !auto_prepare_database {
+    if matches!(database_mode, DatabaseModeArg::VerifyOnly) {
         ensure_database_schema_is_current(state).await?;
         ensure_database_backfills_are_current(state).await?;
         return Ok(());
     }
 
-    info!(
-        "auto database preparation enabled; applying pending migrations and backfills before serving traffic"
-    );
+    info!("database preparation enabled; applying pending migrations and backfills");
 
     let Some(pending_migrations) = state.prepare_database_for_startup().await? else {
         return Ok(());
@@ -2442,10 +3360,10 @@ async fn prepare_database_startup_requirements(
             next_version = next.version,
             next_description = %next.description,
             pending_versions = %format_pending_migrations(&pending_migrations),
-            "running database migrations during service startup..."
+            "running database migrations during database preparation..."
         );
         if state.run_database_migrations().await? {
-            info!("database migrations complete during service startup");
+            info!("database migrations complete");
         }
     }
 
@@ -2464,10 +3382,10 @@ async fn prepare_database_startup_requirements(
         next_version = next.version,
         next_description = %next.description,
         pending_versions = %format_pending_backfills(&pending_backfills),
-        "running database backfills during service startup..."
+        "running database backfills during database preparation..."
     );
     if state.run_database_backfills().await? {
-        info!("database backfills complete during service startup");
+        info!("database backfills complete");
     }
 
     Ok(())
@@ -2512,7 +3430,7 @@ async fn ensure_database_backfills_are_current(
 async fn ensure_database_schema_is_current(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(pending) = state.prepare_database_for_startup().await? else {
+    let Some(pending) = state.pending_database_migrations().await? else {
         return Ok(());
     };
     if pending.is_empty() {
@@ -2531,7 +3449,7 @@ fn pending_schema_error(
     next_description: &str,
 ) -> std::io::Error {
     std::io::Error::other(format!(
-        "database schema is behind by {} migration(s); next pending migration is {} ({})\nrun `aether-gateway --migrate` before starting the service",
+        "database schema is behind by {} migration(s); next pending migration is {} ({})\nrun `aether-gateway db prepare` before starting the service",
         pending_count, next_version, next_description
     ))
 }
@@ -2542,7 +3460,7 @@ fn pending_backfills_error(
     next_description: &str,
 ) -> std::io::Error {
     std::io::Error::other(format!(
-        "database backfills are behind by {} backfill(s); next pending backfill is {} ({})\nrun `aether-gateway --apply-backfills` before starting the service",
+        "database backfills are behind by {} backfill(s); next pending backfill is {} ({})\nrun `aether-gateway db prepare` before starting the service",
         pending_count, next_version, next_description
     ))
 }
@@ -2553,19 +3471,32 @@ mod tests {
         automatic_gateway_request_concurrency_for_capacity,
         automatic_gateway_request_concurrency_for_parallelism, automatic_sql_pool_config,
         automatic_sql_pool_config_for_parallelism, automatic_usage_queue_workers_for_parallelism,
-        ensure_database_backfills_are_current, ensure_database_schema_is_current,
-        pending_backfills_error, pending_schema_error, resolve_healthcheck_url,
-        usage_database_config_for_role, Args, DatabaseDriverArg, DeploymentTopologyArg,
-        GatewayDataArgs, GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg,
-        GatewayLogRotationArg, GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs,
-        NodeRoleArg, RuntimeBackendArg, VideoTaskTruthSourceArg,
-        DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, DEFAULT_GATEWAY_LISTENER_SHARDS,
+        copy_database_config, ensure_database_backfills_are_current,
+        ensure_database_schema_is_current, pending_backfills_error, pending_schema_error,
+        read_data_import_input_with_limit, resolve_database_mode, resolve_healthcheck_url,
+        usage_database_config_for_role, validate_gateway_data_encryption_key,
+        write_atomic_private_export, Args, DataCommand, DatabaseCommand, DatabaseDriverArg,
+        DatabaseModeArg, DeploymentTopologyArg, GatewayDataArgs, GatewayFrontdoorArgs,
+        GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg, GatewayLoggingArgs,
+        GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
+        VideoTaskTruthSourceArg, DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
+        DEFAULT_GATEWAY_HTTP_HEADER_MAX_BYTES, DEFAULT_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS,
+        DEFAULT_GATEWAY_HTTP_MAX_HEADERS, DEFAULT_GATEWAY_LISTENER_SHARDS,
         DEFAULT_GATEWAY_LISTEN_BACKLOG, MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
         MAX_GATEWAY_LISTENER_SHARDS, MAX_GATEWAY_LISTEN_BACKLOG,
         MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, MIN_GATEWAY_LISTEN_BACKLOG,
     };
     use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
     use aether_gateway::AppState;
+    use bytes::Bytes;
+    use clap::Parser;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Incoming as HyperIncoming;
+    use hyper::{Request as HyperRequest, Response as HyperResponse};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    use hyper_util::server::conn::auto::Builder as HyperServerBuilder;
+    use std::convert::Infallible;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_args() -> Args {
         Args {
@@ -2574,13 +3505,17 @@ mod tests {
             listen_backlog: DEFAULT_GATEWAY_LISTEN_BACKLOG,
             listener_shards: DEFAULT_GATEWAY_LISTENER_SHARDS,
             http2_max_concurrent_streams: DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
+            http_header_read_timeout_ms: DEFAULT_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS,
+            http_header_max_bytes: DEFAULT_GATEWAY_HTTP_HEADER_MAX_BYTES,
+            http_max_headers: DEFAULT_GATEWAY_HTTP_MAX_HEADERS,
             healthcheck: false,
             healthcheck_timeout_ms: 3_000,
             deployment_topology: DeploymentTopologyArg::SingleNode,
             node_role: NodeRoleArg::All,
             migrate: false,
             apply_backfills: false,
-            auto_prepare_database: false,
+            database_mode: None,
+            auto_prepare_database: None,
             static_dir: None,
             video_task_truth_source_mode: VideoTaskTruthSourceArg::PythonSyncReport,
             video_task_poller_interval_ms: 5_000,
@@ -2650,7 +3585,7 @@ mod tests {
             rate_limit: GatewayRateLimitArgs {
                 bucket_seconds: 60,
                 key_ttl_seconds: 120,
-                fail_open: true,
+                fail_open: false,
             },
             logging: GatewayLoggingArgs {
                 log_format: GatewayLogFormatArg::Pretty,
@@ -2680,6 +3615,19 @@ mod tests {
             },
         )
         .expect("test database config should build")
+    }
+
+    fn temporary_sqlite_args(label: &str) -> (Args, std::path::PathBuf) {
+        let mut args = test_args();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        let database_path =
+            std::env::temp_dir().join(format!("aether-{label}-{}-{nonce}.db", std::process::id()));
+        args.data.database_driver = Some(DatabaseDriverArg::Sqlite);
+        args.data.database_url = Some(format!("sqlite://{}", database_path.display()));
+        (args, database_path)
     }
 
     #[test]
@@ -2750,6 +3698,40 @@ mod tests {
     }
 
     #[test]
+    fn clamps_http_header_security_settings_without_touching_stream_concurrency() {
+        assert_eq!(
+            super::gateway_http_header_read_timeout_ms(0),
+            super::MIN_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS
+        );
+        assert_eq!(
+            super::gateway_http_header_read_timeout_ms(u64::MAX),
+            super::MAX_GATEWAY_HTTP_HEADER_READ_TIMEOUT_MS
+        );
+        assert_eq!(
+            super::gateway_http_header_max_bytes(1),
+            super::MIN_GATEWAY_HTTP_HEADER_MAX_BYTES
+        );
+        assert_eq!(
+            super::gateway_http_header_max_bytes(usize::MAX),
+            super::MAX_GATEWAY_HTTP_HEADER_MAX_BYTES
+        );
+        assert_eq!(
+            super::gateway_http_max_headers(0),
+            super::MIN_GATEWAY_HTTP_MAX_HEADERS
+        );
+        assert_eq!(
+            super::gateway_http_max_headers(usize::MAX),
+            super::MAX_GATEWAY_HTTP_MAX_HEADERS
+        );
+        assert_eq!(
+            super::gateway_http2_max_concurrent_streams(
+                super::DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS
+            ),
+            16_384
+        );
+    }
+
+    #[test]
     fn auto_gateway_request_concurrency_scales_and_clamps() {
         assert_eq!(
             automatic_gateway_request_concurrency_for_parallelism(1),
@@ -2793,11 +3775,14 @@ mod tests {
     }
 
     #[test]
-    fn normal_runtime_config_keeps_gateway_only_logs() {
+    fn normal_runtime_config_includes_database_lifecycle_logs() {
         let config = test_args()
             .runtime_config()
             .expect("runtime config should build");
-        assert_eq!(config.default_log_filter, "aether_gateway=info");
+        assert_eq!(
+            config.default_log_filter,
+            "aether_gateway=info,aether_data=info"
+        );
     }
 
     #[test]
@@ -2814,11 +3799,92 @@ mod tests {
     #[test]
     fn auto_prepare_database_runtime_config_enables_data_logs() {
         let mut args = test_args();
-        args.auto_prepare_database = true;
+        args.auto_prepare_database = Some(true);
         let config = args.runtime_config().expect("runtime config should build");
         assert_eq!(
             config.default_log_filter,
             "aether_gateway=info,aether_data=info"
+        );
+    }
+
+    #[test]
+    fn database_mode_defaults_to_auto_and_preserves_legacy_false() {
+        assert_eq!(resolve_database_mode(None, None), DatabaseModeArg::Auto);
+        assert_eq!(
+            resolve_database_mode(None, Some(false)),
+            DatabaseModeArg::VerifyOnly
+        );
+        assert_eq!(
+            resolve_database_mode(Some(DatabaseModeArg::Auto), Some(false)),
+            DatabaseModeArg::Auto
+        );
+    }
+
+    #[test]
+    fn parses_database_commands_and_verify_only_mode() {
+        let status = Args::try_parse_from(["aether-gateway", "db", "status"])
+            .expect("db status should parse");
+        assert!(matches!(
+            status.command,
+            Some(DataCommand::Db(args))
+                if matches!(args.command, DatabaseCommand::Status)
+        ));
+
+        let verify_only =
+            Args::try_parse_from(["aether-gateway", "--database-mode", "verify-only"])
+                .expect("verify-only mode should parse");
+        assert_eq!(
+            verify_only.effective_database_mode(),
+            DatabaseModeArg::VerifyOnly
+        );
+
+        let legacy_false =
+            Args::try_parse_from(["aether-gateway", "--auto-prepare-database=false"])
+                .expect("legacy false setting should parse");
+        assert_eq!(
+            legacy_false.effective_database_mode(),
+            DatabaseModeArg::VerifyOnly
+        );
+
+        let prepare = Args::try_parse_from(["aether-gateway", "db", "prepare"])
+            .expect("db prepare should parse");
+        assert!(matches!(
+            prepare.command,
+            Some(DataCommand::Db(args))
+                if matches!(args.command, DatabaseCommand::Prepare)
+        ));
+    }
+
+    #[test]
+    fn database_arguments_are_global_for_database_commands() {
+        let before = Args::try_parse_from([
+            "aether-gateway",
+            "--database-driver",
+            "sqlite",
+            "--database-url",
+            "sqlite:///tmp/before.db",
+            "db",
+            "status",
+        ])
+        .expect("database arguments before db should parse");
+        assert_eq!(
+            before.data.database_url.as_deref(),
+            Some("sqlite:///tmp/before.db")
+        );
+
+        let after = Args::try_parse_from([
+            "aether-gateway",
+            "db",
+            "prepare",
+            "--database-driver",
+            "sqlite",
+            "--database-url",
+            "sqlite:///tmp/after.db",
+        ])
+        .expect("database arguments after db prepare should parse");
+        assert_eq!(
+            after.data.database_url.as_deref(),
+            Some("sqlite:///tmp/after.db")
         );
     }
 
@@ -3307,6 +4373,280 @@ mod tests {
     }
 
     #[test]
+    fn gateway_data_encryption_key_rejects_weak_and_published_values() {
+        assert!(validate_gateway_data_encryption_key(None).is_ok());
+        assert!(
+            validate_gateway_data_encryption_key(Some("0123456789abcdef0123456789abcdef")).is_ok()
+        );
+
+        for insecure in [
+            "short-secret",
+            "change-this-to-another-secure-random-string",
+            "change-this-to-a-secure-random-string",
+            "dev-encryption-key-do-not-use-in-production",
+        ] {
+            assert!(
+                validate_gateway_data_encryption_key(Some(insecure)).is_err(),
+                "accepted insecure key: {insecure}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_copy_requires_tls_for_remote_sql_but_preserves_loopback_compatibility() {
+        let remote_postgres = copy_database_config(
+            DatabaseDriverArg::Postgres,
+            "postgres://user:pass@db.example/aether",
+            "source",
+            false,
+        )
+        .expect("remote postgres config should build");
+        assert!(remote_postgres.pool.require_ssl);
+
+        let remote_mysql = copy_database_config(
+            DatabaseDriverArg::Mysql,
+            "mysql://user:pass@192.0.2.10:3306/aether",
+            "target",
+            false,
+        )
+        .expect("remote mysql config should build");
+        assert!(remote_mysql.pool.require_ssl);
+
+        for url in [
+            "postgres://user:pass@localhost/aether",
+            "postgres://user:pass@127.42.17.9/aether",
+            "postgres://user:pass@[::1]/aether",
+            "postgres://user:pass@[::ffff:127.0.0.1]/aether",
+        ] {
+            let config = copy_database_config(DatabaseDriverArg::Postgres, url, "source", false)
+                .expect("literal loopback config should build");
+            assert!(
+                !config.pool.require_ssl,
+                "loopback URL unexpectedly requires TLS: {url}"
+            );
+        }
+
+        let explicitly_insecure = copy_database_config(
+            DatabaseDriverArg::Postgres,
+            "postgres://user:pass@db.example/aether",
+            "source",
+            true,
+        )
+        .expect("explicit insecure opt-out should build");
+        assert!(!explicitly_insecure.pool.require_ssl);
+
+        let sqlite = copy_database_config(
+            DatabaseDriverArg::Sqlite,
+            "sqlite://./data/aether.db",
+            "target",
+            false,
+        )
+        .expect("sqlite config should build");
+        assert!(!sqlite.pool.require_ssl);
+    }
+
+    #[test]
+    fn data_copy_tls_policy_is_conservative_for_non_loopback_and_query_hosts() {
+        let query_remote = copy_database_config(
+            DatabaseDriverArg::Postgres,
+            "postgres:///aether?host=db.example",
+            "source",
+            false,
+        )
+        .expect("query-host postgres config should build");
+        assert!(query_remote.pool.require_ssl);
+
+        let authority_loopback_query_remote = copy_database_config(
+            DatabaseDriverArg::Postgres,
+            "postgres://user:pass@localhost/aether?host=db.example",
+            "source",
+            false,
+        )
+        .expect("query-host override config should build");
+        assert!(authority_loopback_query_remote.pool.require_ssl);
+
+        let authority_loopback_hostaddr_remote = copy_database_config(
+            DatabaseDriverArg::Postgres,
+            "postgres://user:pass@localhost/aether?hostaddr=192.0.2.10",
+            "source",
+            false,
+        )
+        .expect("hostaddr override config should build");
+        assert!(authority_loopback_hostaddr_remote.pool.require_ssl);
+
+        let query_loopback = copy_database_config(
+            DatabaseDriverArg::Postgres,
+            "postgres://user:pass@db.example/aether?host=127.0.0.1",
+            "source",
+            false,
+        )
+        .expect("query-loopback config should build");
+        assert!(!query_loopback.pool.require_ssl);
+
+        let hostless = copy_database_config(
+            DatabaseDriverArg::Postgres,
+            "postgres:///aether",
+            "source",
+            false,
+        )
+        .expect("hostless postgres config should build");
+        // SQLx resolves a hostless PostgreSQL URL to its local socket or
+        // localhost default; that path is safe to keep plaintext for local
+        // development, just like an explicit loopback URL.
+        assert!(!hostless.pool.require_ssl);
+    }
+
+    #[test]
+    fn data_copy_cli_accepts_independent_insecure_opt_outs() {
+        let parsed = Args::try_parse_from([
+            "aether-gateway",
+            "copy",
+            "--source-driver",
+            "postgres",
+            "--source-url",
+            "postgres://user:pass@db.example/aether",
+            "--source-allow-insecure",
+            "--target-driver",
+            "mysql",
+            "--target-url",
+            "mysql://user:pass@db.example/aether",
+        ])
+        .expect("copy command should parse endpoint-specific TLS flags");
+
+        let Some(DataCommand::Copy(copy)) = parsed.command else {
+            panic!("expected copy command");
+        };
+        assert!(copy.source_allow_insecure);
+        assert!(!copy.target_allow_insecure);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_export_output_is_private_atomic_and_no_clobber_by_default() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "aether-data-export-output-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = root.join("export.jsonl");
+
+        write_atomic_private_export(&output, b"first\n", false).unwrap();
+        let metadata = std::fs::symlink_metadata(&output).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(write_atomic_private_export(&output, b"second\n", false).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"first\n");
+
+        write_atomic_private_export(&output, b"second\n", true).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"second\n");
+
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"known-good").unwrap();
+        std::fs::remove_file(&output).unwrap();
+        symlink(&victim, &output).unwrap();
+        assert!(write_atomic_private_export(&output, b"replace\n", true).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"known-good");
+
+        std::fs::remove_file(&output).unwrap();
+        std::fs::hard_link(&victim, &output).unwrap();
+        assert!(write_atomic_private_export(&output, b"replace\n", true).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"known-good");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_export_rejects_an_unsafe_symbolic_link_parent_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "aether-data-export-parent-link-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let real_parent = root.join("real");
+        let linked_parent = root.join("linked");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        // A symlink into a directory writable by other users must not become
+        // an escape hatch for the private export.
+        std::fs::set_permissions(&real_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let output = linked_parent.join("export.jsonl");
+        assert!(write_atomic_private_export(&output, b"must not be written", false).is_err());
+        assert!(!real_parent.join("export.jsonl").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_import_input_is_bounded_and_rejects_final_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "aether-data-import-input-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let input = root.join("input.jsonl");
+        std::fs::write(&input, b"0123456789").unwrap();
+        let error = read_data_import_input_with_limit(&input, 4)
+            .expect_err("an input larger than the configured limit must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("4 byte limit"));
+
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, b"safe\n").unwrap();
+        let link = root.join("input-link.jsonl");
+        symlink(&target, &link).unwrap();
+        let error = read_data_import_input_with_limit(&link, 1024)
+            .expect_err("a final symbolic link must not be followed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must not be a symbolic link"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_import_input_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "aether-data-import-fifo-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fifo = root.join("input.fifo");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // O_NONBLOCK in open_data_import_file means this call reaches the
+        // regular-file check immediately even when no FIFO writer exists.
+        let error = read_data_import_input_with_limit(&fifo, 1024)
+            .expect_err("FIFO input must be rejected before reading");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn redis_runtime_config_owns_redis_connection() {
         let mut args = test_args();
         args.data.database_driver = Some(DatabaseDriverArg::Postgres);
@@ -3492,17 +4832,17 @@ mod tests {
     }
 
     #[test]
-    fn pending_schema_error_mentions_explicit_migrate_command() {
+    fn pending_schema_error_mentions_database_prepare_command() {
         let error = pending_schema_error(2, 20260413020000, "squash usage schema split");
         let message = error.to_string();
         assert!(message.contains("database schema is behind by 2 migration(s)"));
         assert!(message.contains("20260413020000"));
         assert!(message.contains("squash usage schema split"));
-        assert!(message.contains("aether-gateway --migrate"));
+        assert!(message.contains("aether-gateway db prepare"));
     }
 
     #[test]
-    fn pending_backfills_error_mentions_explicit_apply_backfills_command() {
+    fn pending_backfills_error_mentions_database_prepare_command() {
         let message = pending_backfills_error(
             1,
             20260422110000,
@@ -3512,7 +4852,7 @@ mod tests {
         assert!(message.contains("database backfills are behind by 1 backfill(s)"));
         assert!(message.contains("20260422110000"));
         assert!(message.contains("backfill stats aggregate read path support"));
-        assert!(message.contains("aether-gateway --apply-backfills"));
+        assert!(message.contains("aether-gateway db prepare"));
         assert!(message.contains("before starting the service"));
     }
 
@@ -3535,9 +4875,77 @@ mod tests {
     #[tokio::test]
     async fn auto_prepare_database_is_noop_without_database_pool() {
         let state = AppState::new().expect("state should build");
-        super::prepare_database_startup_requirements(&state, true)
+        super::prepare_database_startup_requirements(&state, DatabaseModeArg::Auto)
             .await
             .expect("disabled data backend should not block startup");
+    }
+
+    #[tokio::test]
+    async fn verify_only_does_not_prepare_fresh_sqlite_database() {
+        let (args, database_path) = temporary_sqlite_args("verify-only");
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_config(args.data.to_config())
+            .expect("sqlite state should build");
+        let pending_before = state
+            .pending_database_migrations()
+            .await
+            .expect("pending migrations should load")
+            .expect("sqlite should expose migration state");
+        assert!(!pending_before.is_empty());
+
+        let error =
+            super::prepare_database_startup_requirements(&state, DatabaseModeArg::VerifyOnly)
+                .await
+                .expect_err("verify-only should reject a fresh database");
+        assert!(error.to_string().contains("aether-gateway db prepare"));
+
+        let pending_after = state
+            .pending_database_migrations()
+            .await
+            .expect("pending migrations should reload")
+            .expect("sqlite should expose migration state");
+        assert_eq!(pending_after, pending_before);
+        drop(state);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_prepares_fresh_sqlite_database() {
+        let (args, database_path) = temporary_sqlite_args("auto-prepare");
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_config(args.data.to_config())
+            .expect("sqlite state should build");
+
+        super::prepare_database_startup_requirements(&state, DatabaseModeArg::Auto)
+            .await
+            .expect("auto mode should prepare a fresh database");
+        assert!(state
+            .pending_database_migrations()
+            .await
+            .expect("pending migrations should load")
+            .expect("sqlite should expose migration state")
+            .is_empty());
+        assert!(state
+            .pending_database_backfills()
+            .await
+            .expect("pending backfills should load")
+            .expect("sqlite should expose backfill state")
+            .is_empty());
+        drop(state);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn database_prepare_requires_database_url() {
+        let data = test_args().data;
+        let error = super::run_database_prepare(&data)
+            .await
+            .expect_err("missing database URL should fail");
+        assert!(error
+            .to_string()
+            .contains("AETHER_DATABASE_DRIVER/AETHER_DATABASE_URL"));
     }
 
     #[tokio::test]
@@ -3593,5 +5001,175 @@ mod tests {
             .await
             .expect("sqlite backfills should be an explicit no-op");
         let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn first_request_gate_closes_a_connection_that_never_reaches_service() {
+        let gate = super::GatewayFirstRequestGate::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::drive_gateway_connection(
+                std::future::pending::<Result<(), ()>>(),
+                gate,
+                std::time::Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("first-request deadline should fire promptly");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_request_gate_does_not_deadline_a_streaming_connection() {
+        let gate = super::GatewayFirstRequestGate::new();
+        gate.mark_seen();
+        // Model a body that remains active after request headers arrive.
+        let connection = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok::<(), ()>(())
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            super::drive_gateway_connection(connection, gate, std::time::Duration::from_millis(5))
+                .await
+        })
+        .await
+        .expect("streaming connection should finish");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn first_request_deadline_covers_partial_http1_and_h2_preface() {
+        let prefixes: &[&[u8]] = &[
+            b"G",
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n",
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n",
+        ];
+        for prefix in prefixes {
+            let (mut client, server) = tokio::io::duplex(16 * 1024);
+            client
+                .write_all(prefix)
+                .await
+                .expect("fixture prefix should be writable");
+            let gate = super::GatewayFirstRequestGate::new();
+            let service = tower::service_fn(|_request: HyperRequest<HyperIncoming>| async {
+                Ok::<_, Infallible>(HyperResponse::new(Full::new(Bytes::from_static(b"ok"))))
+            });
+            let mut builder = HyperServerBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(std::time::Duration::from_millis(10))
+                .max_buf_size(super::MIN_GATEWAY_HTTP_HEADER_MAX_BYTES)
+                .max_headers(super::MIN_GATEWAY_HTTP_MAX_HEADERS);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(super::DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS)
+                .max_header_list_size(super::MIN_GATEWAY_HTTP_HEADER_MAX_BYTES as u32);
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                super::drive_gateway_connection(
+                    builder.serve_connection_with_upgrades(
+                        TokioIo::new(server),
+                        super::TowerToHyperService::new(super::GatewayFirstRequestService {
+                            inner: service,
+                            gate: gate.clone(),
+                        }),
+                    ),
+                    gate,
+                    std::time::Duration::from_millis(5),
+                ),
+            )
+            .await
+            .expect("partial protocol input should hit the first-request deadline");
+            assert!(
+                result.is_ok(),
+                "deadline should close without a parser error"
+            );
+
+            let mut byte = [0u8; 1];
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut byte))
+                    .await
+                    .expect("timed-out connection should close its peer");
+            assert!(matches!(read, Ok(0) | Err(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn first_request_deadline_does_not_cut_off_a_delayed_http1_body() {
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let gate = super::GatewayFirstRequestGate::new();
+        let (headers_seen_tx, mut headers_seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service = tower::service_fn(move |request: HyperRequest<HyperIncoming>| {
+            let _ = headers_seen_tx.send(());
+            async move {
+                let body = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("test body should decode")
+                    .to_bytes();
+                Ok::<_, Infallible>(HyperResponse::new(Full::new(body)))
+            }
+        });
+        let mut builder = HyperServerBuilder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(std::time::Duration::from_millis(20))
+            .max_buf_size(super::MIN_GATEWAY_HTTP_HEADER_MAX_BYTES)
+            .max_headers(super::MIN_GATEWAY_HTTP_MAX_HEADERS);
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(super::DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS)
+            .max_header_list_size(super::MIN_GATEWAY_HTTP_HEADER_MAX_BYTES as u32);
+
+        let server_task = tokio::spawn(async move {
+            super::drive_gateway_connection(
+                builder.serve_connection_with_upgrades(
+                    TokioIo::new(server),
+                    super::TowerToHyperService::new(super::GatewayFirstRequestService {
+                        inner: service,
+                        gate: gate.clone(),
+                    }),
+                ),
+                gate,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+        });
+        client
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 5\r\n\r\n",
+            )
+            .await
+            .expect("request headers should be writable");
+        tokio::time::timeout(std::time::Duration::from_secs(1), headers_seen_rx.recv())
+            .await
+            .expect("request headers should reach the service")
+            .expect("service notification should remain available");
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        client
+            .write_all(b"hello")
+            .await
+            .expect("body should remain writable after the header deadline");
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("streaming response should complete")
+        .expect("response should be readable");
+        let result = server_task
+            .await
+            .expect("server connection task should join");
+        assert!(result.is_ok());
+        assert!(response
+            .windows(b"hello".len())
+            .any(|window| window == b"hello"));
     }
 }

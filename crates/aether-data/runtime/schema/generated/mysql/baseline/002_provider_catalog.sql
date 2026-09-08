@@ -454,6 +454,7 @@ CREATE TABLE IF NOT EXISTS routing_groups (
     `description` LONGTEXT,
     `enabled` TINYINT(1) NOT NULL DEFAULT 1,
     `is_system_default` TINYINT(1) NOT NULL DEFAULT 0,
+    `sort_order` BIGINT NOT NULL DEFAULT 0,
     `config_json` JSON NOT NULL,
     `version` BIGINT NOT NULL DEFAULT 1,
     `created_at` BIGINT NOT NULL,
@@ -461,7 +462,8 @@ CREATE TABLE IF NOT EXISTS routing_groups (
     `published_at` BIGINT,
     PRIMARY KEY (`id`),
     UNIQUE KEY routing_groups_name_key (`name`),
-    KEY routing_groups_system_default_idx (`is_system_default`, `enabled`)
+    KEY routing_groups_system_default_idx (`is_system_default`, `enabled`),
+    KEY routing_groups_enabled_sort_idx (`enabled`, `sort_order`, `name`, `id`)
 );
 
 CREATE TABLE IF NOT EXISTS routing_group_bindings (
