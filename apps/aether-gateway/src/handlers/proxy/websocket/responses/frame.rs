@@ -7,6 +7,8 @@
 
 use serde_json::Value;
 
+use super::request::MAX_RESPONSES_WEBSOCKET_RESPONSE_ID_BYTES;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResponsesWebSocketFrameTerminal {
     pub(super) status_code: u16,
@@ -89,6 +91,23 @@ impl<'a> ParsedResponsesWebSocketFrame<'a> {
         &self.event
     }
 
+    /// Whether the provider attached a named-lane identity to this frame.
+    ///
+    /// Aether's current relay owns only the implicit default lane. OpenAI's
+    /// named-lane contract places `stream_id` directly on each public event;
+    /// Codex may additionally batch those events under `chunks`. Inspect both
+    /// wire positions without looking through arbitrary response payloads so
+    /// a model-produced field named `stream_id` is not mistaken for transport
+    /// framing.
+    pub(super) fn carries_stream_id(&self) -> bool {
+        self.event.get("stream_id").is_some()
+            || self
+                .event
+                .get("chunks")
+                .and_then(Value::as_array)
+                .is_some_and(|chunks| chunks.iter().any(|event| event.get("stream_id").is_some()))
+    }
+
     pub(super) fn event_type(&self) -> Option<&str> {
         self.event_type.as_deref()
     }
@@ -107,6 +126,30 @@ impl<'a> ParsedResponsesWebSocketFrame<'a> {
 
     pub(super) fn terminal(&self) -> Option<ResponsesWebSocketFrameTerminal> {
         self.terminal
+    }
+
+    /// Returns the opaque response ID only for a successfully observed,
+    /// provider-persistable terminal. Failed, cancelled, malformed and
+    /// oversized terminal IDs must never establish continuation ownership.
+    pub(super) fn continuation_response_id(&self) -> Option<&str> {
+        let terminal = self.terminal?;
+        if terminal.status_code >= 400 || terminal.cancelled {
+            return None;
+        }
+        let event = self.terminal_event.as_ref()?;
+        if !matches!(
+            event_type_of(event),
+            Some("response.completed" | "response.done" | "response.incomplete")
+        ) {
+            return None;
+        }
+        let response_id = event
+            .pointer("/response/id")
+            .or_else(|| event.get("response_id"))
+            .and_then(Value::as_str)?;
+        (!response_id.trim().is_empty()
+            && response_id.len() <= MAX_RESPONSES_WEBSOCKET_RESPONSE_ID_BYTES)
+            .then_some(response_id)
     }
 
     /// Return a bounded label suitable for structured logs.  Event payloads
@@ -206,7 +249,7 @@ fn responses_incomplete_default_status(event: &Value) -> u16 {
 
 fn terminal_for_event(event: &Value) -> Option<ResponsesWebSocketFrameTerminal> {
     match event_type_of(event).unwrap_or_default() {
-        "response.completed" => Some(ResponsesWebSocketFrameTerminal {
+        "response.completed" | "response.done" => Some(ResponsesWebSocketFrameTerminal {
             status_code: websocket_event_status_code(event, 200),
             cancelled: false,
         }),
@@ -308,6 +351,29 @@ mod tests {
     }
 
     #[test]
+    fn continuation_id_requires_a_successful_persistable_terminal() {
+        for event_type in ["response.completed", "response.done"] {
+            let raw = format!(r#"{{"type":"{event_type}","response":{{"id":"resp_persisted"}}}}"#);
+            let frame = ParsedResponsesWebSocketFrame::parse(&raw).expect("valid terminal");
+            assert_eq!(frame.continuation_response_id(), Some("resp_persisted"));
+        }
+        let incomplete = ParsedResponsesWebSocketFrame::parse(
+            r#"{"type":"response.incomplete","response":{"id":"resp_partial","incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        )
+        .expect("valid incomplete terminal");
+        assert_eq!(incomplete.continuation_response_id(), Some("resp_partial"));
+
+        for raw in [
+            r#"{"type":"response.failed","response":{"id":"resp_failed"}}"#,
+            r#"{"type":"response.cancelled","response":{"id":"resp_cancelled"}}"#,
+            r#"{"type":"response.completed","status_code":500,"response":{"id":"resp_error"}}"#,
+        ] {
+            let frame = ParsedResponsesWebSocketFrame::parse(raw).expect("valid terminal");
+            assert_eq!(frame.continuation_response_id(), None);
+        }
+    }
+
+    #[test]
     fn future_response_event_keeps_its_exact_original_text_and_unknown_fields() {
         let raw = "{ \n  \"future_top_level\": {\"nested\": [1, true, null]}, \n  \"type\": \"response.future_capability.delta\", \n  \"delta\": {\"new_wire_shape\": \"opaque\"}\n}";
         let frame = ParsedResponsesWebSocketFrame::parse(raw).expect("valid future event");
@@ -336,6 +402,36 @@ mod tests {
         assert_eq!(round_trip, **event);
         assert_eq!(round_trip["future_capability"], json!({"mode": "new"}));
         assert_eq!(round_trip["response"]["future_usage"]["novel_tokens"], 7);
+    }
+
+    #[test]
+    fn detects_a_top_level_named_lane_identity() {
+        let frame = ParsedResponsesWebSocketFrame::parse(
+            r#"{"type":"response.in_progress","stream_id":"planner","response":{"id":"resp_1"}}"#,
+        )
+        .expect("valid named-lane event");
+
+        assert!(frame.carries_stream_id());
+    }
+
+    #[test]
+    fn detects_a_named_lane_identity_inside_a_batch() {
+        let frame = ParsedResponsesWebSocketFrame::parse(
+            r#"{"type":"codex.response.metadata","chunks":[{"type":"codex.rate_limits"},{"type":"response.completed","stream_id":"planner","response":{"id":"resp_1"}}]}"#,
+        )
+        .expect("valid named-lane batch");
+
+        assert!(frame.carries_stream_id());
+    }
+
+    #[test]
+    fn response_payload_fields_are_not_mistaken_for_lane_framing() {
+        let frame = ParsedResponsesWebSocketFrame::parse(
+            r#"{"type":"response.completed","response":{"id":"resp_1","metadata":{"stream_id":"model-owned"}}}"#,
+        )
+        .expect("valid default-lane event");
+
+        assert!(!frame.carries_stream_id());
     }
 
     #[test]

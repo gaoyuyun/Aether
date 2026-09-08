@@ -168,16 +168,42 @@ pub(crate) fn codex_quota_exhaustion_reset_at(
     quota_metadata: &Value,
     now_unix_secs: u64,
 ) -> Option<u64> {
+    codex_quota_exhaustion_reset_at_for_prefixes(
+        quota_metadata,
+        now_unix_secs,
+        &["primary", "secondary"],
+    )
+}
+
+/// Returns the reset deadline for an exhausted model-scoped Codex window without promoting that
+/// window to account-wide exhaustion.
+pub(crate) fn codex_model_quota_exhaustion_reset_at(
+    quota_metadata: &Value,
+    now_unix_secs: u64,
+) -> Option<u64> {
+    codex_quota_exhaustion_reset_at_for_prefixes(
+        quota_metadata,
+        now_unix_secs,
+        &["spark_primary", "spark_secondary"],
+    )
+}
+
+fn codex_quota_exhaustion_reset_at_for_prefixes(
+    quota_metadata: &Value,
+    now_unix_secs: u64,
+    window_prefixes: &[&str],
+) -> Option<u64> {
     let Some(metadata) = quota_metadata.as_object() else {
         return None;
     };
 
-    let exhausted_windows = ["primary", "secondary"]
-        .into_iter()
+    let exhausted_windows = window_prefixes
+        .iter()
+        .copied()
         .filter(|prefix| codex_window_is_exhausted(metadata, prefix))
         .collect::<Vec<_>>();
     let prefixes = if exhausted_windows.is_empty() {
-        vec!["primary", "secondary"]
+        window_prefixes.to_vec()
     } else {
         exhausted_windows
     };

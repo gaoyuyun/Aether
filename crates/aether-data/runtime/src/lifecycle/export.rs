@@ -3,11 +3,17 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(all(feature = "postgres", feature = "sqlite"))]
 use futures_util::TryStreamExt;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 #[cfg(all(feature = "postgres", feature = "sqlite"))]
 use sqlx::Acquire;
 use sqlx::Row;
 #[cfg(any(feature = "mysql", feature = "sqlite"))]
 use sqlx::{Column, TypeInfo, ValueRef};
+
+use aether_data_contracts::repository::candidates::{
+    sanitize_request_candidate_error_type, sanitize_request_candidate_extra_data,
+    sanitize_request_candidate_required_capabilities, sanitize_request_candidate_skip_reason,
+};
 
 use crate::error::SqlResultExt;
 use crate::{DataLayerError, DatabaseDriver, SqlDatabaseConfig};
@@ -45,6 +51,17 @@ use postgres::normalize_postgres_import_payload;
 
 pub const EXPORT_FORMAT_VERSION: u32 = 2;
 const MIN_SUPPORTED_EXPORT_FORMAT_VERSION: u32 = 1;
+
+// JSONL imports are ultimately materialized as a `DataImportPlan`, so an
+// attacker-controlled document can otherwise consume memory in both the input
+// string and the parsed row/payload vectors. Keep these bounds deliberately
+// separate from HTTP request limits: database exports may contain large body
+// blobs, while still needing a finite parser budget. The total budget is kept
+// below the gateway's 256 MiB request-body ceiling because parsing duplicates
+// portions of the input in serde values and the import plan.
+pub const MAX_JSONL_INPUT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_JSONL_RECORDS: usize = 1_000_000;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -238,6 +255,14 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
     AuxiliaryTable {
         name: "usage_counter_deltas",
         primary_key: &["id"],
+    },
+    AuxiliaryTable {
+        name: "usage_cost_reservations",
+        primary_key: &["reservation_token"],
+    },
+    AuxiliaryTable {
+        name: "usage_request_admissions",
+        primary_key: &["event_token"],
     },
     AuxiliaryTable {
         name: "background_task_runs",
@@ -463,12 +488,93 @@ impl DataImportPlan {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+
+    fn imports_domain(&self, domain: ExportDomain) -> bool {
+        self.manifest.domains.contains(&domain)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportRow {
     pub id: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IdentityImportScope {
+    user_ids: Vec<String>,
+    oauth_link_ids: Vec<String>,
+    oauth_provider_types: Vec<String>,
+    finalizes_oauth_links: bool,
+    validates_oauth_login_methods: bool,
+}
+
+impl IdentityImportScope {
+    fn from_plan(plan: &DataImportPlan) -> Result<Self, DataLayerError> {
+        let scope = Self {
+            user_ids: imported_payload_ids(plan, ExportDomain::Users, "id")?,
+            oauth_link_ids: imported_payload_ids(plan, ExportDomain::UserOAuthLinks, "id")?,
+            oauth_provider_types: imported_payload_ids(
+                plan,
+                ExportDomain::OAuthProviders,
+                "provider_type",
+            )?,
+            finalizes_oauth_links: plan.imports_domain(ExportDomain::UserOAuthLinks),
+            validates_oauth_login_methods: plan.imports_domain(ExportDomain::UserOAuthLinks)
+                || plan.imports_domain(ExportDomain::OAuthProviders),
+        };
+        if let Some(provider_type) = scope.oauth_provider_types.iter().find(|provider_type| {
+            provider_type.is_empty()
+                || provider_type.as_str() != provider_type.trim().to_ascii_lowercase()
+        }) {
+            return Err(DataLayerError::InvalidInput(format!(
+                "OAuth provider import has non-canonical provider_type '{provider_type}'"
+            )));
+        }
+        Ok(scope)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IdentityImportState {
+    affected_user_ids: BTreeSet<String>,
+}
+
+fn imported_payload_ids(
+    plan: &DataImportPlan,
+    domain: ExportDomain,
+    payload_field: &str,
+) -> Result<Vec<String>, DataLayerError> {
+    plan.rows(domain)
+        .iter()
+        .map(|row| {
+            let payload_id = row
+                .payload
+                .as_object()
+                .and_then(|payload| payload.get(payload_field))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    DataLayerError::InvalidInput(format!(
+                        "{} export row '{}' must contain a non-empty string {}",
+                        domain.as_str(),
+                        row.id,
+                        payload_field
+                    ))
+                })?;
+            if payload_id != row.id {
+                return Err(DataLayerError::InvalidInput(format!(
+                    "{} export row id '{}' does not match payload {} '{}'",
+                    domain.as_str(),
+                    row.id,
+                    payload_field,
+                    payload_id
+                )));
+            }
+            Ok(payload_id.to_string())
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -523,6 +629,139 @@ struct PostgresImportColumn {
 type PostgresImportColumns = BTreeMap<String, PostgresImportColumn>;
 #[cfg(any(feature = "mysql", feature = "sqlite"))]
 type ImportColumnNames = BTreeSet<String>;
+
+const IMPORTED_CREDENTIAL_REVOKE_REASON: &str = "imported_credentials_revoked";
+
+fn imported_credential_tombstone() -> String {
+    format!("{:x}", Sha256::digest(uuid::Uuid::new_v4().as_bytes()))
+}
+
+fn set_supported_import_value(
+    object: &mut serde_json::Map<String, Value>,
+    target_has_column: &impl Fn(&str) -> bool,
+    column: &str,
+    value: Value,
+) {
+    if target_has_column(column) {
+        object.insert(column.to_string(), value);
+    }
+}
+
+fn deactivate_imported_credentials(
+    table_name: &str,
+    object: &mut serde_json::Map<String, Value>,
+    target_has_column: impl Fn(&str) -> bool,
+) {
+    let table_name = table_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(table_name)
+        .trim_matches(|ch| matches!(ch, '"' | '`'));
+
+    match table_name {
+        "users"
+            if object
+                .get("password_hash")
+                .is_some_and(|value| !value.is_null()) =>
+        {
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "password_hash",
+                Value::String(format!(
+                    "$aether-import-revoked${}",
+                    imported_credential_tombstone()
+                )),
+            );
+        }
+        "users" => {}
+        "api_keys" => {
+            if object.contains_key("key_hash") {
+                set_supported_import_value(
+                    object,
+                    &target_has_column,
+                    "key_hash",
+                    Value::String(imported_credential_tombstone()),
+                );
+            }
+            set_supported_import_value(object, &target_has_column, "key_encrypted", Value::Null);
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "status",
+                Value::String("disabled".to_string()),
+            );
+            set_supported_import_value(object, &target_has_column, "is_active", Value::Bool(false));
+            set_supported_import_value(object, &target_has_column, "is_locked", Value::Bool(true));
+        }
+        "management_tokens" => {
+            if object.contains_key("token_hash") {
+                set_supported_import_value(
+                    object,
+                    &target_has_column,
+                    "token_hash",
+                    Value::String(imported_credential_tombstone()),
+                );
+            }
+            set_supported_import_value(object, &target_has_column, "is_active", Value::Bool(false));
+        }
+        "user_sessions" => {
+            if object.contains_key("refresh_token_hash") {
+                set_supported_import_value(
+                    object,
+                    &target_has_column,
+                    "refresh_token_hash",
+                    Value::String(imported_credential_tombstone()),
+                );
+            }
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "prev_refresh_token_hash",
+                Value::Null,
+            );
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "revoked_at",
+                Value::from(chrono::Utc::now().timestamp()),
+            );
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "revoke_reason",
+                Value::String(IMPORTED_CREDENTIAL_REVOKE_REASON.to_string()),
+            );
+        }
+        "proxy_nodes" => {
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "tunnel_generation",
+                Value::String(uuid::Uuid::new_v4().to_string()),
+            );
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "tunnel_connected",
+                Value::Bool(false),
+            );
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "status",
+                Value::String("offline".to_string()),
+            );
+            set_supported_import_value(
+                object,
+                &target_has_column,
+                "active_connections",
+                Value::from(0),
+            );
+        }
+        _ => {}
+    }
+}
 
 const USAGE_REQUEST_BODY_DETAIL_COLUMNS: &[&str] = &[
     "request_body",
@@ -707,6 +946,27 @@ pub fn encode_jsonl(records: &[DataExportRecord]) -> Result<String, DataLayerErr
     for record in records {
         let line = serde_json::to_string(record)
             .map_err(|err| DataLayerError::UnexpectedValue(err.to_string()))?;
+        if line.len() > MAX_JSONL_LINE_BYTES {
+            return Err(DataLayerError::InvalidInput(format!(
+                "export JSONL record exceeds the {} byte line limit",
+                MAX_JSONL_LINE_BYTES
+            )));
+        }
+        let output_len = output
+            .len()
+            .checked_add(line.len())
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| {
+                DataLayerError::InvalidInput(
+                    "export JSONL exceeds the input size limit".to_string(),
+                )
+            })?;
+        if output_len > MAX_JSONL_INPUT_BYTES {
+            return Err(DataLayerError::InvalidInput(format!(
+                "export JSONL exceeds the {} byte input limit",
+                MAX_JSONL_INPUT_BYTES
+            )));
+        }
         output.push_str(&line);
         output.push('\n');
     }
@@ -714,10 +974,41 @@ pub fn encode_jsonl(records: &[DataExportRecord]) -> Result<String, DataLayerErr
 }
 
 pub fn decode_jsonl(input: &str) -> Result<Vec<DataExportRecord>, DataLayerError> {
+    decode_jsonl_with_limits(
+        input,
+        MAX_JSONL_INPUT_BYTES,
+        MAX_JSONL_LINE_BYTES,
+        MAX_JSONL_RECORDS,
+    )
+}
+
+fn decode_jsonl_with_limits(
+    input: &str,
+    max_input_bytes: usize,
+    max_line_bytes: usize,
+    max_records: usize,
+) -> Result<Vec<DataExportRecord>, DataLayerError> {
+    if input.len() > max_input_bytes {
+        return Err(DataLayerError::InvalidInput(format!(
+            "export JSONL exceeds the {max_input_bytes} byte input limit"
+        )));
+    }
+
     let mut records = Vec::new();
     for (line_index, line) in input.lines().enumerate() {
+        if line.len() > max_line_bytes {
+            return Err(DataLayerError::InvalidInput(format!(
+                "export JSONL record on line {} exceeds the {max_line_bytes} byte line limit",
+                line_index + 1,
+            )));
+        }
         if line.trim().is_empty() {
             continue;
+        }
+        if records.len() >= max_records {
+            return Err(DataLayerError::InvalidInput(format!(
+                "export JSONL exceeds the {max_records} record limit"
+            )));
         }
         let record = serde_json::from_str::<DataExportRecord>(line).map_err(|err| {
             DataLayerError::InvalidInput(format!(
@@ -761,6 +1052,12 @@ pub fn build_import_plan(input: &str) -> Result<DataImportPlan, DataLayerError> 
 }
 
 pub fn validate_export_records(records: &[DataExportRecord]) -> Result<(), DataLayerError> {
+    if records.len() > MAX_JSONL_RECORDS {
+        return Err(DataLayerError::InvalidInput(format!(
+            "export JSONL exceeds the {} record limit",
+            MAX_JSONL_RECORDS
+        )));
+    }
     let Some(DataExportRecord::Manifest { manifest }) = records.first() else {
         return Err(DataLayerError::InvalidInput(
             "export JSONL must start with a manifest record".to_string(),
@@ -1170,13 +1467,14 @@ async fn copy_postgres_sqlite_table(
     let mut imported = 0usize;
 
     while let Some(row) = rows.try_next().await.map_sql_err()? {
-        let payload = row.try_get::<Value, _>("payload").map_sql_err()?;
-        let object = payload.as_object().ok_or_else(|| {
+        let mut payload = row.try_get::<Value, _>("payload").map_sql_err()?;
+        let object = payload.as_object_mut().ok_or_else(|| {
             DataLayerError::UnexpectedValue(format!(
                 "postgres copy row for table '{}' did not produce a JSON object",
                 table.table_name
             ))
         })?;
+        prepare_postgres_sqlite_copy_payload(table, object);
         let mut query = sqlx::query(&target_sql);
         for column in &table.columns {
             let value = object.get(&column.sqlite.name).ok_or_else(|| {
@@ -1192,6 +1490,21 @@ async fn copy_postgres_sqlite_table(
     }
 
     Ok(imported)
+}
+
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
+fn prepare_postgres_sqlite_copy_payload(
+    table: &SchemaCopyTable,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    deactivate_imported_credentials(&table.table_name, object, |column_name| {
+        table
+            .columns
+            .iter()
+            .any(|column| column.sqlite.name == column_name)
+    });
+    sanitize_request_candidate_auxiliary_payload(&table.table_name, object);
+    sanitize_payment_security_payload(&table.table_name, object);
 }
 
 #[cfg(all(feature = "postgres", feature = "sqlite"))]
@@ -1759,8 +2072,83 @@ fn payload_with_table(payload: Value, table_name: &str) -> Result<Value, DataLay
         DataLayerError::UnexpectedValue("export row payload must be a JSON object".to_string())
     })?;
     normalize_billing_payload(table_name, &mut object)?;
+    sanitize_request_candidate_auxiliary_payload(table_name, &mut object);
+    sanitize_payment_security_payload(table_name, &mut object);
     object.insert("__table".to_string(), Value::String(table_name.to_string()));
     Ok(Value::Object(object))
+}
+
+fn sanitize_request_candidate_auxiliary_payload(
+    table_name: &str,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    if table_name != "request_candidates" {
+        return;
+    }
+
+    object.insert("error_message".to_string(), Value::Null);
+    sanitize_request_candidate_auxiliary_string(
+        object,
+        "skip_reason",
+        sanitize_request_candidate_skip_reason,
+    );
+    sanitize_request_candidate_auxiliary_string(
+        object,
+        "error_type",
+        sanitize_request_candidate_error_type,
+    );
+    sanitize_request_candidate_auxiliary_json(
+        object,
+        "extra_data",
+        sanitize_request_candidate_extra_data,
+    );
+    sanitize_request_candidate_auxiliary_json(
+        object,
+        "required_capabilities",
+        sanitize_request_candidate_required_capabilities,
+    );
+}
+
+fn sanitize_payment_security_payload(
+    table_name: &str,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    match table_name {
+        "payment_orders" => {
+            object.insert("gateway_response".to_string(), Value::Null);
+        }
+        "payment_callbacks" => {
+            object.insert("payload".to_string(), Value::Null);
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_request_candidate_auxiliary_string(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    sanitize: fn(Option<String>) -> Option<String>,
+) {
+    let value = object
+        .remove(field)
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    object.insert(
+        field.to_string(),
+        sanitize(value).map_or(Value::Null, Value::String),
+    );
+}
+
+fn sanitize_request_candidate_auxiliary_json(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    sanitize: fn(Option<Value>) -> Option<Value>,
+) {
+    let value = object.remove(field).and_then(|value| match value {
+        Value::Null => None,
+        Value::String(raw) => serde_json::from_str::<Value>(&raw).ok(),
+        value => Some(value),
+    });
+    object.insert(field.to_string(), sanitize(value).unwrap_or(Value::Null));
 }
 
 fn normalize_billing_payload(
@@ -1816,5 +2204,197 @@ fn domain_payload_table(
             ))
         })?,
     };
+    sanitize_request_candidate_auxiliary_payload(&table_name, &mut object);
+    sanitize_payment_security_payload(&table_name, &mut object);
     Ok((table_name, Value::Object(object)))
+}
+
+#[cfg(test)]
+mod payment_export_security_tests {
+    use serde_json::json;
+
+    use super::{domain_payload_table, payload_with_table, ExportRow};
+
+    #[test]
+    fn wallet_exports_and_imports_drop_payment_capabilities_and_raw_callbacks() {
+        let order = payload_with_table(
+            json!({
+                "id": "order-1",
+                "gateway_response": {
+                    "client_secret": "pi_1_secret_replayable",
+                    "_stripe_client_secret_encrypted": "ciphertext",
+                    "customer": {"email": "payer@example.com"},
+                    "payment_url": "https://pay.example/checkout?token=secret",
+                },
+            }),
+            "payment_orders",
+        )
+        .expect("payment order export should sanitize");
+        assert!(order["gateway_response"].is_null());
+
+        let callback = ExportRow {
+            id: "payment_callbacks:callback-1".to_string(),
+            payload: json!({
+                "__table": "payment_callbacks",
+                "id": "callback-1",
+                "payload": {
+                    "client_secret": "pi_1_secret_replayable",
+                    "customer_email": "payer@example.com",
+                },
+            }),
+        };
+        let (table, callback) = domain_payload_table(&callback, "wallet", Some("wallets"))
+            .expect("payment callback import should sanitize");
+        assert_eq!(table, "payment_callbacks");
+        assert!(callback["payload"].is_null());
+
+        let encoded = format!("{order}{callback}");
+        for forbidden in [
+            "client_secret",
+            "replayable",
+            "ciphertext",
+            "customer",
+            "payer@example.com",
+            "token=secret",
+        ] {
+            assert!(!encoded.contains(forbidden), "exported {forbidden}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_candidate_export_security_tests {
+    use serde_json::json;
+
+    #[cfg(all(feature = "postgres", feature = "sqlite"))]
+    use serde_json::Value;
+
+    use super::{domain_payload_table, payload_with_table, ExportRow};
+
+    #[cfg(all(feature = "postgres", feature = "sqlite"))]
+    use super::{
+        prepare_postgres_sqlite_copy_payload, PostgresImportColumn, SchemaCopyColumn,
+        SchemaCopyTable, SqliteCopyColumn,
+    };
+
+    #[test]
+    fn request_candidate_auxiliary_export_and_import_drop_sensitive_diagnostics() {
+        let raw = json!({
+            "id": "candidate-1",
+            "error_message": "Bearer export-secret",
+            "skip_reason": "secret skip reason",
+            "error_type": "secret error type",
+            "extra_data": "{\"upstream_url\":\"https://user:pass@example.com/private/export-secret?token=secret\",\"unknown\":\"secret\",\"header_rules\":[{\"id\":\"secret-rule\",\"action\":\"set\",\"name\":\"authorization\",\"value\":\"secret\"}]}",
+            "required_capabilities": "{\"cache_1h\":\"true\",\"tenant_secret\":\"secret\"}"
+        });
+
+        let exported = payload_with_table(raw, "request_candidates")
+            .expect("candidate export payload should sanitize");
+        assert!(exported["error_message"].is_null());
+        assert_eq!(exported["skip_reason"], "unclassified_skip");
+        assert_eq!(exported["error_type"], "unclassified_error");
+        assert_eq!(
+            exported["extra_data"]["upstream_url"],
+            "https://example.com/"
+        );
+        assert_eq!(exported["extra_data"]["header_rules"]["count"], 1);
+        assert_eq!(exported["required_capabilities"]["cache_1h"], true);
+        let encoded = exported.to_string();
+        for sensitive in [
+            "export-secret",
+            "user:pass",
+            "secret-rule",
+            "authorization",
+            "tenant_secret",
+        ] {
+            assert!(!encoded.contains(sensitive));
+        }
+
+        let imported_row = ExportRow {
+            id: "request_candidates:[\"candidate-1\"]".to_string(),
+            payload: json!({
+                "__table": "request_candidates",
+                "id": "candidate-1",
+                "error_message": "Bearer import-secret",
+                "extra_data": {"free_text": "import-secret"},
+                "required_capabilities": {"vision": 1, "secret": "import-secret"}
+            }),
+        };
+        let (table, imported) = domain_payload_table(&imported_row, "auxiliary", None)
+            .expect("candidate import payload should sanitize");
+        assert_eq!(table, "request_candidates");
+        assert!(imported["error_message"].is_null());
+        assert!(imported["extra_data"].is_null());
+        assert_eq!(imported["required_capabilities"], json!({"vision": true}));
+        assert!(!imported.to_string().contains("import-secret"));
+    }
+
+    #[cfg(all(feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn postgres_to_sqlite_fast_copy_sanitizes_request_candidate_diagnostics() {
+        let table = SchemaCopyTable {
+            table_name: "request_candidates".to_string(),
+            columns: [
+                "error_message",
+                "skip_reason",
+                "error_type",
+                "extra_data",
+                "required_capabilities",
+            ]
+            .into_iter()
+            .map(|name| SchemaCopyColumn {
+                sqlite: SqliteCopyColumn {
+                    name: name.to_string(),
+                    declared_type: "TEXT".to_string(),
+                    not_null: false,
+                    has_default: false,
+                    primary_key_position: 0,
+                },
+                postgres: PostgresImportColumn {
+                    data_type: "text".to_string(),
+                    udt_name: "text".to_string(),
+                    is_nullable: true,
+                    has_default: false,
+                },
+            })
+            .collect(),
+        };
+        let mut payload = json!({
+            "error_message": "Bearer fast-copy-secret",
+            "skip_reason": "fast-copy-secret",
+            "error_type": "fast-copy-secret",
+            "extra_data": {
+                "upstream_url": "https://user:pass@example.com/private?token=fast-copy-secret",
+                "image_progress": {
+                    "phase": "upstream_streaming",
+                    "message": "fast-copy-secret"
+                }
+            },
+            "required_capabilities": {
+                "vision": 1,
+                "tenant_secret": "fast-copy-secret"
+            }
+        })
+        .as_object()
+        .cloned()
+        .expect("copy payload should be an object");
+
+        prepare_postgres_sqlite_copy_payload(&table, &mut payload);
+
+        assert!(payload["error_message"].is_null());
+        assert_eq!(payload["skip_reason"], "unclassified_skip");
+        assert_eq!(payload["error_type"], "unclassified_error");
+        assert_eq!(
+            payload["extra_data"]["upstream_url"],
+            "https://example.com/"
+        );
+        assert_eq!(
+            payload["extra_data"]["image_progress"],
+            json!({"phase": "upstream_streaming"})
+        );
+        assert_eq!(payload["required_capabilities"], json!({"vision": true}));
+        assert!(!Value::Object(payload)
+            .to_string()
+            .contains("fast-copy-secret"));
+    }
 }

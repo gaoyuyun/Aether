@@ -8,8 +8,13 @@ use aether_runtime_state::RuntimeSemaphore;
 
 use crate::server::SpawnedServer;
 
+pub const TUNNEL_HARNESS_NODE_ID: &str = "node-baseline";
+pub const TUNNEL_HARNESS_GENERATION: &str = "tunnel-harness-generation-1";
+pub const TUNNEL_HARNESS_MANAGEMENT_TOKEN: &str = "ae-tunnel-harness-management-token";
+
 #[derive(Debug, Clone)]
 pub struct TunnelHarnessConfig {
+    pub node_id: String,
     pub max_streams: usize,
     pub ping_interval: Duration,
     pub outbound_queue_capacity: usize,
@@ -20,6 +25,7 @@ pub struct TunnelHarnessConfig {
 impl Default for TunnelHarnessConfig {
     fn default() -> Self {
         Self {
+            node_id: TUNNEL_HARNESS_NODE_ID.to_string(),
             max_streams: 128,
             ping_interval: Duration::from_secs(15),
             outbound_queue_capacity: 128,
@@ -62,6 +68,12 @@ impl TunnelHarness {
         } else {
             state
         };
+        let state = aether_gateway::configure_test_tunnel_runtime_auth(
+            state,
+            &config.node_id,
+            TUNNEL_HARNESS_GENERATION,
+            TUNNEL_HARNESS_MANAGEMENT_TOKEN,
+        )?;
         let router = build_tunnel_runtime_router_with_state(state);
         let server = match port {
             Some(port) => SpawnedServer::start_on_port(port, router)
@@ -81,4 +93,20 @@ impl TunnelHarness {
     pub fn port(&self) -> u16 {
         self.server.port()
     }
+}
+
+pub fn insert_tunnel_harness_auth_headers(
+    headers: &mut http::HeaderMap,
+    node_id: &str,
+) -> Result<(), http::header::InvalidHeaderValue> {
+    headers.insert("x-node-id", http::HeaderValue::from_str(node_id)?);
+    headers.insert(
+        aether_contracts::tunnel_security::TUNNEL_GENERATION_HEADER,
+        http::HeaderValue::from_static(TUNNEL_HARNESS_GENERATION),
+    );
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static(concat!("Bearer ", "ae-tunnel-harness-management-token")),
+    );
+    Ok(())
 }

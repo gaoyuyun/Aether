@@ -3,9 +3,7 @@ use std::sync::{Arc, Mutex};
 use aether_contracts::{
     ExecutionPlan, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, EXECUTION_REQUEST_HTTP1_ONLY_HEADER,
 };
-use aether_crypto::{
-    decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY,
-};
+use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
@@ -31,8 +29,39 @@ use crate::constants::{
     TRUSTED_ADMIN_USER_ROLE_HEADER,
 };
 use crate::data::{GatewayDataConfig, GatewayDataState};
+use crate::handlers::shared::{
+    open_provider_ops_credential, provider_ops_credential_binding_from_config,
+};
 
 const PROVIDER_OPS_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn open_stored_provider_ops_credential(
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    field: &str,
+    stored: &str,
+) -> String {
+    let provider_ops = provider
+        .config
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|config| config.get("provider_ops"))
+        .and_then(serde_json::Value::as_object)
+        .expect("provider ops config should be present");
+    let base_url = provider_ops
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .expect("provider ops base_url should be present");
+    let binding = provider_ops_credential_binding_from_config(&provider.id, provider_ops, base_url)
+        .expect("provider ops credential binding should be valid");
+    let state = AppState::new()
+        .expect("gateway state should build")
+        .with_data_state_for_tests(
+            GatewayDataState::disabled().with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    open_provider_ops_credential(&state, &binding, field, stored)
+        .expect("provider ops credential should decrypt")
+        .plaintext
+}
 
 fn run_provider_ops_test<F, Fut>(test_name: &'static str, make_future: F)
 where
@@ -554,7 +583,10 @@ async fn gateway_saves_admin_provider_ops_config_locally_with_trusted_admin_prin
                     "tenant": "acme"
                 },
                 "credentials": {
-                    "refresh_token": "************",
+                    // A binding change (architecture/auth type/base URL) must be
+                    // accompanied by a newly supplied secret; masked values are
+                    // intentionally rejected by the handler.
+                    "refresh_token": "new-refresh-secret",
                     "api_key": "live-secret-api-key",
                 }
             },
@@ -621,9 +653,8 @@ async fn gateway_saves_admin_provider_ops_config_locally_with_trusted_admin_prin
         .expect("refresh token should be string");
     assert_ne!(stored_refresh, "refresh-secret-1234");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_refresh)
-            .expect("refresh token should decrypt"),
-        "refresh-secret-1234"
+        open_stored_provider_ops_credential(&stored_provider, "refresh_token", stored_refresh),
+        "new-refresh-secret"
     );
     let stored_api_key = credentials
         .get("api_key")
@@ -631,8 +662,7 @@ async fn gateway_saves_admin_provider_ops_config_locally_with_trusted_admin_prin
         .expect("api key should be string");
     assert_ne!(stored_api_key, "live-secret-api-key");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_api_key)
-            .expect("api key should decrypt"),
+        open_stored_provider_ops_credential(&stored_provider, "api_key", stored_api_key),
         "live-secret-api-key"
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
@@ -1307,7 +1337,7 @@ async fn gateway_verifies_admin_provider_ops_locally_for_anyrouter_proxy_mode_im
                         plan.headers
                             .get(EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER)
                             .map(String::as_str),
-                        None
+                        Some("false")
                     );
                     Json(json!({
                         "request_id": plan.request_id,
@@ -1723,7 +1753,9 @@ async fn gateway_verifies_admin_provider_ops_locally_for_new_api_with_trusted_ad
     assert_eq!(payload["data"]["used_quota"], 12.5);
     assert_eq!(payload["data"]["request_count"], 9);
     assert_eq!(payload["data"]["email"], "");
-    assert_eq!(payload["data"]["extra"]["group"], "default");
+    // The safe verification projection intentionally drops unknown upstream
+    // fields such as `group`; only the documented fields are returned.
+    assert_eq!(payload["data"]["extra"], json!({}));
     assert_eq!(payload["updated_credentials"], serde_json::Value::Null);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -2542,8 +2574,11 @@ async fn gateway_verifies_admin_provider_ops_sub2api_persists_rotated_runtime_cr
         .and_then(serde_json::Value::as_str)
         .expect("refresh token should be string");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_refresh_token)
-            .expect("refresh token should decrypt"),
+        open_stored_provider_ops_credential(
+            &stored_provider,
+            "refresh_token",
+            stored_refresh_token
+        ),
         "refresh-token-new"
     );
     let stored_cached_access_token = credentials
@@ -2551,8 +2586,11 @@ async fn gateway_verifies_admin_provider_ops_sub2api_persists_rotated_runtime_cr
         .and_then(serde_json::Value::as_str)
         .expect("cached access token should be string");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_cached_access_token,)
-            .expect("cached access token should decrypt"),
+        open_stored_provider_ops_credential(
+            &stored_provider,
+            "_cached_access_token",
+            stored_cached_access_token,
+        ),
         "access-token-new"
     );
     assert!(
@@ -2939,7 +2977,7 @@ async fn gateway_handles_admin_provider_ops_balance_locally_for_generic_api_prox
     assert_eq!(payload["data"]["total_available"], 5.0);
     assert_eq!(payload["data"]["total_used"], 1.0);
     assert_eq!(payload["data"]["extra"]["checkin_success"], true);
-    assert_eq!(payload["data"]["extra"]["checkin_message"], "代理签到成功");
+    assert_eq!(payload["data"]["extra"]["checkin_message"], "签到成功");
 
     let plans = execution_plans.lock().expect("mutex should lock");
     assert_eq!(plans.len(), 2);
@@ -3084,10 +3122,7 @@ async fn gateway_handles_admin_provider_ops_balance_locally_without_proxy_via_ex
     assert_eq!(payload["data"]["total_available"], 5.0);
     assert_eq!(payload["data"]["total_used"], 1.0);
     assert_eq!(payload["data"]["extra"]["checkin_success"], true);
-    assert_eq!(
-        payload["data"]["extra"]["checkin_message"],
-        "执行层签到成功"
-    );
+    assert_eq!(payload["data"]["extra"]["checkin_message"], "签到成功");
 
     let plans = execution_plans.lock().expect("mutex should lock");
     assert_eq!(plans.len(), 2);
@@ -3214,7 +3249,7 @@ async fn gateway_handles_admin_provider_ops_checkin_locally_with_trusted_admin_p
     assert_eq!(payload["action_type"], "checkin");
     assert_eq!(payload["data"]["reward"], 1.5);
     assert_eq!(payload["data"]["streak_days"], 3);
-    assert_eq!(payload["data"]["message"], "今日签到完成");
+    assert_eq!(payload["data"]["message"], "签到成功");
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -3347,7 +3382,7 @@ async fn gateway_handles_admin_provider_ops_checkin_locally_for_generic_api_prox
     assert_eq!(payload["action_type"], "checkin");
     assert_eq!(payload["data"]["reward"], 1.5);
     assert_eq!(payload["data"]["streak_days"], 3);
-    assert_eq!(payload["data"]["message"], "今日签到完成");
+    assert_eq!(payload["data"]["message"], "签到成功");
     assert_eq!(execution_plans.lock().expect("mutex should lock").len(), 1);
 
     gateway_handle.abort();
@@ -3588,7 +3623,7 @@ async fn gateway_handles_admin_provider_ops_batch_balance_locally_with_trusted_a
     );
     assert_eq!(
         payload["provider-anyrouter"]["data"]["extra"]["checkin_message"],
-        "Anyrouter 签到成功"
+        "签到成功"
     );
     assert_eq!(payload["provider-missing"]["status"], "not_configured");
     assert_eq!(payload["provider-missing"]["message"], "未配置操作设置");
@@ -4791,8 +4826,11 @@ async fn gateway_handles_admin_provider_ops_sub2api_balance_with_refresh_token_r
         .and_then(serde_json::Value::as_str)
         .expect("refresh token should be string");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_refresh_token)
-            .expect("refresh token should decrypt"),
+        open_stored_provider_ops_credential(
+            &stored_provider,
+            "refresh_token",
+            stored_refresh_token
+        ),
         "refresh-token-new"
     );
     let stored_cached_access_token = credentials
@@ -4800,8 +4838,11 @@ async fn gateway_handles_admin_provider_ops_sub2api_balance_with_refresh_token_r
         .and_then(serde_json::Value::as_str)
         .expect("cached access token should be string");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_cached_access_token,)
-            .expect("cached access token should decrypt"),
+        open_stored_provider_ops_credential(
+            &stored_provider,
+            "_cached_access_token",
+            stored_cached_access_token,
+        ),
         "access-token-new"
     );
     assert!(
@@ -5193,8 +5234,11 @@ async fn gateway_handles_admin_provider_ops_sub2api_balance_with_session_login_i
         .and_then(serde_json::Value::as_str)
         .expect("refresh token should be string");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_refresh_token)
-            .expect("refresh token should decrypt"),
+        open_stored_provider_ops_credential(
+            &stored_provider,
+            "refresh_token",
+            stored_refresh_token
+        ),
         "login-refresh-token"
     );
     let stored_cached_access_token = credentials
@@ -5202,8 +5246,11 @@ async fn gateway_handles_admin_provider_ops_sub2api_balance_with_session_login_i
         .and_then(serde_json::Value::as_str)
         .expect("cached access token should be string");
     assert_eq!(
-        decrypt_python_fernet_ciphertext(DEVELOPMENT_ENCRYPTION_KEY, stored_cached_access_token,)
-            .expect("cached access token should decrypt"),
+        open_stored_provider_ops_credential(
+            &stored_provider,
+            "_cached_access_token",
+            stored_cached_access_token,
+        ),
         "login-access-token"
     );
     assert!(

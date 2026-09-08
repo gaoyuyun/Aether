@@ -1,6 +1,7 @@
 use aether_data_contracts::repository::video_tasks::{StoredVideoTask, UpsertVideoTask};
 use serde_json::{json, Map, Value};
 
+use crate::types::sanitize_video_task_error_code;
 use crate::{
     local_status_from_stored, non_empty_owned, request_body_string, GeminiVideoTaskSeed,
     LocalVideoTaskPersistence, LocalVideoTaskReadResponse, LocalVideoTaskSnapshot,
@@ -16,11 +17,26 @@ impl LocalVideoTaskSnapshot {
     }
 
     pub fn from_stored_task(task: &StoredVideoTask) -> Option<Self> {
-        task.request_metadata
+        let mut snapshot = task
+            .request_metadata
             .as_ref()
             .and_then(|metadata| metadata.get("rust_local_snapshot"))
             .cloned()
-            .and_then(|value| serde_json::from_value::<LocalVideoTaskSnapshot>(value).ok())
+            .and_then(|value| serde_json::from_value::<LocalVideoTaskSnapshot>(value).ok())?;
+
+        // The row is the ownership source of truth. Older embedded snapshots can
+        // contain stale identity fields after a task import or repair.
+        match &mut snapshot {
+            Self::OpenAi(seed) => {
+                seed.user_id = task.user_id.clone();
+                seed.api_key_id = task.api_key_id.clone();
+            }
+            Self::Gemini(seed) => {
+                seed.user_id = task.user_id.clone();
+                seed.api_key_id = task.api_key_id.clone();
+            }
+        }
+        Some(snapshot)
     }
 
     pub fn from_stored_task_with_transport(
@@ -97,6 +113,33 @@ impl LocalVideoTaskSnapshot {
         }
     }
 
+    pub(crate) fn sanitize_persisted_diagnostics(&mut self) -> bool {
+        match self {
+            Self::OpenAi(seed) => {
+                let previous_error_code = seed.error_code.clone();
+                let error_code =
+                    sanitized_error_code_for_status(seed.status, seed.error_code.take());
+                let changed = previous_error_code != error_code || seed.error_message.is_some();
+                seed.error_code = error_code;
+                seed.error_message = None;
+                changed
+            }
+            Self::Gemini(seed) => {
+                let previous_error_code = seed.error_code.clone();
+                let error_code =
+                    sanitized_error_code_for_status(seed.status, seed.error_code.take());
+                let safe_metadata = Value::Object(Map::new());
+                let changed = previous_error_code != error_code
+                    || seed.error_message.is_some()
+                    || seed.metadata != safe_metadata;
+                seed.error_code = error_code;
+                seed.error_message = None;
+                seed.metadata = safe_metadata;
+                changed
+            }
+        }
+    }
+
     pub fn read_response(&self) -> LocalVideoTaskReadResponse {
         match self {
             Self::OpenAi(seed) => match seed.status {
@@ -130,6 +173,18 @@ impl LocalVideoTaskSnapshot {
         }
     }
 
+    pub fn belongs_to_user(&self, user_id: &str) -> bool {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            return false;
+        }
+        let owner = match self {
+            Self::OpenAi(seed) => seed.user_id.as_deref(),
+            Self::Gemini(seed) => seed.user_id.as_deref(),
+        };
+        owner.map(str::trim) == Some(user_id)
+    }
+
     pub fn is_active_for_refresh(&self) -> bool {
         match self {
             Self::OpenAi(seed) => matches!(
@@ -159,5 +214,18 @@ impl LocalVideoTaskSnapshot {
             Self::OpenAi(seed) => seed.transport.provider_name.as_deref(),
             Self::Gemini(seed) => seed.transport.provider_name.as_deref(),
         }
+    }
+}
+
+fn sanitized_error_code_for_status(
+    status: LocalVideoTaskStatus,
+    error_code: Option<String>,
+) -> Option<String> {
+    match status {
+        LocalVideoTaskStatus::Failed => sanitize_video_task_error_code(error_code)
+            .or_else(|| Some("provider_error".to_string())),
+        LocalVideoTaskStatus::Expired => Some("expired".to_string()),
+        LocalVideoTaskStatus::Cancelled => Some("cancelled".to_string()),
+        _ => None,
     }
 }

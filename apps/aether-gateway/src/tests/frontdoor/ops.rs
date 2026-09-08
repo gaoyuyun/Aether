@@ -75,6 +75,7 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
     assert!(owned_routes
         .iter()
         .any(|value| value == "/v1/responses/compact"));
+    assert!(owned_routes.iter().any(|value| value == "/v1/realtime"));
     assert!(owned_routes.iter().any(|value| value == "/v1/alpha/search"));
     assert!(owned_routes.iter().any(|value| value == "/health"));
     assert!(owned_routes.iter().any(|value| value == "/v1/health"));
@@ -188,7 +189,7 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
         .any(|value| value == "/v1internal:streamGenerateContent"));
     assert_eq!(
         payload["rust_frontdoor"]["internal_gateway"]["status"],
-        "rust_native_control_plane"
+        "test_loopback_compatibility"
     );
     assert_eq!(
         payload["rust_frontdoor"]["internal_gateway"]["path_prefixes"][0],

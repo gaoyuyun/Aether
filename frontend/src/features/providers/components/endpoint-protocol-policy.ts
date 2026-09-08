@@ -2,6 +2,11 @@ import { normalizeEndpointApiFormat } from './endpoint-default-paths'
 
 export type FixedUpstreamStreamPolicy = 'force_stream' | 'force_non_stream'
 
+export function isWebSocketEndpointApiFormat(apiFormat: string): boolean {
+  const normalizedApiFormat = normalizeEndpointApiFormat(apiFormat)
+  return normalizedApiFormat === 'openai:realtime' || normalizedApiFormat === 'codex:live'
+}
+
 export function fixedEndpointUpstreamStreamPolicy(
   providerType: string | null | undefined,
   apiFormat: string,

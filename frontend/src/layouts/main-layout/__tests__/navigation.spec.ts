@@ -64,6 +64,50 @@ describe('main layout navigation builder', () => {
     expect(itemNames).toContain('tx:nav.billingCenter')
   })
 
+  it('exposes remote control to users and active administrators', () => {
+    const userNavigation = buildNavigation({
+      canAccessAdmin: false,
+      modules: {},
+      isModuleActive: () => false,
+      t: translate,
+    })
+    const adminNavigation = buildNavigation({
+      canAccessAdmin: true,
+      modules: {
+        vscodex: {
+          active: true,
+          admin_route: '/dashboard/vscodex',
+          admin_menu_group: 'overview',
+          admin_menu_order: 80,
+          admin_menu_icon: 'SquareTerminal',
+          display_name: '远程控制',
+        },
+      },
+      isModuleActive: () => false,
+      t: translate,
+    })
+
+    const findVscodeControl = (navigation: ReturnType<typeof buildNavigation>) => (
+      navigation
+        .flatMap(group => group.items)
+        .find(item => item.href === '/dashboard/vscodex')
+    )
+
+    expect(findVscodeControl(userNavigation)).toMatchObject({
+      name: 'tx:nav.vscodex',
+      href: '/dashboard/vscodex',
+    })
+    expect(findVscodeControl(adminNavigation)).toMatchObject({
+      name: '远程控制',
+      href: '/dashboard/vscodex',
+    })
+
+    const overviewItems = adminNavigation.find(group => group.title === 'tx:nav.group.overview')?.items ?? []
+    expect(overviewItems.findIndex(item => item.name === '远程控制')).toBe(
+      overviewItems.findIndex(item => item.name === 'tx:nav.performanceAnalysis') + 1,
+    )
+  })
+
   it('builds admin navigation with dynamic module menu items sorted by menu order', () => {
     const navigation = buildNavigation({
       canAccessAdmin: true,
@@ -174,6 +218,40 @@ describe('main layout navigation builder', () => {
       { label: 'tx:nav.group.management' },
       { label: 'tx:nav.routing', href: '/admin/routing' },
       { label: 'tx:breadcrumb.routingCreate' },
+    ])
+
+    expect(buildBreadcrumbs({
+      route: route('/dashboard/vscodex'),
+      navigation: buildNavigation({
+        canAccessAdmin: true,
+        modules: {
+          vscodex: {
+            active: true,
+            admin_route: '/dashboard/vscodex',
+            admin_menu_group: 'overview',
+            admin_menu_order: 80,
+            admin_menu_icon: 'SquareTerminal',
+            display_name: '远程控制',
+          },
+        },
+        isModuleActive: () => false,
+        t: translate,
+      }),
+      modules: {
+        vscodex: {
+          active: true,
+          admin_route: '/dashboard/vscodex',
+          admin_menu_group: 'overview',
+          admin_menu_order: 80,
+          admin_menu_icon: 'SquareTerminal',
+          display_name: '远程控制',
+        },
+      },
+      isNavActive: href => href === '/dashboard/vscodex',
+      t: translate,
+    })).toEqual([
+      expect.objectContaining({ label: expect.any(String) }),
+      { label: '远程控制' },
     ])
   })
 })

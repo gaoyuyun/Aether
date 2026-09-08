@@ -258,7 +258,7 @@
                       <div class="flex flex-wrap gap-2 text-muted-foreground/60">
                         <span>Provider: {{ replayResult.mapping.target_provider }}</span>
                         <span>Endpoint: {{ replayResult.mapping.target_endpoint_id }}</span>
-                        <span>Format: {{ replayResult.mapping.target_api_format || '-' }}</span>
+                        <span>Format: {{ formatApiFormat(replayResult.mapping.target_api_format) }}</span>
                       </div>
                       <div
                         v-if="replayResult.mapping.mapping_source && replayResult.mapping.mapping_source !== 'none'"
@@ -326,6 +326,7 @@ import { dashboardApi, type ReplayResponse, type RequestDetail } from '@/api/das
 import { getProvidersSummary } from '@/api/endpoints/providers'
 import { getProviderKeys } from '@/api/endpoints/keys'
 import type { EndpointAPIKey } from '@/api/endpoints/types'
+import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { useClipboard } from '@/composables/useClipboard'
 import { useEscapeKey } from '@/composables/useEscapeKey'
 import Card from '@/components/ui/card.vue'

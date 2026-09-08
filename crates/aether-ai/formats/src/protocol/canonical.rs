@@ -1,8 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::formats::openai::responses::openai_responses_message_item_id;
+use crate::formats::openai::responses::{
+    decode_gemini_tool_signature_carrier, GeminiToolSignatureCarrierDirection,
+};
 use crate::formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort;
 use crate::formats::shared::model_directives::ReasoningEffort;
 use crate::formats::shared::response::remove_empty_pages_from_tool_input_value;
@@ -53,7 +58,7 @@ pub enum CanonicalStopReason {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CanonicalToolChoice {
     Auto,
@@ -62,7 +67,7 @@ pub enum CanonicalToolChoice {
     Tool { name: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CanonicalContentBlock {
     Text {
@@ -144,7 +149,7 @@ pub enum CanonicalContentBlock {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalInstruction {
     pub role: CanonicalRole,
     #[serde(default)]
@@ -153,7 +158,7 @@ pub struct CanonicalInstruction {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalMessage {
     pub role: CanonicalRole,
     #[serde(default)]
@@ -162,7 +167,7 @@ pub struct CanonicalMessage {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalGenerationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
@@ -188,7 +193,7 @@ pub struct CanonicalGenerationConfig {
     pub top_logprobs: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalToolDefinition {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,7 +206,7 @@ pub struct CanonicalToolDefinition {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalThinkingConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -211,7 +216,7 @@ pub struct CanonicalThinkingConfig {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalResponseFormat {
     pub format_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,7 +225,7 @@ pub struct CanonicalResponseFormat {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalUsage {
     #[serde(default)]
     pub input_tokens: u64,
@@ -250,7 +255,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CanonicalEmbeddingInput {
     String(String),
@@ -260,7 +265,7 @@ pub enum CanonicalEmbeddingInput {
     Multimodal(Vec<CanonicalEmbeddingContent>),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbeddingContent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -332,7 +337,7 @@ impl CanonicalEmbeddingContent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbeddingRequest {
     pub input: CanonicalEmbeddingInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -349,7 +354,7 @@ pub struct CanonicalEmbeddingRequest {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRerankRequest {
     pub query: String,
     #[serde(default)]
@@ -370,7 +375,7 @@ impl CanonicalRerankRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbedding {
     #[serde(default)]
     pub index: usize,
@@ -380,7 +385,7 @@ pub struct CanonicalEmbedding {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalEmbeddingResponse {
     pub id: String,
     pub model: String,
@@ -392,7 +397,7 @@ pub struct CanonicalEmbeddingResponse {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRequest {
     #[serde(default)]
     pub model: String,
@@ -424,7 +429,7 @@ pub struct CanonicalRequest {
     pub extensions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalResponseOutput {
     #[serde(default)]
     pub index: usize,
@@ -450,7 +455,7 @@ impl Default for CanonicalResponseOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalResponse {
     pub id: String,
     pub model: String,
@@ -464,6 +469,425 @@ pub struct CanonicalResponse {
     pub usage: Option<CanonicalUsage>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extensions: BTreeMap<String, Value>,
+}
+
+fn debug_json_bytes(value: &Value) -> Option<usize> {
+    serde_json::to_vec(value).ok().map(|bytes| bytes.len())
+}
+
+fn debug_json_map_bytes(value: &Map<String, Value>) -> Option<usize> {
+    serde_json::to_vec(value).ok().map(|bytes| bytes.len())
+}
+
+fn debug_json_option_bytes(value: Option<&Value>) -> Option<usize> {
+    value.and_then(debug_json_bytes)
+}
+
+fn debug_string_len(value: Option<&str>) -> Option<usize> {
+    value.map(str::len)
+}
+
+fn debug_string_list_summary(value: Option<&Vec<String>>) -> Option<(usize, usize)> {
+    value.map(|values| (values.len(), values.iter().map(String::len).sum::<usize>()))
+}
+
+fn debug_json_list_summary(value: &[Value]) -> (usize, usize) {
+    (
+        value.len(),
+        value.iter().filter_map(debug_json_bytes).sum::<usize>(),
+    )
+}
+
+impl fmt::Debug for CanonicalToolChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CanonicalToolChoice");
+        match self {
+            Self::Auto => debug.field("kind", &"auto"),
+            Self::None => debug.field("kind", &"none"),
+            Self::Required => debug.field("kind", &"required"),
+            Self::Tool { name } => debug.field("kind", &"tool").field("name_len", &name.len()),
+        }
+        .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalContentBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CanonicalContentBlock");
+        match self {
+            Self::Text { text, extensions } => debug
+                .field("kind", &"text")
+                .field("text_len", &text.len())
+                .field("extension_count", &extensions.len()),
+            Self::Thinking {
+                text,
+                signature,
+                encrypted_content,
+                extensions,
+            } => debug
+                .field("kind", &"thinking")
+                .field("text_len", &text.len())
+                .field("signature_len", &debug_string_len(signature.as_deref()))
+                .field(
+                    "encrypted_content_len",
+                    &debug_string_len(encrypted_content.as_deref()),
+                )
+                .field("extension_count", &extensions.len()),
+            Self::Image {
+                data,
+                url,
+                media_type,
+                detail,
+                extensions,
+            } => debug
+                .field("kind", &"image")
+                .field("data_len", &debug_string_len(data.as_deref()))
+                .field("url_len", &debug_string_len(url.as_deref()))
+                .field("media_type", media_type)
+                .field("detail", detail)
+                .field("extension_count", &extensions.len()),
+            Self::File {
+                data,
+                file_id,
+                file_url,
+                media_type,
+                filename,
+                extensions,
+            } => debug
+                .field("kind", &"file")
+                .field("data_len", &debug_string_len(data.as_deref()))
+                .field("file_id_len", &debug_string_len(file_id.as_deref()))
+                .field("file_url_len", &debug_string_len(file_url.as_deref()))
+                .field("media_type", media_type)
+                .field("filename_len", &debug_string_len(filename.as_deref()))
+                .field("extension_count", &extensions.len()),
+            Self::Audio {
+                data,
+                media_type,
+                format,
+                extensions,
+            } => debug
+                .field("kind", &"audio")
+                .field("data_len", &debug_string_len(data.as_deref()))
+                .field("media_type", media_type)
+                .field("format", format)
+                .field("extension_count", &extensions.len()),
+            Self::ToolUse {
+                id,
+                name,
+                input,
+                extensions,
+            } => debug
+                .field("kind", &"tool_use")
+                .field("id_len", &id.len())
+                .field("name_len", &name.len())
+                .field("input_bytes", &debug_json_bytes(input))
+                .field("extension_count", &extensions.len()),
+            Self::ToolResult {
+                tool_use_id,
+                name,
+                output,
+                content_text,
+                is_error,
+                extensions,
+            } => debug
+                .field("kind", &"tool_result")
+                .field("tool_use_id_len", &tool_use_id.len())
+                .field("name_len", &debug_string_len(name.as_deref()))
+                .field("output_bytes", &debug_json_option_bytes(output.as_ref()))
+                .field(
+                    "content_text_len",
+                    &debug_string_len(content_text.as_deref()),
+                )
+                .field("is_error", is_error)
+                .field("extension_count", &extensions.len()),
+            Self::Unknown {
+                raw_type,
+                payload,
+                extensions,
+            } => debug
+                .field("kind", &"unknown")
+                .field("raw_type_len", &raw_type.len())
+                .field("payload_bytes", &debug_json_bytes(payload))
+                .field("extension_count", &extensions.len()),
+        }
+        .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalInstruction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalInstruction")
+            .field("role", &self.role)
+            .field("text_len", &self.text.len())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalMessage")
+            .field("role", &self.role)
+            .field("content_count", &self.content.len())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalGenerationConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalGenerationConfig")
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field(
+                "stop_sequences",
+                &debug_string_list_summary(self.stop_sequences.as_ref()),
+            )
+            .field("n", &self.n)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("seed", &self.seed)
+            .field("logprobs", &self.logprobs)
+            .field("top_logprobs", &self.top_logprobs)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalToolDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalToolDefinition")
+            .field("name_len", &self.name.len())
+            .field(
+                "description_len",
+                &debug_string_len(self.description.as_deref()),
+            )
+            .field(
+                "parameters_bytes",
+                &debug_json_option_bytes(self.parameters.as_ref()),
+            )
+            .field("strict", &self.strict)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalThinkingConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalThinkingConfig")
+            .field("enabled", &self.enabled)
+            .field("budget_tokens", &self.budget_tokens)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalResponseFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalResponseFormat")
+            .field("format_type_len", &self.format_type.len())
+            .field(
+                "json_schema_bytes",
+                &debug_json_option_bytes(self.json_schema.as_ref()),
+            )
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalUsage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalUsage")
+            .field("input_tokens", &self.input_tokens)
+            .field(
+                "input_tokens_include_cache",
+                &self.input_tokens_include_cache,
+            )
+            .field("output_tokens", &self.output_tokens)
+            .field("total_tokens", &self.total_tokens)
+            .field("cache_read_tokens", &self.cache_read_tokens)
+            .field("cache_write_tokens", &self.cache_write_tokens)
+            .field(
+                "cache_creation_ephemeral_5m_tokens",
+                &self.cache_creation_ephemeral_5m_tokens,
+            )
+            .field(
+                "cache_creation_ephemeral_1h_tokens",
+                &self.cache_creation_ephemeral_1h_tokens,
+            )
+            .field("reasoning_tokens", &self.reasoning_tokens)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CanonicalEmbeddingInput");
+        match self {
+            Self::String(value) => debug
+                .field("kind", &"string")
+                .field("item_count", &1)
+                .field("total_text_bytes", &value.len()),
+            Self::StringArray(values) => debug
+                .field("kind", &"string_array")
+                .field("item_count", &values.len())
+                .field(
+                    "total_text_bytes",
+                    &values.iter().map(String::len).sum::<usize>(),
+                ),
+            Self::TokenArray(values) => debug
+                .field("kind", &"token_array")
+                .field("item_count", &values.len()),
+            Self::TokenArrayArray(values) => debug
+                .field("kind", &"token_array_array")
+                .field("item_count", &values.len())
+                .field(
+                    "total_token_count",
+                    &values.iter().map(Vec::len).sum::<usize>(),
+                ),
+            Self::Multimodal(values) => debug
+                .field("kind", &"multimodal")
+                .field("item_count", &values.len()),
+        }
+        .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbeddingContent")
+            .field("text_len", &debug_string_len(self.text.as_deref()))
+            .field("image_len", &debug_string_len(self.image.as_deref()))
+            .field("video_len", &debug_string_len(self.video.as_deref()))
+            .field(
+                "multi_images_summary",
+                &self
+                    .multi_images
+                    .as_ref()
+                    .map(|images| (images.len(), images.iter().map(String::len).sum::<usize>())),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbeddingRequest")
+            .field("input", &self.input)
+            .field("encoding_format", &self.encoding_format)
+            .field("dimensions", &self.dimensions)
+            .field("task_len", &debug_string_len(self.task.as_deref()))
+            .field("user_len", &debug_string_len(self.user.as_deref()))
+            .field(
+                "parameters_bytes",
+                &self.parameters.as_ref().and_then(debug_json_map_bytes),
+            )
+            .field("parameter_count", &self.parameters.as_ref().map(Map::len))
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalRerankRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalRerankRequest")
+            .field("query_len", &self.query.len())
+            .field("documents", &debug_json_list_summary(&self.documents))
+            .field("top_n", &self.top_n)
+            .field("return_documents", &self.return_documents)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbedding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbedding")
+            .field("index", &self.index)
+            .field("embedding_len", &self.embedding.len())
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalEmbeddingResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalEmbeddingResponse")
+            .field("id_len", &self.id.len())
+            .field("model_len", &self.model.len())
+            .field("embedding_count", &self.embeddings.len())
+            .field("usage", &self.usage)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalRequest")
+            .field("model_len", &self.model.len())
+            .field("instruction_count", &self.instructions.len())
+            .field("system_len", &debug_string_len(self.system.as_deref()))
+            .field("message_count", &self.messages.len())
+            .field("embedding", &self.embedding)
+            .field("rerank", &self.rerank)
+            .field("generation", &self.generation)
+            .field("tool_count", &self.tools.len())
+            .field("tool_choice", &self.tool_choice)
+            .field("thinking", &self.thinking)
+            .field("response_format", &self.response_format)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field(
+                "metadata_bytes",
+                &debug_json_option_bytes(self.metadata.as_ref()),
+            )
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalResponseOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalResponseOutput")
+            .field("index", &self.index)
+            .field("role", &self.role)
+            .field("content_count", &self.content.len())
+            .field("stop_reason", &self.stop_reason)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CanonicalResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalResponse")
+            .field("id_len", &self.id.len())
+            .field("model_len", &self.model.len())
+            .field("output_count", &self.outputs.len())
+            .field("content_count", &self.content.len())
+            .field("stop_reason", &self.stop_reason)
+            .field("usage", &self.usage)
+            .field("extension_count", &self.extensions.len())
+            .finish()
+    }
 }
 
 pub fn from_openai_chat_to_canonical_request(body_json: &Value) -> Option<CanonicalRequest> {
@@ -1118,6 +1542,25 @@ pub(crate) fn gemini_contents_to_canonical_messages(
     };
     let contents = contents.as_array()?;
     let mut messages = Vec::new();
+    let mut reserved_tool_call_ids = contents
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|content| content.get("parts"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(|part| {
+            part.get("functionCall")
+                .or_else(|| part.get("function_call"))
+                .or_else(|| part.get("functionResponse"))
+                .or_else(|| part.get("function_response"))
+                .and_then(Value::as_object)
+                .and_then(gemini_explicit_function_id)
+                .map(ToOwned::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut pending_tool_calls = VecDeque::<(String, String)>::new();
+    let mut next_generated_tool_call_index = 0usize;
     for content in contents {
         let content_object = content.as_object()?;
         let role = match content_object
@@ -1136,7 +1579,77 @@ pub(crate) fn gemini_contents_to_canonical_messages(
         let parts = content_object.get("parts").and_then(Value::as_array)?;
         let mut blocks = Vec::new();
         for (index, part) in parts.iter().enumerate() {
-            blocks.push(gemini_part_to_canonical_block(part, index)?);
+            let mut block = gemini_part_to_canonical_block(part, index)?;
+            match &mut block {
+                CanonicalContentBlock::ToolUse { id, name, .. } => {
+                    let has_explicit_id = part
+                        .as_object()
+                        .and_then(|part| {
+                            part.get("functionCall")
+                                .or_else(|| part.get("function_call"))
+                        })
+                        .and_then(Value::as_object)
+                        .and_then(gemini_explicit_function_id)
+                        .is_some();
+                    if !has_explicit_id {
+                        loop {
+                            let generated = format!("call_auto_{next_generated_tool_call_index}");
+                            next_generated_tool_call_index += 1;
+                            if reserved_tool_call_ids.insert(generated.clone()) {
+                                *id = generated;
+                                break;
+                            }
+                        }
+                    }
+                    pending_tool_calls.push_back((id.clone(), name.clone()));
+                }
+                CanonicalContentBlock::ToolResult {
+                    tool_use_id, name, ..
+                } => {
+                    let explicit_response_id = part
+                        .as_object()
+                        .and_then(|part| {
+                            part.get("functionResponse")
+                                .or_else(|| part.get("function_response"))
+                        })
+                        .and_then(Value::as_object)
+                        .and_then(gemini_explicit_function_id);
+                    let matched_position = explicit_response_id
+                        .and_then(|response_id| {
+                            pending_tool_calls
+                                .iter()
+                                .position(|(call_id, _)| call_id == response_id)
+                        })
+                        .or_else(|| {
+                            if explicit_response_id.is_none() {
+                                name.as_deref().and_then(|response_name| {
+                                    pending_tool_calls
+                                        .iter()
+                                        .position(|(_, call_name)| call_name == response_name)
+                                })
+                            } else {
+                                None
+                            }
+                        });
+                    let matched_call = matched_position
+                        .and_then(|position| pending_tool_calls.remove(position))
+                        .or_else(|| {
+                            if explicit_response_id.is_none() && name.is_none() {
+                                pending_tool_calls.pop_front()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some((call_id, call_name)) = matched_call {
+                        *tool_use_id = call_id;
+                        if name.is_none() {
+                            *name = Some(call_name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            blocks.push(block);
         }
         if blocks.is_empty() {
             continue;
@@ -1156,19 +1669,21 @@ pub(crate) fn gemini_part_to_canonical_block(
 ) -> Option<CanonicalContentBlock> {
     let part_object = part.as_object()?;
     if let Some(text) = part_object.get("text").and_then(Value::as_str) {
-        if part_object
+        let thought_signature = part_object
+            .get("thoughtSignature")
+            .or_else(|| part_object.get("thought_signature"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let is_thinking = part_object
             .get("thought")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-        {
+            || (text.trim().is_empty() && thought_signature.is_some());
+        if is_thinking {
             return Some(CanonicalContentBlock::Thinking {
                 text: text.to_string(),
-                signature: part_object
-                    .get("thoughtSignature")
-                    .or_else(|| part_object.get("thought_signature"))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
+                signature: thought_signature,
                 encrypted_content: None,
                 extensions: gemini_extensions(
                     part_object,
@@ -1205,11 +1720,7 @@ pub(crate) fn gemini_part_to_canonical_block(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())?;
-        let id = function_call
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let id = gemini_explicit_function_id(function_call)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("call_auto_{index}"));
         return Some(CanonicalContentBlock::ToolUse {
@@ -1233,11 +1744,7 @@ pub(crate) fn gemini_part_to_canonical_block(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let tool_use_id = function_response
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let tool_use_id = gemini_explicit_function_id(function_response)
             .map(ToOwned::to_owned)
             .or_else(|| name.clone())
             .unwrap_or_else(|| format!("toolu_response_{index}"));
@@ -1264,6 +1771,16 @@ pub(crate) fn gemini_part_to_canonical_block(
         raw_type: gemini_raw_part_type(part_object),
         payload: part.clone(),
         extensions: BTreeMap::from([("gemini".to_string(), part.clone())]),
+    })
+}
+
+fn gemini_explicit_function_id(function: &Map<String, Value>) -> Option<&str> {
+    ["id", "call_id", "callId"].iter().find_map(|field| {
+        function
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     })
 }
 
@@ -1817,13 +2334,7 @@ pub(crate) fn openai_message_content_blocks(
                 .unwrap_or_default()
                 .to_string(),
             name: None,
-            output: match message.get("content") {
-                Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
-                    .ok()
-                    .or_else(|| Some(Value::String(raw.clone()))),
-                Some(value) => Some(value.clone()),
-                None => None,
-            },
+            output: message.get("content").cloned(),
             content_text: Some(if text.is_empty() {
                 message
                     .get("content")
@@ -1981,7 +2492,31 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                     .to_ascii_lowercase();
                 match item_type.as_str() {
                     "reasoning" => {
-                        pending_reasoning = openai_responses_reasoning_block_from_item(item_object);
+                        let reasoning = openai_responses_reasoning_block_from_item(item_object);
+                        let previous_signature = reasoning.as_ref().and_then(|block| match block {
+                            CanonicalContentBlock::Thinking {
+                                text,
+                                encrypted_content: Some(carrier),
+                                ..
+                            } if text.trim().is_empty() => decode_gemini_tool_signature_carrier(
+                                carrier,
+                            )
+                            .and_then(|(signature, direction)| {
+                                (direction == GeminiToolSignatureCarrierDirection::Previous)
+                                    .then_some(signature)
+                            }),
+                            _ => None,
+                        });
+                        if let Some(signature) = previous_signature {
+                            if attach_gemini_signature_to_previous_tool_use(
+                                &mut messages,
+                                signature,
+                            ) {
+                                pending_reasoning = None;
+                                continue;
+                            }
+                        }
+                        pending_reasoning = reasoning;
                     }
                     "message" => {
                         let role = openai_role_to_canonical(
@@ -2114,7 +2649,7 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 generated
                             });
                         let raw_output = item_object.get("output");
-                        let output = Some(parse_jsonish_value(raw_output));
+                        let output = Some(raw_output.cloned().unwrap_or_else(|| json!({})));
                         let mut extensions = openai_responses_extensions(
                             item_object,
                             &[
@@ -2192,10 +2727,28 @@ fn openai_responses_opaque_input_item_message(item: &Value, raw_type: String) ->
 
 fn append_openai_responses_tool_use(
     messages: &mut Vec<CanonicalMessage>,
-    tool_use: CanonicalContentBlock,
+    mut tool_use: CanonicalContentBlock,
     pending_reasoning: &mut Option<CanonicalContentBlock>,
 ) {
-    let reasoning = pending_reasoning.take();
+    let mut reasoning = pending_reasoning.take();
+    if let Some(CanonicalContentBlock::Thinking {
+        text,
+        encrypted_content: Some(carrier),
+        ..
+    }) = reasoning.as_ref()
+    {
+        if text.trim().is_empty() {
+            if let Some((signature, GeminiToolSignatureCarrierDirection::Next)) =
+                decode_gemini_tool_signature_carrier(carrier)
+            {
+                if let CanonicalContentBlock::ToolUse { extensions, .. } = &mut tool_use {
+                    canonical_extension_object_mut(extensions, "gemini")
+                        .insert("thoughtSignature".to_string(), Value::String(signature));
+                    reasoning = None;
+                }
+            }
+        }
+    }
     if let Some(last_message) = messages.last_mut() {
         if last_message.role == CanonicalRole::Assistant
             && (!is_openai_responses_input_message(&last_message.extensions)
@@ -2219,6 +2772,24 @@ fn append_openai_responses_tool_use(
         content,
         extensions: BTreeMap::new(),
     });
+}
+
+fn attach_gemini_signature_to_previous_tool_use(
+    messages: &mut [CanonicalMessage],
+    signature: String,
+) -> bool {
+    let Some(message) = messages.last_mut() else {
+        return false;
+    };
+    if message.role != CanonicalRole::Assistant {
+        return false;
+    }
+    let Some(CanonicalContentBlock::ToolUse { extensions, .. }) = message.content.last_mut() else {
+        return false;
+    };
+    canonical_extension_object_mut(extensions, "gemini")
+        .insert("thoughtSignature".to_string(), Value::String(signature));
+    true
 }
 
 fn canonical_assistant_message_has_visible_content(message: &CanonicalMessage) -> bool {
@@ -2550,7 +3121,7 @@ pub(crate) fn openai_responses_output_to_canonical(
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| format!("call_auto_{index}"));
                 let raw_output = item_object.get("output");
-                let output = Some(parse_jsonish_value(raw_output));
+                let output = Some(raw_output.cloned().unwrap_or_else(|| json!({})));
                 let mut extensions = openai_responses_extensions(
                     item_object,
                     &[
@@ -3504,6 +4075,12 @@ pub(crate) fn is_claude_tool_result(extensions: &BTreeMap<String, Value>) -> boo
         == Some(CLAUDE_TOOL_RESULT_SOURCE_MARKER)
 }
 
+pub(crate) fn is_cross_format_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
+    is_claude_tool_result(extensions)
+        || is_openai_chat_tool_result(extensions)
+        || is_openai_responses_tool_result(extensions)
+}
+
 fn is_openai_responses_tool_result(extensions: &BTreeMap<String, Value>) -> bool {
     extensions
         .get(AETHER_EXTENSION_NAMESPACE)
@@ -3948,11 +4525,7 @@ pub(crate) fn flush_openai_responses_message_item(
     if message_content.is_empty() {
         return;
     }
-    let id = if *message_index == 0 {
-        format!("{response_id}_msg")
-    } else {
-        format!("{response_id}_msg_{message_index}")
-    };
+    let id = openai_responses_message_item_id(response_id, *message_index);
     output.push(json!({
         "type": "message",
         "id": id,
@@ -4378,7 +4951,7 @@ pub(crate) type GeminiCanonicalTools = (
     Option<Value>,
 );
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct GeminiGoogleSearchGrounding {
     pub source_field: &'static str,
     pub source_dialect: &'static str,
@@ -4386,6 +4959,23 @@ pub(crate) struct GeminiGoogleSearchGrounding {
     pub payload: Value,
     pub raw_payload: Value,
     pub output_payload: Value,
+}
+
+impl fmt::Debug for GeminiGoogleSearchGrounding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GeminiGoogleSearchGrounding")
+            .field("source_field", &self.source_field)
+            .field("source_dialect", &self.source_dialect)
+            .field("legacy", &self.legacy)
+            .field("payload_bytes", &debug_json_bytes(&self.payload))
+            .field("raw_payload_bytes", &debug_json_bytes(&self.raw_payload))
+            .field(
+                "output_payload_bytes",
+                &debug_json_bytes(&self.output_payload),
+            )
+            .finish()
+    }
 }
 
 pub(crate) fn gemini_google_search_grounding(
@@ -8456,6 +9046,139 @@ mod tests {
         let canonical = from_openai_responses_to_canonical_response(&response)
             .expect("legacy usage alias should parse");
         assert_eq!(canonical.usage.as_ref().unwrap().cache_write_tokens, 5);
+    }
+
+    #[test]
+    fn gemini_request_pairs_parallel_idless_function_responses_by_order() {
+        let contents = json!([
+            {
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "lookup", "args": {"q": "first"}}},
+                    {"functionCall": {"name": "lookup", "args": {"q": "second"}}}
+                ]
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {"functionResponse": {"name": "lookup", "response": {"result": "one"}}},
+                    {"functionResponse": {"name": "lookup", "response": {"result": "two"}}}
+                ]
+            }
+        ]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let call_ids = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => panic!("expected tool use"),
+            })
+            .collect::<Vec<_>>();
+        let result_ids = messages[1]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                _ => panic!("expected tool result"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_ne!(call_ids[0], call_ids[1]);
+        assert_eq!(result_ids, call_ids);
+    }
+
+    #[test]
+    fn gemini_request_pairs_idless_function_responses_by_name() {
+        let contents = json!([{
+            "role": "model",
+            "parts": [
+                {"functionCall": {"name": "first", "args": {}}},
+                {"functionCall": {"name": "second", "args": {}}}
+            ]
+        }, {
+            "role": "user",
+            "parts": [
+                {"functionResponse": {"name": "second", "response": {"result": 2}}},
+                {"functionResponse": {"name": "first", "response": {"result": 1}}}
+            ]
+        }]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let call_ids = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => panic!("expected tool use"),
+            })
+            .collect::<Vec<_>>();
+        let result_ids = messages[1]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+                _ => panic!("expected tool result"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(result_ids, vec![call_ids[1], call_ids[0]]);
+    }
+
+    #[test]
+    fn gemini_request_generated_function_call_ids_avoid_explicit_ids() {
+        let contents = json!([{
+            "role": "model",
+            "parts": [
+                {"functionCall": {"name": "first", "args": {}}},
+                {"functionCall": {"id": "call_auto_0", "name": "second", "args": {}}}
+            ]
+        }]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let call_ids = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                CanonicalContentBlock::ToolUse { id, .. } => id.as_str(),
+                _ => panic!("expected tool use"),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(call_ids, vec!["call_auto_1", "call_auto_0"]);
+    }
+
+    #[test]
+    fn gemini_request_generated_function_call_ids_avoid_explicit_response_ids() {
+        let contents = json!([{
+            "role": "model",
+            "parts": [{"functionCall": {"name": "generated", "args": {}}}]
+        }, {
+            "role": "user",
+            "parts": [{
+                "functionResponse": {
+                    "id": "call_auto_0",
+                    "name": "external",
+                    "response": {"result": "done"}
+                }
+            }]
+        }]);
+
+        let messages = super::gemini_contents_to_canonical_messages(Some(&contents))
+            .expect("Gemini contents should parse");
+        let CanonicalContentBlock::ToolUse { id: call_id, .. } = &messages[0].content[0] else {
+            panic!("expected tool use");
+        };
+        let CanonicalContentBlock::ToolResult { tool_use_id, .. } = &messages[1].content[0] else {
+            panic!("expected tool result");
+        };
+
+        assert_eq!(call_id, "call_auto_1");
+        assert_eq!(tool_use_id, "call_auto_0");
     }
 
     #[test]

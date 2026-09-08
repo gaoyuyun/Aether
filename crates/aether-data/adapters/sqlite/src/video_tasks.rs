@@ -72,6 +72,22 @@ impl SqliteVideoTaskRepository {
         row.as_ref().map(map_video_task_row).transpose()
     }
 
+    async fn find_by_id_for_user(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> Result<Option<StoredVideoTask>, DataLayerError> {
+        let row = sqlx::query(&format!(
+            "{VIDEO_TASK_COLUMNS} WHERE id = ? AND user_id = ? LIMIT 1"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+        row.as_ref().map(map_video_task_row).transpose()
+    }
+
     async fn find_by_short_id(
         &self,
         short_id: &str,
@@ -81,6 +97,22 @@ impl SqliteVideoTaskRepository {
             .fetch_optional(&self.pool)
             .await
             .map_sql_err()?;
+        row.as_ref().map(map_video_task_row).transpose()
+    }
+
+    async fn find_by_short_id_for_user(
+        &self,
+        short_id: &str,
+        user_id: &str,
+    ) -> Result<Option<StoredVideoTask>, DataLayerError> {
+        let row = sqlx::query(&format!(
+            "{VIDEO_TASK_COLUMNS} WHERE short_id = ? AND user_id = ? LIMIT 1"
+        ))
+        .bind(short_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
         row.as_ref().map(map_video_task_row).transpose()
     }
 
@@ -114,6 +146,26 @@ impl VideoTaskReadRepository for SqliteVideoTaskRepository {
                 user_id,
                 external_task_id,
             } => self.find_by_user_external(user_id, external_task_id).await,
+        }
+    }
+
+    async fn find_for_user(
+        &self,
+        key: VideoTaskLookupKey<'_>,
+        user_id: &str,
+    ) -> Result<Option<StoredVideoTask>, DataLayerError> {
+        match key {
+            VideoTaskLookupKey::Id(id) => self.find_by_id_for_user(id, user_id).await,
+            VideoTaskLookupKey::ShortId(short_id) => {
+                self.find_by_short_id_for_user(short_id, user_id).await
+            }
+            VideoTaskLookupKey::UserExternal {
+                user_id: lookup_user_id,
+                external_task_id,
+            } if lookup_user_id == user_id => {
+                self.find_by_user_external(user_id, external_task_id).await
+            }
+            VideoTaskLookupKey::UserExternal { .. } => Ok(None),
         }
     }
 
@@ -258,15 +310,21 @@ impl VideoTaskReadRepository for SqliteVideoTaskRepository {
 
 #[async_trait]
 impl VideoTaskWriteRepository for SqliteVideoTaskRepository {
-    async fn upsert(&self, task: UpsertVideoTask) -> Result<StoredVideoTask, DataLayerError> {
+    async fn upsert(&self, mut task: UpsertVideoTask) -> Result<StoredVideoTask, DataLayerError> {
+        task.sanitize_for_persistence();
         let id = task.id.clone();
+        let expected_identity = task.clone();
         bind_task(sqlx::query(UPSERT_SQL), task, true, false)?
             .execute(&self.pool)
             .await
             .map_sql_err()?;
-        self.find_by_id(&id)
-            .await?
-            .ok_or_else(|| DataLayerError::UnexpectedValue("upserted video task missing".into()))
+        let stored = self.find_by_id(&id).await?.ok_or_else(|| {
+            DataLayerError::InvalidInput(format!(
+                "video task {id} conflicts with persisted immutable identity"
+            ))
+        })?;
+        stored.ensure_immutable_identity_matches(&expected_identity)?;
+        Ok(stored)
     }
 
     async fn update_if_active(
@@ -405,10 +463,26 @@ ON CONFLICT(id) DO UPDATE SET
   error_code = excluded.error_code,
   error_message = excluded.error_message,
   request_metadata = excluded.request_metadata,
-  created_at = excluded.created_at,
+  created_at = COALESCE(video_tasks.created_at, excluded.created_at),
   submitted_at = excluded.submitted_at,
   completed_at = excluded.completed_at,
   updated_at = excluded.updated_at
+WHERE video_tasks.short_id IS excluded.short_id
+  AND video_tasks.request_id IS excluded.request_id
+  AND video_tasks.user_id IS excluded.user_id
+  AND video_tasks.api_key_id IS excluded.api_key_id
+  AND video_tasks.external_task_id IS excluded.external_task_id
+  AND video_tasks.provider_id IS excluded.provider_id
+  AND video_tasks.endpoint_id IS excluded.endpoint_id
+  AND video_tasks.key_id IS excluded.key_id
+  AND video_tasks.client_api_format IS excluded.client_api_format
+  AND video_tasks.provider_api_format IS excluded.provider_api_format
+  AND video_tasks.format_converted IS excluded.format_converted
+  AND video_tasks.model IS excluded.model
+  AND video_tasks.duration_seconds IS excluded.duration_seconds
+  AND video_tasks.resolution IS excluded.resolution
+  AND video_tasks.aspect_ratio IS excluded.aspect_ratio
+  AND video_tasks.size IS excluded.size
 "#;
 
 const UPDATE_IF_ACTIVE_SQL: &str = r#"
@@ -445,20 +519,38 @@ UPDATE video_tasks SET
   error_code = ?,
   error_message = ?,
   request_metadata = ?,
-  created_at = ?,
+  created_at = COALESCE(created_at, ?),
   submitted_at = ?,
   completed_at = ?,
   updated_at = ?
 WHERE id = ?
   AND status IN ('pending', 'submitted', 'queued', 'processing')
+  AND short_id IS ?
+  AND request_id IS ?
+  AND user_id IS ?
+  AND api_key_id IS ?
+  AND external_task_id IS ?
+  AND provider_id IS ?
+  AND endpoint_id IS ?
+  AND key_id IS ?
+  AND client_api_format IS ?
+  AND provider_api_format IS ?
+  AND format_converted IS ?
+  AND model IS ?
+  AND duration_seconds IS ?
+  AND resolution IS ?
+  AND aspect_ratio IS ?
+  AND size IS ?
 "#;
 
 fn bind_task<'q>(
     query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    task: UpsertVideoTask,
+    mut task: UpsertVideoTask,
     include_insert_id: bool,
     include_update_id: bool,
 ) -> Result<sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>, DataLayerError> {
+    task.sanitize_for_persistence();
+    let identity = task.clone();
     let original_request_body = json_to_string(&task.original_request_body)?;
     let request_metadata = json_to_string(&task.request_metadata)?;
     let query = if include_insert_id {
@@ -528,10 +620,36 @@ fn bind_task<'q>(
             "video task updated_at",
         )?);
     if include_update_id {
-        Ok(bound.bind(task.id))
+        bind_identity_guard(bound.bind(task.id), identity)
     } else {
         Ok(bound)
     }
+}
+
+fn bind_identity_guard<'q>(
+    query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    identity: UpsertVideoTask,
+) -> Result<sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>, DataLayerError> {
+    Ok(query
+        .bind(identity.short_id)
+        .bind(identity.request_id)
+        .bind(identity.user_id)
+        .bind(identity.api_key_id)
+        .bind(identity.external_task_id)
+        .bind(identity.provider_id)
+        .bind(identity.endpoint_id)
+        .bind(identity.key_id)
+        .bind(identity.client_api_format)
+        .bind(identity.provider_api_format)
+        .bind(identity.format_converted)
+        .bind(identity.model)
+        .bind(optional_u32_to_i32(
+            identity.duration_seconds,
+            "video task duration_seconds",
+        )?)
+        .bind(identity.resolution)
+        .bind(identity.aspect_ratio)
+        .bind(identity.size))
 }
 
 fn push_filter<'args>(
@@ -699,7 +817,7 @@ fn optional_u32_to_i32(value: Option<u32>, name: &str) -> Result<Option<i32>, Da
 
 #[cfg(test)]
 mod tests {
-    use super::SqliteVideoTaskRepository;
+    use super::{SqliteVideoTaskRepository, UPDATE_IF_ACTIVE_SQL, UPSERT_SQL};
     use crate::run_migrations;
     use aether_data_contracts::repository::video_tasks::{
         UpsertVideoTask, VideoTaskLookupKey, VideoTaskQueryFilter, VideoTaskReadRepository,
@@ -707,6 +825,40 @@ mod tests {
     };
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn sqlite_write_sql_guards_every_immutable_identity_field() {
+        for column in [
+            "short_id",
+            "request_id",
+            "user_id",
+            "api_key_id",
+            "external_task_id",
+            "provider_id",
+            "endpoint_id",
+            "key_id",
+            "client_api_format",
+            "provider_api_format",
+            "format_converted",
+            "model",
+            "duration_seconds",
+            "resolution",
+            "aspect_ratio",
+            "size",
+        ] {
+            assert!(
+                UPSERT_SQL.contains(&format!("video_tasks.{column} IS excluded.{column}")),
+                "upsert should guard {column}"
+            );
+            assert!(
+                UPDATE_IF_ACTIVE_SQL.contains(&format!("{column} IS ?")),
+                "active update should guard {column}"
+            );
+        }
+        assert!(UPSERT_SQL
+            .contains("created_at = COALESCE(video_tasks.created_at, excluded.created_at)"));
+        assert!(UPDATE_IF_ACTIVE_SQL.contains("created_at = COALESCE(created_at, ?)"));
+    }
 
     #[tokio::test]
     async fn sqlite_repository_writes_and_reads_video_tasks() {
@@ -750,6 +902,26 @@ mod tests {
             .await
             .expect("user/external lookup should load")
             .is_some());
+        assert!(repository
+            .find_for_user(VideoTaskLookupKey::Id("task-1"), "user-1")
+            .await
+            .expect("owner id lookup should load")
+            .is_some());
+        assert!(repository
+            .find_for_user(VideoTaskLookupKey::Id("task-1"), "user-2")
+            .await
+            .expect("foreign id lookup should run")
+            .is_none());
+        assert!(repository
+            .find_for_user(VideoTaskLookupKey::ShortId("short-task-1"), "user-1")
+            .await
+            .expect("owner short id lookup should load")
+            .is_some());
+        assert!(repository
+            .find_for_user(VideoTaskLookupKey::ShortId("short-task-1"), "user-2")
+            .await
+            .expect("foreign short id lookup should run")
+            .is_none());
 
         let due = repository
             .list_due(100, 10)
@@ -795,12 +967,94 @@ mod tests {
             .update_if_active(UpsertVideoTask {
                 status: VideoTaskStatus::Processing,
                 progress_percent: 50,
+                created_at_unix_ms: 90,
+                submitted_at_unix_secs: Some(90),
                 ..sample_task("task-1", VideoTaskStatus::Processing, 150)
             })
             .await
             .expect("active task should update")
             .expect("active task should exist");
         assert_eq!(updated.progress_percent, 50);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejects_identity_conflicts_without_modifying_task_state() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+
+        let repository = SqliteVideoTaskRepository::new(pool);
+        let original = sample_task("task-owned", VideoTaskStatus::Submitted, 100);
+        repository
+            .upsert(original.clone())
+            .await
+            .expect("original task should insert");
+
+        let conflict = repository
+            .upsert(UpsertVideoTask {
+                user_id: Some("attacker".to_string()),
+                key_id: Some("attacker-key".to_string()),
+                status: VideoTaskStatus::Completed,
+                progress_percent: 100,
+                completed_at_unix_secs: Some(200),
+                updated_at_unix_secs: 200,
+                ..original.clone()
+            })
+            .await
+            .expect_err("conflicting owner should be rejected");
+        assert!(conflict.to_string().contains("immutable field user_id"));
+
+        let after_upsert = repository
+            .find(VideoTaskLookupKey::Id("task-owned"))
+            .await
+            .expect("task lookup should succeed")
+            .expect("original task should remain");
+        assert_eq!(after_upsert.user_id.as_deref(), Some("user-1"));
+        assert_eq!(after_upsert.key_id.as_deref(), Some("provider-key-1"));
+        assert_eq!(after_upsert.status, VideoTaskStatus::Submitted);
+        assert_eq!(after_upsert.progress_percent, 0);
+        assert_eq!(after_upsert.completed_at_unix_secs, None);
+        assert_eq!(after_upsert.updated_at_unix_secs, 100);
+
+        let active_conflict = repository
+            .update_if_active(UpsertVideoTask {
+                request_id: "attacker-request".to_string(),
+                status: VideoTaskStatus::Failed,
+                updated_at_unix_secs: 300,
+                ..original.clone()
+            })
+            .await
+            .expect("guarded active update should execute");
+        assert!(active_conflict.is_none());
+        let after_active_conflict = repository
+            .find(VideoTaskLookupKey::Id("task-owned"))
+            .await
+            .expect("task lookup should succeed")
+            .expect("original task should remain");
+        assert_eq!(after_active_conflict.request_id, "request-task-owned");
+        assert_eq!(after_active_conflict.status, VideoTaskStatus::Submitted);
+        assert_eq!(after_active_conflict.updated_at_unix_secs, 100);
+
+        let updated = repository
+            .upsert(UpsertVideoTask {
+                status: VideoTaskStatus::Processing,
+                progress_percent: 50,
+                poll_count: 2,
+                created_at_unix_ms: 999,
+                updated_at_unix_secs: 200,
+                ..original
+            })
+            .await
+            .expect("same owner state update should succeed");
+        assert_eq!(updated.status, VideoTaskStatus::Processing);
+        assert_eq!(updated.progress_percent, 50);
+        assert_eq!(updated.poll_count, 2);
+        assert_eq!(updated.created_at_unix_ms, 90);
     }
 
     #[tokio::test]

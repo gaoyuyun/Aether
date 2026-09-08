@@ -186,6 +186,11 @@ SELECT
       OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'websocket_mode') IN ('true', 'false')
+      OR NULLIF(BTRIM("usage".request_metadata->>'websocket_transport'), '') IS NOT NULL
+      OR ("usage".request_metadata->>'usage_available') IN ('true', 'false')
+      OR ("usage".request_metadata->>'usage_pricing_available') IN ('true', 'false')
+      OR json_typeof("usage".request_metadata->'live_session') = 'object'
+      OR json_typeof("usage".request_metadata->'realtime_session') = 'object'
       THEN jsonb_strip_nulls(jsonb_build_object(
         'client_ip',
         NULLIF(BTRIM("usage".request_metadata->>'client_ip'), ''),
@@ -219,6 +224,32 @@ SELECT
         CASE
           WHEN ("usage".request_metadata->>'websocket_mode') IN ('true', 'false')
             THEN ("usage".request_metadata->>'websocket_mode')::boolean
+          ELSE NULL
+        END,
+        'websocket_transport',
+        NULLIF(BTRIM("usage".request_metadata->>'websocket_transport'), ''),
+        'usage_available',
+        CASE
+          WHEN ("usage".request_metadata->>'usage_available') IN ('true', 'false')
+            THEN ("usage".request_metadata->>'usage_available')::boolean
+          ELSE NULL
+        END,
+        'usage_pricing_available',
+        CASE
+          WHEN ("usage".request_metadata->>'usage_pricing_available') IN ('true', 'false')
+            THEN ("usage".request_metadata->>'usage_pricing_available')::boolean
+          ELSE NULL
+        END,
+        'live_session',
+        CASE
+          WHEN json_typeof("usage".request_metadata->'live_session') = 'object'
+            THEN "usage".request_metadata->'live_session'
+          ELSE NULL
+        END,
+        'realtime_session',
+        CASE
+          WHEN json_typeof("usage".request_metadata->'realtime_session') = 'object'
+            THEN "usage".request_metadata->'realtime_session'
           ELSE NULL
         END
       ))::json
@@ -296,11 +327,13 @@ SELECT
   usage_settlement_snapshots.billing_rule_id AS settlement_billing_rule_id,
   usage_settlement_snapshots.billing_rule_version AS settlement_billing_rule_version,
   CAST(EXTRACT(EPOCH FROM "usage".created_at) AS BIGINT) AS created_at_unix_ms,
-  GREATEST(
-    COALESCE(NULLIF("usage".updated_at_unix_secs, 0), 0),
-    COALESCE(CAST(EXTRACT(EPOCH FROM usage_settlement_snapshots.finalized_at) AS BIGINT), 0),
-    COALESCE(CAST(EXTRACT(EPOCH FROM "usage".finalized_at) AS BIGINT), 0),
-    CAST(EXTRACT(EPOCH FROM "usage".created_at) AS BIGINT)
+  COALESCE(
+    NULLIF("usage".updated_at_unix_secs, 0),
+    GREATEST(
+      COALESCE(CAST(EXTRACT(EPOCH FROM usage_settlement_snapshots.finalized_at) AS BIGINT), 0),
+      COALESCE(CAST(EXTRACT(EPOCH FROM "usage".finalized_at) AS BIGINT), 0),
+      CAST(EXTRACT(EPOCH FROM "usage".created_at) AS BIGINT)
+    )
   ) AS updated_at_unix_secs,
   CAST(
     EXTRACT(

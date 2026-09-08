@@ -15,7 +15,8 @@ use crate::repository::usage::{
 };
 use aether_data_contracts::repository::usage::{
     usage_body_ref, ProviderApiKeyWindowUsageRequest, UsageAuditAggregationGroupBy,
-    UsageAuditAggregationQuery, UsageBodyCaptureState, UsageBodyField, UsageDashboardSummaryQuery,
+    UsageAuditAggregationQuery, UsageAuditKeywordSearchQuery, UsageAuditListQuery,
+    UsageAuditSummaryQuery, UsageBodyCaptureState, UsageBodyField, UsageDashboardSummaryQuery,
     UsageLeaderboardGroupBy, UsageLeaderboardQuery, UsageProviderPerformanceQuery,
     UsageTimeSeriesGranularity,
 };
@@ -330,6 +331,79 @@ async fn provider_aggregation_skips_unknown_provider_labels() {
         legacy_name_row.secondary_name.as_deref(),
         Some("legacy_name")
     );
+}
+
+#[tokio::test]
+async fn unmetered_session_audit_counts_lifecycle_without_token_or_cost_contribution() {
+    let metered = sample_usage("req-metered", 100);
+    let mut live = sample_usage("req-live", 200);
+    live.request_metadata = Some(json!({
+        "usage_available": false,
+        "websocket_mode": true,
+        "websocket_transport": "codex_live_direct",
+    }));
+    live.billing_status = "void".to_string();
+    live.input_tokens = 0;
+    live.output_tokens = 0;
+    live.total_tokens = 0;
+    live.cache_creation_input_tokens = 0;
+    live.cache_creation_ephemeral_5m_input_tokens = 0;
+    live.cache_creation_ephemeral_1h_input_tokens = 0;
+    live.cache_read_input_tokens = 0;
+    live.total_cost_usd = 0.0;
+    live.actual_total_cost_usd = 0.0;
+    let repository = InMemoryUsageReadRepository::seed(vec![metered, live]);
+
+    let listed = repository
+        .list_usage_audits(&UsageAuditListQuery {
+            created_from_unix_secs: Some(0),
+            created_until_unix_secs: Some(1_000),
+            newest_first: true,
+            ..UsageAuditListQuery::default()
+        })
+        .await
+        .expect("audit list should succeed");
+    assert_eq!(listed.len(), 2);
+    assert!(!listed
+        .iter()
+        .find(|item| item.request_id == "req-live")
+        .expect("Live row should remain visible")
+        .usage_available());
+
+    let aggregate = repository
+        .aggregate_usage_audits(&UsageAuditAggregationQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 1_000,
+            group_by: UsageAuditAggregationGroupBy::Model,
+            limit: 10,
+            exclude_reserved_provider_labels: false,
+        })
+        .await
+        .expect("aggregate should succeed");
+    assert_eq!(aggregate.len(), 1);
+    assert_eq!(aggregate[0].request_count, 2);
+    assert_eq!(aggregate[0].total_tokens, 150);
+
+    let summary = repository
+        .summarize_usage_audits(&UsageAuditSummaryQuery {
+            created_from_unix_secs: 0,
+            created_until_unix_secs: 1_000,
+            ..UsageAuditSummaryQuery::default()
+        })
+        .await
+        .expect("summary should succeed");
+    assert_eq!(summary.total_requests, 2);
+    assert_eq!(summary.recorded_total_tokens, 150);
+
+    let provider_key_summaries = repository
+        .summarize_usage_by_provider_api_key_ids(&["provider-key-1".to_string()])
+        .await
+        .expect("provider key lifecycle summary should succeed");
+    let provider_key_summary = provider_key_summaries
+        .get("provider-key-1")
+        .expect("provider key summary");
+    assert_eq!(provider_key_summary.request_count, 2);
+    assert_eq!(provider_key_summary.total_tokens, 150);
 }
 
 #[tokio::test]
@@ -712,6 +786,64 @@ async fn upsert_allows_completed_recovery_after_void_failure() {
         Some(json!({ "trace_id": "trace-recovered" }))
     );
     assert_eq!(stored.total_tokens, 10);
+}
+
+#[tokio::test]
+async fn stale_terminal_event_cannot_replace_usage_routing_or_counter_contribution() {
+    let auth_api_keys = sample_auth_api_key_repository(&["api-key-1"]);
+    let repository = InMemoryUsageReadRepository::default()
+        .with_auth_api_key_repository(Arc::clone(&auth_api_keys));
+
+    let mut newer = sample_upsert_usage_record("req-stale-terminal");
+    newer.api_key_id = Some("api-key-1".to_string());
+    newer.status = "completed".to_string();
+    newer.status_code = Some(200);
+    newer.total_tokens = Some(5);
+    newer.total_cost_usd = Some(0.5);
+    newer.candidate_id = Some("candidate-new".to_string());
+    newer.route_kind = Some("route-new".to_string());
+    newer.updated_at_unix_secs = 200;
+    newer.finalized_at_unix_secs = Some(200);
+    repository
+        .upsert(newer)
+        .await
+        .expect("newer terminal usage should upsert");
+
+    let mut stale = sample_upsert_usage_record("req-stale-terminal");
+    stale.api_key_id = Some("api-key-1".to_string());
+    stale.status = "failed".to_string();
+    stale.billing_status = "void".to_string();
+    stale.status_code = Some(503);
+    stale.total_tokens = Some(999);
+    stale.total_cost_usd = Some(99.0);
+    stale.candidate_id = Some("candidate-stale".to_string());
+    stale.route_kind = Some("route-stale".to_string());
+    stale.updated_at_unix_secs = 199;
+    stale.finalized_at_unix_secs = Some(199);
+    let stored = repository
+        .upsert(stale)
+        .await
+        .expect("stale terminal usage should be ignored");
+
+    assert_eq!(stored.status, "completed");
+    assert_eq!(stored.billing_status, "pending");
+    assert_eq!(stored.status_code, Some(200));
+    assert_eq!(stored.total_tokens, 5);
+    assert_eq!(stored.total_cost_usd, 0.5);
+    assert_eq!(stored.routing_candidate_id(), Some("candidate-new"));
+    assert_eq!(stored.routing_route_kind(), Some("route-new"));
+    assert_eq!(stored.updated_at_unix_secs, 200);
+
+    let key = auth_api_keys
+        .list_export_api_keys_by_ids(&["api-key-1".to_string()])
+        .await
+        .expect("api key stats should load")
+        .into_iter()
+        .next()
+        .expect("api key should exist");
+    assert_eq!(key.total_requests, 1);
+    assert_eq!(key.total_tokens, 5);
+    assert_eq!(key.total_cost_usd, 0.5);
 }
 
 #[tokio::test]
@@ -1116,6 +1248,23 @@ async fn detached_body_seed_moves_large_payloads_behind_usage_refs() {
 }
 
 #[tokio::test]
+async fn seed_discards_cross_request_and_cross_field_body_refs() {
+    let mut usage = sample_usage("req-ref-target", 100);
+    usage.request_body_ref = Some("usage://request/req-ref-owner/request_body".to_string());
+    usage.response_body_ref = Some("usage://request/req-ref-target/request_body".to_string());
+
+    let repository = InMemoryUsageReadRepository::seed(vec![usage]);
+    let stored = repository
+        .find_by_request_id("req-ref-target")
+        .await
+        .expect("find should succeed")
+        .expect("usage should exist");
+
+    assert!(stored.request_body_ref.is_none());
+    assert!(stored.response_body_ref.is_none());
+}
+
+#[tokio::test]
 async fn upsert_writes_usage_record() {
     let repository = InMemoryUsageReadRepository::default();
     let stored = repository
@@ -1446,12 +1595,7 @@ async fn upsert_does_not_backfill_typed_body_refs_from_request_metadata() {
         .expect("upsert should succeed");
 
     assert_eq!(stored.request_body_ref, None);
-    assert_eq!(
-        stored.request_metadata,
-        Some(json!({
-            "request_body_ref": "usage://request/req-upsert-body-ref-metadata/request_body"
-        }))
-    );
+    assert_eq!(stored.request_metadata, None);
 }
 
 #[tokio::test]
@@ -1908,6 +2052,54 @@ async fn list_usage_audits_applies_second_based_time_filters() {
 
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_id, "req-2");
+}
+
+#[tokio::test]
+async fn usage_audit_websocket_filter_applies_to_list_count_and_keyword_search() {
+    let mut websocket = sample_usage("req-ws", 2);
+    websocket.request_metadata = Some(json!({
+        "websocket_mode": true,
+        "websocket_transport": "codex_live_direct",
+    }));
+    let repository =
+        InMemoryUsageReadRepository::seed(vec![sample_usage("req-http", 1), websocket]);
+
+    let list_query = crate::repository::usage::UsageAuditListQuery {
+        is_websocket: Some(true),
+        ..Default::default()
+    };
+    let listed = repository
+        .list_usage_audits(&list_query)
+        .await
+        .expect("WebSocket list should succeed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].request_id, "req-ws");
+    assert_eq!(
+        repository
+            .count_usage_audits(&list_query)
+            .await
+            .expect("WebSocket count should succeed"),
+        1
+    );
+
+    let keyword_query = UsageAuditKeywordSearchQuery {
+        is_websocket: Some(true),
+        keywords: vec!["gpt-4.1".to_string()],
+        ..Default::default()
+    };
+    let keyword_matches = repository
+        .list_usage_audits_by_keyword_search(&keyword_query)
+        .await
+        .expect("WebSocket keyword list should succeed");
+    assert_eq!(keyword_matches.len(), 1);
+    assert_eq!(keyword_matches[0].request_id, "req-ws");
+    assert_eq!(
+        repository
+            .count_usage_audits_by_keyword_search(&keyword_query)
+            .await
+            .expect("WebSocket keyword count should succeed"),
+        1
+    );
 }
 
 #[tokio::test]

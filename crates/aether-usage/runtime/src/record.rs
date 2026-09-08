@@ -1,4 +1,6 @@
-use aether_data_contracts::repository::usage::UpsertUsageRecord;
+use aether_data_contracts::repository::usage::{
+    UpsertUsageRecord, USAGE_AVAILABLE_METADATA_KEY, USAGE_PRICING_AVAILABLE_METADATA_KEY,
+};
 use aether_data_contracts::DataLayerError;
 
 use crate::request_metadata::{
@@ -33,7 +35,8 @@ fn metadata_u64(metadata: Option<&serde_json::Value>, key: &str) -> Option<u64> 
 pub fn build_upsert_usage_record_from_event(
     event: &UsageEvent,
 ) -> Result<UpsertUsageRecord, DataLayerError> {
-    let (status, billing_status) = lifecycle_status_and_billing(event.event_type);
+    let (status, billing_status) =
+        lifecycle_status_and_billing(event.event_type, event.data.request_metadata.as_ref());
     let finalized_at_unix_secs = match event.event_type {
         UsageEventType::Pending | UsageEventType::Streaming => None,
         UsageEventType::Completed | UsageEventType::Failed | UsageEventType::Cancelled => {
@@ -41,6 +44,11 @@ pub fn build_upsert_usage_record_from_event(
         }
     };
     let mut data = event.data.clone();
+    if usage_is_explicitly_unavailable(data.request_metadata.as_ref()) {
+        clear_unavailable_usage_fields(&mut data);
+    } else if usage_pricing_is_explicitly_unavailable(data.request_metadata.as_ref()) {
+        clear_unavailable_pricing_fields(&mut data);
+    }
     // Request-derived facts are captured before body capture policy is applied. Do not let a
     // truncation/disabled placeholder clear those facts while converting the queued event into a
     // database record. Inline (or ref-loaded) bodies remain authoritative and may clear stale
@@ -177,14 +185,60 @@ pub fn build_upsert_usage_record_from_event(
     })
 }
 
-fn lifecycle_status_and_billing(event_type: UsageEventType) -> (&'static str, &'static str) {
+fn clear_unavailable_usage_fields(data: &mut crate::UsageEventData) {
+    data.input_tokens = None;
+    data.output_tokens = None;
+    data.total_tokens = None;
+    data.cache_creation_input_tokens = None;
+    data.cache_creation_ephemeral_5m_input_tokens = None;
+    data.cache_creation_ephemeral_1h_input_tokens = None;
+    data.cache_read_input_tokens = None;
+    data.cache_creation_cost_usd = None;
+    data.cache_read_cost_usd = None;
+    data.total_cost_usd = None;
+    data.actual_total_cost_usd = None;
+}
+
+fn clear_unavailable_pricing_fields(data: &mut crate::UsageEventData) {
+    data.cache_creation_cost_usd = None;
+    data.cache_read_cost_usd = None;
+    data.total_cost_usd = None;
+    data.actual_total_cost_usd = None;
+}
+
+fn lifecycle_status_and_billing(
+    event_type: UsageEventType,
+    request_metadata: Option<&serde_json::Value>,
+) -> (&'static str, &'static str) {
     match event_type {
         UsageEventType::Pending => ("pending", "pending"),
         UsageEventType::Streaming => ("streaming", "pending"),
+        UsageEventType::Completed
+            if usage_is_explicitly_unavailable(request_metadata)
+                || usage_pricing_is_explicitly_unavailable(request_metadata) =>
+        {
+            ("completed", "void")
+        }
         UsageEventType::Completed => ("completed", "pending"),
         UsageEventType::Failed => ("failed", "void"),
         UsageEventType::Cancelled => ("cancelled", "void"),
     }
+}
+
+fn usage_is_explicitly_unavailable(request_metadata: Option<&serde_json::Value>) -> bool {
+    request_metadata
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| metadata.get(USAGE_AVAILABLE_METADATA_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+}
+
+fn usage_pricing_is_explicitly_unavailable(request_metadata: Option<&serde_json::Value>) -> bool {
+    request_metadata
+        .and_then(serde_json::Value::as_object)
+        .and_then(|metadata| metadata.get(USAGE_PRICING_AVAILABLE_METADATA_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
 }
 
 fn empty_to_none(value: Option<String>) -> Option<String> {
@@ -438,6 +492,97 @@ mod tests {
     }
 
     #[test]
+    fn completed_unmetered_session_audit_is_void_without_fabricated_usage() {
+        let record = build_upsert_usage_record_from_event(&UsageEvent {
+            event_type: UsageEventType::Completed,
+            request_id: "req-live-session".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            data: UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-live".to_string(),
+                status_code: Some(200),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                total_tokens: Some(120),
+                total_cost_usd: Some(1.25),
+                actual_total_cost_usd: Some(1.25),
+                request_metadata: Some(serde_json::json!({
+                    "usage_available": false,
+                    "websocket_mode": true,
+                    "websocket_transport": "codex_live_direct",
+                })),
+                ..UsageEventData::default()
+            },
+        })
+        .expect("record should build");
+
+        assert_eq!(record.status, "completed");
+        assert_eq!(record.billing_status, "void");
+        assert_eq!(record.input_tokens, None);
+        assert_eq!(record.output_tokens, None);
+        assert_eq!(record.total_tokens, None);
+        assert_eq!(record.total_cost_usd, None);
+        assert_eq!(record.actual_total_cost_usd, None);
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("usage_available"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn completed_authoritative_unpriced_session_is_void_but_keeps_tokens() {
+        let record = build_upsert_usage_record_from_event(&UsageEvent {
+            event_type: UsageEventType::Completed,
+            request_id: "req-realtime-audio".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            data: UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-realtime".to_string(),
+                status_code: Some(200),
+                input_tokens: Some(120),
+                output_tokens: Some(40),
+                total_tokens: Some(160),
+                cache_read_input_tokens: Some(30),
+                cache_creation_cost_usd: Some(0.25),
+                cache_read_cost_usd: Some(0.1),
+                total_cost_usd: Some(1.25),
+                actual_total_cost_usd: Some(1.5),
+                request_metadata: Some(serde_json::json!({
+                    "usage_available": true,
+                    "usage_pricing_available": false,
+                    "websocket_mode": true,
+                    "websocket_transport": "openai_realtime",
+                })),
+                ..UsageEventData::default()
+            },
+        })
+        .expect("record should build");
+
+        assert_eq!(record.status, "completed");
+        assert_eq!(record.billing_status, "void");
+        assert_eq!(record.input_tokens, Some(120));
+        assert_eq!(record.output_tokens, Some(40));
+        assert_eq!(record.total_tokens, Some(160));
+        assert_eq!(record.cache_read_input_tokens, Some(30));
+        assert_eq!(record.cache_creation_cost_usd, None);
+        assert_eq!(record.cache_read_cost_usd, None);
+        assert_eq!(record.total_cost_usd, None);
+        assert_eq!(record.actual_total_cost_usd, None);
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("usage_pricing_available"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn sanitizes_request_metadata_before_building_upsert_record() {
         let record = build_upsert_usage_record_from_event(&UsageEvent {
             event_type: UsageEventType::Completed,
@@ -463,7 +608,8 @@ mod tests {
         assert_eq!(
             record.request_metadata,
             Some(serde_json::json!({
-                "billing_snapshot": { "status": "complete" }
+                "billing_snapshot": { "status": "complete" },
+                "billing_snapshot_status": "complete"
             }))
         );
     }

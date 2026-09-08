@@ -153,11 +153,7 @@ mod tests {
         let factory = SqlitePoolFactory::new(config).expect("factory should build");
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_lazy_with(
-                factory
-                    .connect_options()
-                    .expect("options should build"),
-            );
+            .connect_lazy_with(factory.connect_options().expect("options should build"));
         let (cache_size,): (i64,) = sqlx::query_as("PRAGMA cache_size;")
             .fetch_one(&pool)
             .await

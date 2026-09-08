@@ -3,6 +3,7 @@ use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::ai_serving::AiSurfaceFinalizeError;
@@ -33,6 +34,9 @@ pub(crate) enum GatewayError {
         status: StatusCode,
         message: String,
     },
+    PlanUsageLimited(crate::plan_usage_policy::PlanUsagePolicyRejection),
+    LastActiveAdminUpdateDenied,
+    LastActiveAdminDeleteDenied,
     Internal(String),
 }
 
@@ -43,6 +47,10 @@ impl GatewayError {
             | Self::ControlUnavailable { message, .. }
             | Self::Client { message, .. }
             | Self::Internal(message) => message,
+            Self::PlanUsageLimited(rejection) => format!(
+                "subscription plan {} limit {} reached for {} window; retry after {} seconds",
+                rejection.metric, rejection.limit, rejection.window, rejection.retry_after
+            ),
             Self::LocalExecutionPlanningTimeout {
                 phase, timeout_ms, ..
             } => {
@@ -55,6 +63,8 @@ impl GatewayError {
             } => {
                 format!("gateway admission gate {gate} timed out after {queue_budget_ms}ms")
             }
+            Self::LastActiveAdminUpdateDenied => "不能降级或停用最后一个管理员账户".to_string(),
+            Self::LastActiveAdminDeleteDenied => "不能删除最后一个管理员账户".to_string(),
         }
     }
 }
@@ -63,7 +73,13 @@ impl IntoResponse for GatewayError {
     fn into_response(self) -> Response<Body> {
         match self {
             Self::UpstreamUnavailable { trace_id, message } => {
-                warn!(trace_id = %trace_id, error = %message, "gateway proxy unavailable");
+                let error_fingerprint = gateway_error_fingerprint(&message);
+                warn!(
+                    trace_id = %trace_id,
+                    error_fingerprint,
+                    error_length = message.len(),
+                    "gateway proxy unavailable"
+                );
                 let body = Json(json!({
                     "error": {
                         "message": "gateway proxy unavailable",
@@ -81,7 +97,13 @@ impl IntoResponse for GatewayError {
                 response
             }
             Self::ControlUnavailable { trace_id, message } => {
-                warn!(trace_id = %trace_id, error = %message, "gateway control unavailable");
+                let error_fingerprint = gateway_error_fingerprint(&message);
+                warn!(
+                    trace_id = %trace_id,
+                    error_fingerprint,
+                    error_length = message.len(),
+                    "gateway control unavailable"
+                );
                 let body = Json(json!({
                     "error": {
                         "message": "gateway control unavailable",
@@ -162,17 +184,57 @@ impl IntoResponse for GatewayError {
                 })),
             )
                 .into_response(),
-            Self::Internal(message) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
+            Self::PlanUsageLimited(rejection) => (
+                StatusCode::TOO_MANY_REQUESTS,
                 Json(json!({
                     "error": {
-                        "message": message,
+                        "type": "plan_usage_limit_exceeded",
+                        "message": "套餐使用限制已达到上限，请稍后重试",
+                        "details": {
+                            "metric": rejection.metric,
+                            "window": rejection.window,
+                            "limit": rejection.limit,
+                            "retry_after": rejection.retry_after,
+                        }
                     }
                 })),
             )
                 .into_response(),
+            Self::LastActiveAdminUpdateDenied => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "detail": "不能降级或停用最后一个管理员账户" })),
+            )
+                .into_response(),
+            Self::LastActiveAdminDeleteDenied => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "detail": "不能删除最后一个管理员账户" })),
+            )
+                .into_response(),
+            Self::Internal(message) => {
+                let error_fingerprint = gateway_error_fingerprint(&message);
+                tracing::error!(
+                    event_name = "gateway_internal_error",
+                    error_fingerprint,
+                    error_length = message.len(),
+                    "internal gateway error hidden from client"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": "internal server error",
+                        }
+                    })),
+                )
+                    .into_response()
+            }
         }
     }
+}
+
+fn gateway_error_fingerprint(message: &str) -> String {
+    let digest = Sha256::digest(message.as_bytes());
+    format!("{:x}", digest)[..16].to_string()
 }
 
 impl From<AiSurfaceFinalizeError> for GatewayError {
@@ -183,12 +245,41 @@ impl From<AiSurfaceFinalizeError> for GatewayError {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::to_bytes;
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use axum::response::IntoResponse;
 
     use crate::constants::TRACE_ID_HEADER;
 
-    use super::GatewayError;
+    use super::{gateway_error_fingerprint, GatewayError};
+
+    #[tokio::test]
+    async fn internal_errors_do_not_expose_internal_details() {
+        let response = GatewayError::Internal(
+            "database connection failed: password=internal-secret".to_string(),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("internal error response body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("internal error response should be JSON");
+        assert_eq!(payload["error"]["message"], "internal server error");
+        assert!(!String::from_utf8_lossy(&body).contains("internal-secret"));
+    }
+
+    #[test]
+    fn error_fingerprints_are_stable_without_containing_source_text() {
+        let secret_error = "postgresql://admin:database-secret@db.internal/aether";
+        let fingerprint = gateway_error_fingerprint(secret_error);
+
+        assert_eq!(fingerprint, gateway_error_fingerprint(secret_error));
+        assert_eq!(fingerprint.len(), 16);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!fingerprint.contains("database-secret"));
+    }
 
     #[test]
     fn admission_timeout_returns_429_with_retry_after_without_panicking() {

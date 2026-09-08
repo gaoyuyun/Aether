@@ -30,13 +30,20 @@ impl MysqlPoolFactory {
     }
 
     pub fn connect_options(&self) -> Result<MySqlConnectOptions, DataLayerError> {
-        let ssl_mode = if self.config.pool.require_ssl {
-            MySqlSslMode::Required
-        } else {
-            MySqlSslMode::Preferred
-        };
         MySqlConnectOptions::from_str(self.config.url.trim())
             .map(|options| {
+                // Preserve explicit VERIFY_CA/VERIFY_IDENTITY from the URL.
+                // `require_ssl` is a minimum transport guarantee: upgrade
+                // weaker modes to Required, never downgrade verification.
+                let ssl_mode = if self.config.pool.require_ssl
+                    && !matches!(
+                        options.get_ssl_mode(),
+                        MySqlSslMode::VerifyCa | MySqlSslMode::VerifyIdentity
+                    ) {
+                    MySqlSslMode::Required
+                } else {
+                    options.get_ssl_mode()
+                };
                 options
                     .ssl_mode(ssl_mode)
                     .statement_cache_capacity(self.config.pool.statement_cache_capacity)
@@ -78,6 +85,52 @@ impl MysqlPoolFactory {
 mod tests {
     use super::MysqlPoolFactory;
     use crate::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
+    use sqlx::mysql::MySqlSslMode;
+
+    fn ssl_mode(url: &str, require_ssl: bool) -> MySqlSslMode {
+        MysqlPoolFactory::new(SqlDatabaseConfig {
+            driver: DatabaseDriver::Mysql,
+            url: url.to_string(),
+            pool: SqlPoolConfig {
+                require_ssl,
+                ..SqlPoolConfig::default()
+            },
+        })
+        .expect("mysql config should build")
+        .connect_options()
+        .expect("mysql options should parse")
+        .get_ssl_mode()
+    }
+
+    #[test]
+    fn preserves_explicit_mysql_verification_modes() {
+        assert!(matches!(
+            ssl_mode(
+                "mysql://user:pass@localhost/aether?ssl-mode=VERIFY_IDENTITY",
+                false
+            ),
+            MySqlSslMode::VerifyIdentity
+        ));
+        assert!(matches!(
+            ssl_mode(
+                "mysql://user:pass@localhost/aether?ssl-mode=VERIFY_CA",
+                true
+            ),
+            MySqlSslMode::VerifyCa
+        ));
+    }
+
+    #[test]
+    fn require_ssl_only_upgrades_weak_mysql_modes() {
+        for mode in ["DISABLED", "PREFERRED", "REQUIRED"] {
+            let url = format!("mysql://user:pass@localhost/aether?ssl-mode={mode}");
+            assert!(matches!(ssl_mode(&url, true), MySqlSslMode::Required));
+        }
+        assert!(matches!(
+            ssl_mode("mysql://user:pass@localhost/aether", false),
+            MySqlSslMode::Preferred
+        ));
+    }
 
     #[tokio::test]
     async fn factory_builds_lazy_pool_from_valid_config() {

@@ -3,7 +3,7 @@ use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite};
 
 use aether_data_contracts::repository::oauth_providers::{
     OAuthProviderReadRepository, OAuthProviderWriteRepository, StoredOAuthProviderConfig,
-    UpsertOAuthProviderConfigRecord,
+    UpsertOAuthProviderConfigOutcome, UpsertOAuthProviderConfigRecord,
 };
 use aether_data_contracts::DataLayerError;
 use aether_data_query::{push_eq, push_limit, WhereClause};
@@ -101,6 +101,13 @@ WHERE users.is_active = 1
   )
 "#;
 
+const COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL: &str = r#"
+UPDATE oauth_providers
+SET client_secret_encrypted = ?
+WHERE provider_type = ?
+  AND client_secret_encrypted = ?
+"#;
+
 #[async_trait]
 impl OAuthProviderReadRepository for SqliteOAuthProviderRepository {
     async fn list_oauth_provider_configs(
@@ -143,12 +150,51 @@ impl OAuthProviderReadRepository for SqliteOAuthProviderRepository {
 
 #[async_trait]
 impl OAuthProviderWriteRepository for SqliteOAuthProviderRepository {
-    async fn upsert_oauth_provider_config(
+    async fn upsert_oauth_provider_config_guarded(
         &self,
         record: &UpsertOAuthProviderConfigRecord,
-    ) -> Result<StoredOAuthProviderConfig, DataLayerError> {
+        ldap_exclusive: bool,
+        force_disable: bool,
+        _locked_users_snapshot: usize,
+    ) -> Result<UpsertOAuthProviderConfigOutcome, DataLayerError> {
         record.validate()?;
         let now = now_unix_secs();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let existing_enabled: Option<bool> =
+            sqlx::query_scalar("SELECT is_enabled FROM oauth_providers WHERE provider_type = ?")
+                .bind(&record.provider_type)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+        if !force_disable && !record.is_enabled && existing_enabled == Some(true) {
+            let row = sqlx::query(COUNT_LOCKED_USERS_IF_PROVIDER_DISABLED_SQL)
+                .bind(&record.provider_type)
+                .bind(&record.provider_type)
+                .bind(ldap_exclusive)
+                .bind(&record.provider_type)
+                .fetch_one(&mut *tx)
+                .await
+                .map_sql_err()?;
+            let affected_count =
+                usize::try_from(row.try_get::<i64, _>("locked_count").map_sql_err()?.max(0))
+                    .map_err(|_| {
+                        DataLayerError::UnexpectedValue(
+                            "oauth_providers.locked_user_count overflowed".to_string(),
+                        )
+                    })?;
+            if affected_count > 0 {
+                tx.rollback().await.map_sql_err()?;
+                return Ok(
+                    UpsertOAuthProviderConfigOutcome::DisableRequiresConfirmation {
+                        affected_count,
+                    },
+                );
+            }
+        }
         sqlx::query(
             r#"
 INSERT INTO oauth_providers (
@@ -213,27 +259,70 @@ ON CONFLICT(provider_type) DO UPDATE SET
         .bind(now as i64)
         .bind(record.client_secret_encrypted.mode_name())
         .bind(record.client_secret_encrypted.value())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_sql_err()?;
 
-        self.get_provider(&record.provider_type)
-            .await?
-            .ok_or_else(|| {
-                DataLayerError::UnexpectedValue("upserted OAuth provider missing".to_string())
-            })
+        let row = sqlx::query(&format!(
+            "{OAUTH_PROVIDER_COLUMNS} WHERE provider_type = ? LIMIT 1"
+        ))
+        .bind(&record.provider_type)
+        .fetch_one(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let provider = map_oauth_provider_row(&row)?;
+        tx.commit().await.map_sql_err()?;
+        Ok(UpsertOAuthProviderConfigOutcome::Upserted(provider))
     }
 
-    async fn delete_oauth_provider_config(
+    async fn compare_and_swap_oauth_provider_client_secret(
         &self,
         provider_type: &str,
+        expected: &str,
+        replacement: &str,
     ) -> Result<bool, DataLayerError> {
-        let result = sqlx::query("DELETE FROM oauth_providers WHERE provider_type = ?")
+        let result = sqlx::query(COMPARE_AND_SWAP_OAUTH_PROVIDER_CLIENT_SECRET_SQL)
+            .bind(replacement)
             .bind(provider_type)
+            .bind(expected)
             .execute(&self.pool)
             .await
             .map_sql_err()?;
-        Ok(result.rows_affected() > 0)
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn delete_oauth_provider_config_if_unlinked(
+        &self,
+        provider_type: &str,
+        has_links_snapshot: bool,
+    ) -> Result<bool, DataLayerError> {
+        if has_links_snapshot {
+            return Ok(false);
+        }
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_sql_err()?;
+        let provider_exists: Option<String> =
+            sqlx::query_scalar("SELECT provider_type FROM oauth_providers WHERE provider_type = ?")
+                .bind(provider_type)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_sql_err()?;
+        if provider_exists.is_none() {
+            tx.rollback().await.map_sql_err()?;
+            return Ok(false);
+        }
+        let result = sqlx::query(
+            "DELETE FROM oauth_providers WHERE provider_type = ? AND NOT EXISTS (SELECT 1 FROM user_oauth_links WHERE user_oauth_links.provider_type = oauth_providers.provider_type)",
+        )
+            .bind(provider_type)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        tx.commit().await.map_sql_err()?;
+        Ok(result.rows_affected() == 1)
     }
 }
 
@@ -370,7 +459,7 @@ mod tests {
     use crate::run_migrations;
     use aether_data_contracts::repository::oauth_providers::{
         EncryptedSecretUpdate, OAuthProviderReadRepository, OAuthProviderWriteRepository,
-        UpsertOAuthProviderConfigRecord,
+        UpsertOAuthProviderConfigOutcome, UpsertOAuthProviderConfigRecord,
     };
 
     fn sample_upsert(provider_type: &str) -> UpsertOAuthProviderConfigRecord {
@@ -379,8 +468,10 @@ mod tests {
             display_name: format!("{provider_type} display"),
             client_id: format!("{provider_type}-client"),
             client_secret_encrypted: EncryptedSecretUpdate::Preserve,
-            authorization_url_override: Some(format!("https://{provider_type}.example.com/auth")),
-            token_url_override: Some(format!("https://{provider_type}.example.com/token")),
+            authorization_url_override: Some(
+                "https://connect.linux.do/oauth2/authorize".to_string(),
+            ),
+            token_url_override: Some("https://connect.linux.do/oauth2/token".to_string()),
             userinfo_url_override: None,
             scopes: Some(vec!["openid".to_string(), "profile".to_string()]),
             redirect_uri: format!("https://{provider_type}.example.com/redirect"),
@@ -407,7 +498,7 @@ mod tests {
         let created = repository
             .upsert_oauth_provider_config(&UpsertOAuthProviderConfigRecord {
                 client_secret_encrypted: EncryptedSecretUpdate::Set("secret-1".to_string()),
-                ..sample_upsert("github")
+                ..sample_upsert("linuxdo")
             })
             .await
             .expect("provider should upsert");
@@ -420,13 +511,38 @@ mod tests {
         let updated = repository
             .upsert_oauth_provider_config(&UpsertOAuthProviderConfigRecord {
                 client_secret_encrypted: EncryptedSecretUpdate::Preserve,
-                display_name: "GitHub".to_string(),
-                ..sample_upsert("github")
+                display_name: "Linux.do".to_string(),
+                ..sample_upsert("linuxdo")
             })
             .await
             .expect("provider should update");
-        assert_eq!(updated.display_name, "GitHub");
+        assert_eq!(updated.display_name, "Linux.do");
         assert_eq!(updated.client_secret_encrypted.as_deref(), Some("secret-1"));
+        assert!(
+            repository
+                .compare_and_swap_oauth_provider_client_secret(
+                    "linuxdo",
+                    "secret-1",
+                    "record-bound-v2",
+                )
+                .await
+                .expect("client secret CAS should execute")
+        );
+        let migrated = repository
+            .get_oauth_provider_config("linuxdo")
+            .await
+            .expect("provider should fetch")
+            .expect("provider should exist");
+        assert_eq!(migrated.display_name, "Linux.do");
+        assert_eq!(migrated.updated_at_unix_secs, updated.updated_at_unix_secs);
+        assert_eq!(
+            migrated.client_secret_encrypted.as_deref(),
+            Some("record-bound-v2")
+        );
+        assert!(!repository
+            .compare_and_swap_oauth_provider_client_secret("linuxdo", "secret-1", "must-not-win",)
+            .await
+            .expect("stale client secret CAS should execute"));
 
         let listed = repository
             .list_oauth_provider_configs()
@@ -435,7 +551,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
 
         let fetched = repository
-            .get_oauth_provider_config("github")
+            .get_oauth_provider_config("linuxdo")
             .await
             .expect("provider should fetch")
             .expect("provider should exist");
@@ -461,8 +577,8 @@ INSERT INTO users (
 INSERT INTO user_oauth_links (
   id, user_id, provider_type, provider_user_id, linked_at
 ) VALUES
-  ('link-1', 'user-oauth', 'github', 'gh-1', 1),
-  ('link-2', 'user-local', 'github', 'gh-2', 1)
+  ('link-1', 'user-oauth', 'linuxdo', 'linuxdo-1', 1),
+  ('link-2', 'user-local', 'linuxdo', 'linuxdo-2', 1)
 "#,
         )
         .execute(&pool)
@@ -470,22 +586,68 @@ INSERT INTO user_oauth_links (
         .expect("oauth links should seed");
         assert_eq!(
             repository
-                .count_locked_users_if_provider_disabled("github", false)
+                .count_locked_users_if_provider_disabled("linuxdo", false)
                 .await
                 .expect("locked users should count"),
             1
         );
         assert_eq!(
             repository
-                .count_locked_users_if_provider_disabled("github", true)
+                .count_locked_users_if_provider_disabled("linuxdo", true)
                 .await
                 .expect("locked users should count"),
             2
         );
 
-        assert!(repository
-            .delete_oauth_provider_config("github")
+        assert_eq!(
+            repository
+                .upsert_oauth_provider_config_guarded(
+                    &UpsertOAuthProviderConfigRecord {
+                        is_enabled: false,
+                        ..sample_upsert("linuxdo")
+                    },
+                    false,
+                    false,
+                    0,
+                )
+                .await
+                .expect("guarded disable should resolve"),
+            UpsertOAuthProviderConfigOutcome::DisableRequiresConfirmation { affected_count: 1 }
+        );
+        let forced = repository
+            .upsert_oauth_provider_config_guarded(
+                &UpsertOAuthProviderConfigRecord {
+                    is_enabled: false,
+                    ..sample_upsert("linuxdo")
+                },
+                false,
+                true,
+                0,
+            )
             .await
-            .expect("provider should delete"));
+            .expect("forced provider disable should succeed");
+        assert!(matches!(
+            forced,
+            UpsertOAuthProviderConfigOutcome::Upserted(provider) if !provider.is_enabled
+        ));
+
+        assert!(!repository
+            .delete_oauth_provider_config_if_unlinked("linuxdo", false)
+            .await
+            .expect("linked provider deletion should resolve"));
+        assert!(repository
+            .get_oauth_provider_config("linuxdo")
+            .await
+            .expect("provider should fetch")
+            .is_some());
+
+        sqlx::query("DELETE FROM user_oauth_links WHERE provider_type = 'linuxdo'")
+            .execute(&pool)
+            .await
+            .expect("links should delete");
+        assert!(repository
+            .delete_oauth_provider_config_if_unlinked("linuxdo", false)
+            .await
+            .expect("unlinked provider should delete"));
     }
 }

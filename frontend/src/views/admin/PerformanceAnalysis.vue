@@ -408,7 +408,7 @@
                         {{ item.context.provider_name || item.context.provider_id || '未知上游' }}
                       </Badge>
                       <Badge variant="outline">
-                        {{ item.context.api_format || item.context.model || '未知格式' }}
+                        {{ item.context.api_format ? formatApiFormat(item.context.api_format) : item.context.model || '未知格式' }}
                       </Badge>
                     </div>
 
@@ -460,7 +460,7 @@
                         </Badge>
                       </div>
                       <div class="mt-1 text-xs text-muted-foreground">
-                        {{ item.key_name || item.key_id }} · {{ item.api_format || '未知格式' }}
+                        {{ item.key_name || item.key_id }} · {{ item.api_format ? formatApiFormat(item.api_format) : '未知格式' }}
                       </div>
                     </div>
                     <span class="shrink-0 text-xs text-muted-foreground">
@@ -849,6 +849,7 @@ import {
   type ProviderPerformanceItem,
   type ProviderPerformanceResponse,
 } from '@/api/admin'
+import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import {
   monitoringApi,
   type AdminMonitoringCircuitHistoryItem,

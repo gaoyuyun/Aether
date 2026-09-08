@@ -13,8 +13,9 @@ use crate::ai_serving::AiExecutionDecision;
 use crate::clock::current_unix_secs;
 use crate::handlers::proxy::websocket::transport::UpstreamWebSocketErrorCodes;
 use crate::orchestration::{
-    codex_account_id_from_headers, codex_quota_exhaustion_reset_at,
-    sync_codex_websocket_quota_metadata, ResponsesWebSocketAdapter,
+    codex_account_id_from_headers, codex_model_quota_exhaustion_reset_at,
+    codex_quota_exhaustion_reset_at, sync_codex_websocket_quota_metadata,
+    ResponsesWebSocketAdapter,
 };
 use crate::AppState;
 
@@ -24,6 +25,7 @@ const CODEX_WEBSOCKET_RATE_LIMITS_REPORT_CONTEXT_FIELD: &str = "codex_websocket_
 const CODEX_UPSTREAM_WEBSOCKET_ERRORS: UpstreamWebSocketErrorCodes = UpstreamWebSocketErrorCodes {
     upstream_url_missing: "codex_upstream_url_missing",
     upstream_url_invalid: "codex_upstream_url_invalid",
+    frontdoor_self_loop: "codex_websocket_frontdoor_self_loop",
     headers_invalid: "codex_websocket_headers_invalid",
     client_build_failed: "codex_websocket_client_build_failed",
     proxy_invalid: "codex_websocket_proxy_invalid",
@@ -113,16 +115,37 @@ impl ResponsesWebSocketProtocolAdapter for CodexResponsesWebSocketAdapter {
         event: &Value,
     ) -> Option<ResponsesWebSocketAdapterObservation> {
         let rate_limits = parse_codex_rate_limits(event)?;
-        let exhausted =
+        let account_exhausted =
             aether_admin::provider::quota::codex_rate_limit_metadata_exhausted(&rate_limits);
-        let retry_exclusion_until_unix_secs =
-            codex_quota_exhaustion_reset_at(&rate_limits, current_unix_secs());
+        let active_limit_exhausted =
+            aether_admin::provider::quota::codex_websocket_response_has_usage_limit_error(event);
+        let now_unix_secs = current_unix_secs();
+        let scoped_reset_at = if account_exhausted {
+            codex_quota_exhaustion_reset_at(&rate_limits, now_unix_secs)
+        } else {
+            codex_model_quota_exhaustion_reset_at(&rate_limits, now_unix_secs)
+        };
+        let retry_exclusion_until_unix_secs = active_limit_exhausted
+            .then(|| {
+                aether_admin::provider::quota::codex_websocket_usage_limit_reset_at(
+                    event,
+                    now_unix_secs,
+                )
+            })
+            .flatten()
+            .or(scoped_reset_at);
         Some(ResponsesWebSocketAdapterObservation {
-            drain: exhausted.then_some(ResponsesWebSocketDrainDirective {
-                error_code: "codex_account_quota_exhausted",
-                retry_current_turn: true,
-                retry_exclusion_until_unix_secs,
-            }),
+            drain: (account_exhausted || active_limit_exhausted).then_some(
+                ResponsesWebSocketDrainDirective {
+                    error_code: if account_exhausted {
+                        "codex_account_quota_exhausted"
+                    } else {
+                        "codex_active_limit_exhausted"
+                    },
+                    retry_current_turn: true,
+                    retry_exclusion_until_unix_secs,
+                },
+            ),
             quota_metadata: Some(rate_limits),
         })
     }
@@ -260,6 +283,16 @@ mod tests {
     };
 
     #[test]
+    fn codex_adapter_has_a_distinct_frontdoor_self_loop_error() {
+        let adapter = CodexResponsesWebSocketAdapter;
+
+        assert_eq!(
+            adapter.upstream_errors().frontdoor_self_loop,
+            "codex_websocket_frontdoor_self_loop"
+        );
+    }
+
+    #[test]
     fn codex_rate_limit_chunk_is_kept_for_the_terminal_report() {
         let adapter = CodexResponsesWebSocketAdapter;
         assert!(adapter.observes_upstream_events());
@@ -324,6 +357,91 @@ mod tests {
             }),
             Some(&json!(100.0))
         );
+    }
+
+    #[test]
+    fn model_scoped_usage_limit_error_drains_without_account_exhaustion() {
+        let adapter = CodexResponsesWebSocketAdapter;
+        let event = json!({
+            "type": "error",
+            "error": {
+                "type": "usage_limit_reached",
+                "plan_type": "pro",
+            },
+            "status_code": 429,
+            "headers": {
+                "X-Codex-Plan-Type": "pro",
+                "X-Codex-Active-Limit": "codex_bengalfox",
+                "X-Codex-Primary-Used-Percent": "100",
+                "X-Codex-Primary-Window-Minutes": "300",
+                "X-Codex-Primary-Reset-At": "4000000000",
+                "X-Codex-Bengalfox-Limit-Name": "GPT-5.3-Codex-Spark",
+                "X-Codex-Bengalfox-Primary-Used-Percent": "100",
+                "X-Codex-Bengalfox-Primary-Window-Minutes": "300",
+                "X-Codex-Bengalfox-Primary-Reset-At": "4000000000",
+            },
+        });
+
+        let observation = adapter
+            .observe_upstream_event(&event)
+            .expect("model-scoped quota error should be observed");
+        let drain = observation
+            .drain
+            .expect("model-scoped quota error should retry the current turn");
+        let quota = observation
+            .quota_metadata
+            .expect("model-scoped quota metadata should be retained");
+
+        assert_eq!(drain.error_code, "codex_active_limit_exhausted");
+        assert!(drain.retry_current_turn);
+        assert_eq!(
+            drain.retry_exclusion_until_unix_secs,
+            Some(4_000_000_000u64)
+        );
+        assert_eq!(quota["spark_primary_used_percent"], json!(100.0));
+        assert!(quota.get("allowed").is_none());
+        assert!(quota.get("limit_reached").is_none());
+        assert!(!aether_admin::provider::quota::codex_rate_limit_metadata_exhausted(&quota));
+    }
+
+    #[test]
+    fn account_scoped_usage_limit_error_keeps_account_drain_semantics() {
+        let adapter = CodexResponsesWebSocketAdapter;
+        let event = json!({
+            "type": "error",
+            "error": {
+                "type": "usage_limit_reached",
+                "plan_type": "free",
+                "resets_at": 4_000_000_000u64,
+            },
+            "status_code": 429,
+            "headers": {
+                "X-Codex-Plan-Type": "free",
+                "X-Codex-Primary-Used-Percent": "100",
+                "X-Codex-Primary-Window-Minutes": "43200",
+                "X-Codex-Primary-Reset-At": "4000000000",
+            },
+        });
+
+        let observation = adapter
+            .observe_upstream_event(&event)
+            .expect("account quota error should be observed");
+        let drain = observation
+            .drain
+            .expect("account quota error should retry the current turn");
+        let quota = observation
+            .quota_metadata
+            .expect("account quota metadata should be retained");
+
+        assert_eq!(drain.error_code, "codex_account_quota_exhausted");
+        assert!(drain.retry_current_turn);
+        assert_eq!(
+            drain.retry_exclusion_until_unix_secs,
+            Some(4_000_000_000u64)
+        );
+        assert_eq!(quota["allowed"], json!(false));
+        assert_eq!(quota["limit_reached"], json!(true));
+        assert!(aether_admin::provider::quota::codex_rate_limit_metadata_exhausted(&quota));
     }
 
     #[test]

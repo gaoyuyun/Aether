@@ -721,6 +721,7 @@ impl ClaudeClientEmitter {
                 out.extend(self.ensure_tool_block(index, &call_id, &name)?);
                 Ok(out)
             }
+            CanonicalStreamEvent::ToolCallSignature { .. } => Ok(Vec::new()),
             CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
                 let (call_id, name) = {
                     let state = self.tool_states.entry(index).or_default();

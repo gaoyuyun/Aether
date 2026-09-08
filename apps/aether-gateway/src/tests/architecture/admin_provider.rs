@@ -1163,7 +1163,8 @@ fn admin_provider_write_uses_specific_local_owners() {
         "crate::handlers::admin::provider::write::normalize::{",
         "normalize_auth_type,",
         "validate_vertex_api_formats,",
-        "encrypt_catalog_secret_with_fallbacks, json_string_list,",
+        ".seal_provider_catalog_key_api_key(",
+        ".seal_provider_catalog_key_auth_config(",
         "normalize_json_object, normalize_string_list,",
     ] {
         assert!(
@@ -1243,7 +1244,6 @@ fn admin_provider_ops_providers_mod_stays_thin() {
         "apps/aether-gateway/src/handlers/admin/provider/ops/providers/support.rs",
     );
     for pattern in [
-        "pub(super) const ADMIN_PROVIDER_OPS_SENSITIVE_FIELDS:",
         "pub(super) const ADMIN_PROVIDER_OPS_CONNECT_RUST_ONLY_MESSAGE:",
         "pub(super) const ADMIN_PROVIDER_OPS_ACTION_RUST_ONLY_MESSAGE:",
         "pub(super) const ADMIN_PROVIDER_OPS_VERIFY_RUST_ONLY_MESSAGE:",
@@ -1257,6 +1257,30 @@ fn admin_provider_ops_providers_mod_stays_thin() {
             "handlers/admin/provider/ops/providers/support.rs should own {pattern}"
         );
     }
+    assert!(
+        !providers_support.contains("ADMIN_PROVIDER_OPS_SENSITIVE_FIELDS"),
+        "provider ops support should not duplicate the shared credential sensitivity policy"
+    );
+
+    let provider_ops_credentials =
+        read_workspace_file("apps/aether-gateway/src/handlers/shared/provider_ops_credential.rs");
+    for pattern in [
+        "pub(crate) const PROVIDER_OPS_PERSISTENT_SECRET_FIELDS:",
+        "pub(crate) const PROVIDER_OPS_TRANSIENT_SECRET_FIELDS:",
+        "pub(crate) fn provider_ops_credential_field_is_secret(",
+    ] {
+        assert!(
+            provider_ops_credentials.contains(pattern),
+            "handlers/shared/provider_ops_credential.rs should own provider credential sensitivity policy {pattern}"
+        );
+    }
+    let providers_config = read_workspace_file(
+        "apps/aether-gateway/src/handlers/admin/provider/ops/providers/config.rs",
+    );
+    assert!(
+        providers_config.contains("provider_ops_credential_field_is_secret"),
+        "provider ops config should consume the shared credential sensitivity policy"
+    );
 
     for path in [
         "apps/aether-gateway/src/maintenance/runtime.rs",
@@ -1950,8 +1974,9 @@ fn admin_provider_oauth_quota_mod_stays_thin() {
         "handlers/admin/provider/oauth/quota/antigravity.rs should import common quota helpers from shared.rs"
     );
     assert!(
-        quota_antigravity
-            .contains("use aether_provider_pool::build_antigravity_pool_quota_request;"),
+        quota_antigravity.contains("use aether_provider_pool::{")
+            && quota_antigravity.contains("build_antigravity_pool_quota_request")
+            && quota_antigravity.contains("build_antigravity_pool_quota_summary_request"),
         "handlers/admin/provider/oauth/quota/antigravity.rs should delegate antigravity quota request construction to aether-provider-pool"
     );
     let quota_chatgpt_web = read_workspace_file(

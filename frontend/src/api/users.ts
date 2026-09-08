@@ -454,6 +454,16 @@ export const usersApi = {
     return response.data
   },
 
+  async revokeUserPlanEntitlement(
+    userId: string,
+    entitlementId: string
+  ): Promise<AdminUserPlanEntitlementsResponse> {
+    const response = await apiClient.delete<AdminUserPlanEntitlementsResponse>(
+      `/api/admin/users/${userId}/billing/entitlements/${entitlementId}`
+    )
+    return response.data
+  },
+
   async revokeUserSession(userId: string, sessionId: string): Promise<{ message: string }> {
     const response = await apiClient.delete<{ message: string }>(`/api/admin/users/${userId}/sessions/${sessionId}`)
     return response.data

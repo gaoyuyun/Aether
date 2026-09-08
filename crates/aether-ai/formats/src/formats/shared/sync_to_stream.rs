@@ -12,6 +12,11 @@ use crate::formats::gemini::generate_content::stream::GeminiClientEmitter;
 use crate::formats::openai::chat::stream::{
     OpenAIChatClientEmitter, OpenAIResponsesClientEmitter, OpenAIResponsesProviderState,
 };
+use crate::formats::openai::image::{
+    bounded_openai_image_revised_prompt, is_safe_openai_image_base64_payload,
+    normalize_openai_image_output_format, parse_safe_openai_image_data_url,
+    sanitize_openai_image_source_url,
+};
 use crate::formats::openai::responses::history::{
     record_converted_response_history, ResponseHistoryRecord,
 };
@@ -26,6 +31,8 @@ use crate::formats::shared::stream_core::{
 };
 use crate::formats::shared::stream_rewrite::maybe_build_ai_surface_stream_rewriter;
 use crate::formats::shared::AiSurfaceFinalizeError;
+
+const MAX_OPENAI_IMAGE_OUTPUTS: usize = 64;
 
 pub struct SyncToStreamBridgeOutcome {
     pub sse_body: Vec<u8>,
@@ -118,12 +125,14 @@ pub fn maybe_bridge_standard_sync_json_to_stream(
             openai_responses_terminal_event_type(&openai_responses_response)
                 .unwrap_or("response.completed"),
             provider_actual_service_tier.as_deref(),
+            &bridge_context,
         )?
     } else {
         emit_client_stream_from_canonical_frames(
             canonical_frames,
             client_api_format.as_str(),
             provider_actual_service_tier.as_deref(),
+            &bridge_context,
         )?
     };
 
@@ -167,6 +176,7 @@ fn bridge_openai_responses_same_family_sync_json_to_stream(
         response,
         terminal_event_type,
         provider_actual_service_tier_from_sync_response(response, provider_api_format).as_deref(),
+        report_context,
     )?;
 
     Ok(Some(SyncToStreamBridgeOutcome {
@@ -195,7 +205,7 @@ fn maybe_bridge_openai_image_sync_json_to_stream(
     let Some(image) = outputs.iter().find_map(OpenAiImageOutput::b64_json) else {
         return Ok(None);
     };
-    let image_count = openai_image_response_image_count(response).max(outputs.len() as u64);
+    let image_count = outputs.len() as u64;
     let usage = response.get("usage").cloned().unwrap_or(Value::Null);
     let event_name = openai_image_completed_event_name(report_context);
     let sse_body = encode_json_sse(
@@ -235,7 +245,7 @@ fn maybe_bridge_openai_image_sync_json_to_chat_stream(
         return Ok(None);
     }
 
-    let image_count = openai_image_response_image_count(response).max(outputs.len() as u64);
+    let image_count = outputs.len() as u64;
     let summary = openai_image_terminal_summary(response, report_context, image_count);
     let response_id = openai_image_bridge_response_id(response, report_context, "chatcmpl-image");
     let model = openai_image_bridge_response_model(response, report_context);
@@ -346,7 +356,7 @@ fn maybe_bridge_openai_image_sync_json_to_responses_stream(
         }),
     )?);
 
-    let image_count = openai_image_response_image_count(response).max(outputs.len() as u64);
+    let image_count = outputs.len() as u64;
     Ok(Some(SyncToStreamBridgeOutcome {
         sse_body,
         terminal_summary: Some(openai_image_terminal_summary(
@@ -369,17 +379,20 @@ struct OpenAiImageOutput {
 
 impl OpenAiImageOutput {
     fn b64_json(&self) -> Option<String> {
-        self.b64_json
-            .clone()
-            .or_else(|| self.url.as_deref().and_then(extract_base64_from_data_url))
+        let value = self
+            .b64_json
+            .as_deref()
+            .or_else(|| self.url.as_deref().and_then(extract_base64_from_data_url))?;
+        is_safe_openai_image_base64_payload(value).then(|| value.to_string())
     }
 
     fn source_url(&self) -> Option<String> {
-        self.url.clone().or_else(|| {
+        let source = self.url.clone().or_else(|| {
             self.b64_json
                 .as_ref()
                 .map(|value| format!("data:{};base64,{value}", self.mime_type))
-        })
+        })?;
+        sanitize_openai_image_source_url(&source)
     }
 
     fn markdown(&self, index: usize) -> String {
@@ -388,7 +401,10 @@ impl OpenAiImageOutput {
         } else {
             format!("generated image {}", index + 1)
         };
-        match self.source_url() {
+        match self
+            .source_url()
+            .and_then(|url| escape_markdown_image_destination(&url))
+        {
             Some(url) => format!("![{alt}]({url})"),
             None => String::new(),
         }
@@ -405,7 +421,11 @@ impl OpenAiImageOutput {
             Value::String("image_generation_call".to_string()),
         );
         item.insert("status".to_string(), Value::String("completed".to_string()));
-        if let Some(result) = self.b64_json().or_else(|| self.url.clone()) {
+        if let Some(result) = self.b64_json().or_else(|| {
+            self.url
+                .as_deref()
+                .and_then(sanitize_openai_image_source_url)
+        }) {
             item.insert("result".to_string(), Value::String(result));
         }
         if let Some(output_format) = self.output_format.as_ref() {
@@ -467,6 +487,7 @@ fn collect_openai_image_outputs(
         .flatten()
         .filter_map(Value::as_object)
         .filter_map(|item| openai_image_output_from_item(item, report_context))
+        .take(MAX_OPENAI_IMAGE_OUTPUTS)
         .collect()
 }
 
@@ -480,7 +501,7 @@ fn openai_image_output_from_item(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+        .and_then(sanitize_openai_image_source_url);
     if b64_json.is_none() && url.is_none() {
         return None;
     }
@@ -488,10 +509,13 @@ fn openai_image_output_from_item(
         .get("output_format")
         .or_else(|| item.get("format"))
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(normalize_openai_image_output_format)
         .map(ToOwned::to_owned)
-        .or_else(|| image_request_output_format(report_context));
+        .or_else(|| {
+            image_request_output_format(report_context).and_then(|value| {
+                normalize_openai_image_output_format(&value).map(ToOwned::to_owned)
+            })
+        });
     let mime_type = url
         .as_deref()
         .and_then(extract_mime_type_from_data_url)
@@ -504,8 +528,7 @@ fn openai_image_output_from_item(
     let revised_prompt = item
         .get("revised_prompt")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(bounded_openai_image_revised_prompt)
         .map(ToOwned::to_owned);
 
     Some(OpenAiImageOutput {
@@ -515,14 +538,6 @@ fn openai_image_output_from_item(
         output_format,
         revised_prompt,
     })
-}
-
-fn openai_image_response_image_count(response: &Map<String, Value>) -> u64 {
-    response
-        .get("data")
-        .and_then(Value::as_array)
-        .map(|items| items.len() as u64)
-        .unwrap_or(0)
 }
 
 fn openai_image_terminal_summary(
@@ -677,11 +692,12 @@ fn image_request_quality(report_context: Option<&Value>) -> Option<String> {
 }
 
 fn mime_type_from_image_output_format(output_format: &str) -> String {
-    match output_format.trim().to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" => "image/jpeg".to_string(),
-        "webp" => "image/webp".to_string(),
-        "png" => "image/png".to_string(),
-        value if !value.is_empty() => format!("image/{value}"),
+    match output_format.trim() {
+        value if value.eq_ignore_ascii_case("jpg") || value.eq_ignore_ascii_case("jpeg") => {
+            "image/jpeg".to_string()
+        }
+        value if value.eq_ignore_ascii_case("webp") => "image/webp".to_string(),
+        value if value.eq_ignore_ascii_case("png") => "image/png".to_string(),
         _ => "image/png".to_string(),
     }
 }
@@ -910,29 +926,36 @@ fn extract_openai_image_sync_b64_json(item: &serde_json::Map<String, Value>) -> 
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| is_safe_openai_image_base64_payload(value))
         .map(ToOwned::to_owned)
         .or_else(|| {
             item.get("url")
                 .and_then(Value::as_str)
                 .and_then(extract_base64_from_data_url)
+                .map(ToOwned::to_owned)
         })
 }
 
-fn extract_base64_from_data_url(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let (metadata, payload) = trimmed.split_once(',')?;
-    if !metadata.starts_with("data:") || !metadata.ends_with(";base64") {
-        return None;
-    }
-    (!payload.trim().is_empty()).then(|| payload.trim().to_string())
+fn extract_base64_from_data_url(value: &str) -> Option<&str> {
+    parse_safe_openai_image_data_url(value).map(|(_, payload)| payload)
 }
 
 fn extract_mime_type_from_data_url(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let (metadata, _) = trimmed.split_once(',')?;
-    let mime_type = metadata.strip_prefix("data:")?.strip_suffix(";base64")?;
-    let mime_type = mime_type.trim();
-    (!mime_type.is_empty()).then(|| mime_type.to_string())
+    parse_safe_openai_image_data_url(value).map(|(mime_type, _)| mime_type.to_string())
+}
+
+fn escape_markdown_image_destination(value: &str) -> Option<String> {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_control() || character.is_whitespace() {
+            return None;
+        }
+        if matches!(character, '\\' | '(' | ')') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Some(escaped)
 }
 
 fn openai_image_completed_event_name(report_context: Option<&Value>) -> &'static str {
@@ -1046,6 +1069,7 @@ fn emit_client_stream_from_canonical_frames(
     canonical_frames: Vec<CanonicalStreamFrame>,
     client_api_format: &str,
     provider_actual_service_tier: Option<&str>,
+    report_context: &Value,
 ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
     match client_api_format {
         "openai:chat" => {
@@ -1054,7 +1078,7 @@ fn emit_client_stream_from_canonical_frames(
             emit_with_openai_chat_emitter(&mut emitter, canonical_frames)
         }
         "openai:responses" | "openai:responses:compact" => {
-            let mut emitter = OpenAIResponsesClientEmitter::default();
+            let mut emitter = OpenAIResponsesClientEmitter::with_report_context(report_context);
             emitter.set_actual_service_tier(provider_actual_service_tier);
             emit_with_openai_responses_emitter(&mut emitter, canonical_frames)
         }
@@ -1115,8 +1139,9 @@ fn emit_openai_responses_stream_with_authoritative_terminal(
     authoritative_response: &Value,
     terminal_event_type: &'static str,
     provider_actual_service_tier: Option<&str>,
+    report_context: &Value,
 ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
-    let mut emitter = OpenAIResponsesClientEmitter::default();
+    let mut emitter = OpenAIResponsesClientEmitter::with_report_context(report_context);
     emitter.set_actual_service_tier(provider_actual_service_tier);
     let mut output = Vec::new();
     for frame in canonical_frames {
@@ -1315,7 +1340,11 @@ fn standardized_usage_from_openai_usage(value: &Value) -> Option<StandardizedUsa
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{maybe_bridge_standard_sync_json_to_stream, standardized_usage_from_openai_usage};
+    use super::{
+        maybe_bridge_standard_sync_json_to_stream, standardized_usage_from_openai_usage,
+        OpenAiImageOutput,
+    };
+    use crate::formats::openai::namespace::NamespaceToolAliases;
 
     fn utf8(bytes: Vec<u8>) -> String {
         String::from_utf8(bytes).expect("utf8 should decode")
@@ -1378,6 +1407,88 @@ mod tests {
             .storage_key
             .starts_with("ai:responses:history:v1:"));
         assert!(history_record.payload.contains("resp_sync_history_1"));
+    }
+
+    #[test]
+    fn chat_sync_bridge_restores_namespaced_responses_tool_identity() {
+        let report_context = json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "needs_conversion": true,
+            "original_request_body": {
+                "model": "qwen",
+                "input": "write the report",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "vulnerability_report",
+                        "parameters": {"type": "object"}
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "mcp__vulnerability_report",
+                        "description": "Reporting tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "vulnerability_report",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"report_path": {"type": "string"}}
+                            }
+                        }]
+                    }
+                ]
+            }
+        });
+        let aliases = NamespaceToolAliases::from_report_context(&report_context);
+        let chat_name = aliases
+            .chat_name("mcp__vulnerability_report", "vulnerability_report")
+            .expect("namespace alias");
+        let outcome = maybe_bridge_standard_sync_json_to_stream(
+            &json!({
+                "id": "chatcmpl_namespace_sync_1",
+                "object": "chat.completion",
+                "model": "qwen",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_namespace_sync_1",
+                            "type": "function",
+                            "function": {
+                                "name": chat_name,
+                                "arguments": "{\"report_path\":\"reports/finding.md\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }),
+            "openai:chat",
+            "openai:responses",
+            Some(&report_context),
+        )
+        .expect("bridge should succeed")
+        .expect("bridge should produce SSE");
+
+        let body = utf8(outcome.sse_body);
+        let events = json_sse_events(&body);
+        let done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .expect("function call should complete");
+        assert_eq!(done["item"]["name"], "vulnerability_report");
+        assert_eq!(done["item"]["namespace"], "mcp__vulnerability_report");
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("response should complete");
+        assert_eq!(
+            completed["response"]["output"][0]["namespace"],
+            "mcp__vulnerability_report"
+        );
     }
 
     #[test]
@@ -1800,6 +1911,98 @@ mod tests {
         assert!(output.contains("\"type\":\"image_edit.completed\""));
         assert!(output.contains("\"b64_json\":\"d29ybGQ=\""));
         assert!(output.contains("\"total_tokens\":9"));
+    }
+
+    #[test]
+    fn bridges_openai_image_sync_http_url_with_markdown_escaping() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:chat",
+            "image_request": {"operation": "generate"}
+        });
+        let outcome = maybe_bridge_standard_sync_json_to_stream(
+            &json!({
+                "id": "img_url_123",
+                "data": [{
+                    "url": "https://cdn.example.test/generated/(image).png"
+                }]
+            }),
+            "openai:image",
+            "openai:chat",
+            Some(&report_context),
+        )
+        .expect("bridge should succeed")
+        .expect("valid HTTP image URL should bridge");
+
+        let output = utf8(outcome.sse_body);
+        assert!(output.contains("generated/\\\\(image\\\\).png"));
+    }
+
+    #[test]
+    fn rejects_non_http_image_urls_and_untrusted_data_mime_types() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:chat",
+            "image_request": {"operation": "generate"}
+        });
+        for item in [
+            json!({"url": "javascript:alert(1)"}),
+            json!({"url": "data:text/html;base64,PGh0bWw+"}),
+        ] {
+            let outcome = maybe_bridge_standard_sync_json_to_stream(
+                &json!({"data": [item]}),
+                "openai:image",
+                "openai:chat",
+                Some(&report_context),
+            )
+            .expect("bridge should not error on an unsupported image source");
+            assert!(outcome.is_none(), "unsupported source must not be emitted");
+        }
+
+        let output = OpenAiImageOutput {
+            b64_json: Some("aGVsbG8=".to_string()),
+            url: None,
+            mime_type: "image/png".to_string(),
+            output_format: Some("text/html);javascript:alert(1)".to_string()),
+            revised_prompt: None,
+        }
+        .markdown(0);
+        assert_eq!(output, "![generated image](data:image/png;base64,aGVsbG8=)");
+    }
+
+    #[test]
+    fn image_summary_counts_only_safe_emitted_outputs() {
+        let report_context = json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:chat",
+            "image_request": {"operation": "generate"}
+        });
+        let outcome = maybe_bridge_standard_sync_json_to_stream(
+            &json!({
+                "data": [
+                    {"b64_json": "not-base64!"},
+                    {"url": "javascript:alert(1)"},
+                    {"b64_json": "aGVsbG8="}
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
+            }),
+            "openai:image",
+            "openai:chat",
+            Some(&report_context),
+        )
+        .expect("bridge should ignore unsupported outputs")
+        .expect("valid output should still bridge");
+
+        let output = utf8(outcome.sse_body);
+        assert!(output.contains("data:image/png;base64,aGVsbG8="));
+        assert!(!output.contains("not-base64"));
+        assert!(!output.contains("javascript:"));
+        let usage = outcome
+            .terminal_summary
+            .and_then(|summary| summary.standardized_usage)
+            .expect("safe output should produce usage");
+        assert_eq!(usage.request_count, 1);
+        assert_eq!(usage.dimensions.get("image_count"), Some(&json!(1)));
     }
 
     #[test]

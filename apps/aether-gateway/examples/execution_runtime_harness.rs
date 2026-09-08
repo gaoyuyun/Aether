@@ -30,7 +30,7 @@ struct Args {
     #[arg(
         long,
         env = "AETHER_EXECUTION_RUNTIME_UNIX_SOCKET",
-        default_value = "/tmp/aether-execution-runtime.sock"
+        default_value = "/tmp/aether-execution-runtime/aether-execution-runtime.sock"
     )]
     unix_socket: PathBuf,
 

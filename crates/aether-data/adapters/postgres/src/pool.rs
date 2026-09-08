@@ -6,16 +6,22 @@ use std::time::Duration;
 
 fn connect_options(config: &PostgresPoolConfig) -> Result<PgConnectOptions, DataLayerError> {
     config.validate()?;
-
-    let ssl_mode = if config.require_ssl {
-        PgSslMode::Require
-    } else {
-        PgSslMode::Prefer
-    };
-
     let options = PgConnectOptions::from_str(config.database_url.trim()).map_err(|err| {
         DataLayerError::InvalidConfiguration(format!("invalid postgres database_url: {err}"))
     })?;
+
+    // Preserve an explicit verification mode from the URL. `require_ssl` is
+    // a minimum transport guarantee, so it may upgrade Disable/Allow/Prefer
+    // to Require but must never silently weaken VerifyCa/VerifyFull.
+    let ssl_mode = if config.require_ssl
+        && !matches!(
+            options.get_ssl_mode(),
+            PgSslMode::VerifyCa | PgSslMode::VerifyFull
+        ) {
+        PgSslMode::Require
+    } else {
+        options.get_ssl_mode()
+    };
 
     Ok(options
         .ssl_mode(ssl_mode)
@@ -53,8 +59,43 @@ impl PostgresPoolFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::PostgresPoolFactory;
+    use super::{connect_options, PostgresPoolFactory};
     use crate::PostgresPoolConfig;
+    use sqlx::postgres::PgSslMode;
+
+    fn ssl_mode(url: &str, require_ssl: bool) -> PgSslMode {
+        connect_options(&PostgresPoolConfig {
+            database_url: url.to_string(),
+            require_ssl,
+            ..PostgresPoolConfig::default()
+        })
+        .expect("postgres options should parse")
+        .get_ssl_mode()
+    }
+
+    #[test]
+    fn preserves_explicit_postgres_verification_modes() {
+        assert!(matches!(
+            ssl_mode("postgres://localhost/aether?sslmode=verify-full", false),
+            PgSslMode::VerifyFull
+        ));
+        assert!(matches!(
+            ssl_mode("postgres://localhost/aether?sslmode=verify-ca", true),
+            PgSslMode::VerifyCa
+        ));
+    }
+
+    #[test]
+    fn require_ssl_only_upgrades_weak_postgres_modes() {
+        for mode in ["disable", "allow", "prefer"] {
+            let url = format!("postgres://localhost/aether?sslmode={mode}");
+            assert!(matches!(ssl_mode(&url, true), PgSslMode::Require));
+        }
+        assert!(matches!(
+            ssl_mode("postgres://localhost/aether", false),
+            PgSslMode::Prefer
+        ));
+    }
 
     #[tokio::test]
     async fn factory_builds_lazy_pool_from_valid_config() {

@@ -42,13 +42,17 @@
                 <!-- 格式转换按钮 -->
                 <span
                   class="mr-1"
-                  :title="isEndpointFormatConversionDisabled ? formatConversionDisabledTooltip : (endpoint.format_acceptance_config?.enabled ? '已启用格式转换（点击关闭）' : '启用格式转换')"
+                  :title="isEndpointFormatConversionDisabled(endpoint) ? getFormatConversionDisabledTooltip(endpoint) : (endpoint.format_acceptance_config?.enabled ? '已启用格式转换（点击关闭）' : '启用格式转换')"
                 >
                   <Button
                     variant="ghost"
                     size="icon"
-                    :class="`h-7 w-7 ${endpoint.format_acceptance_config?.enabled ? 'text-primary' : ''} ${isEndpointFormatConversionDisabled ? 'opacity-50' : ''}`"
-                    :disabled="togglingFormatEndpointId === endpoint.id || isEndpointFormatConversionDisabled"
+                    class="h-7 w-7"
+                    :class="{
+                      'text-primary': endpoint.format_acceptance_config?.enabled,
+                      'opacity-50': isEndpointFormatConversionDisabled(endpoint),
+                    }"
+                    :disabled="togglingFormatEndpointId === endpoint.id || isEndpointFormatConversionDisabled(endpoint)"
                     @click="handleToggleFormatConversion(endpoint)"
                   >
                     <Shuffle class="w-3.5 h-3.5" />
@@ -103,6 +107,7 @@
                 </Popover>
                 <!-- 上游流式三态按钮 -->
                 <Button
+                  v-if="!isWebSocketEndpointApiFormat(endpoint.api_format)"
                   variant="ghost"
                   size="icon"
                   :class="getUpstreamStreamButtonClass(endpoint)"
@@ -936,7 +941,11 @@
             <SelectTrigger class="h-auto w-auto gap-1.5 !border-0 bg-transparent !shadow-none p-0 font-medium rounded-none flex-row-reverse !ring-0 !ring-offset-0 !outline-none [&>svg]:h-4 [&>svg]:w-4 [&>svg]:opacity-70">
               <SelectValue placeholder="选择格式..." />
             </SelectTrigger>
-            <SelectContent :disable-portal="false">
+            <SelectContent
+              :disable-portal="false"
+              align="start"
+              class="max-h-[min(24rem,var(--radix-select-content-available-height))] min-w-[max(12rem,var(--radix-select-trigger-width))]"
+            >
               <SelectItem
                 v-for="format in availableFormats"
                 :key="format.value"
@@ -1052,7 +1061,10 @@ import AlertDialog from '@/components/common/AlertDialog.vue'
 import EndpointConditionEditor from './EndpointConditionEditor.vue'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
 import { getDefaultEndpointBaseUrl, getDefaultEndpointPath } from './endpoint-default-paths'
-import { fixedEndpointUpstreamStreamPolicy } from './endpoint-protocol-policy'
+import {
+  fixedEndpointUpstreamStreamPolicy,
+  isWebSocketEndpointApiFormat,
+} from './endpoint-protocol-policy'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import {
   createEndpoint,
@@ -1076,6 +1088,10 @@ import {
   type EditableConditionNode,
   validateEditableCondition,
 } from './endpoint-rule-condition'
+import {
+  endpointSecretMarkerPayload,
+  retainsEndpointSecret,
+} from './endpoint-secret-markers'
 
 // 编辑用的规则类型（统一的可编辑结构）
 interface EditableRule {
@@ -1083,6 +1099,7 @@ interface EditableRule {
   enabled: boolean
   key: string      // set/drop 用
   value: string    // set 用
+  retainValue: boolean
   from: string     // rename 用
   to: string       // rename 用
   condition: EditableConditionNode | null
@@ -1096,11 +1113,14 @@ interface EditableBodyRule {
   enabled: boolean
   path: string     // set/drop/append/insert/regex_replace 用
   value: string    // set/append/insert 用（JSON 格式）
+  retainValue: boolean
   from: string     // rename 用
   to: string       // rename 用
   index: string    // insert 用（字符串输入，保存时解析为 int）
   pattern: string  // regex_replace 用
+  retainPattern: boolean
   replacement: string // regex_replace 用
+  retainReplacement: boolean
   flags: string    // regex_replace 用（i/m/s）
   count: string    // regex_replace 用（空=默认全部；0=全部）
   condition: EditableConditionNode | null
@@ -1136,13 +1156,17 @@ const emit = defineEmits<{
   'endpointUpdated': []
 }>()
 
-// 计算端点级格式转换是否应该被禁用
-const isEndpointFormatConversionDisabled = computed(() => {
-  return props.systemFormatConversionEnabled || props.providerFormatConversionEnabled
-})
+// WebSocket 端点只支持原始帧透传，不能进入 HTTP body 格式转换链。
+function isEndpointFormatConversionDisabled(endpoint: ProviderEndpoint): boolean {
+  return isWebSocketEndpointApiFormat(endpoint.api_format)
+    || Boolean(props.systemFormatConversionEnabled)
+    || Boolean(props.providerFormatConversionEnabled)
+}
 
-// 获取禁用提示
-const formatConversionDisabledTooltip = computed(() => {
+function getFormatConversionDisabledTooltip(endpoint: ProviderEndpoint): string {
+  if (isWebSocketEndpointApiFormat(endpoint.api_format)) {
+    return legacyT('WebSocket 端点不支持格式转换')
+  }
   if (props.systemFormatConversionEnabled) {
     return legacyT('请先关闭系统级开关')
   }
@@ -1150,7 +1174,7 @@ const formatConversionDisabledTooltip = computed(() => {
     return legacyT('请先关闭提供商级开关')
   }
   return ''
-})
+}
 
 const { success, error: showError } = useToast()
 const proxyNodesStore = useProxyNodesStore()
@@ -2065,7 +2089,16 @@ async function clearEndpointProxy(endpoint: ProviderEndpoint) {
 }
 
 function emptyHeaderRule(): EditableRule {
-  return { action: 'set', enabled: true, key: '', value: '', from: '', to: '', condition: null }
+  return {
+    action: 'set',
+    enabled: true,
+    key: '',
+    value: '',
+    retainValue: false,
+    from: '',
+    to: '',
+    condition: null,
+  }
 }
 
 function editableHeaderRulesFromRules(rules: HeaderRule[] | null | undefined): EditableRule[] {
@@ -2073,7 +2106,15 @@ function editableHeaderRulesFromRules(rules: HeaderRule[] | null | undefined): E
   const editableRules: EditableRule[] = []
   for (const rule of rules) {
     if (rule.action === 'set') {
-      editableRules.push({ ...emptyHeaderRule(), action: 'set', enabled: rule.enabled !== false, key: rule.key, value: rule.value || '', condition: conditionToEditable(rule.condition) })
+      editableRules.push({
+        ...emptyHeaderRule(),
+        action: 'set',
+        enabled: rule.enabled !== false,
+        key: rule.key,
+        value: rule.value || '',
+        retainValue: retainsEndpointSecret(rule.value, rule.has_value),
+        condition: conditionToEditable(rule.condition),
+      })
     } else if (rule.action === 'drop') {
       editableRules.push({ ...emptyHeaderRule(), action: 'drop', enabled: rule.enabled !== false, key: rule.key, condition: conditionToEditable(rule.condition) })
     } else if (rule.action === 'rename') {
@@ -2089,11 +2130,14 @@ function emptyBodyRule(action: BodyRuleAction = 'set'): EditableBodyRule {
     enabled: true,
     path: '',
     value: '',
+    retainValue: false,
     from: '',
     to: '',
     index: '',
     pattern: '',
+    retainPattern: false,
     replacement: '',
+    retainReplacement: false,
     flags: '',
     count: '',
     condition: null,
@@ -2107,24 +2151,26 @@ function editableBodyRulesFromRules(rules: BodyRule[] | null | undefined): Edita
   for (const rule of rules) {
     if (rule.action === 'set') {
       const { value } = initBodyRuleSetValueForEditor(rule.value)
-      bodyRules.push({ ...emptyBodyRule('set'), enabled: rule.enabled !== false, path: rule.path, value, condition: conditionToEditable(rule.condition) })
+      bodyRules.push({ ...emptyBodyRule('set'), enabled: rule.enabled !== false, path: rule.path, value, retainValue: retainsEndpointSecret(rule.value, rule.has_value), condition: conditionToEditable(rule.condition) })
     } else if (rule.action === 'drop') {
       bodyRules.push({ ...emptyBodyRule('drop'), enabled: rule.enabled !== false, path: rule.path, condition: conditionToEditable(rule.condition) })
     } else if (rule.action === 'rename') {
       bodyRules.push({ ...emptyBodyRule('rename'), enabled: rule.enabled !== false, from: rule.from, to: rule.to, condition: conditionToEditable(rule.condition) })
     } else if (rule.action === 'append') {
       const { value } = initBodyRuleSetValueForEditor(rule.value)
-      bodyRules.push({ ...emptyBodyRule('append'), enabled: rule.enabled !== false, path: rule.path || '', value, condition: conditionToEditable(rule.condition) })
+      bodyRules.push({ ...emptyBodyRule('append'), enabled: rule.enabled !== false, path: rule.path || '', value, retainValue: retainsEndpointSecret(rule.value, rule.has_value), condition: conditionToEditable(rule.condition) })
     } else if (rule.action === 'insert') {
       const { value } = initBodyRuleSetValueForEditor(rule.value)
-      bodyRules.push({ ...emptyBodyRule('insert'), enabled: rule.enabled !== false, path: rule.path || '', value, index: String(rule.index ?? ''), condition: conditionToEditable(rule.condition) })
+      bodyRules.push({ ...emptyBodyRule('insert'), enabled: rule.enabled !== false, path: rule.path || '', value, retainValue: retainsEndpointSecret(rule.value, rule.has_value), index: String(rule.index ?? ''), condition: conditionToEditable(rule.condition) })
     } else if (rule.action === 'regex_replace') {
       bodyRules.push({
         ...emptyBodyRule('regex_replace'),
         enabled: rule.enabled !== false,
         path: rule.path || '',
         pattern: rule.pattern || '',
+        retainPattern: retainsEndpointSecret(rule.pattern, rule.has_pattern),
         replacement: rule.replacement || '',
+        retainReplacement: retainsEndpointSecret(rule.replacement, rule.has_replacement),
         flags: rule.flags || '',
         count: rule.count === undefined || rule.count === null ? '' : String(rule.count),
         condition: conditionToEditable(rule.condition),
@@ -2350,6 +2396,7 @@ function updateEndpointRuleField(endpointId: string, index: number, field: 'key'
   const rules = getEndpointEditRules(endpointId)
   if (rules[index]) {
     rules[index][field] = value
+    if (field === 'value') rules[index].retainValue = false
   }
 }
 
@@ -2357,6 +2404,7 @@ function updateEndpointResponseRuleField(endpointId: string, index: number, fiel
   const rules = getEndpointEditResponseRules(endpointId)
   if (rules[index]) {
     rules[index][field] = value
+    if (field === 'value') rules[index].retainValue = false
   }
 }
 
@@ -2563,6 +2611,9 @@ function updateEndpointBodyRuleField(endpointId: string, index: number, field: '
   const rules = getEndpointEditBodyRules(endpointId)
   if (rules[index]) {
     rules[index][field] = value
+    if (field === 'value') rules[index].retainValue = false
+    if (field === 'pattern') rules[index].retainPattern = false
+    if (field === 'replacement') rules[index].retainReplacement = false
   }
 }
 
@@ -2712,6 +2763,7 @@ function getBodySetValueValidation(rule: EditableBodyRule): boolean | null {
 // 正则表达式验证状态：true=有效, false=无效, null=空
 function getRegexPatternValidation(rule: EditableBodyRule): boolean | null {
   if (rule.action !== 'regex_replace') return null
+  if (rule.retainPattern) return true
   const pattern = rule.pattern.trim()
   if (!pattern) return null
   try {
@@ -2881,6 +2933,7 @@ function hasBodyRulesChanges(endpoint: ProviderEndpoint): boolean {
       const baseline = initBodyRuleSetValueForEditor(original.value)
       if (edited.path !== original.path) return true
       if (edited.value !== baseline.value) return true
+      if (edited.retainValue !== retainsEndpointSecret(original.value, original.has_value)) return true
     } else if (edited.action === 'drop' && original.action === 'drop') {
       if (edited.path !== original.path) return true
     } else if (edited.action === 'rename' && original.action === 'rename') {
@@ -2889,15 +2942,19 @@ function hasBodyRulesChanges(endpoint: ProviderEndpoint): boolean {
       const baseline = initBodyRuleSetValueForEditor(original.value)
       if (edited.path !== original.path) return true
       if (edited.value !== baseline.value) return true
+      if (edited.retainValue !== retainsEndpointSecret(original.value, original.has_value)) return true
     } else if (edited.action === 'insert' && original.action === 'insert') {
       const baseline = initBodyRuleSetValueForEditor(original.value)
       if (edited.path !== original.path) return true
       if (edited.index !== String(original.index ?? '')) return true
       if (edited.value !== baseline.value) return true
+      if (edited.retainValue !== retainsEndpointSecret(original.value, original.has_value)) return true
     } else if (edited.action === 'regex_replace' && original.action === 'regex_replace') {
       if (edited.path !== original.path) return true
       if (edited.pattern !== (original.pattern ?? '')) return true
       if (edited.replacement !== (original.replacement ?? '')) return true
+      if (edited.retainPattern !== retainsEndpointSecret(original.pattern, original.has_pattern)) return true
+      if (edited.retainReplacement !== retainsEndpointSecret(original.replacement, original.has_replacement)) return true
       if (edited.flags !== (original.flags ?? '')) return true
       if (edited.count !== (original.count === undefined || original.count === null ? '' : String(original.count))) return true
     }
@@ -2916,7 +2973,7 @@ function rulesToBodyRules(rules: EditableBodyRule[]): BodyRule[] | null {
     if (rule.action === 'set' && rule.path.trim()) {
       let value: unknown = rule.value
       try { value = restoreOriginalPlaceholder(JSON.parse(prepareValueForJsonParse(rule.value.trim()))) } catch { value = rule.value }
-      result.push({ action: 'set', path: rule.path.trim(), value, ...common })
+      result.push({ action: 'set', path: rule.path.trim(), value, ...endpointSecretMarkerPayload('has_value', rule.retainValue, value), ...common })
     } else if (rule.action === 'drop' && rule.path.trim()) {
       result.push({ action: 'drop', path: rule.path.trim(), ...common })
     } else if (rule.action === 'rename' && rule.from.trim() && rule.to.trim()) {
@@ -2924,19 +2981,21 @@ function rulesToBodyRules(rules: EditableBodyRule[]): BodyRule[] | null {
     } else if (rule.action === 'append' && rule.path.trim()) {
       let value: unknown = rule.value
       try { value = restoreOriginalPlaceholder(JSON.parse(prepareValueForJsonParse(rule.value.trim()))) } catch { value = rule.value }
-      result.push({ action: 'append', path: rule.path.trim(), value, ...common })
+      result.push({ action: 'append', path: rule.path.trim(), value, ...endpointSecretMarkerPayload('has_value', rule.retainValue, value), ...common })
     } else if (rule.action === 'insert' && rule.path.trim()) {
       let value: unknown = rule.value
       try { value = restoreOriginalPlaceholder(JSON.parse(prepareValueForJsonParse(rule.value.trim()))) } catch { value = rule.value }
       if (!isStrictIntegerString(rule.index)) continue
       const idx = parseInt(rule.index.trim(), 10)
-      result.push({ action: 'insert', path: rule.path.trim(), index: idx, value, ...common })
+      result.push({ action: 'insert', path: rule.path.trim(), index: idx, value, ...endpointSecretMarkerPayload('has_value', rule.retainValue, value), ...common })
     } else if (rule.action === 'regex_replace' && rule.path.trim() && rule.pattern.trim()) {
       const entry: BodyRuleRegexReplace = {
         action: 'regex_replace',
         path: rule.path.trim(),
         pattern: rule.pattern,
         replacement: rule.replacement || '',
+        ...endpointSecretMarkerPayload('has_pattern', rule.retainPattern, rule.pattern),
+        ...endpointSecretMarkerPayload('has_replacement', rule.retainReplacement, rule.replacement),
         ...(rule.flags.trim() ? { flags: rule.flags.trim() } : {}),
         ...(isStrictNonNegativeIntegerString(rule.count) ? { count: parseInt(rule.count.trim(), 10) } : {}),
       }
@@ -2983,6 +3042,7 @@ function getBodyValidationErrorForEndpoint(endpointId: string): string | null {
       const pathErr = validateBodyRulePathForEndpoint(endpointId, rule.path, i)
       if (pathErr) return `${prefix}${pathErr}`
       if (!rule.pattern.trim()) return `${prefix}${legacyT('正则表达式不能为空')}`
+      if (!rule.retainPattern) {
       try {
         new RegExp(rule.pattern.trim())
       } catch (err: unknown) {
@@ -2990,6 +3050,7 @@ function getBodyValidationErrorForEndpoint(endpointId: string): string | null {
         return locale.value === 'en-US'
           ? `${prefix}Invalid regular expression: ${message}`
           : `${prefix}正则表达式无效：${message}`
+      }
       }
       const flags = rule.flags.trim()
       if (flags) {
@@ -3041,6 +3102,7 @@ function editableHeaderRulesChanged(edited: EditableRule[], originalRules: Heade
     if (edited.enabled !== (original.enabled !== false)) return true
     if (edited.action === 'set' && original.action === 'set') {
       if (edited.key !== original.key || edited.value !== (original.value || '')) return true
+      if (edited.retainValue !== retainsEndpointSecret(original.value, original.has_value)) return true
     } else if (edited.action === 'drop' && original.action === 'drop') {
       if (edited.key !== original.key) return true
     } else if (edited.action === 'rename' && original.action === 'rename') {
@@ -3129,7 +3191,13 @@ function rulesToHeaderRules(rules: EditableRule[]): HeaderRule[] | null {
     const condition = editableConditionToApi(rule.condition)
     const common = { ...(rule.enabled ? {} : { enabled: false }), ...(condition ? { condition } : {}) }
     if (rule.action === 'set' && rule.key.trim()) {
-      result.push({ action: 'set', key: rule.key.trim(), value: rule.value, ...common })
+      result.push({
+        action: 'set',
+        key: rule.key.trim(),
+        value: rule.value,
+        ...endpointSecretMarkerPayload('has_value', rule.retainValue, rule.value),
+        ...common,
+      })
     } else if (rule.action === 'drop' && rule.key.trim()) {
       result.push({ action: 'drop', key: rule.key.trim(), ...common })
     } else if (rule.action === 'rename' && rule.from.trim() && rule.to.trim()) {

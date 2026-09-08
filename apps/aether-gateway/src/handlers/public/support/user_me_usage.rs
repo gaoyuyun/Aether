@@ -31,6 +31,38 @@ use super::{
 
 const USERS_ME_USAGE_DATA_UNAVAILABLE_DETAIL: &str = "用户用量数据暂不可用";
 const SHOW_PROVIDER_IN_USER_USAGE_CONFIG_KEY: &str = "show_provider_in_user_usage";
+// The active-usage endpoint accepts an explicit list of request IDs.  Keep
+// this list bounded before it reaches the repository layer: SQLite/MySQL
+// expand every value into a bind parameter, while PostgreSQL still has to
+// materialize the complete array.  Request IDs are normally UUIDs, but a
+// generous per-item bound preserves compatibility with provider-generated
+// identifiers without allowing query amplification.
+const MAX_USERS_ME_USAGE_IDS: usize = 256;
+const MAX_USERS_ME_USAGE_ID_BYTES: usize = 256;
+const MAX_USERS_ME_USAGE_IDS_QUERY_BYTES: usize = 64 * 1024;
+
+fn users_me_usage_public_error_message(item: &StoredRequestUsageAudit) -> Option<String> {
+    if item
+        .error_message
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && item.status_code.is_none_or(|status| status < 400)
+    {
+        return None;
+    }
+
+    item.error_category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            item.status_code
+                .filter(|status| *status >= 400)
+                .map(|status| format!("http_{status}"))
+        })
+        .or_else(|| Some("request_failed".to_string()))
+}
 
 fn build_users_me_usage_reader_unavailable_response() -> Response<Body> {
     build_auth_error_response(
@@ -84,6 +116,51 @@ fn users_me_usage_fast_page_total(offset: usize, limit: usize, record_count: usi
         .saturating_add(usize::from(record_count == limit))
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct UsersMeUsageRecordFilter {
+    api_format: Option<String>,
+    statuses: Option<Vec<String>>,
+    is_stream: Option<bool>,
+    is_websocket: Option<bool>,
+    error_only: bool,
+}
+
+fn parse_users_me_usage_record_filter(query: Option<&str>) -> UsersMeUsageRecordFilter {
+    let mut filter = UsersMeUsageRecordFilter {
+        api_format: query_param_value(query, "api_format")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ..UsersMeUsageRecordFilter::default()
+    };
+    let Some(status) = query_param_value(query, "status")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return filter;
+    };
+
+    match status.as_str() {
+        "stream" => {
+            filter.is_stream = Some(true);
+            filter.is_websocket = Some(false);
+        }
+        "standard" => {
+            filter.is_stream = Some(false);
+            filter.is_websocket = Some(false);
+        }
+        "websocket" | "ws" => filter.is_websocket = Some(true),
+        "error" | "failed" => filter.error_only = true,
+        "active" => {
+            filter.statuses = Some(vec!["pending".to_string(), "streaming".to_string()]);
+        }
+        "pending" | "streaming" | "completed" | "cancelled" => {
+            filter.statuses = Some(vec![status]);
+        }
+        _ => {}
+    }
+    filter
+}
+
 fn parse_users_me_usage_hours(query: Option<&str>) -> Result<u32, String> {
     match query_param_value(query, "hours") {
         Some(value) => parse_bounded_u32("hours", &value, 1, 720),
@@ -107,15 +184,37 @@ fn parse_users_me_usage_timeline_limit(query: Option<&str>) -> Result<usize, Str
     }
 }
 
-fn parse_users_me_usage_ids(query: Option<&str>) -> Option<BTreeSet<String>> {
-    let ids = query_param_value(query, "ids")?;
-    let values = ids
+fn parse_users_me_usage_ids(query: Option<&str>) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(ids) = query_param_value(query, "ids") else {
+        return Ok(None);
+    };
+    if ids.len() > MAX_USERS_ME_USAGE_IDS_QUERY_BYTES {
+        return Err(format!(
+            "ids query value must not exceed {MAX_USERS_ME_USAGE_IDS_QUERY_BYTES} bytes"
+        ));
+    }
+
+    let mut values = BTreeSet::new();
+    let mut item_count = 0usize;
+    for value in ids
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<BTreeSet<_>>();
-    (!values.is_empty()).then_some(values)
+    {
+        item_count = item_count.saturating_add(1);
+        if item_count > MAX_USERS_ME_USAGE_IDS {
+            return Err(format!(
+                "ids must contain at most {MAX_USERS_ME_USAGE_IDS} identifiers"
+            ));
+        }
+        if value.len() > MAX_USERS_ME_USAGE_ID_BYTES {
+            return Err(format!(
+                "each id must not exceed {MAX_USERS_ME_USAGE_ID_BYTES} bytes"
+            ));
+        }
+        values.insert(value.to_owned());
+    }
+    Ok((!values.is_empty()).then_some(values))
 }
 
 fn users_me_usage_cache_creation_tokens(item: &StoredRequestUsageAudit) -> u64 {
@@ -500,6 +599,11 @@ fn build_users_me_usage_record_payload(
         "first_byte_time_ms": item.first_byte_time_ms,
         "is_stream": item.is_stream,
         "is_websocket": item.is_websocket(),
+        "websocket_transport": item.websocket_transport(),
+        "usage_available": item.usage_available(),
+        "usage_pricing_available": item.usage_pricing_available(),
+        "input_audio_tokens": item.realtime_input_audio_tokens(),
+        "output_audio_tokens": item.realtime_output_audio_tokens(),
         "upstream_is_stream": upstream_is_stream,
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
@@ -516,7 +620,7 @@ fn build_users_me_usage_record_payload(
         "cache_creation_ephemeral_1h_input_tokens": item.cache_creation_ephemeral_1h_input_tokens,
         "cache_read_input_tokens": item.cache_read_input_tokens,
         "status_code": item.status_code,
-        "error_message": item.error_message,
+        "error_message": users_me_usage_public_error_message(item),
         "request_type": item.request_type,
         "input_price_per_1m": input_price_per_1m,
         "output_price_per_1m": output_price_per_1m,
@@ -585,11 +689,16 @@ fn build_users_me_usage_active_payload(
         "updated_at": unix_secs_to_rfc3339(item.updated_at_unix_secs),
         "response_time_updated_at": users_me_usage_response_time_updated_at(item),
         "status_code": item.status_code,
-        "error_message": item.error_message,
+        "error_message": users_me_usage_public_error_message(item),
         "api_format": item.api_format,
         "endpoint_api_format": item.endpoint_api_format,
         "is_stream": item.is_stream,
         "is_websocket": item.is_websocket(),
+        "websocket_transport": item.websocket_transport(),
+        "usage_available": item.usage_available(),
+        "usage_pricing_available": item.usage_pricing_available(),
+        "input_audio_tokens": item.realtime_input_audio_tokens(),
+        "output_audio_tokens": item.realtime_output_audio_tokens(),
         "upstream_is_stream": upstream_is_stream,
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
@@ -968,6 +1077,7 @@ pub(super) async fn handle_users_me_usage_get(
         Ok(value) => value,
         Err(detail) => return admin_stats_bad_request_response(detail),
     };
+    let record_filter = parse_users_me_usage_record_filter(query);
 
     // When no time range is specified, default to 7 days to avoid full-table scans.
     let effective_time_range = time_range.or_else(|| {
@@ -1114,13 +1224,14 @@ pub(super) async fn handle_users_me_usage_get(
                         user_id: Some(auth.user.id.clone()),
                         provider_name: None,
                         model: None,
-                        api_format: None,
+                        api_format: record_filter.api_format.clone(),
                         client_family: None,
                         exclude_unknown_model_or_provider: false,
-                        statuses: None,
+                        statuses: record_filter.statuses.clone(),
                         exclude_status_codes: Vec::new(),
-                        is_stream: None,
-                        error_only: false,
+                        is_stream: record_filter.is_stream,
+                        is_websocket: record_filter.is_websocket,
+                        error_only: record_filter.error_only,
                         keywords,
                         matched_user_ids_by_keyword: Vec::new(),
                         auth_user_reader_available: false,
@@ -1177,13 +1288,14 @@ pub(super) async fn handle_users_me_usage_get(
                                 user_id: Some(auth.user.id.clone()),
                                 provider_name: None,
                                 model: None,
-                                api_format: None,
+                                api_format: record_filter.api_format.clone(),
                                 client_family: None,
                                 exclude_unknown_model_or_provider: false,
-                                statuses: None,
+                                statuses: record_filter.statuses.clone(),
                                 exclude_status_codes: Vec::new(),
-                                is_stream: None,
-                                error_only: false,
+                                is_stream: record_filter.is_stream,
+                                is_websocket: record_filter.is_websocket,
+                                error_only: record_filter.error_only,
                                 limit: None,
                                 offset: None,
                                 newest_first: true,
@@ -1207,13 +1319,14 @@ pub(super) async fn handle_users_me_usage_get(
                             user_id: Some(auth.user.id.clone()),
                             provider_name: None,
                             model: None,
-                            api_format: None,
+                            api_format: record_filter.api_format.clone(),
                             client_family: None,
                             exclude_unknown_model_or_provider: false,
-                            statuses: None,
+                            statuses: record_filter.statuses.clone(),
                             exclude_status_codes: Vec::new(),
-                            is_stream: None,
-                            error_only: false,
+                            is_stream: record_filter.is_stream,
+                            is_websocket: record_filter.is_websocket,
+                            error_only: record_filter.error_only,
                             limit: Some(limit),
                             offset: Some(offset),
                             newest_first: true,
@@ -1352,7 +1465,12 @@ pub(super) async fn handle_users_me_usage_active_get(
                 );
             }
         };
-    let ids = parse_users_me_usage_ids(request_context.request_query_string.as_deref());
+    let ids = match parse_users_me_usage_ids(request_context.request_query_string.as_deref()) {
+        Ok(value) => value,
+        Err(message) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, message, false);
+        }
+    };
     // When polling for active (pending/streaming) requests without specific ids,
     // limit to the last 1 hour to avoid scanning all historical records.
     let items = match ids.as_ref() {
@@ -1387,6 +1505,7 @@ pub(super) async fn handle_users_me_usage_active_get(
                 statuses: Some(vec!["pending".to_string(), "streaming".to_string()]),
                 exclude_status_codes: Vec::new(),
                 is_stream: None,
+                is_websocket: None,
                 error_only: false,
                 limit: Some(50),
                 offset: None,
@@ -1641,10 +1760,75 @@ mod tests {
 
     use super::{
         apply_users_me_usage_state_override, build_users_me_usage_active_payload,
-        build_users_me_usage_record_payload, users_me_usage_client_is_stream,
-        users_me_usage_provider_visibility_enabled, users_me_usage_upstream_is_stream,
+        build_users_me_usage_record_payload, parse_users_me_usage_ids,
+        parse_users_me_usage_record_filter, users_me_usage_client_is_stream,
+        users_me_usage_is_failed, users_me_usage_provider_visibility_enabled,
+        users_me_usage_terminal_candidate_state_override, users_me_usage_upstream_is_stream,
+        MAX_USERS_ME_USAGE_IDS, MAX_USERS_ME_USAGE_ID_BYTES,
     };
     use crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override;
+
+    #[test]
+    fn user_active_usage_ids_are_trimmed_and_deduplicated() {
+        let ids = parse_users_me_usage_ids(Some("ids=req-2,%20req-1,req-2"))
+            .expect("bounded ids should parse")
+            .expect("non-empty ids should be present");
+
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec!["req-1", "req-2"]);
+        assert_eq!(
+            parse_users_me_usage_ids(Some("other=value")).expect("missing ids should parse"),
+            None
+        );
+    }
+
+    #[test]
+    fn user_active_usage_ids_reject_query_amplification() {
+        let too_many = (0..=MAX_USERS_ME_USAGE_IDS)
+            .map(|index| format!("req-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_users_me_usage_ids(Some(&format!("ids={too_many}"))).is_err());
+
+        let oversized = "x".repeat(MAX_USERS_ME_USAGE_ID_BYTES + 1);
+        assert!(parse_users_me_usage_ids(Some(&format!("ids={oversized}"))).is_err());
+    }
+
+    #[test]
+    fn users_me_usage_transport_statuses_are_disjoint_server_side_filters() {
+        let live_websocket = parse_users_me_usage_record_filter(Some(
+            "limit=20&api_format=codex%3Alive&status=websocket",
+        ));
+        assert_eq!(live_websocket.api_format.as_deref(), Some("codex:live"));
+        assert_eq!(live_websocket.is_websocket, Some(true));
+
+        let live_without_status =
+            parse_users_me_usage_record_filter(Some("api_format=codex%3Alive"));
+        assert_eq!(
+            live_without_status.api_format.as_deref(),
+            Some("codex:live")
+        );
+        assert_eq!(live_without_status.is_websocket, None);
+
+        for status in ["websocket", "ws", "WS"] {
+            let filter = parse_users_me_usage_record_filter(Some(
+                format!("limit=20&status={status}").as_str(),
+            ));
+            assert_eq!(filter.is_websocket, Some(true));
+            assert_eq!(filter.is_stream, None);
+            assert_eq!(filter.statuses, None);
+            assert!(!filter.error_only);
+        }
+
+        for (status, expected_stream) in [("stream", true), ("standard", false)] {
+            let filter = parse_users_me_usage_record_filter(Some(
+                format!("limit=20&status={status}").as_str(),
+            ));
+            assert_eq!(filter.is_stream, Some(expected_stream));
+            assert_eq!(filter.is_websocket, Some(false));
+            assert_eq!(filter.statuses, None);
+            assert!(!filter.error_only);
+        }
+    }
 
     fn sample_usage(status: &str) -> StoredRequestUsageAudit {
         StoredRequestUsageAudit::new(
@@ -1856,6 +2040,12 @@ mod tests {
             request_metadata: Some(json!({
                 "websocket_mode": true,
                 "websocket_transport": "responses",
+                "usage_available": false,
+                "usage_pricing_available": false,
+                "realtime_session": {
+                    "input_audio_tokens": 7,
+                    "output_audio_tokens": 3,
+                },
             })),
             ..sample_usage("completed")
         };
@@ -1866,6 +2056,16 @@ mod tests {
 
         assert_eq!(record["is_websocket"], true);
         assert_eq!(active["is_websocket"], true);
+        assert_eq!(record["websocket_transport"], "responses");
+        assert_eq!(active["websocket_transport"], "responses");
+        assert_eq!(record["usage_available"], false);
+        assert_eq!(active["usage_available"], false);
+        assert_eq!(record["usage_pricing_available"], false);
+        assert_eq!(active["usage_pricing_available"], false);
+        assert_eq!(record["input_audio_tokens"], 7);
+        assert_eq!(active["input_audio_tokens"], 7);
+        assert_eq!(record["output_audio_tokens"], 3);
+        assert_eq!(active["output_audio_tokens"], 3);
     }
 
     #[test]
@@ -2049,6 +2249,37 @@ mod tests {
         assert_eq!(payload["effective_input_tokens"], 4941);
         assert_eq!(payload["cache_creation_input_tokens"], 687);
         assert_eq!(payload["cache_read_input_tokens"], 52873);
+    }
+
+    #[test]
+    fn user_usage_active_pending_with_failure_signal_is_not_active() {
+        let item = StoredRequestUsageAudit {
+            status_code: Some(503),
+            error_message: Some("upstream failed".to_string()),
+            ..sample_usage("pending")
+        };
+
+        assert!(users_me_usage_is_failed(&item));
+    }
+
+    #[test]
+    fn user_usage_payload_does_not_return_historical_raw_error_text() {
+        let item = StoredRequestUsageAudit {
+            status_code: Some(401),
+            error_message: Some(
+                "upstream said Authorization: Bearer live-secret at https://api.example?key=secret"
+                    .to_string(),
+            ),
+            error_category: Some("authentication_error".to_string()),
+            ..sample_usage("failed")
+        };
+
+        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item);
+        assert_eq!(record["error_message"], "authentication_error");
+        assert_eq!(active["error_message"], "authentication_error");
+        assert!(!record.to_string().contains("live-secret"));
+        assert!(!active.to_string().contains("live-secret"));
     }
 
     #[test]

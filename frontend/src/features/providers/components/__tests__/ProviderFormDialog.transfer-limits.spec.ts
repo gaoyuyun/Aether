@@ -138,6 +138,36 @@ function clickButton(text: string) {
   button.click()
 }
 
+const billingFieldNames = [
+  'billing_type',
+  'monthly_quota_usd',
+  'quota_reset_day',
+  'quota_last_reset_at',
+  'quota_expires_at',
+] as const
+
+function expectBillingConfigurationHidden() {
+  for (const text of [
+    '计费类型',
+    '月卡额度',
+    '按量付费',
+    '免费套餐',
+    '周期额度 (USD)',
+    '重置周期 (天)',
+    '周期开始时间',
+    '过期时间',
+  ]) {
+    expect(document.body.textContent).not.toContain(text)
+  }
+}
+
+function expectBillingFieldsOmitted(payload: unknown) {
+  expect(payload).toEqual(expect.any(Object))
+  for (const field of billingFieldNames) {
+    expect(payload).not.toHaveProperty(field)
+  }
+}
+
 beforeEach(() => {
   endpointMocks.createProvider.mockReset()
   endpointMocks.createProvider.mockResolvedValue({ id: 'provider-new', name: 'New Provider' })
@@ -349,6 +379,7 @@ describe('ProviderFormDialog provider types', () => {
       '#codex-fingerprint-convergence',
     )
     expect(convergenceSwitch).not.toBeNull()
+    expect(document.body.textContent).toContain('Codex 指纹收敛')
     expect(convergenceSwitch?.getAttribute('aria-checked')).toBe('false')
 
     convergenceSwitch?.click()

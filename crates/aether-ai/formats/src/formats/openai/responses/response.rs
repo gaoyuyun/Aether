@@ -6,12 +6,12 @@ use std::{
 use serde_json::{json, Map, Value};
 
 use super::{
-    encode_tool_result_error, history::record_converted_response_history,
-    openai_responses_synthetic_reasoning_item_id,
+    encode_gemini_tool_signature_carrier, encode_tool_result_error,
+    history::record_converted_response_history, openai_responses_synthetic_reasoning_item_id,
 };
 
 use crate::{
-    formats::context::FormatContext,
+    formats::{context::FormatContext, openai::namespace::NamespaceToolAliases},
     protocol::canonical::{
         canonical_content_block_to_openai_responses_part, canonical_extension_object_mut,
         canonical_tool_use_to_openai_responses_item, canonical_usage_to_openai_responses_usage,
@@ -114,6 +114,7 @@ fn openai_responses_incomplete_stop_reason(body: &Map<String, Value>) -> Canonic
 }
 
 pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bool) -> Value {
+    let namespace_tool_aliases = NamespaceToolAliases::from_report_context(report_context);
     let mut response = Map::new();
     let response_id = canonical.id.replace("chatcmpl", "resp");
     response.insert("id".to_string(), Value::String(response_id.clone()));
@@ -239,7 +240,30 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                     &response_id,
                     &mut message_index,
                 );
-                if is_responses_web_search_tool(name) {
+                if let Some(signature) = extensions
+                    .get("gemini")
+                    .and_then(Value::as_object)
+                    .and_then(|gemini| {
+                        gemini
+                            .get("thoughtSignature")
+                            .or_else(|| gemini.get("thought_signature"))
+                    })
+                    .and_then(Value::as_str)
+                    .and_then(encode_gemini_tool_signature_carrier)
+                {
+                    output.push(json!({
+                        "type": "reasoning",
+                        "id": openai_responses_synthetic_reasoning_item_id(
+                            &response_id,
+                            output.len(),
+                        ),
+                        "status": "completed",
+                        "encrypted_content": signature,
+                        "summary": [],
+                    }));
+                }
+                let namespaced_tool = namespace_tool_aliases.responses_name(name);
+                if namespaced_tool.is_none() && is_responses_web_search_tool(name) {
                     output.push(json!({
                         "type": "web_search_call",
                         "id": id,
@@ -250,9 +274,24 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                         },
                     }));
                 } else {
-                    output.push(canonical_tool_use_to_openai_responses_item(
-                        id, name, input, extensions,
-                    ));
+                    let response_name = namespaced_tool
+                        .map(|(_, child_name)| child_name)
+                        .unwrap_or(name.as_str());
+                    let mut item = canonical_tool_use_to_openai_responses_item(
+                        id,
+                        response_name,
+                        input,
+                        extensions,
+                    );
+                    if let Some((namespace, _)) = namespaced_tool {
+                        if let Some(item) = item.as_object_mut() {
+                            item.insert(
+                                "namespace".to_string(),
+                                Value::String(namespace.to_string()),
+                            );
+                        }
+                    }
+                    output.push(item);
                 }
             }
             CanonicalContentBlock::ToolResult {
@@ -594,6 +633,66 @@ mod tests {
         assert_eq!(body["output_text"], "");
         assert!(body["created_at"].as_i64().is_some());
         assert!(body["completed_at"].as_i64().is_some());
+    }
+
+    #[test]
+    fn responses_response_builder_restores_namespaced_chat_tool_identity() {
+        let report_context = json!({
+            "original_request_body": {
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "vulnerability_report",
+                        "description": "ordinary function",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "mcp__vulnerability_report",
+                        "description": "reporting tools",
+                        "tools": [{
+                            "type": "function",
+                            "name": "vulnerability_report",
+                            "description": "write the confirmed report",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"report_path": {"type": "string"}},
+                                "required": ["report_path"]
+                            },
+                            "strict": true
+                        }]
+                    }
+                ]
+            }
+        });
+        let aliases = NamespaceToolAliases::from_report_context(&report_context);
+        let chat_name = aliases
+            .chat_name("mcp__vulnerability_report", "vulnerability_report")
+            .expect("namespace child should have a Chat alias")
+            .to_string();
+        assert_ne!(chat_name, "vulnerability_report");
+
+        let response = CanonicalResponse {
+            id: "chatcmpl_namespace".to_string(),
+            model: "qwen".to_string(),
+            content: vec![CanonicalContentBlock::ToolUse {
+                id: "call_report_1".to_string(),
+                name: chat_name,
+                input: json!({"report_path": "reports/sql-001-c1.md"}),
+                extensions: BTreeMap::new(),
+            }],
+            outputs: Vec::new(),
+            stop_reason: Some(CanonicalStopReason::ToolUse),
+            usage: None,
+            extensions: BTreeMap::new(),
+        };
+
+        let body = to_raw(&response, &report_context, false);
+        let item = &body["output"][0];
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["name"], "vulnerability_report");
+        assert_eq!(item["namespace"], "mcp__vulnerability_report");
+        assert_eq!(item["call_id"], "call_report_1");
     }
 
     #[test]

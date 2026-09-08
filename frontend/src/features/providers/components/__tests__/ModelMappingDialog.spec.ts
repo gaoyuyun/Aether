@@ -153,7 +153,24 @@ describe('ModelMappingDialog', () => {
     mountedApps.push({ app, root })
 
     await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenCalledTimes(1))
-    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1')
+    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1', undefined, false)
+
+    // Both manual fetch and refresh must bypass the backend cache.
+    upstreamModelMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-old' }] })
+    await nextTick()
+    const fetchButton = root.querySelector<HTMLButtonElement>('[title="从提供商获取模型"]')
+    expect(fetchButton).not.toBeNull()
+    fetchButton!.click()
+    await vi.waitFor(() => expect(root.textContent).toContain('gpt-old'))
+    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true)
+
+    upstreamModelMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-6-astra' }] })
+    const refreshButton = root.querySelector<HTMLButtonElement>('[title="刷新上游模型"]')
+    expect(refreshButton).not.toBeNull()
+    refreshButton!.click()
+    await vi.waitFor(() => expect(root.textContent).toContain('gpt-6-astra'))
+    expect(root.textContent).not.toContain('gpt-old')
+    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true)
   })
 
   it('offers session compaction only for an explicitly selected Responses endpoint', async () => {

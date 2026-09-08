@@ -22,13 +22,14 @@ use crate::ai_serving::api::{
 };
 use crate::execution_runtime::ndjson::encode_stream_frame_ndjson;
 use crate::execution_runtime::transport::{
-    append_upstream_response_body_chunk, decode_response_body_bytes, format_hyper_error_chain,
-    format_wreq_upstream_request_error, stream_first_byte_timeout_message, DirectUpstreamResponse,
+    append_upstream_response_body_chunk, decode_response_body_bytes,
+    stream_first_byte_timeout_message, DirectUpstreamResponse,
 };
 use crate::execution_runtime::DirectUpstreamStreamExecution;
 use crate::GatewayError;
 
 const STREAM_USAGE_OBSERVER_MAX_LINE_BYTES: usize = 1024 * 1024;
+const UPSTREAM_STREAM_READ_ERROR_MESSAGE: &str = "Upstream response stream failed";
 
 pub(crate) fn build_direct_execution_frame_stream(
     execution: DirectUpstreamStreamExecution,
@@ -39,6 +40,7 @@ pub(crate) fn build_direct_execution_frame_stream(
             candidate_id: _,
             status_code,
             headers,
+            upstream_content_length,
             provider_api_format,
             stream_summary_report_context,
             prefetched_body,
@@ -74,7 +76,11 @@ pub(crate) fn build_direct_execution_frame_stream(
         let mut stream_terminal_observer = StreamingStandardTerminalObserver::default();
         let mut observer_buffered = Vec::new();
 
-        if should_buffer_non_stream_response(&headers, &observer_context) {
+        if should_buffer_non_stream_response(
+            &headers,
+            upstream_content_length,
+            &observer_context,
+        ) {
             let original_headers = headers.clone();
             match buffer_non_sse_upstream_body(
                 prefetched_body,
@@ -104,8 +110,10 @@ pub(crate) fn build_direct_execution_frame_stream(
                             summary = outcome.terminal_summary;
                         }
                         Ok(None) => {}
-                        Err(err) => {
-                            yield Err(IoError::other(format!("{err:?}")));
+                        Err(_err) => {
+                            yield Err(IoError::other(
+                                "Execution runtime stream conversion failed",
+                            ));
                             return;
                         }
                     }
@@ -250,16 +258,16 @@ pub(crate) fn build_direct_execution_frame_stream(
                         }
                     }
                 }
-                Err(message) => {
+                Err(_message) => {
                     warn!(
                         event_name = "stream_pump_body_read_error",
                         log_type = "ops",
                         status_code,
                         upstream_bytes,
-                        error = %message,
+                        error_category = "prefetched_body_read_failed",
                         "upstream body stream read error"
                     );
-                    match encode_error_frame(message) {
+                    match encode_error_frame(UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string()) {
                         Ok(frame) => yield Ok(frame),
                         Err(encode_err) => {
                             yield Err(encode_err);
@@ -333,14 +341,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 }
                             }
                         }
-                        Err(err) => {
-                            let message = format_error_chain(&err);
+                        Err(_err) => {
+                            let message = UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string();
                             warn!(
                                 event_name = "stream_pump_body_read_error",
                                 log_type = "ops",
                                 status_code,
                                 upstream_bytes,
-                                error = %message,
+                                error_category = "reqwest_body_read_failed",
                                 "upstream body stream read error"
                             );
                             match encode_error_frame(message) {
@@ -415,14 +423,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 }
                             }
                         }
-                        Err(err) => {
-                            let message = format_hyper_error_chain(&err);
+                        Err(_err) => {
+                            let message = UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string();
                             warn!(
                                 event_name = "stream_pump_body_read_error",
                                 log_type = "ops",
                                 status_code,
                                 upstream_bytes,
-                                error = %message,
+                                error_category = "hyper_body_read_failed",
                                 "upstream body stream read error"
                             );
                             match encode_error_frame(message) {
@@ -497,14 +505,14 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 }
                             }
                         }
-                        Err(err) => {
-                            let message = format_wreq_upstream_request_error(&err);
+                        Err(_err) => {
+                            let message = UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string();
                             warn!(
                                 event_name = "stream_pump_body_read_error",
                                 log_type = "ops",
                                 status_code,
                                 upstream_bytes,
-                                error = %message,
+                                error_category = "browser_body_read_failed",
                                 "upstream body stream read error"
                             );
                             match encode_error_frame(message) {
@@ -575,16 +583,16 @@ pub(crate) fn build_direct_execution_frame_stream(
                         }
                     }
                     Ok(None) => break,
-                    Err(message) => {
+                    Err(_message) => {
                         warn!(
                             event_name = "stream_pump_body_read_error",
                             log_type = "ops",
                             status_code,
                             upstream_bytes,
-                            error = %message,
+                            error_category = "tunnel_body_read_failed",
                             "upstream body stream read error"
                         );
-                        match encode_error_frame(message) {
+                        match encode_error_frame(UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string()) {
                             Ok(frame) => yield Ok(frame),
                             Err(encode_err) => {
                                 yield Err(encode_err);
@@ -664,14 +672,14 @@ fn encode_data_frame(chunk: &Bytes) -> Result<Bytes, IoError> {
     })
 }
 
-fn encode_error_frame(message: String) -> Result<Bytes, IoError> {
+fn encode_error_frame(_message: String) -> Result<Bytes, IoError> {
     encode_stream_frame_ndjson(&StreamFrame {
         frame_type: StreamFrameType::Error,
         payload: StreamFramePayload::Error {
             error: ExecutionError {
                 kind: ExecutionErrorKind::ProtocolError,
                 phase: ExecutionPhase::StreamRead,
-                message,
+                message: UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string(),
                 upstream_status: None,
                 retryable: true,
                 failover_recommended: true,
@@ -770,6 +778,7 @@ fn should_treat_upstream_response_as_stream(
 
 fn should_buffer_non_stream_response(
     headers: &BTreeMap<String, String>,
+    upstream_content_length: Option<u64>,
     report_context: &Value,
 ) -> bool {
     if should_treat_upstream_response_as_stream(headers, report_context) {
@@ -780,6 +789,22 @@ fn should_buffer_non_stream_response(
         .get("upstream_is_stream")
         .and_then(Value::as_bool)
         == Some(false)
+    {
+        return true;
+    }
+
+    // `content-length` is intentionally removed from the response header map
+    // before it reaches the execution stream.  Retain its parsed value as
+    // internal metadata so only a declared fixed-length JSON response is
+    // converted to the client's SSE contract.
+    if report_context
+        .get("upstream_is_stream")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && upstream_content_length.is_some()
+        && headers
+            .get("content-type")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("json"))
     {
         return true;
     }
@@ -813,9 +838,9 @@ async fn buffer_non_sse_upstream_body(
                     &mut upstream_bytes,
                 )?;
             }
-            Err(message) => {
+            Err(_message) => {
                 return Err(BufferedUpstreamBodyError {
-                    message,
+                    message: UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string(),
                     ttfb_ms,
                     upstream_bytes,
                     first_byte_timeout: None,
@@ -864,13 +889,13 @@ async fn buffer_non_sse_upstream_body(
                             &mut upstream_bytes,
                         )?;
                     }
-                    Err(err) => {
-                        let message = format_error_chain(&err);
+                    Err(_err) => {
+                        let message = UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string();
                         warn!(
                             event_name = "stream_pump_body_read_error",
                             log_type = "ops",
                             upstream_bytes,
-                            error = %message,
+                            error_category = "reqwest_body_read_failed",
                             "upstream body stream read error"
                         );
                         return Err(BufferedUpstreamBodyError {
@@ -922,13 +947,13 @@ async fn buffer_non_sse_upstream_body(
                             &mut upstream_bytes,
                         )?;
                     }
-                    Err(err) => {
-                        let message = format_hyper_error_chain(&err);
+                    Err(_err) => {
+                        let message = UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string();
                         warn!(
                             event_name = "stream_pump_body_read_error",
                             log_type = "ops",
                             upstream_bytes,
-                            error = %message,
+                            error_category = "hyper_body_read_failed",
                             "upstream body stream read error"
                         );
                         return Err(BufferedUpstreamBodyError {
@@ -980,13 +1005,13 @@ async fn buffer_non_sse_upstream_body(
                             &mut upstream_bytes,
                         )?;
                     }
-                    Err(err) => {
-                        let message = format_wreq_upstream_request_error(&err);
+                    Err(_err) => {
+                        let message = UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string();
                         warn!(
                             event_name = "stream_pump_body_read_error",
                             log_type = "ops",
                             upstream_bytes,
-                            error = %message,
+                            error_category = "browser_body_read_failed",
                             "upstream body stream read error"
                         );
                         return Err(BufferedUpstreamBodyError {
@@ -1034,16 +1059,16 @@ async fn buffer_non_sse_upstream_body(
                     )?;
                 }
                 Ok(None) => break,
-                Err(message) => {
+                Err(_message) => {
                     warn!(
                         event_name = "stream_pump_body_read_error",
                         log_type = "ops",
                         upstream_bytes,
-                        error = %message,
+                        error_category = "tunnel_body_read_failed",
                         "upstream body stream read error"
                     );
                     return Err(BufferedUpstreamBodyError {
-                        message,
+                        message: UPSTREAM_STREAM_READ_ERROR_MESSAGE.to_string(),
                         ttfb_ms,
                         upstream_bytes,
                         first_byte_timeout: None,
@@ -1071,14 +1096,16 @@ fn maybe_bridge_non_sse_sync_json_to_stream(
         return Ok(None);
     }
 
-    let decoded_body_bytes = decode_response_body_bytes(headers, body_bytes)
-        .map_err(|error| GatewayError::Internal(error.to_string()))?;
+    let decoded_body_bytes = decode_response_body_bytes(headers, body_bytes).map_err(|_error| {
+        GatewayError::Internal("execution runtime response decode failed".to_string())
+    })?;
     if !response_body_is_json(headers, decoded_body_bytes.as_ref()) {
         return Ok(None);
     }
 
-    let body_json: Value = serde_json::from_slice(decoded_body_bytes.as_ref())
-        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let body_json: Value = serde_json::from_slice(decoded_body_bytes.as_ref()).map_err(|_err| {
+        GatewayError::Internal("execution runtime response JSON decode failed".to_string())
+    })?;
     let client_api_format = report_context
         .get("client_api_format")
         .and_then(Value::as_str)
@@ -1114,17 +1141,6 @@ fn response_body_is_json(headers: &BTreeMap<String, String>, body_bytes: &[u8]) 
     serde_json::from_slice::<Value>(body_bytes).is_ok()
 }
 
-fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut message = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    message
-}
-
 fn observe_stream_chunk(
     observer: &mut StreamingStandardTerminalObserver,
     report_context: &Value,
@@ -1135,10 +1151,8 @@ fn observe_stream_chunk(
     let normalized = if let Some(normalizer) = private_stream_normalizer {
         match normalizer.push_chunk(chunk) {
             Ok(normalized) => normalized,
-            Err(err) => {
-                observer.disable_with_error(format!(
-                    "failed to normalize provider private stream chunk: {err:?}"
-                ));
+            Err(_err) => {
+                observer.disable_with_error("provider stream normalization failed");
                 return;
             }
         }
@@ -1160,23 +1174,21 @@ fn finalize_stream_terminal_summary(
             Ok(flushed) => {
                 observe_normalized_bytes(observer, report_context, observer_buffered, &flushed)
             }
-            Err(err) => observer.disable_with_error(format!(
-                "failed to flush provider private stream normalization: {err:?}"
-            )),
+            Err(_err) => observer.disable_with_error("provider stream normalization failed"),
         }
     }
 
     if !observer_buffered.is_empty() {
         let line = std::mem::take(observer_buffered);
-        if let Err(err) = observer.push_line(report_context, line) {
-            observer.disable_with_error(err.to_string());
+        if let Err(_err) = observer.push_line(report_context, line) {
+            observer.disable_with_error("stream usage parsing failed");
         }
     }
 
     match observer.finish(report_context) {
         Ok(summary) => summary,
-        Err(err) => {
-            observer.disable_with_error(err.to_string());
+        Err(_err) => {
+            observer.disable_with_error("stream usage parsing failed");
             observer.latest_summary().cloned()
         }
     }
@@ -1216,8 +1228,8 @@ fn observe_normalized_bytes(
         remaining = &remaining[line_part_len..];
         if observer_buffered.last() == Some(&b'\n') {
             let line = std::mem::take(observer_buffered);
-            if let Err(err) = observer.push_line(report_context, line) {
-                observer.disable_with_error(err.to_string());
+            if let Err(_err) = observer.push_line(report_context, line) {
+                observer.disable_with_error("stream usage parsing failed");
                 observer_buffered.clear();
                 return;
             }
@@ -1232,7 +1244,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use aether_contracts::tunnel_security::TUNNEL_SECURITY_NON_TLS_REQUIRED;
     use aether_contracts::{ExecutionPlan, ExecutionTimeouts, RequestBody};
+    use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
+    use aether_data::repository::proxy_nodes::{InMemoryProxyNodeRepository, StoredProxyNode};
     use async_stream::stream;
     use axum::body::{Body, Bytes};
     use axum::extract::ws::Message;
@@ -1245,9 +1260,9 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        build_direct_execution_frame_stream, observe_normalized_bytes,
+        build_direct_execution_frame_stream, encode_error_frame, observe_normalized_bytes,
         should_buffer_non_stream_response, should_treat_upstream_response_as_stream,
-        STREAM_USAGE_OBSERVER_MAX_LINE_BYTES,
+        STREAM_USAGE_OBSERVER_MAX_LINE_BYTES, UPSTREAM_STREAM_READ_ERROR_MESSAGE,
     };
     use crate::ai_serving::api::StreamingStandardTerminalObserver;
     use crate::execution_runtime::transport::{
@@ -1265,6 +1280,66 @@ mod tests {
             url: None,
             extra: Some(serde_json::json!({"tunnel_base_url": base_url})),
         }
+    }
+
+    const LOCAL_TUNNEL_TEST_PSK: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+    const LOCAL_TUNNEL_TEST_GENERATION: &str = "stream-pump-test-generation-1";
+
+    fn authenticated_local_tunnel_test_state() -> AppState {
+        let node = StoredProxyNode::new(
+            "node-1".to_string(),
+            "Node 1".to_string(),
+            "127.0.0.1".to_string(),
+            0,
+            false,
+            "online".to_string(),
+            30,
+            1,
+            0,
+            0,
+            0,
+            0,
+            true,
+            true,
+            1,
+        )
+        .expect("tunnel node should build")
+        .with_runtime_fields(
+            None,
+            None,
+            None,
+            None,
+            Some(serde_json::json!({
+                "tunnel_security": {
+                    "mode": TUNNEL_SECURITY_NON_TLS_REQUIRED,
+                    "encryption_key": LOCAL_TUNNEL_TEST_PSK,
+                }
+            })),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .with_tunnel_generation(LOCAL_TUNNEL_TEST_GENERATION.to_string());
+        let data = crate::data::GatewayDataState::with_proxy_node_repository_for_tests(Arc::new(
+            InMemoryProxyNodeRepository::seed([node]),
+        ))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+        AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(data)
+    }
+
+    async fn recv_tunnel_test_frame(
+        proxy_rx: &mut aether_runtime::BoundedQueueReceiver<Message>,
+        description: &str,
+    ) -> Message {
+        tokio::time::timeout(Duration::from_secs(5), proxy_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
+            .unwrap_or_else(|| panic!("proxy channel closed before {description}"))
     }
 
     #[test]
@@ -1295,10 +1370,12 @@ mod tests {
 
         assert!(!should_buffer_non_stream_response(
             &BTreeMap::from([("content-type".into(), "application/json".into())]),
+            None,
             &streaming_context
         ));
         assert!(should_buffer_non_stream_response(
             &BTreeMap::from([("content-type".into(), "application/json".into())]),
+            None,
             &non_stream_context
         ));
         assert!(should_buffer_non_stream_response(
@@ -1306,12 +1383,25 @@ mod tests {
                 ("content-type".into(), "application/json".into()),
                 ("content-length".into(), "128".into()),
             ]),
+            Some(128),
             &streaming_context
         ));
         assert!(!should_buffer_non_stream_response(
             &BTreeMap::from([("content-type".into(), "text/event-stream".into())]),
+            None,
             &non_stream_context
         ));
+    }
+
+    #[test]
+    fn error_frames_do_not_include_transport_details() {
+        let secret = "Bearer stream-secret https://user:password@example.test/private";
+        let frame = encode_error_frame(secret.to_string()).expect("error frame should encode");
+        let frame = String::from_utf8(frame.to_vec()).expect("error frame should be utf8");
+
+        assert!(frame.contains(UPSTREAM_STREAM_READ_ERROR_MESSAGE));
+        assert!(!frame.contains(secret));
+        assert!(!frame.contains("stream-secret"));
     }
 
     #[test]
@@ -1920,20 +2010,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_execution_frame_stream_preserves_local_tunnel_stream_error_message() {
-        let state = AppState::new().expect("app state should build");
+    async fn direct_execution_frame_stream_sanitizes_local_tunnel_stream_error_message() {
+        let state = authenticated_local_tunnel_test_state();
         let tunnel_app = state.tunnel.app_state();
         let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
         let (proxy_close_tx, _) = watch::channel(false);
-        tunnel_app.hub.register_proxy(Arc::new(TunnelProxyConn::new(
-            801,
-            "node-1".to_string(),
-            "Node 1".to_string(),
-            proxy_tx,
-            proxy_close_tx,
-            16,
-            2,
-        )));
+        tunnel_app.hub.register_proxy(Arc::new(
+            TunnelProxyConn::new(
+                801,
+                "node-1".to_string(),
+                "Node 1".to_string(),
+                proxy_tx,
+                proxy_close_tx,
+                16,
+                2,
+            )
+            .with_tunnel_generation(LOCAL_TUNNEL_TEST_GENERATION.to_string())
+            .with_authenticated_key(LOCAL_TUNNEL_TEST_PSK.to_string()),
+        ));
 
         let plan = ExecutionPlan {
             request_id: "req-local-stream-error-1".into(),
@@ -1967,7 +2061,7 @@ mod tests {
             execute_stream_plan_via_local_tunnel(&state_for_task, &plan_for_task).await
         });
 
-        let request_headers = match proxy_rx.recv().await.expect("headers frame should arrive") {
+        let request_headers = match recv_tunnel_test_frame(&mut proxy_rx, "headers frame").await {
             Message::Binary(data) => data,
             other => panic!("unexpected message: {other:?}"),
         };
@@ -1975,7 +2069,7 @@ mod tests {
             .expect("request header frame should parse");
         assert_eq!(request_header.msg_type, tunnel_protocol::REQUEST_HEADERS);
 
-        let request_body = match proxy_rx.recv().await.expect("body frame should arrive") {
+        let request_body = match recv_tunnel_test_frame(&mut proxy_rx, "body frame").await {
             Message::Binary(data) => data,
             other => panic!("unexpected message: {other:?}"),
         };
@@ -2057,28 +2151,29 @@ mod tests {
             .and_then(Value::as_str)
             .expect("error frame should include a message");
 
-        assert_eq!(error_message, original_error);
-        assert!(
-            !error_message.contains("unexpected EOF during chunk size line"),
-            "local tunnel path should preserve the original proxy error text"
-        );
+        assert_eq!(error_message, UPSTREAM_STREAM_READ_ERROR_MESSAGE);
+        assert!(!error_message.contains(original_error));
     }
 
     #[tokio::test]
     async fn second_local_tunnel_request_works_after_first_completes() {
-        let state = AppState::new().expect("app state should build");
+        let state = authenticated_local_tunnel_test_state();
         let tunnel_app = state.tunnel.app_state();
         let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
         let (proxy_close_tx, _) = watch::channel(false);
-        tunnel_app.hub.register_proxy(Arc::new(TunnelProxyConn::new(
-            900,
-            "node-1".to_string(),
-            "Node 1".to_string(),
-            proxy_tx,
-            proxy_close_tx,
-            16,
-            2,
-        )));
+        tunnel_app.hub.register_proxy(Arc::new(
+            TunnelProxyConn::new(
+                900,
+                "node-1".to_string(),
+                "Node 1".to_string(),
+                proxy_tx,
+                proxy_close_tx,
+                16,
+                2,
+            )
+            .with_tunnel_generation(LOCAL_TUNNEL_TEST_GENERATION.to_string())
+            .with_authenticated_key(LOCAL_TUNNEL_TEST_PSK.to_string()),
+        ));
 
         let plan = ExecutionPlan {
             request_id: "req-reuse-1".into(),
@@ -2115,13 +2210,13 @@ mod tests {
             );
 
         // Read request frames from proxy side
-        let req1_headers = match proxy_rx.recv().await.expect("req1 headers") {
+        let req1_headers = match recv_tunnel_test_frame(&mut proxy_rx, "req1 headers").await {
             Message::Binary(data) => data,
             other => panic!("unexpected: {other:?}"),
         };
         let req1_header =
             tunnel_protocol::FrameHeader::parse(&req1_headers).expect("req1 header parse");
-        let _req1_body = proxy_rx.recv().await.expect("req1 body");
+        let _req1_body = recv_tunnel_test_frame(&mut proxy_rx, "req1 body").await;
 
         // Simulate proxy response
         let resp_meta = serde_json::to_vec(&tunnel_protocol::ResponseMeta {
@@ -2188,10 +2283,7 @@ mod tests {
             );
 
         // Read second request's frames
-        let req2_headers = tokio::time::timeout(Duration::from_secs(2), proxy_rx.recv())
-            .await
-            .expect("second request should arrive within 2s")
-            .expect("req2 headers");
+        let req2_headers = recv_tunnel_test_frame(&mut proxy_rx, "req2 headers").await;
         let req2_data = match req2_headers {
             Message::Binary(data) => data,
             other => panic!("unexpected: {other:?}"),

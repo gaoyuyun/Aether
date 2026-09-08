@@ -5,6 +5,7 @@ import {
   hasUsageRetry,
   isUsageRecordFailed,
   isUsageUpstreamStream,
+  isUsageWebSocket,
   resolveDisplayRequestStatus,
 } from '../utils/status'
 
@@ -69,13 +70,19 @@ export function useUsageFilters(options: UseUsageFiltersOptions) {
     }
 
     if (filterStatus.value !== '__all__') {
-      if (filterStatus.value === 'stream') {
+      if (filterStatus.value === 'websocket') {
+        records = records.filter(record => isUsageWebSocket(record))
+      } else if (filterStatus.value === 'stream') {
         records = records.filter(record =>
-          isUsageUpstreamStream(record) && !isUsageRecordFailed(record)
+          isUsageUpstreamStream(record)
+          && !isUsageWebSocket(record)
+          && !isUsageRecordFailed(record)
         )
       } else if (filterStatus.value === 'standard') {
         records = records.filter(record =>
-          !isUsageUpstreamStream(record) && !isUsageRecordFailed(record)
+          !isUsageUpstreamStream(record)
+          && !isUsageWebSocket(record)
+          && !isUsageRecordFailed(record)
         )
       } else if (filterStatus.value === 'active') {
         records = records.filter(record =>

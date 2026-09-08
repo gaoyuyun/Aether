@@ -101,12 +101,13 @@ use proxy_upgrade_rollout::*;
 pub(crate) use proxy_upgrade_rollout::{
     cancel_proxy_upgrade_rollout, clear_proxy_upgrade_rollout_conflicts,
     collect_proxy_upgrade_rollout_probes, inspect_proxy_upgrade_rollout,
-    record_proxy_upgrade_traffic_success, restore_proxy_upgrade_rollout_skipped_nodes,
-    retry_proxy_upgrade_rollout_node, skip_proxy_upgrade_rollout_node, start_proxy_upgrade_rollout,
-    ProxyUpgradeRolloutCancelSummary, ProxyUpgradeRolloutConflictClearSummary,
-    ProxyUpgradeRolloutNodeActionSummary, ProxyUpgradeRolloutPendingProbe,
-    ProxyUpgradeRolloutProbeConfig, ProxyUpgradeRolloutSkippedRestoreSummary,
-    ProxyUpgradeRolloutStatus, ProxyUpgradeRolloutSummary, ProxyUpgradeRolloutTrackedNodeState,
+    record_proxy_upgrade_traffic_success, record_proxy_upgrade_traffic_success_for_generation,
+    restore_proxy_upgrade_rollout_skipped_nodes, retry_proxy_upgrade_rollout_node,
+    skip_proxy_upgrade_rollout_node, start_proxy_upgrade_rollout, ProxyUpgradeRolloutCancelSummary,
+    ProxyUpgradeRolloutConflictClearSummary, ProxyUpgradeRolloutNodeActionSummary,
+    ProxyUpgradeRolloutPendingProbe, ProxyUpgradeRolloutProbeConfig,
+    ProxyUpgradeRolloutSkippedRestoreSummary, ProxyUpgradeRolloutStatus,
+    ProxyUpgradeRolloutSummary, ProxyUpgradeRolloutTrackedNodeState,
 };
 use request_candidate_cleanup::*;
 use runners::*;

@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const DEFAULT_BODY_BUFFER_PERMIT_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_CONTENT_ENCODINGS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct BodyBufferPolicy {
     max_bytes: u64,
-    read_timeout: Duration,
+    read_timeout: Option<Duration>,
     queue_timeout: Duration,
     budget_bytes: usize,
     permit_bytes: usize,
@@ -33,7 +34,23 @@ impl BodyBufferPolicy {
         budget_bytes: usize,
         budget: Arc<Semaphore>,
     ) -> Self {
-        Self::with_permit_bytes(
+        Self::new_with_optional_read_timeout(
+            max_bytes,
+            Some(read_timeout),
+            queue_timeout,
+            budget_bytes,
+            budget,
+        )
+    }
+
+    pub fn new_with_optional_read_timeout(
+        max_bytes: u64,
+        read_timeout: Option<Duration>,
+        queue_timeout: Duration,
+        budget_bytes: usize,
+        budget: Arc<Semaphore>,
+    ) -> Self {
+        Self::with_optional_read_timeout_and_permit_bytes(
             max_bytes,
             read_timeout,
             queue_timeout,
@@ -51,9 +68,27 @@ impl BodyBufferPolicy {
         permit_bytes: usize,
         budget: Arc<Semaphore>,
     ) -> Self {
+        Self::with_optional_read_timeout_and_permit_bytes(
+            max_bytes,
+            Some(read_timeout),
+            queue_timeout,
+            budget_bytes,
+            permit_bytes,
+            budget,
+        )
+    }
+
+    pub fn with_optional_read_timeout_and_permit_bytes(
+        max_bytes: u64,
+        read_timeout: Option<Duration>,
+        queue_timeout: Duration,
+        budget_bytes: usize,
+        permit_bytes: usize,
+        budget: Arc<Semaphore>,
+    ) -> Self {
         Self {
             max_bytes,
-            read_timeout,
+            read_timeout: read_timeout.filter(|timeout| !timeout.is_zero()),
             queue_timeout,
             budget_bytes,
             permit_bytes: permit_bytes.max(1),
@@ -66,6 +101,10 @@ impl BodyBufferPolicy {
     }
 
     pub fn read_timeout(&self) -> Duration {
+        self.read_timeout.unwrap_or_default()
+    }
+
+    pub fn optional_read_timeout(&self) -> Option<Duration> {
         self.read_timeout
     }
 
@@ -75,6 +114,16 @@ impl BodyBufferPolicy {
 
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+
+    /// The body buffer budget is also a hard per-request ceiling.  A request
+    /// whose configured body limit is larger than the shared budget must not
+    /// be allowed to reserve only the budget and then collect/decompress past
+    /// it, otherwise chunked and compressed requests can defeat the memory
+    /// bound.
+    pub fn effective_max_bytes(&self) -> u64 {
+        self.max_bytes
+            .min(u64::try_from(self.budget_bytes).unwrap_or(u64::MAX))
     }
 
     pub fn reservation_bytes(&self, headers: &HeaderMap) -> usize {
@@ -89,10 +138,12 @@ impl BodyBufferPolicy {
         &self,
         headers: &HeaderMap,
     ) -> Result<BodyBufferReservation, BodyBufferError> {
-        if let Some(declared) = declared_content_length(headers) {
-            if declared > self.max_bytes {
+        let effective_max_bytes = self.effective_max_bytes();
+        let declared_content_length = validate_request_body_headers(headers)?;
+        if let Some(declared) = declared_content_length {
+            if declared > effective_max_bytes {
                 return Err(BodyBufferError::TooLarge {
-                    limit_bytes: self.max_bytes,
+                    limit_bytes: effective_max_bytes,
                 });
             }
         }
@@ -118,7 +169,7 @@ impl BodyBufferPolicy {
 
         Ok(BodyBufferReservation {
             permit,
-            max_bytes: self.max_bytes,
+            max_bytes: effective_max_bytes,
             read_timeout: self.read_timeout,
             requested_bytes,
         })
@@ -129,7 +180,7 @@ impl BodyBufferPolicy {
 pub struct BodyBufferReservation {
     permit: OwnedSemaphorePermit,
     max_bytes: u64,
-    read_timeout: Duration,
+    read_timeout: Option<Duration>,
     requested_bytes: usize,
 }
 
@@ -147,21 +198,29 @@ impl BodyBufferReservation {
         } = self;
         let started_at = Instant::now();
         let body_limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        let bytes = match tokio::time::timeout(read_timeout, to_bytes(body, body_limit)).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) if collection_exceeded_limit(&error) => {
+        let collected = match read_timeout {
+            Some(read_timeout) => {
+                match tokio::time::timeout(read_timeout, to_bytes(body, body_limit)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(BodyBufferError::Timeout {
+                            timeout_ms: duration_millis(read_timeout),
+                        });
+                    }
+                }
+            }
+            None => to_bytes(body, body_limit).await,
+        };
+        let bytes = match collected {
+            Ok(bytes) => bytes,
+            Err(error) if collection_exceeded_limit(&error) => {
                 return Err(BodyBufferError::TooLarge {
                     limit_bytes: max_bytes,
                 });
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 return Err(BodyBufferError::ReadFailed {
                     message: error.to_string(),
-                });
-            }
-            Err(_) => {
-                return Err(BodyBufferError::Timeout {
-                    timeout_ms: duration_millis(read_timeout),
                 });
             }
         };
@@ -208,6 +267,9 @@ impl BufferedBody {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BodyBufferError {
+    InvalidHeaders {
+        message: String,
+    },
     TooLarge {
         limit_bytes: u64,
     },
@@ -227,6 +289,7 @@ pub enum BodyBufferError {
 impl BodyBufferError {
     pub fn http_status(&self) -> StatusCode {
         match self {
+            Self::InvalidHeaders { .. } => StatusCode::BAD_REQUEST,
             Self::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Timeout { .. } => StatusCode::REQUEST_TIMEOUT,
@@ -236,6 +299,7 @@ impl BodyBufferError {
 
     pub fn client_message(&self) -> String {
         match self {
+            Self::InvalidHeaders { .. } => "Invalid request body headers".to_string(),
             Self::TooLarge { limit_bytes } => format!("Request body exceeds {limit_bytes} bytes"),
             Self::Overloaded { .. } => {
                 "Request body buffering capacity is temporarily exhausted".to_string()
@@ -249,6 +313,7 @@ impl BodyBufferError {
 
     pub fn reason(&self) -> &'static str {
         match self {
+            Self::InvalidHeaders { .. } => "invalid_request_body_headers",
             Self::TooLarge { .. } => "request_body_too_large",
             Self::Overloaded { .. } => "request_body_buffer_overloaded",
             Self::Timeout { .. } => "request_body_read_timeout",
@@ -257,11 +322,71 @@ impl BodyBufferError {
     }
 }
 
-fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
+fn validate_request_body_headers(headers: &HeaderMap) -> Result<Option<u64>, BodyBufferError> {
+    let declared_content_length = declared_content_length(headers)?;
+    if declared_content_length.is_some() && headers.contains_key(header::TRANSFER_ENCODING) {
+        return Err(invalid_body_headers(
+            "content-length and transfer-encoding must not be combined",
+        ));
+    }
+    validate_content_encoding_headers(headers)?;
+    Ok(declared_content_length)
+}
+
+fn declared_content_length(headers: &HeaderMap) -> Result<Option<u64>, BodyBufferError> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid_body_headers("duplicate content-length header"));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| invalid_body_headers("invalid content-length header"))?
+        .trim();
+    if value.is_empty() || value.contains(',') {
+        return Err(invalid_body_headers("ambiguous content-length header"));
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| invalid_body_headers("invalid content-length header"))
+}
+
+fn validate_content_encoding_headers(headers: &HeaderMap) -> Result<(), BodyBufferError> {
+    if headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .nth(1)
+        .is_some()
+    {
+        return Err(invalid_body_headers("duplicate content-encoding header"));
+    }
+    let mut count = 0usize;
+    for value in headers.get_all(header::CONTENT_ENCODING).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| invalid_body_headers("invalid content-encoding header"))?;
+        for encoding in value.split(',') {
+            if encoding.trim().is_empty() {
+                return Err(invalid_body_headers("invalid content-encoding header"));
+            }
+            count = count.saturating_add(1);
+            if count > MAX_REQUEST_CONTENT_ENCODINGS {
+                return Err(invalid_body_headers(
+                    "content-encoding chain exceeds the supported limit",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn invalid_body_headers(message: &str) -> BodyBufferError {
+    BodyBufferError::InvalidHeaders {
+        message: message.to_string(),
+    }
 }
 
 fn reservation_bytes(headers: &HeaderMap, max_bytes: u64, budget_bytes: usize) -> usize {
@@ -269,14 +394,21 @@ fn reservation_bytes(headers: &HeaderMap, max_bytes: u64, budget_bytes: usize) -
         .unwrap_or(usize::MAX)
         .min(budget_bytes);
     let encoded = headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("identity"));
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |value| {
+                value.split(',').map(str::trim).any(|encoding| {
+                    !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity")
+                })
+            })
+        });
     if encoded {
         return reservation_ceiling;
     }
     declared_content_length(headers)
+        .ok()
+        .flatten()
         .map(|value| {
             usize::try_from(value)
                 .unwrap_or(usize::MAX)
@@ -341,10 +473,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlimited_body_uses_budget_as_reservation_ceiling() {
+    async fn rejects_ambiguous_content_length_headers_before_reading_body() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        headers.append(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let error = policy(10, Duration::from_secs(1), Arc::new(Semaphore::new(1)))
+            .reserve(&headers)
+            .await
+            .expect_err("duplicate content-length must be rejected");
+        assert!(matches!(error, BodyBufferError::InvalidHeaders { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_content_length_with_transfer_encoding_before_reading_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        let error = policy(10, Duration::from_secs(1), Arc::new(Semaphore::new(1)))
+            .reserve(&headers)
+            .await
+            .expect_err("content-length plus transfer-encoding must be rejected");
+        assert!(matches!(error, BodyBufferError::InvalidHeaders { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_overlong_content_encoding_chain_before_reading_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip, gzip, gzip, gzip, gzip, gzip, gzip, gzip, gzip"),
+        );
+        let error = policy(10, Duration::from_secs(1), Arc::new(Semaphore::new(1)))
+            .reserve(&headers)
+            .await
+            .expect_err("overlong content-encoding chain must be rejected");
+        assert!(matches!(error, BodyBufferError::InvalidHeaders { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_content_encoding_fields_before_reading_body() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        headers.append(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let error = policy(10, Duration::from_secs(1), Arc::new(Semaphore::new(1)))
+            .reserve(&headers)
+            .await
+            .expect_err("duplicate content-encoding fields must be rejected");
+        assert!(matches!(error, BodyBufferError::InvalidHeaders { .. }));
+    }
+
+    #[tokio::test]
+    async fn body_limit_larger_than_budget_is_capped_before_reading() {
         let budget = Arc::new(Semaphore::new(5));
         let policy = BodyBufferPolicy::with_permit_bytes(
-            u64::MAX,
+            10,
             Duration::from_secs(1),
             Duration::from_secs(1),
             5,
@@ -354,24 +539,31 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("10"));
 
-        let reservation = policy
+        let error = policy
             .reserve(&headers)
             .await
-            .expect("unlimited body should reserve the available budget");
-        assert_eq!(reservation.requested_bytes(), 5);
-        assert_eq!(budget.available_permits(), 0);
+            .expect_err("declared body above the shared budget must be rejected");
+        assert_eq!(error, BodyBufferError::TooLarge { limit_bytes: 5 });
+        assert_eq!(budget.available_permits(), 5);
 
-        let buffered = reservation
-            .collect(Body::from(Bytes::from_static(b"0123456789")))
+        let mut small_headers = HeaderMap::new();
+        small_headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let reservation = policy
+            .reserve(&small_headers)
             .await
-            .expect("unlimited body should collect beyond the reservation ceiling");
-        assert_eq!(buffered.bytes().as_ref(), b"0123456789");
+            .expect("body within the shared budget should remain accepted");
+        assert_eq!(reservation.requested_bytes(), 5);
+        let buffered = reservation
+            .collect(Body::from(Bytes::from_static(b"01234")))
+            .await
+            .expect("body within the shared budget should collect");
+        assert_eq!(buffered.bytes().as_ref(), b"01234");
         drop(buffered);
         assert_eq!(budget.available_permits(), 5);
     }
 
     #[tokio::test]
-    async fn encoded_unlimited_body_reserves_the_full_budget() {
+    async fn unlimited_body_is_still_bounded_by_budget() {
         let budget = Arc::new(Semaphore::new(4));
         let policy = BodyBufferPolicy::with_permit_bytes(
             u64::MAX,
@@ -390,6 +582,25 @@ mod tests {
             .expect("encoded unlimited body should reserve the available budget");
         assert_eq!(reservation.requested_bytes(), 4);
         assert_eq!(budget.available_permits(), 0);
+
+        let error = reservation
+            .collect(Body::from(Bytes::from_static(b"01234")))
+            .await
+            .expect_err("unlimited body must still be bounded by the shared budget");
+        assert_eq!(error, BodyBufferError::TooLarge { limit_bytes: 4 });
+        assert_eq!(budget.available_permits(), 4);
+
+        let reservation = policy
+            .reserve(&HeaderMap::new())
+            .await
+            .expect("a body at the budget boundary should reserve");
+        let buffered = reservation
+            .collect(Body::from(Bytes::from_static(b"0123")))
+            .await
+            .expect("a body at the budget boundary should collect");
+        assert_eq!(buffered.bytes().as_ref(), b"0123");
+        drop(buffered);
+        assert_eq!(budget.available_permits(), 4);
     }
 
     #[tokio::test]
@@ -439,6 +650,48 @@ mod tests {
             .await
             .expect_err("slow body should time out");
         assert_eq!(error, BodyBufferError::Timeout { timeout_ms: 5 });
+    }
+
+    #[tokio::test]
+    async fn disabled_read_timeout_allows_slow_body_to_complete() {
+        let stream = stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{")) })
+            .chain(stream::once(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"}"))
+            }));
+        let policy = BodyBufferPolicy::with_optional_read_timeout_and_permit_bytes(
+            1024,
+            None,
+            Duration::from_secs(1),
+            1024,
+            DEFAULT_BODY_BUFFER_PERMIT_BYTES,
+            Arc::new(Semaphore::new(1)),
+        );
+        let reservation = policy
+            .reserve(&HeaderMap::new())
+            .await
+            .expect("reservation should succeed");
+        let buffered = tokio::time::timeout(
+            Duration::from_secs(1),
+            reservation.collect(Body::from_stream(stream)),
+        )
+        .await
+        .expect("test body should finish")
+        .expect("disabled read timeout should allow a slow body");
+        assert_eq!(buffered.bytes().as_ref(), b"{}");
+    }
+
+    #[test]
+    fn zero_read_timeout_is_normalized_to_disabled() {
+        let policy = BodyBufferPolicy::new_with_optional_read_timeout(
+            1024,
+            Some(Duration::ZERO),
+            Duration::from_secs(1),
+            1024,
+            Arc::new(Semaphore::new(1)),
+        );
+        assert_eq!(policy.optional_read_timeout(), None);
+        assert_eq!(policy.read_timeout(), Duration::ZERO);
     }
 
     #[tokio::test]

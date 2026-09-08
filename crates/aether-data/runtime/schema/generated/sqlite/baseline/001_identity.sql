@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS users (
     email_verified INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1,
     is_deleted INTEGER NOT NULL DEFAULT 0,
+    security_version INTEGER NOT NULL DEFAULT 0,
     allowed_models TEXT,
     allowed_models_mode TEXT NOT NULL DEFAULT 'unrestricted',
     allowed_providers TEXT,
@@ -185,6 +186,7 @@ CREATE INDEX IF NOT EXISTS user_preferences_user_id_idx ON user_preferences (use
 CREATE TABLE IF NOT EXISTS user_sessions (
     id TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL,
+    security_version INTEGER NOT NULL DEFAULT 0,
     client_device_id TEXT NOT NULL,
     device_label TEXT,
     device_type TEXT NOT NULL DEFAULT 'unknown',

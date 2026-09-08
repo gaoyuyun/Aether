@@ -2,7 +2,7 @@ use serde_json::json;
 use tracing::debug;
 
 use crate::ai_serving::build_request_trace_proxy_value;
-use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
+use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision_with_websocket_mode;
 use crate::ai_serving::planner::report_context::{
     build_local_execution_report_context, insert_native_client_envelope_name,
     insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
@@ -20,7 +20,10 @@ use crate::{
     AiExecutionDecision, AppState, GatewayError,
 };
 
-use super::request::resolve_local_openai_responses_candidate_payload_parts;
+use super::request::{
+    resolve_local_openai_responses_candidate_payload_parts,
+    resolve_local_openai_responses_candidate_payload_parts_with_websocket_mode,
+};
 use super::support::{LocalOpenAiResponsesCandidateAttempt, LocalOpenAiResponsesDecisionInput};
 use super::LocalOpenAiResponsesSpec;
 
@@ -33,6 +36,26 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
     attempt: LocalOpenAiResponsesCandidateAttempt,
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<Option<AiExecutionDecision>, GatewayError> {
+    maybe_build_local_openai_responses_decision_payload_for_candidate_with_websocket_mode(
+        state, parts, trace_id, body_json, input, attempt, spec, false,
+    )
+    .await
+}
+
+/// Builds a candidate payload for a pinned WebSocket turn without changing
+/// the ordinary HTTP/plan-builder path. The explicit mode is carried all the
+/// way to body normalization because a JSON `type` field is not a reliable
+/// transport discriminator once body rules and conversions have run.
+pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_candidate_with_websocket_mode(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    body_json: &serde_json::Value,
+    input: &LocalOpenAiResponsesDecisionInput,
+    attempt: LocalOpenAiResponsesCandidateAttempt,
+    spec: LocalOpenAiResponsesSpec,
+    websocket_continuation: bool,
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let attempt_identity = attempt.attempt_identity();
     let LocalOpenAiResponsesCandidateAttempt {
@@ -41,19 +64,35 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         candidate_id,
         ..
     } = attempt;
-    let Some(resolved) = resolve_local_openai_responses_candidate_payload_parts(
-        state,
-        parts,
-        trace_id,
-        body_json,
-        input,
-        &eligible,
-        candidate_index,
-        &candidate_id,
-        spec,
-    )
-    .await?
-    else {
+    let resolved = if websocket_continuation {
+        resolve_local_openai_responses_candidate_payload_parts_with_websocket_mode(
+            state,
+            parts,
+            trace_id,
+            body_json,
+            input,
+            &eligible,
+            candidate_index,
+            &candidate_id,
+            spec,
+            true,
+        )
+        .await?
+    } else {
+        resolve_local_openai_responses_candidate_payload_parts(
+            state,
+            parts,
+            trace_id,
+            body_json,
+            input,
+            &eligible,
+            candidate_index,
+            &candidate_id,
+            spec,
+        )
+        .await?
+    };
+    let Some(resolved) = resolved else {
         return Ok(None);
     };
     let candidate = &eligible.candidate;
@@ -144,6 +183,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 routing_policy: input.routing_policy.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+                sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
                 client_requested_stream: body_json
                     .get("stream")
                     .and_then(serde_json::Value::as_bool)
@@ -164,6 +204,10 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         &resolved.transport,
     );
 
+    let log_request_query = parts
+        .uri
+        .query()
+        .and_then(crate::ai_serving::api::sanitize_request_query_string);
     debug!(
         event_name = "local_openai_responses_decision_payload_built",
         log_type = "debug",
@@ -180,9 +224,12 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         client_api_format = spec_metadata.api_format,
         provider_api_format = %resolved.provider_api_format,
         request_path = %parts.uri.path(),
-        request_query = ?parts.uri.query(),
-        upstream_base_url = %resolved.transport.endpoint.base_url,
-        upstream_url = %resolved.upstream_url,
+        request_path_and_query = %crate::ai_serving::pure::sanitize_request_path_and_query(
+            parts.uri.path(),
+            parts.uri.query(),
+        ).unwrap_or_else(|| "/".to_string()),
+        upstream_origin = %crate::handlers::shared::security_log_url_origin(&resolved.upstream_url),
+        request_query = ?log_request_query,
         upstream_is_stream = resolved.upstream_is_stream,
         has_envelope = resolved.envelope_name.is_some(),
         "gateway built local openai responses decision payload"
@@ -243,10 +290,11 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         report_context: Some(report_context),
         auth_context: input.auth_context.clone(),
     });
-    apply_provider_request_routing_policy_to_decision(
+    apply_provider_request_routing_policy_to_decision_with_websocket_mode(
         input,
         &mut decision,
         Some(transport.as_ref()),
+        websocket_continuation,
     )?;
     Ok(Some(decision))
 }

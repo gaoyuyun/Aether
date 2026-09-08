@@ -11,12 +11,12 @@ use aether_contracts::ExecutionPlan;
 
 use crate::execution_runtime::acquire_upstream_execution_gate;
 use crate::provider_pool_demand::{
-    acquire_provider_pool_in_flight_guard, ProviderPoolInFlightGuard,
+    acquire_provider_pool_execution_guard, ProviderPoolInFlightAdmission, ProviderPoolInFlightGuard,
 };
 use crate::upstream_admission::UpstreamTargetAdmissionPermit;
 use crate::{AppState, GatewayError};
 
-pub(super) struct ResponsesWebSocketTurnAdmission {
+pub(crate) struct ResponsesWebSocketTurnAdmission {
     upstream_execution: Option<aether_runtime::ConcurrencyPermit>,
     upstream_target: Option<UpstreamTargetAdmissionPermit>,
     provider_pool: Option<ProviderPoolInFlightGuard>,
@@ -24,7 +24,7 @@ pub(super) struct ResponsesWebSocketTurnAdmission {
 }
 
 impl ResponsesWebSocketTurnAdmission {
-    pub(super) async fn acquire(
+    pub(crate) async fn acquire(
         state: &AppState,
         plan: &ExecutionPlan,
         trace_id: &str,
@@ -41,14 +41,17 @@ impl ResponsesWebSocketTurnAdmission {
                 return Err(error);
             }
         };
-        let provider_pool = acquire_provider_pool_in_flight_guard(
-            state.runtime_state.clone(),
-            &plan.provider_id,
-            &plan.request_id,
-            plan.candidate_id.as_deref(),
-            &plan.key_id,
-        )
-        .await;
+        let provider_pool = match acquire_provider_pool_execution_guard(state, plan).await? {
+            ProviderPoolInFlightAdmission::Acquired(guard) => guard,
+            ProviderPoolInFlightAdmission::Saturated { limit } => {
+                drop(upstream_target);
+                drop(upstream_execution);
+                return Err(GatewayError::Client {
+                    status: http::StatusCode::TOO_MANY_REQUESTS,
+                    message: format!("上游账号并发已达上限 ({limit})"),
+                });
+            }
+        };
 
         Ok(Self {
             upstream_execution,
@@ -61,7 +64,7 @@ impl ResponsesWebSocketTurnAdmission {
     /// Release the distributed provider token before the turn's persistence
     /// work. The remaining permits are local RAII guards and are dropped with
     /// this value.
-    pub(super) async fn release(mut self) {
+    pub(crate) async fn release(mut self) {
         if let Some(provider_pool) = self.provider_pool.take() {
             provider_pool.release().await;
         }

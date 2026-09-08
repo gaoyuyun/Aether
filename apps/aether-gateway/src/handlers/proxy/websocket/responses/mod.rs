@@ -12,11 +12,13 @@ mod admission;
 mod binding;
 mod client;
 mod connection;
+mod continuation;
 mod control;
 mod frame;
 mod lifecycle;
 mod observation;
 mod ownership;
+mod plan_admission;
 mod quota;
 mod redaction;
 mod relay_policy;
@@ -27,6 +29,8 @@ mod state;
 mod turn;
 mod turn_state;
 mod upstream;
+
+pub(crate) use admission::ResponsesWebSocketTurnAdmission;
 
 use std::net::SocketAddr;
 

@@ -722,6 +722,7 @@ import {
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { log } from '@/utils/logger'
+import { safePaymentTargetUrl } from '@/utils/paymentUrl'
 import {
   getPaymentInstructionString,
   getStripePaymentInstructions,
@@ -789,7 +790,9 @@ let todayCostPollTimer: ReturnType<typeof setInterval> | null = null
 const rechargeForm = reactive({
   amount_usd: 10,
   payment_option_key: '',
+  idempotency_key: '',
 })
+let rechargeIdempotencyFingerprint = ''
 
 const refundForm = reactive({
   amount_usd: 0,
@@ -859,9 +862,13 @@ const estimatedRechargeFeeAmount = computed(() =>
 const estimatedRechargeFeeRate = computed(() =>
   rechargePaymentBreakdown.value?.feeRate || 0
 )
-const latestRechargePaymentUrl = computed(() =>
-  getPaymentInstructionString(latestRecharge.value?.payment_instructions, 'payment_url')
-)
+const latestRechargePaymentUrl = computed(() => {
+  const paymentUrl = getPaymentInstructionString(
+    latestRecharge.value?.payment_instructions,
+    'payment_url',
+  )
+  return paymentUrl ? safePaymentTargetUrl(paymentUrl) : null
+})
 const latestRechargeStripeInstructions = computed(() =>
   getStripePaymentInstructions(latestRecharge.value?.payment_instructions)
 )
@@ -1128,16 +1135,40 @@ async function submitRecharge() {
 
   submittingRecharge.value = true
   try {
+    // Keep a failed request retryable only while its business parameters stay
+    // identical. Changing the amount or channel must get a fresh key.
+    const requestFingerprint = JSON.stringify([
+      Number(rechargeForm.amount_usd),
+      option.payment_method || '',
+      option.payment_provider || '',
+      option.payment_channel || '',
+    ])
+    if (
+      rechargeForm.idempotency_key
+      && rechargeIdempotencyFingerprint
+      && rechargeIdempotencyFingerprint !== requestFingerprint
+    ) {
+      rechargeForm.idempotency_key = ''
+    }
+    if (!rechargeForm.idempotency_key) {
+      rechargeForm.idempotency_key = typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    }
+    rechargeIdempotencyFingerprint = requestFingerprint
     latestRecharge.value = await walletApi.createRechargeOrder({
       amount_usd: rechargeForm.amount_usd,
       payment_method: option.payment_method,
       payment_provider: option.payment_provider,
       payment_channel: option.payment_channel,
+      idempotency_key: rechargeForm.idempotency_key,
     })
     success('充值订单创建成功')
     await Promise.all([loadOrders(), loadBalance()])
     activeTab.value = 'orders'
     submitPaymentInstructions(latestRecharge.value.payment_instructions)
+    rechargeForm.idempotency_key = ''
+    rechargeIdempotencyFingerprint = ''
   } catch (error) {
     log.error('创建充值订单失败:', error)
     showError(parseApiError(error, '创建充值订单失败'))
@@ -1156,20 +1187,30 @@ function submitPaymentInstructions(instructions: Record<string, unknown> | null 
   }
   const paymentUrl = getPaymentInstructionString(instructions, 'payment_url')
   if (!paymentUrl) return
-  const paymentParams = instructions.payment_params
-  if (paymentParams && typeof paymentParams === 'object' && !Array.isArray(paymentParams)) {
-    submitPaymentForm(paymentUrl, paymentParams as Record<string, unknown>)
+  const safePaymentUrl = safePaymentTargetUrl(paymentUrl)
+  if (!safePaymentUrl) {
+    showError('支付网关返回了不安全的支付地址')
     return
   }
-  const opened = window.open(paymentUrl, '_blank', 'noopener,noreferrer')
+  const paymentParams = instructions.payment_params
+  if (paymentParams && typeof paymentParams === 'object' && !Array.isArray(paymentParams)) {
+    submitPaymentForm(safePaymentUrl, paymentParams as Record<string, unknown>)
+    return
+  }
+  const opened = window.open(safePaymentUrl, '_blank', 'noopener,noreferrer')
   if (!opened) {
-    window.location.href = paymentUrl
+    window.location.href = safePaymentUrl
   }
 }
 
 function submitPaymentForm(url: string, params: Record<string, unknown>) {
+  const safeUrl = safePaymentTargetUrl(url)
+  if (!safeUrl) {
+    showError('支付网关返回了不安全的支付地址')
+    return
+  }
   const form = document.createElement('form')
-  form.action = url
+  form.action = safeUrl
   form.method = 'POST'
   if (!isSafariBrowser()) {
     form.target = '_blank'
@@ -1223,7 +1264,6 @@ async function submitRefund() {
     await walletApi.createRefund({
       amount_usd: refundForm.amount_usd,
       payment_order_id: selectedOrder.id,
-      refund_mode: refundForm.refund_mode || undefined,
       reason: refundForm.reason || undefined,
       idempotency_key: `web_refund_${buildRefundIdempotencyKey()}`,
     })

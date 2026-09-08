@@ -5,6 +5,7 @@ use std::{fmt, str::FromStr};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FormatFamily {
     OpenAi,
+    Codex,
     Claude,
     Gemini,
     Jina,
@@ -23,9 +24,11 @@ pub enum FormatId {
     OpenAiChat,
     OpenAiResponses,
     OpenAiResponsesCompact,
+    OpenAiRealtime,
     OpenAiSearch,
     OpenAiEmbedding,
     OpenAiRerank,
+    CodexLive,
     ClaudeMessages,
     GeminiGenerateContent,
     GeminiInteractions,
@@ -50,9 +53,11 @@ impl FormatId {
             Self::OpenAiChat
             | Self::OpenAiResponses
             | Self::OpenAiResponsesCompact
+            | Self::OpenAiRealtime
             | Self::OpenAiSearch
             | Self::OpenAiEmbedding
             | Self::OpenAiRerank => FormatFamily::OpenAi,
+            Self::CodexLive => FormatFamily::Codex,
             Self::ClaudeMessages => FormatFamily::Claude,
             Self::GeminiGenerateContent | Self::GeminiInteractions | Self::GeminiEmbedding => {
                 FormatFamily::Gemini
@@ -75,9 +80,11 @@ impl FormatId {
             Self::OpenAiChat => "openai:chat",
             Self::OpenAiResponses => "openai:responses",
             Self::OpenAiResponsesCompact => "openai:responses:compact",
+            Self::OpenAiRealtime => "openai:realtime",
             Self::OpenAiSearch => "openai:search",
             Self::OpenAiEmbedding => "openai:embedding",
             Self::OpenAiRerank => "openai:rerank",
+            Self::CodexLive => "codex:live",
             Self::ClaudeMessages => "claude:messages",
             Self::GeminiGenerateContent => "gemini:generate_content",
             Self::GeminiInteractions => "gemini:interactions",
@@ -106,11 +113,15 @@ impl FromStr for FormatId {
             "openai:responses:compact" | "/v1/responses/compact" => {
                 Ok(Self::OpenAiResponsesCompact)
             }
+            "openai:realtime" | "openai_realtime" | "realtime" | "/v1/realtime" => {
+                Ok(Self::OpenAiRealtime)
+            }
             "openai:search" | "openai_search" | "search" | "/v1/alpha/search" => {
                 Ok(Self::OpenAiSearch)
             }
             "openai:embedding" | "/v1/embeddings" => Ok(Self::OpenAiEmbedding),
             "openai:rerank" | "/v1/rerank" => Ok(Self::OpenAiRerank),
+            "codex:live" | "codex_live" | "live" | "/v1/live" => Ok(Self::CodexLive),
             "claude:messages" | "/v1/messages" => Ok(Self::ClaudeMessages),
             "gemini:generate_content" => Ok(Self::GeminiGenerateContent),
             "gemini:interactions"
@@ -270,6 +281,59 @@ mod tests {
         assert_eq!(FormatId::parse("claude:cli"), None);
         assert_eq!(FormatId::parse("gemini:chat"), None);
         assert_eq!(FormatId::parse("gemini:cli"), None);
+    }
+
+    #[test]
+    fn realtime_and_codex_live_are_distinct_first_class_formats() {
+        use super::{FormatFamily, FormatProfile};
+
+        for alias in [
+            "openai:realtime",
+            "OPENAI_REALTIME",
+            "realtime",
+            "/v1/realtime",
+        ] {
+            assert_eq!(FormatId::parse(alias), Some(FormatId::OpenAiRealtime));
+            assert_eq!(normalize_api_format_alias(alias), "openai:realtime");
+        }
+        for alias in ["codex:live", "CODEX_LIVE", "live", "/v1/live"] {
+            assert_eq!(FormatId::parse(alias), Some(FormatId::CodexLive));
+            assert_eq!(normalize_api_format_alias(alias), "codex:live");
+        }
+
+        assert_eq!(FormatId::OpenAiRealtime.family(), FormatFamily::OpenAi);
+        assert_eq!(FormatId::CodexLive.family(), FormatFamily::Codex);
+        assert_eq!(FormatId::OpenAiRealtime.profile(), FormatProfile::Default);
+        assert_eq!(FormatId::CodexLive.profile(), FormatProfile::Default);
+        assert!(!api_format_uses_body_stream_field("openai:realtime"));
+        assert!(!api_format_uses_body_stream_field("codex:live"));
+    }
+
+    #[test]
+    fn realtime_live_and_responses_permissions_do_not_cover_each_other() {
+        for (allowed, requested) in [
+            ("openai:responses", "openai:realtime"),
+            ("openai:responses", "codex:live"),
+            ("openai:realtime", "openai:responses"),
+            ("openai:realtime", "codex:live"),
+            ("codex:live", "openai:responses"),
+            ("codex:live", "openai:realtime"),
+        ] {
+            assert!(!api_format_permission_covers(allowed, requested));
+        }
+        assert!(api_format_permission_covers(
+            "OPENAI_REALTIME",
+            "/v1/realtime"
+        ));
+        assert!(api_format_permission_covers("CODEX_LIVE", "/v1/live"));
+        assert_eq!(
+            api_format_permission_storage_aliases("openai:realtime"),
+            vec!["openai:realtime".to_string()]
+        );
+        assert_eq!(
+            api_format_permission_storage_aliases("codex:live"),
+            vec!["codex:live".to_string()]
+        );
     }
 
     #[test]

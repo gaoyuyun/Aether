@@ -10,6 +10,7 @@
 pub enum FatalRelaySignal {
     ConnectionAdmissionLost,
     InvalidUpstreamText,
+    UnexpectedUpstreamStreamId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,13 @@ pub const fn fatal_relay_policy(signal: FatalRelaySignal) -> FatalRelayPolicy {
             error_code: "responses_websocket_invalid_upstream_event",
             client_message: "Provider returned an invalid WebSocket event",
             close_reason: "invalid_upstream_event",
+        },
+        FatalRelaySignal::UnexpectedUpstreamStreamId => FatalRelayPolicy {
+            status_code: 502,
+            close_code: 1011,
+            error_code: "responses_websocket_unexpected_upstream_stream_id",
+            client_message: "Provider returned a named-lane event on a default-lane connection",
+            close_reason: "unexpected_upstream_stream_id",
         },
     }
 }
@@ -228,6 +236,20 @@ mod tests {
         let action = classify_upstream_frame(upstream.next().unwrap());
         assert_eq!(action, UpstreamFrameAction::FinalizeAndClose);
         assert_eq!(upstream.next(), None);
+    }
+
+    #[test]
+    fn unexpected_named_lane_is_a_terminal_provider_protocol_error() {
+        assert_eq!(
+            fatal_relay_policy(FatalRelaySignal::UnexpectedUpstreamStreamId),
+            FatalRelayPolicy {
+                status_code: 502,
+                close_code: 1011,
+                error_code: "responses_websocket_unexpected_upstream_stream_id",
+                client_message: "Provider returned a named-lane event on a default-lane connection",
+                close_reason: "unexpected_upstream_stream_id",
+            }
+        );
     }
 
     #[test]

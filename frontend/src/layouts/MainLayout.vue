@@ -503,6 +503,7 @@ import LanguageSwitcher from '@/components/common/LanguageSwitcher.vue'
 import ThemeModeButton from '@/components/common/ThemeModeButton.vue'
 import VersionButton from '@/components/common/VersionButton.vue'
 import { buildUpdateErrorStatus } from '@/utils/updateStatus'
+import { safeExternalHttpsUrl } from '@/utils/navigationSecurity'
 import {
   Settings,
   AlertTriangle,
@@ -847,8 +848,9 @@ function handleVersionRefresh() {
 }
 
 function openVersionReleasePage() {
-  if (versionStatus.value?.release_url) {
-    window.open(versionStatus.value.release_url, '_blank', 'noopener,noreferrer')
+  const releaseUrl = safeExternalHttpsUrl(versionStatus.value?.release_url)
+  if (releaseUrl) {
+    window.open(releaseUrl, '_blank', 'noopener,noreferrer')
   }
 }
 
@@ -1091,12 +1093,6 @@ function syncAuthNotice() {
   showAuthError.value = !!authStore.user && !authStore.token
 }
 
-function handleStorageChange(event: StorageEvent) {
-  if (event.key === null || event.key === 'access_token') {
-    syncAuthNotice()
-  }
-}
-
 function handleVisibilityChange() {
   if (!document.hidden) {
     syncAuthNotice()
@@ -1204,7 +1200,6 @@ async function acknowledgeRequiredAnnouncement() {
 }
 
 onMounted(() => {
-  window.addEventListener('storage', handleStorageChange)
   document.addEventListener('visibilitychange', handleVisibilityChange)
   syncAuthNotice()
   applyCachedVersionStatus()
@@ -1238,7 +1233,6 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  window.removeEventListener('storage', handleStorageChange)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   if (updateCheckTimer !== null) {
     window.clearTimeout(updateCheckTimer)

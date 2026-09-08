@@ -4,8 +4,9 @@ use sqlx::{mysql::MySqlRow, Row};
 use aether_data_contracts::repository::billing::{
     AdminBillingCollectorRecord, AdminBillingCollectorWriteInput, AdminBillingMutationOutcome,
     AdminBillingPresetApplyResult, AdminBillingRuleRecord, AdminBillingRuleWriteInput,
-    BillingPlanRecord, BillingPlanWriteInput, BillingReadRepository, PaymentGatewayConfigRecord,
-    PaymentGatewayConfigWriteInput, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+    BillingPlanRecord, BillingPlanWriteInput, BillingReadRepository,
+    PaymentGatewayConfigCasWriteInput, PaymentGatewayConfigRecord, PaymentGatewayConfigWriteInput,
+    PaymentGatewaySecretCasUpdate, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
     UserPlanEntitlementRecord,
 };
 use aether_data_contracts::DataLayerError;
@@ -638,6 +639,157 @@ LIMIT 1
             .transpose()
     }
 
+    async fn compare_and_swap_payment_gateway_secret(
+        &self,
+        update: &PaymentGatewaySecretCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let result = sqlx::query(
+            r#"
+UPDATE payment_gateway_configs
+SET merchant_key_encrypted = ?
+WHERE provider = ?
+  AND BINARY merchant_key_encrypted = BINARY ?
+            "#,
+        )
+        .bind(&update.merchant_key_encrypted)
+        .bind(update.provider.trim().to_ascii_lowercase())
+        .bind(&update.expected_merchant_key_encrypted)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn compare_and_swap_payment_gateway_config(
+        &self,
+        mutation: &PaymentGatewayConfigCasWriteInput,
+    ) -> Result<AdminBillingMutationOutcome<PaymentGatewayConfigRecord>, DataLayerError> {
+        let input = &mutation.input;
+        let provider = input.provider.trim().to_ascii_lowercase();
+        let now = current_unix_secs_i64();
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+
+        if mutation.expected_existing {
+            let current = sqlx::query(
+                r#"
+SELECT merchant_key_encrypted
+FROM payment_gateway_configs
+WHERE provider = ?
+LIMIT 1
+FOR UPDATE
+                "#,
+            )
+            .bind(&provider)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_sql_err()?;
+            let current_secret = match current.as_ref() {
+                Some(row) => row
+                    .try_get::<Option<String>, _>("merchant_key_encrypted")
+                    .map_sql_err()?,
+                None => {
+                    tx.rollback().await.map_sql_err()?;
+                    return Ok(AdminBillingMutationOutcome::NotFound);
+                }
+            };
+            if current_secret != mutation.expected_merchant_key_encrypted {
+                tx.rollback().await.map_sql_err()?;
+                return Ok(AdminBillingMutationOutcome::NotFound);
+            }
+
+            sqlx::query(
+                r#"
+UPDATE payment_gateway_configs
+SET
+  enabled = ?,
+  endpoint_url = ?,
+  callback_base_url = ?,
+  merchant_id = ?,
+  merchant_key_encrypted = CASE
+    WHEN ? THEN merchant_key_encrypted
+    ELSE ?
+  END,
+  pay_currency = ?,
+  usd_exchange_rate = ?,
+  min_recharge_usd = ?,
+  channels_json = ?,
+  updated_at = ?
+WHERE provider = ?
+                "#,
+            )
+            .bind(input.enabled)
+            .bind(&input.endpoint_url)
+            .bind(input.callback_base_url.as_deref())
+            .bind(&input.merchant_id)
+            .bind(input.preserve_existing_secret)
+            .bind(input.merchant_key_encrypted.as_deref())
+            .bind(&input.pay_currency)
+            .bind(input.usd_exchange_rate)
+            .bind(input.min_recharge_usd)
+            .bind(json_to_string(&input.channels_json)?)
+            .bind(now)
+            .bind(&provider)
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        } else {
+            let inserted = sqlx::query(
+                r#"
+INSERT INTO payment_gateway_configs (
+  provider, enabled, endpoint_url, callback_base_url, merchant_id,
+  merchant_key_encrypted, pay_currency, usd_exchange_rate, min_recharge_usd,
+  channels_json, created_at, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&provider)
+            .bind(input.enabled)
+            .bind(&input.endpoint_url)
+            .bind(input.callback_base_url.as_deref())
+            .bind(&input.merchant_id)
+            .bind(input.merchant_key_encrypted.as_deref())
+            .bind(&input.pay_currency)
+            .bind(input.usd_exchange_rate)
+            .bind(input.min_recharge_usd)
+            .bind(json_to_string(&input.channels_json)?)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await;
+            if let Err(err) = inserted {
+                let unique = matches!(
+                    &err,
+                    sqlx::Error::Database(database_error) if database_error.is_unique_violation()
+                );
+                tx.rollback().await.map_sql_err()?;
+                if unique {
+                    return Ok(AdminBillingMutationOutcome::NotFound);
+                }
+                return Err(DataLayerError::sql(err));
+            }
+        }
+
+        let row = sqlx::query(
+            r#"
+SELECT
+  provider, enabled, endpoint_url, callback_base_url, merchant_id,
+  merchant_key_encrypted, pay_currency, usd_exchange_rate, min_recharge_usd,
+  channels_json, created_at AS created_at_unix_secs, updated_at AS updated_at_unix_secs
+FROM payment_gateway_configs
+WHERE provider = ?
+LIMIT 1
+            "#,
+        )
+        .bind(&provider)
+        .fetch_one(&mut *tx)
+        .await
+        .map_sql_err()?;
+        let record = map_payment_gateway_config_mysql(&row)?;
+        tx.commit().await.map_sql_err()?;
+        Ok(AdminBillingMutationOutcome::Applied(record))
+    }
+
     async fn upsert_payment_gateway_config(
         &self,
         input: &PaymentGatewayConfigWriteInput,
@@ -921,6 +1073,39 @@ ORDER BY expires_at ASC, created_at ASC
         ))
     }
 
+    async fn revoke_user_plan_entitlement(
+        &self,
+        user_id: &str,
+        entitlement_id: &str,
+    ) -> Result<AdminBillingMutationOutcome<()>, DataLayerError> {
+        let now = current_unix_secs_i64();
+        let result = sqlx::query(
+            r#"
+UPDATE user_plan_entitlements
+SET status = 'revoked',
+    expires_at = LEAST(expires_at, ?),
+    updated_at = ?
+WHERE id = ?
+  AND user_id = ?
+  AND status = 'active'
+  AND expires_at > ?
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(entitlement_id)
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            Ok(AdminBillingMutationOutcome::NotFound)
+        } else {
+            Ok(AdminBillingMutationOutcome::Applied(()))
+        }
+    }
+
     async fn find_user_daily_quota_availability(
         &self,
         user_id: &str,
@@ -928,13 +1113,19 @@ ORDER BY expires_at ASC, created_at ASC
         let now_unix_secs = current_unix_secs_i64();
         let rows = sqlx::query(
             r#"
-SELECT id, entitlements_snapshot
+SELECT
+    user_plan_entitlements.id,
+    user_plan_entitlements.entitlements_snapshot,
+    billing_plans.entitlements_json AS plan_entitlements_json
 FROM user_plan_entitlements
-WHERE user_id = ?
-  AND status = 'active'
-  AND starts_at <= ?
-  AND expires_at > ?
-ORDER BY expires_at ASC, created_at ASC, id ASC
+JOIN billing_plans ON billing_plans.id = user_plan_entitlements.plan_id
+WHERE user_plan_entitlements.user_id = ?
+    AND user_plan_entitlements.status = 'active'
+    AND user_plan_entitlements.starts_at <= ?
+    AND user_plan_entitlements.expires_at > ?
+ORDER BY user_plan_entitlements.expires_at ASC,
+                 user_plan_entitlements.created_at ASC,
+                 user_plan_entitlements.id ASC
             "#,
         )
         .bind(user_id)
@@ -949,9 +1140,13 @@ ORDER BY expires_at ASC, created_at ASC, id ASC
             let entitlement_id: String = row.try_get("id").map_sql_err()?;
             let entitlements = parse_json(row.try_get("entitlements_snapshot").ok().flatten())?
                 .unwrap_or_else(|| serde_json::json!([]));
+            let plan_entitlements =
+                parse_json(row.try_get("plan_entitlements_json").ok().flatten())?
+                    .unwrap_or_else(|| serde_json::json!([]));
             grants.extend(daily_quota_grants_from_entitlement(
                 &entitlement_id,
                 &entitlements,
+                daily_quota_wallet_overage_policy(&plan_entitlements),
                 now,
             )?);
         }
@@ -1186,6 +1381,7 @@ fn daily_quota_usage_date(
 fn daily_quota_grants_from_entitlement(
     entitlement_id: &str,
     entitlements: &serde_json::Value,
+    current_allow_wallet_overage: Option<bool>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<DailyQuotaGrant>, DataLayerError> {
     let mut grants = Vec::new();
@@ -1211,13 +1407,25 @@ fn daily_quota_grants_from_entitlement(
                     .and_then(serde_json::Value::as_str),
                 now,
             )?,
-            allow_wallet_overage: item
-                .get("allow_wallet_overage")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            allow_wallet_overage: current_allow_wallet_overage.unwrap_or_else(|| {
+                item.get("allow_wallet_overage")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            }),
         });
     }
     Ok(grants)
+}
+
+fn daily_quota_wallet_overage_policy(entitlements: &serde_json::Value) -> Option<bool> {
+    entitlements.as_array()?.iter().find_map(|item| {
+        (item.get("type").and_then(serde_json::Value::as_str) == Some("daily_quota"))
+            .then(|| {
+                item.get("allow_wallet_overage")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .flatten()
+    })
 }
 
 fn read_count_mysql(row: &MySqlRow) -> Result<u64, DataLayerError> {

@@ -302,7 +302,7 @@ mod tests {
             .await
             .expect("sqlite migrations should run");
 
-        let value = serde_json::json!({"enabled": true});
+        let value = serde_json::json!("enabled");
         let stored = backend
             .upsert_system_config_entry("feature.local", &value, Some("local flag"))
             .await
@@ -313,7 +313,40 @@ mod tests {
                 .find_system_config_value("feature.local")
                 .await
                 .expect("system config should read"),
-            Some(value)
+            Some(value.clone())
+        );
+        let replacement = serde_json::json!("disabled");
+        assert!(!backend
+            .compare_and_set_system_config_string_value("feature.local", "stale", "disabled")
+            .await
+            .expect("stale system config compare-and-set should complete"));
+        assert!(backend
+            .compare_and_set_system_config_string_value("feature.local", "enabled", "disabled")
+            .await
+            .expect("matching system config compare-and-set should complete"));
+        assert_eq!(
+            backend
+                .find_system_config_value("feature.local")
+                .await
+                .expect("updated system config should read"),
+            Some(replacement.clone())
+        );
+        sqlx::query("UPDATE system_configs SET value = ? WHERE key = ?")
+            .bind(r#""\u5bc6\u94a5""#)
+            .bind("feature.local")
+            .execute(backend.pool())
+            .await
+            .expect("legacy escaped JSON string should persist");
+        assert!(backend
+            .compare_and_set_system_config_string_value("feature.local", "密钥", "encrypted-value",)
+            .await
+            .expect("escaped JSON string compare-and-set should complete"));
+        assert_eq!(
+            backend
+                .find_system_config_value("feature.local")
+                .await
+                .expect("escaped JSON string replacement should read"),
+            Some(serde_json::json!("encrypted-value"))
         );
         assert_eq!(
             backend
@@ -542,6 +575,22 @@ VALUES ('target-key-1', 'target-user-1', 'hash-target-key', 'target key', 1, 1)
             BTreeMap::from([("source-user-1".to_string(), "target-user-1".to_string())]);
         let api_key_id_map =
             BTreeMap::from([("source-key-1".to_string(), "target-key-1".to_string())]);
+
+        let validation_summary = backend
+            .import_admin_system_usage_aggregates(
+                &snapshot,
+                &user_id_map,
+                &api_key_id_map,
+                AdminSystemUsageAggregateImportMode::ValidateError,
+            )
+            .await
+            .expect("usage aggregates should validate");
+        assert_eq!(validation_summary.stats_daily.created, 1);
+        assert_eq!(validation_summary.stats_user_daily.created, 1);
+        assert_eq!(validation_summary.stats_daily_api_key.created, 1);
+        assert_eq!(sqlite_count(backend.pool(), "stats_daily").await, 0);
+        assert_eq!(sqlite_count(backend.pool(), "stats_user_daily").await, 0);
+        assert_eq!(sqlite_count(backend.pool(), "stats_daily_api_key").await, 0);
 
         let summary = backend
             .import_admin_system_usage_aggregates(

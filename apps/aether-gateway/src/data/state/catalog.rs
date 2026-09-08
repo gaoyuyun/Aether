@@ -1,11 +1,12 @@
 use super::{
     ApiKeyLastUsedDelta, DataLayerError, GatewayDataState, GeminiFileMappingListQuery,
     GeminiFileMappingStats, ProviderCatalogKeyAdaptiveStateUpdate,
-    ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyHealthStateUpdate,
-    ProviderCatalogKeyListQuery, ProviderCatalogKeyOAuthCredentialCasDelete,
-    ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
-    ProviderCatalogKeyStatusSnapshotUpdate, PublicHealthStatusCount, PublicHealthTimelineBucket,
-    StoredGeminiFileMapping, StoredGeminiFileMappingListPage,
+    ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyCredentialsCasUpdate,
+    ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListQuery,
+    ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
+    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
+    ProviderCatalogProviderConfigCasUpdate, ProviderCatalogProxyCasUpdate, PublicHealthStatusCount,
+    PublicHealthTimelineBucket, StoredGeminiFileMapping, StoredGeminiFileMappingListPage,
     StoredProviderCatalogAuthorizationSnapshot, StoredProviderCatalogEndpoint,
     StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
     StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
@@ -14,13 +15,30 @@ use super::{
     UpsertRequestCandidateRecord,
 };
 
+fn sanitize_request_candidate_rows(
+    mut candidates: Vec<StoredRequestCandidate>,
+) -> Vec<StoredRequestCandidate> {
+    for candidate in &mut candidates {
+        candidate.sanitize_sensitive_diagnostics();
+    }
+    candidates
+}
+
+fn sanitize_request_candidate_row(mut candidate: StoredRequestCandidate) -> StoredRequestCandidate {
+    candidate.sanitize_sensitive_diagnostics();
+    candidate
+}
+
 impl GatewayDataState {
     pub(crate) async fn list_request_candidates_by_request_id(
         &self,
         request_id: &str,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         match &self.request_candidate_reader {
-            Some(repository) => repository.list_by_request_id(request_id).await,
+            Some(repository) => repository
+                .list_by_request_id(request_id)
+                .await
+                .map(sanitize_request_candidate_rows),
             None => Ok(Vec::new()),
         }
     }
@@ -30,7 +48,10 @@ impl GatewayDataState {
         request_id: &str,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         match &self.request_candidate_reader {
-            Some(repository) => repository.list_attempted_by_request_id(request_id).await,
+            Some(repository) => repository
+                .list_attempted_by_request_id(request_id)
+                .await
+                .map(sanitize_request_candidate_rows),
             None => Ok(Vec::new()),
         }
     }
@@ -41,7 +62,10 @@ impl GatewayDataState {
         limit: usize,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         match &self.request_candidate_reader {
-            Some(repository) => repository.list_by_provider_id(provider_id, limit).await,
+            Some(repository) => repository
+                .list_by_provider_id(provider_id, limit)
+                .await
+                .map(sanitize_request_candidate_rows),
             None => Ok(Vec::new()),
         }
     }
@@ -51,7 +75,10 @@ impl GatewayDataState {
         limit: usize,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         match &self.request_candidate_reader {
-            Some(repository) => repository.list_recent(limit).await,
+            Some(repository) => repository
+                .list_recent(limit)
+                .await
+                .map(sanitize_request_candidate_rows),
             None => Ok(Vec::new()),
         }
     }
@@ -63,11 +90,10 @@ impl GatewayDataState {
         limit: usize,
     ) -> Result<Vec<StoredRequestCandidate>, DataLayerError> {
         match &self.request_candidate_reader {
-            Some(repository) => {
-                repository
-                    .list_finalized_by_endpoint_ids_since(endpoint_ids, since_unix_secs, limit)
-                    .await
-            }
+            Some(repository) => repository
+                .list_finalized_by_endpoint_ids_since(endpoint_ids, since_unix_secs, limit)
+                .await
+                .map(sanitize_request_candidate_rows),
             None => Ok(Vec::new()),
         }
     }
@@ -111,14 +137,19 @@ impl GatewayDataState {
 
     pub(crate) async fn upsert_request_candidate(
         &self,
-        candidate: UpsertRequestCandidateRecord,
+        mut candidate: UpsertRequestCandidateRecord,
     ) -> Result<Option<StoredRequestCandidate>, DataLayerError> {
+        candidate.sanitize_for_persistence();
         crate::request_diagnostics::observe_db_operation(
             "request_candidate_upsert",
             self.database_pool_summary(),
             async {
                 match &self.request_candidate_writer {
-                    Some(repository) => repository.upsert(candidate).await.map(Some),
+                    Some(repository) => repository
+                        .upsert(candidate)
+                        .await
+                        .map(sanitize_request_candidate_row)
+                        .map(Some),
                     None => Ok(None),
                 }
             },
@@ -173,6 +204,16 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn upsert_gemini_file_mapping_if_owner_matches(
+        &self,
+        record: UpsertGeminiFileMappingRecord,
+    ) -> Result<Option<StoredGeminiFileMapping>, DataLayerError> {
+        match &self.gemini_file_mapping_writer {
+            Some(repository) => repository.upsert_if_owner_matches(record).await,
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn list_gemini_file_mappings(
         &self,
         query: &GeminiFileMappingListQuery,
@@ -183,6 +224,49 @@ impl GatewayDataState {
                 items: Vec::new(),
                 total: 0,
             }),
+        }
+    }
+
+    pub(crate) async fn find_gemini_file_mapping_by_file_name(
+        &self,
+        file_name: &str,
+    ) -> Result<Option<StoredGeminiFileMapping>, DataLayerError> {
+        match &self.gemini_file_mapping_reader {
+            Some(repository) => repository.find_by_file_name(file_name).await,
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn find_active_gemini_file_mapping_for_user(
+        &self,
+        file_name: &str,
+        user_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<Option<StoredGeminiFileMapping>, DataLayerError> {
+        match &self.gemini_file_mapping_reader {
+            Some(repository) => {
+                repository
+                    .find_active_by_file_name_for_user(file_name, user_id, now_unix_secs)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn find_active_gemini_file_mapping_for_owner(
+        &self,
+        file_name: &str,
+        key_id: &str,
+        user_id: &str,
+        now_unix_secs: u64,
+    ) -> Result<Option<StoredGeminiFileMapping>, DataLayerError> {
+        match &self.gemini_file_mapping_reader {
+            Some(repository) => {
+                repository
+                    .find_active_by_file_name_for_owner(file_name, key_id, user_id, now_unix_secs)
+                    .await
+            }
+            None => Ok(None),
         }
     }
 
@@ -207,6 +291,37 @@ impl GatewayDataState {
     ) -> Result<bool, DataLayerError> {
         match &self.gemini_file_mapping_writer {
             Some(repository) => repository.delete_by_file_name(file_name).await,
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn delete_gemini_file_mapping_by_file_name_for_user(
+        &self,
+        file_name: &str,
+        user_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        match &self.gemini_file_mapping_writer {
+            Some(repository) => {
+                repository
+                    .delete_by_file_name_for_user(file_name, user_id)
+                    .await
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) async fn delete_gemini_file_mapping_by_file_name_for_owner(
+        &self,
+        file_name: &str,
+        key_id: &str,
+        user_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        match &self.gemini_file_mapping_writer {
+            Some(repository) => {
+                repository
+                    .delete_by_file_name_for_owner(file_name, key_id, user_id)
+                    .await
+            }
             None => Ok(false),
         }
     }
@@ -396,38 +511,11 @@ impl GatewayDataState {
         }
     }
 
-    pub(crate) async fn update_provider_catalog_key_oauth_credentials(
-        &self,
-        key_id: &str,
-        encrypted_api_key: &str,
-        encrypted_auth_config: Option<&str>,
-        expires_at_unix_secs: Option<u64>,
-    ) -> Result<bool, DataLayerError> {
-        let updated = match &self.provider_catalog_writer {
-            Some(repository) => {
-                repository
-                    .update_key_oauth_credentials(
-                        key_id,
-                        encrypted_api_key,
-                        encrypted_auth_config,
-                        expires_at_unix_secs,
-                    )
-                    .await
-            }
-            None => Ok(false),
-        }?;
-        if updated {
-            self.clear_provider_catalog_cache();
-        }
-        Ok(updated)
-    }
-
     pub(crate) async fn update_provider_catalog_key_oauth_runtime_state(
         &self,
         key_id: &str,
         oauth_invalid_at_unix_secs: Option<u64>,
         oauth_invalid_reason: Option<&str>,
-        encrypted_auth_config_update: Option<&str>,
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, DataLayerError> {
         let updated = match &self.provider_catalog_writer {
@@ -437,7 +525,6 @@ impl GatewayDataState {
                         key_id,
                         oauth_invalid_at_unix_secs,
                         oauth_invalid_reason,
-                        encrypted_auth_config_update,
                         updated_at_unix_secs,
                     )
                     .await
@@ -514,6 +601,30 @@ impl GatewayDataState {
         Ok(updated)
     }
 
+    pub(crate) async fn compare_and_swap_provider_catalog_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.compare_and_swap_provider_config(update).await,
+            None => Ok(false),
+        }?;
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_swap_provider_catalog_provider_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.compare_and_swap_provider_proxy(update).await,
+            None => Ok(false),
+        }?;
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
     pub(crate) async fn delete_provider_catalog_provider(
         &self,
         provider_id: &str,
@@ -582,6 +693,18 @@ impl GatewayDataState {
         Ok(updated)
     }
 
+    pub(crate) async fn compare_and_swap_provider_catalog_endpoint_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.compare_and_swap_endpoint_proxy(update).await,
+            None => Ok(false),
+        }?;
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
     pub(crate) async fn delete_provider_catalog_endpoint(
         &self,
         endpoint_id: &str,
@@ -607,6 +730,32 @@ impl GatewayDataState {
         if updated.is_some() {
             self.clear_provider_catalog_cache();
         }
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_swap_provider_catalog_key_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.compare_and_swap_key_proxy(update).await,
+            None => Ok(false),
+        }?;
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_swap_provider_catalog_key_credentials(
+        &self,
+        update: &ProviderCatalogKeyCredentialsCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.compare_and_swap_key_credentials(update).await,
+            None => Ok(false),
+        }?;
+        // Clear on both outcomes: a CAS miss proves the cached credential
+        // generation was stale and the retry must observe the winning record.
+        self.clear_provider_catalog_cache();
         Ok(updated)
     }
 
@@ -880,5 +1029,83 @@ impl GatewayDataState {
             .await?;
         self.clear_provider_catalog_cache();
         Ok(updated)
+    }
+}
+
+#[cfg(test)]
+mod request_candidate_security_tests {
+    use serde_json::json;
+
+    use super::{
+        sanitize_request_candidate_row, sanitize_request_candidate_rows, StoredRequestCandidate,
+    };
+    use aether_data_contracts::repository::candidates::RequestCandidateStatus;
+
+    fn untrusted_candidate() -> StoredRequestCandidate {
+        let mut candidate = StoredRequestCandidate::new(
+            "candidate-untrusted".to_string(),
+            "request-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            Some("provider-1".to_string()),
+            Some("endpoint-1".to_string()),
+            Some("key-1".to_string()),
+            RequestCandidateStatus::Failed,
+            None,
+            false,
+            Some(500),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+            None,
+            Some(2),
+        )
+        .expect("candidate should build");
+        candidate.skip_reason = Some("Bearer candidate-secret".to_string());
+        candidate.error_type = Some("candidate-secret".to_string());
+        candidate.error_message = Some("Bearer candidate-secret".to_string());
+        candidate.extra_data = Some(json!({
+            "gateway_execution_runtime": true,
+            "request_body": {"token": "candidate-secret"}
+        }));
+        candidate.required_capabilities = Some(json!({
+            "vision": 1,
+            "tenant_secret": "candidate-secret"
+        }));
+        candidate
+    }
+
+    fn assert_candidate_is_sanitized(candidate: &StoredRequestCandidate) {
+        assert_eq!(candidate.skip_reason.as_deref(), Some("unclassified_skip"));
+        assert_eq!(candidate.error_type.as_deref(), Some("unclassified_error"));
+        assert!(candidate.error_message.is_none());
+        assert_eq!(
+            candidate.extra_data,
+            Some(json!({"gateway_execution_runtime": true}))
+        );
+        assert_eq!(
+            candidate.required_capabilities,
+            Some(json!({"vision": true}))
+        );
+        assert!(!serde_json::to_string(candidate)
+            .expect("candidate should serialize")
+            .contains("candidate-secret"));
+    }
+
+    #[test]
+    fn gateway_candidate_boundary_sanitizes_repository_rows_and_write_results() {
+        let candidate = sanitize_request_candidate_row(untrusted_candidate());
+        assert_candidate_is_sanitized(&candidate);
+
+        let candidates = sanitize_request_candidate_rows(vec![untrusted_candidate()]);
+        assert_candidate_is_sanitized(&candidates[0]);
     }
 }

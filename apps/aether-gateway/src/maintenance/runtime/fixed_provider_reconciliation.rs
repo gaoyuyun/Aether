@@ -210,6 +210,28 @@ mod tests {
         .expect("endpoint transport should build");
         responses.updated_at_unix_secs = Some(100);
 
+        let mut live = StoredProviderCatalogEndpoint::new(
+            "endpoint-codex-live".to_string(),
+            provider.id.clone(),
+            "codex:live".to_string(),
+            Some("codex".to_string()),
+            Some("live".to_string()),
+            false,
+        )
+        .expect("Live endpoint should build")
+        .with_transport_fields(
+            "https://voice-proxy.internal/v1".to_string(),
+            None,
+            None,
+            Some(6),
+            Some("/socket/live".to_string()),
+            Some(json!({"custom_transport_option": true})),
+            None,
+            Some(json!({"url": "http://voice-proxy.internal:8080"})),
+        )
+        .expect("Live endpoint transport should build");
+        live.updated_at_unix_secs = Some(100);
+
         let mut key = StoredProviderCatalogKey::new(
             "key-codex".to_string(),
             provider.id.clone(),
@@ -228,10 +250,17 @@ mod tests {
             "custom".to_string(),
         )
         .expect("unrelated provider should build");
+        let fresh_codex_provider = StoredProviderCatalogProvider::new(
+            "provider-codex-fresh".to_string(),
+            "Fresh Codex".to_string(),
+            None,
+            "codex".to_string(),
+        )
+        .expect("fresh Codex provider should build");
 
         let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-            vec![provider, unrelated_provider],
-            vec![responses],
+            vec![provider, fresh_codex_provider, unrelated_provider],
+            vec![responses, live],
             vec![key],
         ));
         let state = AppState::new()
@@ -247,7 +276,7 @@ mod tests {
             .list_endpoints_by_provider_ids(&["provider-codex".to_string()])
             .await
             .expect("endpoints should list");
-        assert_eq!(first_endpoints.len(), 4);
+        assert_eq!(first_endpoints.len(), 5);
         let responses = first_endpoints
             .iter()
             .find(|endpoint| endpoint.api_format == "openai:responses")
@@ -260,7 +289,7 @@ mod tests {
         assert_eq!(responses.max_retries, Some(9));
         assert_eq!(
             responses.proxy,
-            Some(json!({"url": "http://proxy.internal:8080"}))
+            Some(json!({"url": "http://proxy.internal:8080/"}))
         );
         assert_eq!(
             responses
@@ -272,6 +301,26 @@ mod tests {
         assert!(first_endpoints
             .iter()
             .any(|endpoint| endpoint.api_format == "openai:search"));
+        let live = first_endpoints
+            .iter()
+            .find(|endpoint| endpoint.api_format == "codex:live")
+            .expect("Codex Live endpoint should be reconciled from the v2 template");
+        assert_eq!(live.api_family.as_deref(), Some("codex"));
+        assert_eq!(live.endpoint_kind.as_deref(), Some("live"));
+        assert_eq!(live.base_url, "https://voice-proxy.internal/v1");
+        assert_eq!(live.custom_path.as_deref(), Some("/socket/live"));
+        assert_eq!(live.max_retries, Some(6));
+        assert_eq!(
+            live.proxy,
+            Some(json!({"url": "http://voice-proxy.internal:8080/"}))
+        );
+        assert_eq!(
+            live.config
+                .as_ref()
+                .and_then(|value| value.get("custom_transport_option")),
+            Some(&json!(true))
+        );
+        assert!(!live.is_active);
         let keys = repository
             .list_keys_by_provider_ids(&["provider-codex".to_string()])
             .await
@@ -283,6 +332,17 @@ mod tests {
             .await
             .expect("unrelated endpoints should list")
             .is_empty());
+        let fresh_endpoints = repository
+            .list_endpoints_by_provider_ids(&["provider-codex-fresh".to_string()])
+            .await
+            .expect("fresh Codex endpoints should list");
+        assert_eq!(fresh_endpoints.len(), 5);
+        let fresh_live = fresh_endpoints
+            .iter()
+            .find(|endpoint| endpoint.api_format == "codex:live")
+            .expect("v2 reconciliation should add a Codex Live endpoint");
+        assert_eq!(fresh_live.base_url, "https://chatgpt.com/backend-api/codex");
+        assert!(fresh_live.is_active);
 
         assert!(perform_fixed_provider_reconciliation_once(&state)
             .await
@@ -292,6 +352,11 @@ mod tests {
             .await
             .expect("endpoints should list again");
         assert_eq!(second_endpoints, first_endpoints);
+        let second_fresh_endpoints = repository
+            .list_endpoints_by_provider_ids(&["provider-codex-fresh".to_string()])
+            .await
+            .expect("fresh Codex endpoints should list again");
+        assert_eq!(second_fresh_endpoints, fresh_endpoints);
     }
 
     #[tokio::test]

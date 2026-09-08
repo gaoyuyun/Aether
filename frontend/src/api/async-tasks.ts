@@ -212,6 +212,14 @@ export const asyncTasksApi = {
     return response.data
   },
 
+  async getVideoBlob(taskId: string): Promise<Blob> {
+    const response = await apiClient.get<Blob>(
+      `/api/admin/video-tasks/${encodeURIComponent(taskId)}/video`,
+      { responseType: 'blob', timeout: 0 },
+    )
+    return response.data
+  },
+
   async trigger(taskKey: string, payload: Record<string, unknown> = {}): Promise<{ run_id: string; status: string }> {
     const response = await apiClient.post<{ run_id: string; status: string }>(`/api/admin/tasks/${taskKey}/trigger`, payload)
     return response.data

@@ -147,14 +147,22 @@ pub(crate) async fn build_admin_update_user_api_key_response(
         },
         None => None,
     };
+    let name_present = name.is_some();
+    let rate_limit_present = payload.rate_limit.is_some();
+    let concurrent_limit_present = concurrent_limit.is_some();
 
     let Some(updated) = state
         .update_user_api_key_basic(aether_data::repository::auth::UpdateUserApiKeyBasicRecord {
             user_id: user_id.clone(),
             api_key_id: api_key_id.clone(),
+            key_encrypted: None,
+            key_encrypted_present: false,
             name,
+            name_present,
             rate_limit: payload.rate_limit,
+            rate_limit_present,
             concurrent_limit,
+            concurrent_limit_present,
             ip_rules,
             allowed_providers,
             allowed_api_formats,

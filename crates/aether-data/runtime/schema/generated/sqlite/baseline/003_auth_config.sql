@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS oauth_providers (
 
 CREATE TABLE IF NOT EXISTS ldap_configs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    singleton_key INTEGER NOT NULL DEFAULT 1,
     server_url TEXT NOT NULL,
     bind_dn TEXT NOT NULL,
     bind_password_encrypted TEXT,
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS ldap_configs (
     use_starttls INTEGER NOT NULL DEFAULT 0,
     connect_timeout INTEGER NOT NULL DEFAULT 10,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    UNIQUE (singleton_key)
 );
 
 CREATE TABLE IF NOT EXISTS user_oauth_links (

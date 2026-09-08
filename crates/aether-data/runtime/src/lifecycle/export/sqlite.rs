@@ -66,7 +66,9 @@ pub async fn import_sqlite_plan(
     pool: &crate::driver::sqlite::SqlitePool,
     plan: &DataImportPlan,
 ) -> Result<usize, DataLayerError> {
+    let identity_scope = IdentityImportScope::from_plan(plan)?;
     let mut tx = pool.begin().await.map_sql_err()?;
+    let identity_state = capture_sqlite_identity_import_state(&mut tx, &identity_scope).await?;
     let mut imported = 0usize;
     let mut column_cache = BTreeMap::<String, SqliteImportColumns>::new();
     for domain in &plan.manifest.domains {
@@ -99,8 +101,208 @@ pub async fn import_sqlite_plan(
             imported = imported.saturating_add(1);
         }
     }
+    enforce_sqlite_identity_import_invariants(&mut tx, &identity_scope, identity_state).await?;
     tx.commit().await.map_sql_err()?;
     Ok(imported)
+}
+
+async fn capture_sqlite_identity_import_state(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    scope: &IdentityImportScope,
+) -> Result<IdentityImportState, DataLayerError> {
+    let mut affected_user_ids = if scope.finalizes_oauth_links {
+        scope.user_ids.iter().cloned().collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    for link_id in &scope.oauth_link_ids {
+        if let Some(user_id) =
+            sqlx::query_scalar::<_, String>("SELECT user_id FROM user_oauth_links WHERE id = ?")
+                .bind(link_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_sql_err()?
+        {
+            affected_user_ids.insert(user_id);
+        }
+    }
+    for provider_type in &scope.oauth_provider_types {
+        let user_ids = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM user_oauth_links WHERE provider_type = ?",
+        )
+        .bind(provider_type)
+        .fetch_all(&mut **tx)
+        .await
+        .map_sql_err()?;
+        affected_user_ids.extend(user_ids);
+    }
+    Ok(IdentityImportState { affected_user_ids })
+}
+
+async fn enforce_sqlite_identity_import_invariants(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    scope: &IdentityImportScope,
+    mut state: IdentityImportState,
+) -> Result<(), DataLayerError> {
+    for user_id in &scope.user_ids {
+        let auth_source =
+            sqlx::query_scalar::<_, String>("SELECT auth_source FROM users WHERE id = ? LIMIT 1")
+                .bind(user_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_sql_err()?
+                .ok_or_else(|| {
+                    DataLayerError::InvalidInput(format!(
+                        "imported users row '{user_id}' did not produce a user record"
+                    ))
+                })?;
+        if !matches!(auth_source.as_str(), "local" | "ldap" | "oauth") {
+            return Err(DataLayerError::InvalidInput(format!(
+                "imported user '{user_id}' has unsupported auth_source '{auth_source}'"
+            )));
+        }
+        if auth_source == "oauth" {
+            sqlx::query("UPDATE users SET email_verified = 0 WHERE id = ?")
+                .bind(user_id)
+                .execute(&mut **tx)
+                .await
+                .map_sql_err()?;
+        }
+    }
+
+    for link_id in &scope.oauth_link_ids {
+        let user_id = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM user_oauth_links WHERE id = ? LIMIT 1",
+        )
+        .bind(link_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_sql_err()?
+        .ok_or_else(|| {
+            DataLayerError::InvalidInput(format!(
+                "imported OAuth link row '{link_id}' did not produce a link record"
+            ))
+        })?;
+        state.affected_user_ids.insert(user_id);
+    }
+
+    for link_id in &scope.oauth_link_ids {
+        if let Some((provider_type, provider_user_id)) = sqlx::query_as::<_, (String, String)>(
+            r#"
+SELECT imported.provider_type, imported.provider_user_id
+FROM user_oauth_links imported
+JOIN user_oauth_links duplicate
+  ON duplicate.provider_type = imported.provider_type
+ AND duplicate.provider_user_id = imported.provider_user_id
+ AND duplicate.id <> imported.id
+WHERE imported.id = ?
+LIMIT 1
+"#,
+        )
+        .bind(link_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_sql_err()?
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "OAuth import assigns provider identity '{provider_type}:{provider_user_id}' more than once"
+            )));
+        }
+    }
+
+    for link_id in &scope.oauth_link_ids {
+        if let Some((user_id, provider_type)) = sqlx::query_as::<_, (String, String)>(
+            r#"
+SELECT imported.user_id, imported.provider_type
+FROM user_oauth_links imported
+JOIN user_oauth_links duplicate
+  ON duplicate.user_id = imported.user_id
+ AND duplicate.provider_type = imported.provider_type
+ AND duplicate.id <> imported.id
+WHERE imported.id = ?
+LIMIT 1
+"#,
+        )
+        .bind(link_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_sql_err()?
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "OAuth import links user '{user_id}' to provider '{provider_type}' more than once"
+            )));
+        }
+    }
+
+    for link_id in &scope.oauth_link_ids {
+        if let Some(invalid_id) = sqlx::query_scalar::<_, String>(
+            r#"
+SELECT links.id
+FROM user_oauth_links links
+LEFT JOIN users ON users.id = links.user_id
+LEFT JOIN oauth_providers providers ON providers.provider_type = links.provider_type
+WHERE links.id = ?
+  AND (
+       users.id IS NULL
+    OR providers.provider_type IS NULL
+    OR links.provider_type <> LOWER(TRIM(links.provider_type))
+    OR links.provider_type = ''
+    OR links.provider_user_id <> TRIM(links.provider_user_id)
+    OR links.provider_user_id = ''
+    OR providers.provider_type <> LOWER(TRIM(providers.provider_type))
+  )
+LIMIT 1
+"#,
+        )
+        .bind(link_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_sql_err()?
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "OAuth import produced invalid or orphaned link '{invalid_id}'"
+            )));
+        }
+    }
+
+    if !scope.validates_oauth_login_methods {
+        return Ok(());
+    }
+    for user_id in state.affected_user_ids {
+        if sqlx::query_scalar::<_, String>(
+            r#"
+SELECT users.id
+FROM users
+WHERE users.id = ?
+  AND users.auth_source = 'oauth'
+  AND users.is_active = 1
+  AND users.is_deleted = 0
+  AND NOT EXISTS (
+    SELECT 1
+    FROM user_oauth_links links
+    JOIN oauth_providers providers ON providers.provider_type = links.provider_type
+    WHERE links.user_id = users.id
+      AND providers.is_enabled = 1
+      AND links.provider_type = LOWER(TRIM(links.provider_type))
+      AND links.provider_user_id = TRIM(links.provider_user_id)
+      AND links.provider_user_id <> ''
+  )
+LIMIT 1
+"#,
+        )
+        .bind(&user_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_sql_err()?
+        .is_some()
+        {
+            return Err(DataLayerError::InvalidInput(format!(
+                "OAuth import would leave active user '{user_id}' without an enabled identity binding"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn sqlite_domain_table(
@@ -262,7 +464,11 @@ async fn import_sqlite_row(
     row: &ExportRow,
     target_columns: &SqliteImportColumns,
 ) -> Result<(), DataLayerError> {
-    let object = filter_import_payload("sqlite", table_name, domain, row, &target_columns.names)?;
+    let mut object =
+        filter_import_payload("sqlite", table_name, domain, row, &target_columns.names)?;
+    deactivate_imported_credentials(table_name, &mut object, |column_name| {
+        target_columns.names.contains(column_name)
+    });
 
     let columns = object.keys().map(String::as_str).collect::<Vec<_>>();
     let column_sql = columns

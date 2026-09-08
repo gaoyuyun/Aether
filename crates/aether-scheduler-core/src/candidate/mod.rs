@@ -216,6 +216,71 @@ mod tests {
     }
 
     #[test]
+    fn codex_live_enumeration_reuses_responses_mapping_without_widening_provider_scope() {
+        let mut codex = sample_row("codex-live");
+        codex.provider_name = "Codex".to_string();
+        codex.provider_type = "codex".to_string();
+        codex.endpoint_api_format = "codex:live".to_string();
+        codex.endpoint_api_family = Some("codex".to_string());
+        codex.endpoint_kind = Some("live".to_string());
+        codex.key_auth_type = "oauth".to_string();
+        codex.key_api_formats = Some(vec!["codex:live".to_string()]);
+        codex.key_allowed_models = Some(vec!["gpt-future-live".to_string()]);
+        codex.global_model_name = "live-future-alias".to_string();
+        codex.model_provider_model_name = "gpt-future-live".to_string();
+        codex.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "gpt-future-live".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:responses".to_string()]),
+            endpoint_ids: Some(vec![codex.endpoint_id.clone()]),
+            operations: None,
+        }]);
+
+        let constraints = SchedulerAuthConstraints {
+            allowed_providers: Some(vec!["codex".to_string()]),
+            allowed_api_formats: Some(vec!["codex:live".to_string()]),
+            allowed_models: Some(vec!["live-future-alias".to_string()]),
+        };
+        let candidates =
+            super::enumerate_minimal_candidate_selection(EnumerateMinimalCandidateSelectionInput {
+                rows: vec![codex.clone()],
+                normalized_api_format: "codex:live",
+                request_operation: None,
+                requested_model_name: "live-future-alias",
+                resolved_global_model_name: "live-future-alias",
+                require_streaming: true,
+                required_capabilities: None,
+                auth_constraints: Some(&constraints),
+            })
+            .expect("Codex Live candidate enumeration should build");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].selected_provider_model_name,
+            "gpt-future-live"
+        );
+
+        for provider_type in ["openai", "custom"] {
+            let mut non_codex = codex.clone();
+            non_codex.provider_type = provider_type.to_string();
+            let candidates = super::enumerate_minimal_candidate_selection(
+                EnumerateMinimalCandidateSelectionInput {
+                    rows: vec![non_codex],
+                    normalized_api_format: "codex:live",
+                    request_operation: None,
+                    requested_model_name: "live-future-alias",
+                    resolved_global_model_name: "live-future-alias",
+                    require_streaming: true,
+                    required_capabilities: None,
+                    auth_constraints: None,
+                },
+            )
+            .expect("non-Codex Live candidate enumeration should build");
+            assert!(candidates.is_empty());
+        }
+    }
+
+    #[test]
     fn enumeration_preserves_effective_streaming_capability() {
         let mut row = sample_row("1");
         row.model_supports_streaming = Some(false);

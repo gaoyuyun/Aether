@@ -716,10 +716,68 @@ impl RollingFileSink {
 }
 
 fn open_bucketed_log_file(dir: &Path, service_name: &str, bucket: &str) -> io::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(bucketed_log_path(dir, service_name, bucket))
+    let path = bucketed_log_path(dir, service_name, bucket);
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+
+    let file = options.open(&path)?;
+    validate_open_log_file(&file, &path)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_open_log_file(file: &File, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("log destination is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "log destination is owned by another user: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "log destination has multiple hard links: {}",
+                path.display()
+            ),
+        ));
+    }
+    // `mode(0o600)` only affects newly-created files. Tighten an existing
+    // bucket as well so a historical permissive umask cannot keep exposing
+    // request and operational data after an upgrade.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_open_log_file(file: &File, path: &Path) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("log destination is not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn bucketed_log_path(dir: &Path, service_name: &str, bucket: &str) -> PathBuf {
@@ -838,9 +896,9 @@ fn select_log_files_for_cleanup(
 mod tests {
     use super::{
         bucketed_log_path, cleanup_log_files, format_target_cell, log_bucket_key,
-        select_log_files_for_cleanup, FileLoggingConfig, JsonRuntimeEventFormatter,
-        LogFileCandidate, LogRotation, PrettyRuntimeEventFormatter, RollingFileSink,
-        RuntimeLogIdentity,
+        open_bucketed_log_file, select_log_files_for_cleanup, FileLoggingConfig,
+        JsonRuntimeEventFormatter, LogFileCandidate, LogRotation, PrettyRuntimeEventFormatter,
+        RollingFileSink, RuntimeLogIdentity,
     };
     use chrono::{Local, TimeZone};
     use std::fs;
@@ -958,6 +1016,43 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(!file_a.exists(), "cleanup should remove file a");
         assert!(!file_b.exists(), "cleanup should remove file b");
+
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolling_log_file_is_private_and_rejects_symlink_destination() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let dir = std::env::temp_dir().join(format!("aether-runtime-logs-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+
+        let private = open_bucketed_log_file(&dir, "runtime-test", "private")
+            .expect("private log should open");
+        assert_eq!(
+            private
+                .metadata()
+                .expect("log metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(private);
+
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, b"unchanged").expect("victim should exist");
+        let symlink_path = bucketed_log_path(&dir, "runtime-test", "symlink");
+        symlink(&victim, &symlink_path).expect("symlink should exist");
+        assert!(
+            open_bucketed_log_file(&dir, "runtime-test", "symlink").is_err(),
+            "rolling logs must not follow a pre-created symlink"
+        );
+        assert_eq!(
+            fs::read(&victim).expect("victim should remain readable"),
+            b"unchanged"
+        );
 
         fs::remove_dir_all(&dir).expect("temp dir should be removable");
     }

@@ -9,9 +9,11 @@ use sqlx::{
 
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdaptiveStateUpdate, ProviderCatalogKeyAdminCasUpdate,
-    ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
+    ProviderCatalogKeyCredentialsCasUpdate, ProviderCatalogKeyHealthStateUpdate,
+    ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
     ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
     ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
+    ProviderCatalogProviderConfigCasUpdate, ProviderCatalogProxyCasUpdate,
     ProviderCatalogReadRepository, ProviderCatalogUpstreamMetadataNamespaceUpdate,
     ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
     StoredProviderCatalogEndpointIdentity, StoredProviderCatalogKey,
@@ -786,6 +788,48 @@ WHERE id = ?
         self.reload_provider(&provider.id, "updated").await
     }
 
+    pub async fn compare_and_swap_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.provider_id, "provider catalog provider_id")?;
+        let expected_config =
+            optional_json_to_string(&update.expected_config, "providers.expected_config")?;
+        let config = optional_json_to_string(&update.config, "providers.config")?;
+        let rows_affected = sqlx::query(
+            r#"
+UPDATE providers
+SET config = ?, updated_at = ?
+WHERE id = ?
+  AND config IS ?
+"#,
+        )
+        .bind(config)
+        .bind(current_unix_secs() as i64)
+        .bind(&update.provider_id)
+        .bind(expected_config)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected == 1)
+    }
+
+    pub async fn compare_and_swap_provider_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.record_id, "provider catalog provider_id")?;
+        compare_and_swap_proxy_json(
+            &self.pool,
+            "SELECT proxy FROM providers WHERE id = ?",
+            "UPDATE providers SET proxy = ?, updated_at = ? WHERE id = ? AND proxy IS ?",
+            update,
+            "providers.proxy",
+        )
+        .await
+    }
+
     pub async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
         validate_non_empty(provider_id, "provider catalog provider_id")?;
         let rows_affected = sqlx::query("DELETE FROM providers WHERE id = ?")
@@ -990,6 +1034,21 @@ WHERE id = ?
         self.reload_endpoint(&endpoint.id, "updated").await
     }
 
+    pub async fn compare_and_swap_endpoint_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.record_id, "provider catalog endpoint_id")?;
+        compare_and_swap_proxy_json(
+            &self.pool,
+            "SELECT proxy FROM provider_endpoints WHERE id = ?",
+            "UPDATE provider_endpoints SET proxy = ?, updated_at = ? WHERE id = ? AND proxy IS ?",
+            update,
+            "provider_endpoints.proxy",
+        )
+        .await
+    }
+
     pub async fn delete_endpoint(&self, endpoint_id: &str) -> Result<bool, DataLayerError> {
         validate_non_empty(endpoint_id, "provider catalog endpoint_id")?;
         let rows_affected = sqlx::query("DELETE FROM provider_endpoints WHERE id = ?")
@@ -1170,6 +1229,46 @@ WHERE id = ?
             )));
         }
         self.reload_key(&key.id, "updated").await
+    }
+
+    pub async fn compare_and_swap_key_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.record_id, "provider catalog key_id")?;
+        compare_and_swap_proxy_json(
+            &self.pool,
+            "SELECT proxy FROM provider_api_keys WHERE id = ?",
+            "UPDATE provider_api_keys SET proxy = ?, updated_at = ? WHERE id = ? AND proxy IS ?",
+            update,
+            "provider_api_keys.proxy",
+        )
+        .await
+    }
+
+    pub async fn compare_and_swap_key_credentials(
+        &self,
+        update: &ProviderCatalogKeyCredentialsCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        validate_non_empty(&update.key_id, "provider catalog key_id")?;
+        validate_non_empty(
+            &update.expected_provider_id,
+            "provider catalog expected provider_id",
+        )?;
+        let rows_affected = sqlx::query(
+            "UPDATE provider_api_keys SET api_key = ?, encrypted_key = NULL, auth_config = ? WHERE id = ? AND provider_id = ? AND COALESCE(api_key, encrypted_key) IS ? AND auth_config IS ?",
+        )
+        .bind(update.encrypted_api_key.as_deref())
+        .bind(update.encrypted_auth_config.as_deref())
+        .bind(&update.key_id)
+        .bind(&update.expected_provider_id)
+        .bind(update.expected_encrypted_api_key.as_deref())
+        .bind(update.expected_encrypted_auth_config.as_deref())
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+        Ok(rows_affected == 1)
     }
 
     pub async fn compare_and_update_key_admin_state(
@@ -1598,51 +1697,18 @@ WHERE id = ?
         Ok(rows_affected > 0)
     }
 
-    pub async fn update_key_oauth_credentials(
-        &self,
-        key_id: &str,
-        encrypted_api_key: &str,
-        encrypted_auth_config: Option<&str>,
-        expires_at_unix_secs: Option<u64>,
-    ) -> Result<bool, DataLayerError> {
-        validate_non_empty(key_id, "provider catalog key_id")?;
-        validate_non_empty(encrypted_api_key, "provider catalog oauth api_key")?;
-        let rows_affected = sqlx::query(
-            r#"
-UPDATE provider_api_keys
-SET api_key = ?, auth_config = ?, expires_at = ?, updated_at = ?
-WHERE id = ?
-"#,
-        )
-        .bind(encrypted_api_key)
-        .bind(encrypted_auth_config)
-        .bind(optional_i64_from_u64(
-            expires_at_unix_secs,
-            "provider_api_keys.expires_at",
-        )?)
-        .bind(current_unix_secs() as i64)
-        .bind(key_id)
-        .execute(&self.pool)
-        .await
-        .map_sql_err()?
-        .rows_affected();
-        Ok(rows_affected > 0)
-    }
-
     pub async fn update_key_oauth_runtime_state(
         &self,
         key_id: &str,
         oauth_invalid_at_unix_secs: Option<u64>,
         oauth_invalid_reason: Option<&str>,
-        encrypted_auth_config_update: Option<&str>,
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, DataLayerError> {
         validate_non_empty(key_id, "provider catalog key_id")?;
         let rows_affected = sqlx::query(
             r#"
 UPDATE provider_api_keys
-SET oauth_invalid_at = ?, oauth_invalid_reason = ?,
-    auth_config = COALESCE(?, auth_config), updated_at = ?
+SET oauth_invalid_at = ?, oauth_invalid_reason = ?, updated_at = ?
 WHERE id = ?
 "#,
         )
@@ -1651,7 +1717,6 @@ WHERE id = ?
             "provider_api_keys.oauth_invalid_at",
         )?)
         .bind(oauth_invalid_reason)
-        .bind(encrypted_auth_config_update)
         .bind(updated_at_unix_secs.unwrap_or_else(current_unix_secs) as i64)
         .bind(key_id)
         .execute(&self.pool)
@@ -2318,6 +2383,20 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
         Self::update_provider(self, provider).await
     }
 
+    async fn compare_and_swap_provider_config(
+        &self,
+        update: &ProviderCatalogProviderConfigCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_provider_config(self, update).await
+    }
+
+    async fn compare_and_swap_provider_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_provider_proxy(self, update).await
+    }
+
     async fn delete_provider(&self, provider_id: &str) -> Result<bool, DataLayerError> {
         Self::delete_provider(self, provider_id).await
     }
@@ -2353,6 +2432,13 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
         Self::update_endpoint(self, endpoint).await
     }
 
+    async fn compare_and_swap_endpoint_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_endpoint_proxy(self, update).await
+    }
+
     async fn delete_endpoint(&self, endpoint_id: &str) -> Result<bool, DataLayerError> {
         Self::delete_endpoint(self, endpoint_id).await
     }
@@ -2369,6 +2455,20 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
         key: &StoredProviderCatalogKey,
     ) -> Result<StoredProviderCatalogKey, DataLayerError> {
         Self::update_key(self, key).await
+    }
+
+    async fn compare_and_swap_key_proxy(
+        &self,
+        update: &ProviderCatalogProxyCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_key_proxy(self, update).await
+    }
+
+    async fn compare_and_swap_key_credentials(
+        &self,
+        update: &ProviderCatalogKeyCredentialsCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        Self::compare_and_swap_key_credentials(self, update).await
     }
 
     async fn compare_and_update_key_admin_state(
@@ -2465,29 +2565,11 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
         Self::clear_key_oauth_invalid_marker(self, key_id).await
     }
 
-    async fn update_key_oauth_credentials(
-        &self,
-        key_id: &str,
-        encrypted_api_key: &str,
-        encrypted_auth_config: Option<&str>,
-        expires_at_unix_secs: Option<u64>,
-    ) -> Result<bool, DataLayerError> {
-        Self::update_key_oauth_credentials(
-            self,
-            key_id,
-            encrypted_api_key,
-            encrypted_auth_config,
-            expires_at_unix_secs,
-        )
-        .await
-    }
-
     async fn update_key_oauth_runtime_state(
         &self,
         key_id: &str,
         oauth_invalid_at_unix_secs: Option<u64>,
         oauth_invalid_reason: Option<&str>,
-        encrypted_auth_config_update: Option<&str>,
         updated_at_unix_secs: Option<u64>,
     ) -> Result<bool, DataLayerError> {
         Self::update_key_oauth_runtime_state(
@@ -2495,7 +2577,6 @@ impl ProviderCatalogWriteRepository for SqliteProviderCatalogReadRepository {
             key_id,
             oauth_invalid_at_unix_secs,
             oauth_invalid_reason,
-            encrypted_auth_config_update,
             updated_at_unix_secs,
         )
         .await
@@ -2819,6 +2900,44 @@ fn optional_json_to_string(
     field_name: &str,
 ) -> Result<Option<String>, DataLayerError> {
     optional_json_ref_to_string(value.as_ref(), field_name)
+}
+
+async fn compare_and_swap_proxy_json(
+    pool: &SqlitePool,
+    select_sql: &'static str,
+    update_sql: &'static str,
+    update: &ProviderCatalogProxyCasUpdate,
+    field_name: &'static str,
+) -> Result<bool, DataLayerError> {
+    // SQLite stores these JSON fields as TEXT. Legacy Python rows commonly include
+    // insignificant whitespace, so comparing a serde_json re-serialization directly would
+    // make lazy credential migration conflict forever. Compare semantic JSON first and use
+    // the exact observed bytes as the atomic write fence.
+    // Outer None means the row does not exist; inner None is an existing SQL NULL proxy.
+    let observed_raw: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(select_sql)
+        .bind(&update.record_id)
+        .fetch_optional(pool)
+        .await
+        .map_sql_err()?;
+    let Some(observed_raw) = observed_raw else {
+        return Ok(false);
+    };
+    let observed = optional_json_from_string(observed_raw.clone(), field_name)?;
+    if observed != update.expected_proxy {
+        return Ok(false);
+    }
+
+    let replacement = optional_json_to_string(&update.proxy, field_name)?;
+    let rows_affected = sqlx::query(update_sql)
+        .bind(replacement)
+        .bind(current_unix_secs() as i64)
+        .bind(&update.record_id)
+        .bind(observed_raw)
+        .execute(pool)
+        .await
+        .map_sql_err()?
+        .rows_affected();
+    Ok(rows_affected == 1)
 }
 
 fn key_insert_sql() -> &'static str {
@@ -3406,11 +3525,11 @@ fn map_key_row(row: &SqliteRow) -> Result<StoredProviderCatalogKey, DataLayerErr
                 )?,
             );
         key.note = row.try_get("note").map_sql_err()?;
-        key.auth_type_by_format = optional_json_from_string(
+        let auth_type_by_format = optional_json_from_string(
             row.try_get("auth_type_by_format").map_sql_err()?,
             "provider_api_keys.auth_type_by_format",
         )?;
-        key.allow_auth_channel_mismatch_formats = optional_json_from_string(
+        let allow_auth_channel_mismatch_formats = optional_json_from_string(
             row.try_get("allow_auth_channel_mismatch_formats")
                 .map_sql_err()?,
             "provider_api_keys.allow_auth_channel_mismatch_formats",
@@ -3476,7 +3595,10 @@ fn map_key_row(row: &SqliteRow) -> Result<StoredProviderCatalogKey, DataLayerErr
             row.try_get("updated_at_unix_secs").map_sql_err()?,
             "provider_api_keys.updated_at",
         )?;
-        Ok::<_, DataLayerError>(key)
+        key.with_auth_channel_policy_fields(
+            auth_type_by_format,
+            allow_auth_channel_mismatch_formats,
+        )
     })?
 }
 
@@ -3490,11 +3612,221 @@ mod tests {
         ProviderCatalogKeyListOrder, ProviderCatalogKeyListQuery,
         ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthCredentialFence,
         ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
-        ProviderCatalogUpstreamMetadataNamespaceExpectation,
+        ProviderCatalogProxyCasUpdate, ProviderCatalogUpstreamMetadataNamespaceExpectation,
         ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
         StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use serde_json::json;
+
+    #[test]
+    fn credential_cas_migrates_legacy_encrypted_key_with_null_safe_fence() {
+        let source = include_str!("provider_catalog.rs");
+        assert!(source.contains(
+            "UPDATE provider_api_keys SET api_key = ?, encrypted_key = NULL, auth_config = ? WHERE id = ? AND provider_id = ? AND COALESCE(api_key, encrypted_key) IS ? AND auth_config IS ?"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_proxy_cas_accepts_python_spaced_json_and_distinguishes_null_from_missing_rows()
+    {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite pool should connect");
+        run_migrations(&pool)
+            .await
+            .expect("sqlite migrations should run");
+        let repository = SqliteProviderCatalogReadRepository::new(pool.clone());
+
+        let expected_proxy = json!({
+            "url": "http://proxy.example.test:8080/",
+            "username": "alice"
+        });
+        let replacement_proxy = json!({
+            "url": "http://proxy.example.test:8080/",
+            "username": "aether-runtime-secret:v1:sealed"
+        });
+        let mut spaced_provider = StoredProviderCatalogProvider::new(
+            "proxy-cas-spaced-provider".to_string(),
+            "Proxy CAS Spaced Provider".to_string(),
+            None,
+            "custom".to_string(),
+        )
+        .expect("provider should build");
+        spaced_provider.proxy = Some(expected_proxy.clone());
+        repository
+            .create_provider(&spaced_provider, None)
+            .await
+            .expect("provider should create");
+
+        let legacy_python_json =
+            r#"{"url": "http://proxy.example.test:8080/", "username": "alice"}"#;
+        sqlx::query("UPDATE providers SET proxy = ? WHERE id = ?")
+            .bind(legacy_python_json)
+            .bind(&spaced_provider.id)
+            .execute(&pool)
+            .await
+            .expect("legacy proxy JSON should be seeded");
+
+        let update = ProviderCatalogProxyCasUpdate {
+            record_id: spaced_provider.id.clone(),
+            expected_proxy: Some(expected_proxy),
+            proxy: Some(replacement_proxy.clone()),
+        };
+        assert!(repository
+            .compare_and_swap_provider_proxy(&update)
+            .await
+            .expect("semantic proxy CAS should run"));
+        assert!(!repository
+            .compare_and_swap_provider_proxy(&update)
+            .await
+            .expect("stale semantic proxy CAS should run"));
+        let stored_raw: Option<String> =
+            sqlx::query_scalar("SELECT proxy FROM providers WHERE id = ?")
+                .bind(&spaced_provider.id)
+                .fetch_one(&pool)
+                .await
+                .expect("updated proxy should load");
+        assert_eq!(
+            stored_raw
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()
+                .expect("stored proxy should remain valid JSON"),
+            Some(replacement_proxy.clone())
+        );
+        assert_ne!(stored_raw.as_deref(), Some(legacy_python_json));
+
+        let endpoint = StoredProviderCatalogEndpoint::new(
+            "proxy-cas-spaced-endpoint".to_string(),
+            spaced_provider.id.clone(),
+            "openai:chat".to_string(),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            "https://api.example.test/v1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "url": "http://proxy.example.test:8080/",
+                "username": "alice"
+            })),
+        )
+        .expect("endpoint transport should build");
+        repository
+            .create_endpoint(&endpoint)
+            .await
+            .expect("endpoint should create");
+        sqlx::query("UPDATE provider_endpoints SET proxy = ? WHERE id = ?")
+            .bind(legacy_python_json)
+            .bind(&endpoint.id)
+            .execute(&pool)
+            .await
+            .expect("legacy endpoint proxy JSON should be seeded");
+        let endpoint_update = ProviderCatalogProxyCasUpdate {
+            record_id: endpoint.id.clone(),
+            expected_proxy: Some(json!({
+                "url": "http://proxy.example.test:8080/",
+                "username": "alice"
+            })),
+            proxy: Some(replacement_proxy.clone()),
+        };
+        assert!(repository
+            .compare_and_swap_endpoint_proxy(&endpoint_update)
+            .await
+            .expect("semantic endpoint proxy CAS should run"));
+        assert!(!repository
+            .compare_and_swap_endpoint_proxy(&endpoint_update)
+            .await
+            .expect("stale endpoint proxy CAS should run"));
+
+        let key = StoredProviderCatalogKey::new(
+            "proxy-cas-spaced-key".to_string(),
+            spaced_provider.id.clone(),
+            "Proxy CAS Key".to_string(),
+            "api_key".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            None,
+            None::<String>,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!({
+                "url": "http://proxy.example.test:8080/",
+                "username": "alice"
+            })),
+            None,
+        )
+        .expect("key transport should build");
+        repository
+            .create_key(&key)
+            .await
+            .expect("key should create");
+        sqlx::query("UPDATE provider_api_keys SET proxy = ? WHERE id = ?")
+            .bind(legacy_python_json)
+            .bind(&key.id)
+            .execute(&pool)
+            .await
+            .expect("legacy key proxy JSON should be seeded");
+        let key_update = ProviderCatalogProxyCasUpdate {
+            record_id: key.id.clone(),
+            expected_proxy: Some(json!({
+                "url": "http://proxy.example.test:8080/",
+                "username": "alice"
+            })),
+            proxy: Some(replacement_proxy),
+        };
+        assert!(repository
+            .compare_and_swap_key_proxy(&key_update)
+            .await
+            .expect("semantic key proxy CAS should run"));
+        assert!(!repository
+            .compare_and_swap_key_proxy(&key_update)
+            .await
+            .expect("stale key proxy CAS should run"));
+
+        let null_provider = StoredProviderCatalogProvider::new(
+            "proxy-cas-null-provider".to_string(),
+            "Proxy CAS Null Provider".to_string(),
+            None,
+            "custom".to_string(),
+        )
+        .expect("provider should build");
+        repository
+            .create_provider(&null_provider, None)
+            .await
+            .expect("null-proxy provider should create");
+        assert!(repository
+            .compare_and_swap_provider_proxy(&ProviderCatalogProxyCasUpdate {
+                record_id: null_provider.id,
+                expected_proxy: None,
+                proxy: Some(json!({"url": "http://proxy.example.test:8081/"})),
+            })
+            .await
+            .expect("existing NULL proxy should be distinguishable from a missing row"));
+        assert!(!repository
+            .compare_and_swap_provider_proxy(&ProviderCatalogProxyCasUpdate {
+                record_id: "proxy-cas-missing-provider".to_string(),
+                expected_proxy: None,
+                proxy: Some(json!({"url": "http://proxy.example.test:8082/"})),
+            })
+            .await
+            .expect("missing-row proxy CAS should run"));
+    }
 
     #[tokio::test]
     async fn sqlite_admin_credential_cas_rotates_codex_namespace_atomically() {
@@ -4800,15 +5132,6 @@ mod tests {
             .await
             .expect("model fetch success should update atomically"));
         assert!(repository
-            .update_key_oauth_credentials(
-                "key-write-1",
-                "enc-key-2",
-                Some("enc-auth-2"),
-                Some(1_750_000_000),
-            )
-            .await
-            .expect("oauth credentials should update"));
-        assert!(repository
             .update_key_health_state(
                 "key-write-1",
                 true,
@@ -4828,10 +5151,6 @@ mod tests {
             .expect("key should reload")
             .pop()
             .expect("key should exist");
-        assert_eq!(
-            reloaded_key.encrypted_api_key,
-            Some("enc-key-2".to_string())
-        );
         assert_eq!(
             reloaded_key.upstream_metadata,
             Some(json!({

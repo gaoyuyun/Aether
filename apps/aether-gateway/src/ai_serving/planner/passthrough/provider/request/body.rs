@@ -3,7 +3,7 @@ use serde_json::Value;
 use super::super::LocalSameFormatProviderSpec;
 use crate::ai_serving::transport::{
     build_same_format_provider_request_body as build_same_format_provider_request_body_impl,
-    build_same_format_provider_request_body_with_compatibility_report as build_same_format_provider_request_body_with_compatibility_report_impl,
+    build_same_format_provider_request_body_with_compatibility_report_and_reasoning_replay_policy as build_same_format_provider_request_body_with_compatibility_report_impl,
     SameFormatProviderFamily, SameFormatProviderRequestBodyInput,
     SameFormatProviderRequestBodyOutput,
 };
@@ -50,6 +50,7 @@ pub(crate) fn build_same_format_provider_request_body_with_compatibility_report(
     kiro_auth: Option<&crate::ai_serving::transport::kiro::KiroRequestAuth>,
     is_claude_code: bool,
     enable_model_directives: bool,
+    reasoning_replay_policy: crate::ai_serving::OpenAiResponsesReasoningReplayPolicy,
 ) -> Option<SameFormatProviderRequestBodyOutput> {
     build_same_format_provider_request_body_with_compatibility_report_impl(
         SameFormatProviderRequestBodyInput {
@@ -67,6 +68,7 @@ pub(crate) fn build_same_format_provider_request_body_with_compatibility_report(
             is_claude_code,
             enable_model_directives,
         },
+        reasoning_replay_policy,
     )
 }
 

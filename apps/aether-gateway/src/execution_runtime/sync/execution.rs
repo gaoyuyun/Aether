@@ -34,6 +34,7 @@ use crate::ai_serving::api::{
     implicit_sync_finalize_report_kind, maybe_build_sync_finalize_outcome, LocalCoreSyncErrorKind,
     LocalCoreSyncFinalizeOutcome,
 };
+use crate::ai_serving::record_local_runtime_candidate_skip_reason;
 use crate::api::response::{
     attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
     build_client_response_from_parts_with_mutator,
@@ -59,8 +60,8 @@ use crate::execution_runtime::transport::{
     build_request_body, collect_response_headers, decode_response_body_bytes_with_limit,
     execution_plan_response_body_limit_bytes, execution_response_body_mode,
     format_hyper_error_chain, format_upstream_request_error, format_wreq_upstream_request_error,
-    response_body_is_json, send_request, DirectHttpResponse, DirectSyncExecutionRuntime,
-    ExecutionRuntimeTransportError,
+    response_body_is_json, safe_transport_error_message, send_request, DirectHttpResponse,
+    DirectSyncExecutionRuntime, ExecutionRuntimeTransportError,
 };
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::execution_runtime::{
@@ -78,7 +79,9 @@ use crate::orchestration::{
     LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
     LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect, LocalPoolErrorEffect,
 };
-use crate::provider_pool_demand::acquire_provider_pool_in_flight_guard;
+use crate::provider_pool_demand::{
+    acquire_provider_pool_execution_guard, ProviderPoolInFlightAdmission,
+};
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_dispatch,
     record_local_request_candidate_extra_data, record_local_request_candidate_status,
@@ -99,7 +102,7 @@ mod policy;
 #[path = "execution/response.rs"]
 mod response;
 
-use policy::decode_execution_result_body;
+use policy::{decode_execution_result_body, decode_execution_result_body_with_limit};
 pub(crate) use response::{
     maybe_build_local_sync_finalize_response, maybe_build_local_video_error_response,
     maybe_build_local_video_success_outcome, resolve_local_sync_error_background_report_kind,
@@ -114,6 +117,8 @@ const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(
 const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_BYTES: &[u8] = b"\n";
 const OPENAI_IMAGE_SYNC_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
 const INVALID_PROVIDER_SUCCESS_MESSAGE: &str = "Provider returned HTTP 200 but the response did not contain visible model output; retrying another candidate.";
+// Bound incomplete SSE progress records while retaining the ordinary response-body policy.
+const OPENAI_IMAGE_SYNC_PROGRESS_MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 fn elapsed_ms_since(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
@@ -172,6 +177,39 @@ struct SyncAttemptTerminalGuard {
     armed: bool,
 }
 
+/// Keep forced-terminal records useful for operations without copying an
+/// arbitrary `GatewayError` into the candidate/usage stores.  Gateway errors
+/// can wrap provider URLs, credentials, query strings, or database details;
+/// those values belong in the internal logging path only.
+fn persisted_sync_abort_message(error: &GatewayError) -> &'static str {
+    match error {
+        GatewayError::UpstreamUnavailable { .. } => {
+            "local sync attempt aborted before terminal finalization: upstream unavailable"
+        }
+        GatewayError::ControlUnavailable { .. } => {
+            "local sync attempt aborted before terminal finalization: control unavailable"
+        }
+        GatewayError::LocalExecutionPlanningTimeout { .. } => {
+            "local sync attempt aborted before terminal finalization: planning timeout"
+        }
+        GatewayError::AdmissionTimeout { .. } => {
+            "local sync attempt aborted before terminal finalization: admission timeout"
+        }
+        GatewayError::Client { .. } => {
+            "local sync attempt aborted before terminal finalization: client error"
+        }
+        GatewayError::PlanUsageLimited(_) => {
+            "local sync attempt aborted before terminal finalization: usage limit"
+        }
+        GatewayError::LastActiveAdminUpdateDenied | GatewayError::LastActiveAdminDeleteDenied => {
+            "local sync attempt aborted before terminal finalization: policy denied"
+        }
+        GatewayError::Internal(_) => {
+            "local sync attempt aborted before terminal finalization: internal error"
+        }
+    }
+}
+
 impl SyncAttemptTerminalGuard {
     fn new(
         state: &AppState,
@@ -211,7 +249,7 @@ impl SyncAttemptTerminalGuard {
             RequestCandidateStatus::Failed,
             StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
             "local_sync_attempt_aborted",
-            format!("Local sync attempt failed before terminal finalization: {error:?}"),
+            persisted_sync_abort_message(error),
         )
         .await;
     }
@@ -348,7 +386,7 @@ impl SyncExecutionFailure {
             error_type: fallback_kind
                 .map(SyncExecutionFailureFallbackKind::error_type)
                 .unwrap_or("execution_runtime_unavailable"),
-            message: err.to_string(),
+            message: safe_transport_error_message(&err),
             status_code: fallback_kind.map(|_| StatusCode::BAD_GATEWAY.as_u16()),
             latency_ms: None,
             fallback_kind,
@@ -1156,10 +1194,42 @@ impl<'a> OpenAiImageSyncProgressRecorder<'a> {
         if chunk.is_empty() {
             return;
         }
-        self.buffer.extend_from_slice(chunk);
+        let mut blocks = Vec::new();
+        let mut remaining = chunk;
+        let mut parser_overflowed = false;
+        loop {
+            while let Some(block_end) = find_sse_block_end(&self.buffer) {
+                blocks.push(self.buffer.drain(..block_end).collect::<Vec<_>>());
+            }
+            if remaining.is_empty() {
+                break;
+            }
+
+            let capacity =
+                OPENAI_IMAGE_SYNC_PROGRESS_MAX_BUFFER_BYTES.saturating_sub(self.buffer.len());
+            if capacity == 0 {
+                // The progress recorder is observational. Drop an incomplete
+                // oversized record and keep the client-facing response alive.
+                self.buffer.clear();
+                parser_overflowed = true;
+                break;
+            }
+            let take = find_sse_block_end(remaining)
+                .map_or(remaining.len(), |block_end| block_end)
+                .min(capacity);
+            if take == 0 {
+                self.buffer.clear();
+                parser_overflowed = true;
+                break;
+            }
+            self.buffer.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
+        if parser_overflowed {
+            debug!("openai image sync progress parser dropped an oversized incomplete SSE record");
+        }
         let mut force_persist = false;
-        while let Some(block_end) = find_sse_block_end(&self.buffer) {
-            let block = self.buffer.drain(..block_end).collect::<Vec<_>>();
+        for block in blocks {
             let Some(frame) = parse_openai_image_sync_sse_frame(&block) else {
                 continue;
             };
@@ -1837,12 +1907,16 @@ async fn openai_image_sync_json_heartbeat_final_bytes(
         {
             Ok(bytes) if !bytes.is_empty() => bytes.to_vec(),
             Ok(_) => openai_image_sync_json_heartbeat_error_body("empty sync image response"),
-            Err(err) => openai_image_sync_json_heartbeat_error_body(&err.to_string()),
+            Err(_err) => {
+                openai_image_sync_json_heartbeat_error_body("sync image response read failed")
+            }
         },
         Ok(None) => openai_image_sync_json_heartbeat_error_body(
             "sync image execution ended without a local response",
         ),
-        Err(err) => openai_image_sync_json_heartbeat_error_body(&format!("{err:?}")),
+        // Do not serialize the internal error: Debug output can contain
+        // upstream URLs, credentials, or other request-specific details.
+        Err(_err) => openai_image_sync_json_heartbeat_error_body("sync image execution failed"),
     }
 }
 
@@ -1864,7 +1938,7 @@ async fn apply_sync_success_effects(
 ) {
     if let Some(report_context) = report_context {
         crate::ai_serving::persist_converted_response_history(
-            state.runtime_state(),
+            state,
             report_context,
             payload
                 .client_body_json
@@ -2022,6 +2096,37 @@ async fn execute_execution_runtime_sync_impl(
         .unwrap_or_else(|| "-".to_string());
     let candidate_started_at = Instant::now();
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
+    let _provider_pool_in_flight_guard = match acquire_provider_pool_execution_guard(state, &plan)
+        .await?
+    {
+        ProviderPoolInFlightAdmission::Acquired(guard) => guard,
+        ProviderPoolInFlightAdmission::Saturated { limit } => {
+            record_local_runtime_candidate_skip_reason(
+                state,
+                trace_id,
+                "provider_key_concurrency_limit_reached",
+            );
+            if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+                *retry_scope = AiAttemptRetryScope::Candidate;
+            }
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Skipped,
+                    status_code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                    error_type: Some("provider_key_concurrency_limit_reached".to_string()),
+                    error_message: Some(format!("provider key concurrency limit reached: {limit}")),
+                    latency_ms: Some(0),
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: Some(candidate_started_unix_secs),
+                },
+            )
+            .await;
+            return Ok(None);
+        }
+    };
     let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
     let usage_data = state.usage_lifecycle_data_state().as_ref().clone();
     state
@@ -2051,14 +2156,6 @@ async fn execute_execution_runtime_sync_impl(
         candidate_started_at,
     );
     let result = (async {
-    let _provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
-        state.runtime_state.clone(),
-        &plan.provider_id,
-        plan_request_id.as_str(),
-        plan_candidate_id.as_deref(),
-        key_id.as_str(),
-    )
-    .await;
     record_sync_execution_active(
         state,
         &plan,
@@ -2156,7 +2253,7 @@ async fn execute_execution_runtime_sync_impl(
                         }
                     },
                     Err(err) => {
-                        let transport_error_message = err.to_string();
+                        let transport_error_message = safe_transport_error_message(&err);
                         warn!(
                             event_name = "chatgpt_web_image_execution_unavailable",
                             log_type = "ops",
@@ -2168,7 +2265,7 @@ async fn execute_execution_runtime_sync_impl(
                             key_id,
                             model_name,
                             candidate_index = candidate_index.as_str(),
-                            error = %err,
+                            error = %transport_error_message,
                             "gateway ChatGPT-Web image execution unavailable"
                         );
                         let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -2208,7 +2305,7 @@ async fn execute_execution_runtime_sync_impl(
                 }
             }
             Err(err) => {
-                let transport_error_message = err.to_string();
+                let transport_error_message = safe_transport_error_message(&err);
                 warn!(
                     event_name = "grok_execution_unavailable",
                     log_type = "ops",
@@ -2220,7 +2317,7 @@ async fn execute_execution_runtime_sync_impl(
                     key_id,
                     model_name,
                     candidate_index = candidate_index.as_str(),
-                    error = %err,
+                    error = %transport_error_message,
                     "gateway Grok execution unavailable"
                 );
                 let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -2263,7 +2360,7 @@ async fn execute_execution_runtime_sync_impl(
             match (override_fn.0)(&plan) {
                 Ok(result) => result,
                 Err(err) => {
-                    let transport_error_message = format!("{err:?}");
+                    let transport_error_message = persisted_sync_abort_message(&err).to_string();
                     warn!(
                         event_name = "sync_execution_runtime_test_override_failed",
                         log_type = "ops",
@@ -2409,7 +2506,7 @@ async fn execute_execution_runtime_sync_impl(
                         }
                     },
                     Err(err) => {
-                        let transport_error_message = err.to_string();
+                        let transport_error_message = safe_transport_error_message(&err);
                         warn!(
                             event_name = "chatgpt_web_image_execution_unavailable",
                             log_type = "ops",
@@ -2421,7 +2518,7 @@ async fn execute_execution_runtime_sync_impl(
                             key_id,
                             model_name,
                             candidate_index = candidate_index.as_str(),
-                            error = %err,
+                            error = %transport_error_message,
                             "gateway ChatGPT-Web image execution unavailable"
                         );
                         let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -2460,7 +2557,7 @@ async fn execute_execution_runtime_sync_impl(
                     }
                 },
                 Err(err) => {
-                    let transport_error_message = err.to_string();
+                    let transport_error_message = safe_transport_error_message(&err);
                     warn!(
                         event_name = "grok_execution_unavailable",
                         log_type = "ops",
@@ -2472,7 +2569,7 @@ async fn execute_execution_runtime_sync_impl(
                         key_id,
                         model_name,
                         candidate_index = candidate_index.as_str(),
-                        error = %err,
+                        error = %transport_error_message,
                         "gateway Grok execution unavailable"
                     );
                     let terminal_unix_secs = current_request_candidate_unix_ms();
@@ -2573,8 +2670,26 @@ async fn execute_execution_runtime_sync_impl(
             .as_ref()
             .and_then(|telemetry| telemetry.elapsed_ms);
         let mut headers = std::mem::take(&mut result.headers);
-        let (body_bytes, mut body_json, body_base64) =
-            decode_execution_result_body(result.body.take(), &mut headers)?;
+        let result_body = result.body.take();
+        let chatgpt_web_image_result = plan
+            .provider_api_format
+            .eq_ignore_ascii_case("openai:image")
+            && (plan.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-aether-chatgpt-web-image") && value == "1"
+            }) || report_context
+                .as_ref()
+                .and_then(|value| value.get("chatgpt_web_image"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false));
+        let (body_bytes, mut body_json, body_base64) = if chatgpt_web_image_result {
+            decode_execution_result_body_with_limit(
+                result_body,
+                &mut headers,
+                crate::execution_runtime::chatgpt_web_image::chatgpt_web_image_sse_envelope_limit_bytes(),
+            )?
+        } else {
+            decode_execution_result_body(result_body, &mut headers)?
+        };
         let invalid_provider_success = if plan_kind == "claude_count_tokens_sync" {
             None
         } else {
@@ -3333,7 +3448,14 @@ fn maybe_build_implicit_sync_finalize_outcome(
     body_base64: &Option<String>,
     telemetry: &Option<ExecutionTelemetry>,
 ) -> Result<Option<ImplicitSyncFinalizeOutcome>, GatewayError> {
-    if status_code >= 400 || body_json.is_some() || body_base64.is_none() {
+    let needs_conversion = report_context
+        .as_ref()
+        .and_then(|value| value.get("needs_conversion"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let has_captured_stream_body = body_json.is_none() && body_base64.is_some();
+    let has_cross_format_sync_body = needs_conversion && body_json.is_some();
+    if status_code >= 400 || (!has_captured_stream_body && !has_cross_format_sync_body) {
         return Ok(None);
     }
 
@@ -3403,7 +3525,7 @@ async fn execute_sync_via_remote_execution_runtime(
                     status: RequestCandidateStatus::Failed,
                     status_code: None,
                     error_type: Some("execution_runtime_unavailable".to_string()),
-                    error_message: Some(format!("{err:?}")),
+                    error_message: Some(persisted_sync_abort_message(&err).to_string()),
                     latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                     started_at_unix_ms: Some(candidate_started_unix_secs),
                     finished_at_unix_ms: Some(terminal_unix_secs),
@@ -3444,9 +3566,15 @@ async fn execute_sync_via_remote_execution_runtime(
     }
 
     let remote_response_observed_at_unix_ms = current_request_candidate_unix_ms();
-    let mut result = response
-        .json::<ExecutionResult>()
-        .await
+    let response_body = aether_http::read_response_bytes_with_limit(
+        response,
+        crate::execution_runtime::transport::execution_result_envelope_limit_bytes(
+            crate::headers::max_internal_buffered_body_bytes(),
+        ),
+    )
+    .await
+    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let mut result = serde_json::from_slice::<ExecutionResult>(&response_body)
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     result
         .response_observation
@@ -3513,6 +3641,137 @@ mod tests {
             Some("openai:chat".to_string()),
         )
         .with_execution_runtime_candidate(true)
+    }
+
+    #[tokio::test]
+    async fn implicit_sync_finalize_converts_chat_json_to_namespaced_responses() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            Some("openai:responses".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let report_context = Some(json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "needs_conversion": true,
+            "mapped_model": "qwen-upstream",
+            "original_request_body": {
+                "model": "qwen",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__vulnerability_report",
+                    "description": "reporting tools",
+                    "tools": [{
+                        "type": "function",
+                        "name": "vulnerability_report",
+                        "description": "write the confirmed report",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "report_path": {"type": "string"}
+                            },
+                            "required": ["report_path"]
+                        },
+                        "strict": true
+                    }]
+                }]
+            }
+        }));
+        let provider_body = Some(json!({
+            "id": "chatcmpl_namespace_sync",
+            "object": "chat.completion",
+            "created": 1_777_777_777,
+            "model": "qwen-upstream",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_report_1",
+                        "type": "function",
+                        "function": {
+                            "name": "vulnerability_report",
+                            "arguments": "{\"report_path\":\"reports/sql-001-c1.md\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14
+            }
+        }));
+
+        let implicit = maybe_build_implicit_sync_finalize_outcome(
+            "trace-namespace-sync",
+            &decision,
+            "openai_responses_sync",
+            &report_context,
+            StatusCode::OK.as_u16(),
+            &BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            &provider_body,
+            &None,
+            &None,
+        )
+        .expect("cross-format sync JSON finalize should not error")
+        .expect("cross-format sync JSON should be finalized");
+        let response_body = axum::body::to_bytes(implicit.outcome.response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let response_json: Value =
+            serde_json::from_slice(&response_body).expect("response body should be JSON");
+
+        assert_eq!(response_json["object"], "response");
+        assert!(response_json.get("choices").is_none());
+        assert_eq!(response_json["output"][0]["type"], "function_call");
+        assert_eq!(response_json["output"][0]["name"], "vulnerability_report");
+        assert_eq!(
+            response_json["output"][0]["namespace"],
+            "mcp__vulnerability_report"
+        );
+        assert_eq!(response_json["output"][0]["call_id"], "call_report_1");
+    }
+
+    #[test]
+    fn implicit_sync_finalize_leaves_same_format_json_on_passthrough_path() {
+        let report_context = Some(json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+            "needs_conversion": false
+        }));
+        let body_json = Some(json!({
+            "id": "resp_same_format",
+            "object": "response",
+            "status": "completed",
+            "output": []
+        }));
+
+        let outcome = maybe_build_implicit_sync_finalize_outcome(
+            "trace-same-format-sync",
+            &GatewayControlDecision::synthetic(
+                "/v1/responses",
+                Some("ai_public".to_string()),
+                Some("openai".to_string()),
+                Some("responses".to_string()),
+                Some("openai:responses".to_string()),
+            ),
+            "openai_responses_sync",
+            &report_context,
+            StatusCode::OK.as_u16(),
+            &BTreeMap::new(),
+            &body_json,
+            &None,
+            &None,
+        )
+        .expect("same-format sync JSON guard should not error");
+
+        assert!(outcome.is_none());
     }
 
     #[tokio::test]
@@ -3759,6 +4018,20 @@ mod tests {
         );
 
         assert!(message.is_none());
+    }
+
+    #[test]
+    fn forced_sync_abort_message_does_not_copy_internal_error_details() {
+        let secret = "https://user:password@example.test/v1?api_key=should-not-persist";
+        let error = GatewayError::Internal(secret.to_string());
+
+        let message = persisted_sync_abort_message(&error);
+        assert_eq!(
+            message,
+            "local sync attempt aborted before terminal finalization: internal error"
+        );
+        assert!(!message.contains("password"));
+        assert!(!message.contains("api_key"));
     }
 
     #[tokio::test]
@@ -4351,5 +4624,23 @@ mod tests {
             &plan,
             Some(&report_context),
         ));
+    }
+
+    #[tokio::test]
+    async fn openai_image_sync_json_heartbeat_hides_internal_error_details() {
+        let secret = "https://user:password@example.test/private?api_key=top-secret";
+        let bytes = openai_image_sync_json_heartbeat_final_bytes(Err(GatewayError::Internal(
+            secret.to_string(),
+        )))
+        .await;
+
+        let body: Value = serde_json::from_slice(&bytes).expect("heartbeat error body is JSON");
+        assert_eq!(
+            body.pointer("/error/message").and_then(Value::as_str),
+            Some("sync image execution failed")
+        );
+        let body_text = String::from_utf8(bytes).expect("heartbeat body is UTF-8");
+        assert!(!body_text.contains(secret));
+        assert!(!body_text.contains("top-secret"));
     }
 }

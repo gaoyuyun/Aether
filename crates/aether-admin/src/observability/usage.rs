@@ -7,7 +7,10 @@ use aether_billing::{
 use aether_data::repository::users::StoredUserSummary;
 use aether_data_contracts::repository::{
     provider_catalog::{StoredProviderCatalogEndpoint, StoredProviderCatalogProvider},
-    usage::{StoredRequestUsageAudit, StoredUsageAuditSummary, UsageBodyField},
+    usage::{
+        StoredRequestUsageAudit, StoredUsageAuditSummary, UsageBodyField,
+        LIVE_SESSION_METADATA_KEY, REALTIME_SESSION_METADATA_KEY,
+    },
 };
 use axum::{
     body::Body,
@@ -20,6 +23,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use url::form_urlencoded;
 
 pub const ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL: &str = "Admin usage data unavailable";
+
+fn admin_usage_safe_error_message(item: &StoredRequestUsageAudit) -> Option<String> {
+    if item
+        .error_message
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && item.status_code.is_none_or(|status| status < 400)
+    {
+        return None;
+    }
+
+    item.error_category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            item.status_code
+                .filter(|status| *status >= 400)
+                .map(|status| format!("http_{status}"))
+        })
+        .or_else(|| Some("request_failed".to_string()))
+}
 
 pub fn admin_usage_data_unavailable_response(detail: &'static str) -> Response<Body> {
     (
@@ -263,12 +289,17 @@ pub fn admin_usage_has_fallback(item: &StoredRequestUsageAudit) -> bool {
 }
 
 pub fn admin_usage_matches_status(item: &StoredRequestUsageAudit, status: Option<&str>) -> bool {
-    let Some(status) = status.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(status) = status
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+    else {
         return true;
     };
-    match status {
-        "stream" => item.is_stream,
-        "standard" => !item.is_stream,
+    match status.as_str() {
+        "stream" => item.is_stream && !item.is_websocket(),
+        "standard" => !item.is_stream && !item.is_websocket(),
+        "websocket" | "ws" => item.is_websocket(),
         "error" => {
             item.status_code
                 .is_some_and(|value| !(200..300).contains(&value))
@@ -329,6 +360,77 @@ fn admin_usage_strip_settlement_metadata(metadata: &mut serde_json::Map<String, 
 
 fn admin_usage_strip_trace_metadata(metadata: &mut serde_json::Map<String, Value>) {
     metadata.remove("trace_id");
+}
+
+/// Projects historical observability metadata without exposing credentials or
+/// URL query/fragment values. This is shared by all admin observability views
+/// because older rows may predate the current persistence policy.
+pub fn admin_usage_safe_metadata_value(value: &Value) -> Value {
+    admin_usage_safe_metadata_value_inner(value, false)
+}
+
+fn admin_usage_safe_metadata_value_inner(value: &Value, in_realtime_session: bool) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    let compact = key
+                        .chars()
+                        .filter(|ch| ch.is_ascii_alphanumeric())
+                        .map(|ch| ch.to_ascii_lowercase())
+                        .collect::<String>();
+                    // The generic `token` key filter protects historical rows that may
+                    // predate the persistence projection. Realtime audio usage counters
+                    // are explicitly safe numeric metrics, but only when they occur in the
+                    // structured realtime-session object. Do not broaden this exception to
+                    // arbitrary token-shaped fields or string values.
+                    let safe_realtime_counter = in_realtime_session
+                        && matches!(compact.as_str(), "inputaudiotokens" | "outputaudiotokens")
+                        && value.as_u64().is_some();
+                    if (compact.contains("authorization")
+                        || compact.contains("credential")
+                        || compact.contains("secret")
+                        || compact.contains("token")
+                        || compact.contains("apikey")
+                        || compact.contains("password")
+                        || matches!(compact.as_str(), "cookie" | "setcookie" | "headers"))
+                        && !safe_realtime_counter
+                    {
+                        return None;
+                    }
+                    let child_in_realtime_session = compact == "realtimesession";
+                    Some((
+                        key.clone(),
+                        admin_usage_safe_metadata_value_inner(value, child_in_realtime_session),
+                    ))
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| admin_usage_safe_metadata_value_inner(item, false))
+                .collect(),
+        ),
+        Value::String(value) => {
+            if let Ok(mut url) = url::Url::parse(value.trim()) {
+                if !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                {
+                    let _ = url.set_username("");
+                    let _ = url.set_password(None);
+                    url.set_query(None);
+                    url.set_fragment(None);
+                    return Value::String(url.to_string());
+                }
+            }
+            Value::String(value.clone())
+        }
+        other => other.clone(),
+    }
 }
 
 fn admin_usage_string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -1211,12 +1313,17 @@ fn admin_usage_active_request_json(
         "updated_at": unix_secs_to_rfc3339(item.updated_at_unix_secs),
         "response_time_updated_at": admin_usage_response_time_updated_at(item),
         "status_code": item.status_code,
-        "error_message": item.error_message,
+        "error_message": admin_usage_safe_error_message(item),
         "provider": item.provider_name,
         "api_key_name": api_key_name,
         "provider_key_name": provider_key_name,
         "is_stream": item.is_stream,
         "is_websocket": item.is_websocket(),
+        "websocket_transport": item.websocket_transport(),
+        "usage_available": item.usage_available(),
+        "usage_pricing_available": item.usage_pricing_available(),
+        "input_audio_tokens": item.realtime_input_audio_tokens(),
+        "output_audio_tokens": item.realtime_output_audio_tokens(),
         "upstream_is_stream": upstream_is_stream,
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
@@ -1321,7 +1428,7 @@ pub fn admin_usage_record_json(
         "cache_creation_price_per_1m": cache_creation_price_per_1m,
         "cache_read_price_per_1m": cache_read_price_per_1m,
         "status_code": item.status_code,
-        "error_message": item.error_message,
+        "error_message": admin_usage_safe_error_message(item),
         "status": item.status,
         "request_type": item.request_type,
         "has_fallback": admin_usage_has_fallback(item),
@@ -1350,6 +1457,23 @@ pub fn admin_usage_record_json(
         )),
     );
     object.insert("is_websocket".to_string(), json!(item.is_websocket()));
+    object.insert(
+        "websocket_transport".to_string(),
+        json!(item.websocket_transport()),
+    );
+    object.insert("usage_available".to_string(), json!(item.usage_available()));
+    object.insert(
+        "usage_pricing_available".to_string(),
+        json!(item.usage_pricing_available()),
+    );
+    object.insert(
+        "input_audio_tokens".to_string(),
+        json!(item.realtime_input_audio_tokens()),
+    );
+    object.insert(
+        "output_audio_tokens".to_string(),
+        json!(item.realtime_output_audio_tokens()),
+    );
     object.insert("is_stream".to_string(), json!(item.is_stream));
     object.insert(
         UPSTREAM_IS_STREAM_KEY.to_string(),
@@ -2434,7 +2558,11 @@ pub fn build_admin_usage_detail_payload(
         auth_api_key_reader_available,
         provider_key_name,
     );
-    let mut metadata = match item.request_metadata.clone() {
+    let mut metadata = match item
+        .request_metadata
+        .as_ref()
+        .map(admin_usage_safe_metadata_value)
+    {
         Some(Value::Object(object)) => Value::Object(object),
         Some(value) => json!({ "request_metadata": value }),
         None => json!({}),
@@ -2445,6 +2573,16 @@ pub fn build_admin_usage_detail_payload(
         admin_usage_strip_settlement_metadata(object);
         admin_usage_strip_trace_metadata(object);
     }
+    let live_session = metadata
+        .as_object()
+        .and_then(|object| object.get(LIVE_SESSION_METADATA_KEY))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let realtime_session = metadata
+        .as_object()
+        .and_then(|object| object.get(REALTIME_SESSION_METADATA_KEY))
+        .cloned()
+        .unwrap_or(Value::Null);
     payload["user"] = match item.user_id.as_ref() {
         Some(user_id) => json!({
             "id": user_id,
@@ -2475,6 +2613,11 @@ pub fn build_admin_usage_detail_payload(
     payload["client_response_headers"] =
         item.client_response_headers.clone().unwrap_or(Value::Null);
     payload["metadata"] = metadata;
+    // Session summaries are also first-class detail fields. Keep the original
+    // values in `metadata` for backward compatibility while making the detail
+    // contract independent from the generic metadata viewer.
+    payload[LIVE_SESSION_METADATA_KEY] = live_session;
+    payload[REALTIME_SESSION_METADATA_KEY] = realtime_session;
     payload["routing"] = admin_usage_routing_json(item, provider_key_name);
     payload["body_capture"] = admin_usage_body_capture_json(item);
     payload["settlement"] = admin_usage_settlement_json(item);
@@ -2581,7 +2724,8 @@ mod tests {
         admin_usage_has_fallback, admin_usage_is_failed, admin_usage_is_success,
         admin_usage_matches_search, admin_usage_matches_status, admin_usage_matches_username,
         admin_usage_record_json, admin_usage_resolve_request_capture_body,
-        admin_usage_total_tokens, admin_usage_upstream_is_stream, build_admin_usage_detail_payload,
+        admin_usage_safe_metadata_value, admin_usage_total_tokens, admin_usage_upstream_is_stream,
+        build_admin_usage_detail_payload,
     };
     use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageBodyField};
 
@@ -2641,6 +2785,35 @@ mod tests {
         assert!(!admin_usage_is_failed(&item));
         assert!(!admin_usage_matches_status(&item, Some("failed")));
         assert!(admin_usage_matches_status(&item, Some("completed")));
+    }
+
+    #[test]
+    fn admin_usage_summaries_do_not_return_historical_raw_error_text() {
+        let item = StoredRequestUsageAudit {
+            error_category: Some("authentication_error".to_string()),
+            ..sample_usage(
+                "failed",
+                Some(401),
+                Some(
+                    "upstream said Authorization: Bearer live-secret at https://api.example?key=secret",
+                ),
+            )
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["error_message"], "authentication_error");
+        assert_eq!(active["error_message"], "authentication_error");
+        assert!(!record.to_string().contains("live-secret"));
+        assert!(!active.to_string().contains("live-secret"));
     }
 
     #[test]
@@ -2705,6 +2878,12 @@ mod tests {
             request_metadata: Some(json!({
                 "websocket_mode": true,
                 "websocket_transport": "responses",
+                "usage_available": false,
+                "usage_pricing_available": false,
+                "realtime_session": {
+                    "input_audio_tokens": 7,
+                    "output_audio_tokens": 3,
+                },
             })),
             ..sample_usage("completed", Some(200), None)
         };
@@ -2721,6 +2900,103 @@ mod tests {
 
         assert_eq!(record["is_websocket"], true);
         assert_eq!(active["is_websocket"], true);
+        assert_eq!(record["websocket_transport"], "responses");
+        assert_eq!(active["websocket_transport"], "responses");
+        assert_eq!(record["usage_available"], false);
+        assert_eq!(active["usage_available"], false);
+        assert_eq!(record["usage_pricing_available"], false);
+        assert_eq!(active["usage_pricing_available"], false);
+        assert_eq!(record["input_audio_tokens"], 7);
+        assert_eq!(active["input_audio_tokens"], 7);
+        assert_eq!(record["output_audio_tokens"], 3);
+        assert_eq!(active["output_audio_tokens"], 3);
+        assert!(admin_usage_matches_status(&item, Some("websocket")));
+        assert!(admin_usage_matches_status(&item, Some("ws")));
+        assert!(admin_usage_matches_status(&item, Some("WS")));
+        assert!(!admin_usage_matches_status(&item, Some("standard")));
+        assert!(!admin_usage_matches_status(&item, Some("stream")));
+    }
+
+    #[test]
+    fn admin_usage_detail_preserves_websocket_and_session_metadata() {
+        let live_session = json!({
+            "schema_version": "1",
+            "transport": "websocket",
+            "mode": "direct",
+            "state": "closed",
+            "client_frames": 4,
+            "upstream_frames": 8,
+        });
+        let realtime_session = json!({
+            "schema_version": "1",
+            "transport": "websocket",
+            "usage_state": "authoritative",
+            "input_audio_tokens": 7,
+            "output_audio_tokens": 3,
+        });
+        let item = StoredRequestUsageAudit {
+            request_type: Some("live".to_string()),
+            api_format: Some("codex:live".to_string()),
+            endpoint_api_format: Some("codex:live".to_string()),
+            is_stream: true,
+            request_metadata: Some(json!({
+                "websocket_mode": true,
+                "websocket_transport": "codex_live_direct",
+                "usage_available": false,
+                "usage_pricing_available": false,
+                "live_session": live_session,
+                "realtime_session": realtime_session,
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let payload = build_admin_usage_detail_payload(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(payload["is_websocket"], true);
+        assert_eq!(payload["websocket_transport"], "codex_live_direct");
+        assert_eq!(payload["live_session"], live_session);
+        assert_eq!(payload["realtime_session"], realtime_session);
+        assert_eq!(payload["metadata"]["live_session"], live_session);
+        assert_eq!(payload["metadata"]["realtime_session"], realtime_session);
+    }
+
+    #[test]
+    fn admin_usage_safe_metadata_keeps_only_numeric_realtime_audio_counters() {
+        let projected = admin_usage_safe_metadata_value(&json!({
+            "input_audio_tokens": 99,
+            "refresh_token": "should-be-removed",
+            "realtime_session": {
+                "input_audio_tokens": 7,
+                "output_audio_tokens": 3,
+                "input_audio_tokens_text": "should-be-removed",
+                "refresh_token": 11,
+                "nested": {
+                    "output_audio_tokens": 5
+                }
+            }
+        }));
+
+        assert!(projected.get("input_audio_tokens").is_none());
+        assert!(projected.get("refresh_token").is_none());
+        assert_eq!(projected["realtime_session"]["input_audio_tokens"], 7);
+        assert_eq!(projected["realtime_session"]["output_audio_tokens"], 3);
+        assert!(projected["realtime_session"]
+            .get("input_audio_tokens_text")
+            .is_none());
+        assert!(projected["realtime_session"].get("refresh_token").is_none());
+        assert!(projected["realtime_session"]["nested"]
+            .get("output_audio_tokens")
+            .is_none());
     }
 
     #[test]
@@ -3195,6 +3471,46 @@ mod tests {
     }
 
     #[test]
+    fn detail_payload_sanitizes_historical_request_metadata() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "trace_id": "internal-trace",
+                "authorization": "Bearer live-secret",
+                "nested": {
+                    "refresh_token": "refresh-secret",
+                    "endpoint_url": "https://user:password@api.example.test/v1?key=secret#fragment",
+                    "safe_count": 2
+                }
+            })),
+            ..sample_usage("failed", Some(500), Some("failed"))
+        };
+
+        let payload = build_admin_usage_detail_payload(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+        );
+        let metadata = &payload["metadata"];
+        assert!(metadata.get("authorization").is_none());
+        assert!(metadata["nested"].get("refresh_token").is_none());
+        assert_eq!(
+            metadata["nested"]["endpoint_url"],
+            "https://api.example.test/v1"
+        );
+        assert_eq!(metadata["nested"]["safe_count"], 2);
+        let encoded = metadata.to_string();
+        for secret in ["live-secret", "refresh-secret", "password", "key=secret"] {
+            assert!(!encoded.contains(secret), "leaked {secret}");
+        }
+    }
+
+    #[test]
     fn detail_payload_separates_upstream_client_and_summary_errors() {
         let item = StoredRequestUsageAudit {
             error_message: Some(
@@ -3386,14 +3702,8 @@ mod tests {
             &BTreeMap::new(),
         );
 
-        assert_eq!(
-            payload["client_error"]["message"],
-            "没有可用提供商支持模型 gpt-5.4 的流式请求"
-        );
-        assert_eq!(
-            payload["failure_summary"]["message"],
-            "没有可用提供商支持模型 gpt-5.4 的流式请求"
-        );
+        assert!(payload["client_error"]["message"].is_null());
+        assert!(payload["failure_summary"].is_null());
         assert_eq!(
             payload["scheduling_failure"]["title"],
             "本地调度失败：没有可调度候选"
@@ -3403,10 +3713,7 @@ mod tests {
             "candidate_list_empty"
         );
         assert!(payload["scheduling_failure"]["reason_summary"].is_null());
-        assert_eq!(
-            payload["scheduling_failure"]["message"],
-            "没有可用提供商支持模型 gpt-5.4 的流式请求"
-        );
+        assert!(payload["scheduling_failure"]["message"].is_null());
         assert_eq!(payload["scheduling_failure"]["no_upstream_attempt"], true);
     }
 
@@ -3443,14 +3750,8 @@ mod tests {
             &BTreeMap::new(),
         );
 
-        assert_eq!(
-            payload["client_error"]["message"],
-            "没有可用提供商支持模型 gpt-5.4 的流式请求"
-        );
-        assert_eq!(
-            payload["failure_summary"]["message"],
-            "没有可用提供商支持模型 gpt-5.4 的流式请求"
-        );
+        assert!(payload["client_error"]["message"].is_null());
+        assert!(payload["failure_summary"].is_null());
         assert_eq!(
             payload["scheduling_failure"]["title"],
             "本地调度失败：所有候选均被跳过"
@@ -3459,14 +3760,8 @@ mod tests {
             payload["scheduling_failure"]["reason"],
             "all_candidates_skipped"
         );
-        assert_eq!(
-            payload["scheduling_failure"]["reason_summary"],
-            "provider_quota_blocked 2 次"
-        );
-        assert_eq!(
-            payload["scheduling_failure"]["message"],
-            "没有可用提供商支持模型 gpt-5.4 的流式请求"
-        );
+        assert!(payload["scheduling_failure"]["reason_summary"].is_null());
+        assert!(payload["scheduling_failure"]["message"].is_null());
         assert_eq!(payload["scheduling_failure"]["no_upstream_attempt"], true);
     }
 

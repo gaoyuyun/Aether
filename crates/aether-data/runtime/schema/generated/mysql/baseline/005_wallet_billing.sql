@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS payment_orders (
     `product_snapshot` JSON,
     `fulfillment_status` VARCHAR(64) NOT NULL DEFAULT 'pending',
     `fulfillment_error` LONGTEXT,
-    `gateway_order_id` VARCHAR(128),
+    `gateway_order_id` VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin,
     `gateway_response` JSON,
     `status` VARCHAR(64) NOT NULL DEFAULT 'pending',
     `created_at` BIGINT NOT NULL,
@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS payment_orders (
     KEY idx_payment_orders_user_created (`user_id`, `created_at`),
     KEY idx_payment_orders_status (`status`),
     KEY idx_payment_orders_gateway_order_id (`gateway_order_id`),
+    UNIQUE KEY uq_payment_orders_payment_method_gateway_order_id (`payment_method`, `gateway_order_id`),
     KEY idx_payment_orders_kind_status (`order_kind`, `status`),
     KEY idx_payment_orders_product (`product_id`)
 );
@@ -130,8 +131,6 @@ CREATE TABLE IF NOT EXISTS user_referrals (
     KEY idx_user_referrals_inviter (`inviter_user_id`, `created_at`),
     KEY idx_user_referrals_created (`created_at`),
     KEY idx_user_referrals_invite_code (`invite_code_snapshot`),
-    CONSTRAINT user_referrals_inviter_user_id_fkey FOREIGN KEY (`inviter_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
-    CONSTRAINT user_referrals_invitee_user_id_fkey FOREIGN KEY (`invitee_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
     CONSTRAINT user_referrals_first_paid_order_fkey FOREIGN KEY (`first_paid_order_id`) REFERENCES payment_orders (`id`) ON DELETE SET NULL
 );
 
@@ -161,8 +160,6 @@ CREATE TABLE IF NOT EXISTS referral_rewards (
     KEY idx_referral_rewards_created (`created_at`),
     KEY idx_referral_rewards_source_order (`source_order_id`),
     CONSTRAINT referral_rewards_referral_id_fkey FOREIGN KEY (`referral_id`) REFERENCES user_referrals (`id`) ON DELETE CASCADE,
-    CONSTRAINT referral_rewards_inviter_user_id_fkey FOREIGN KEY (`inviter_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
-    CONSTRAINT referral_rewards_invitee_user_id_fkey FOREIGN KEY (`invitee_user_id`) REFERENCES users (`id`) ON DELETE CASCADE,
     CONSTRAINT referral_rewards_source_order_fkey FOREIGN KEY (`source_order_id`) REFERENCES payment_orders (`id`) ON DELETE SET NULL
 );
 

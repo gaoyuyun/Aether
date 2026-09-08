@@ -69,7 +69,7 @@ async fn admin_monitoring_trace_request_returns_local_payload() {
     assert_eq!(payload["candidates"][0]["provider_name"], json!("OpenAI"));
     assert_eq!(
         payload["candidates"][0]["provider_website"],
-        json!("https://openai.com")
+        json!("https://openai.com/")
     );
     assert_eq!(
         payload["candidates"][0]["endpoint_name"],
@@ -292,10 +292,10 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
         payload["candidates"][0]["extra_data"]["execution_path"],
         json!("local_execution_runtime_miss")
     );
-    assert_eq!(
-        payload["candidates"][0]["extra_data"]["failure_diagnostic"]["path"],
-        json!("$.reasoning.summary")
-    );
+    assert!(payload["candidates"][0]["error_message"].is_null());
+    assert!(payload["candidates"][0]["extra_data"]
+        .get("failure_diagnostic")
+        .is_none());
 }
 
 #[tokio::test]
@@ -340,11 +340,9 @@ async fn admin_monitoring_trace_request_returns_oauth_account_label_from_auth_co
         vec![sample_endpoint()],
         vec![oauth_key],
     ));
-    let data_state = GatewayDataState::with_decision_trace_readers_for_tests(
-        request_candidates,
-        provider_catalog,
-    )
-    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let data_state = GatewayDataState::with_request_candidate_reader_for_tests(request_candidates)
+        .attach_provider_catalog_repository_for_tests(provider_catalog)
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
     let state = AppState::new()
         .expect("state should build")
         .with_data_state_for_tests(data_state);
@@ -615,7 +613,7 @@ async fn admin_monitoring_trace_request_exposes_request_path_from_usage_audit() 
     usage.candidate_id = Some("cand-used".to_string());
     usage.request_metadata = Some(json!({
         "request_path": "/v1beta/models/gemini-2.5-pro:generateContent",
-        "request_query_string": "alt=sse"
+        "request_query_string": "alt=sse&key=gemini-secret&access_token=oauth-secret"
     }));
     let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![usage]));
     let data_state =
@@ -649,14 +647,19 @@ async fn admin_monitoring_trace_request_exposes_request_path_from_usage_audit() 
         payload["request_path_and_query"],
         json!("/v1beta/models/gemini-2.5-pro:generateContent?alt=sse")
     );
-    assert_eq!(
-        payload["candidates"][0]["extra_data"]["request_path_and_query"],
-        json!("/v1beta/models/gemini-2.5-pro:generateContent?alt=sse")
-    );
+    assert!(payload["candidates"][0]["extra_data"]
+        .get("request_path")
+        .is_none());
+    assert!(payload["candidates"][0]["extra_data"]
+        .get("request_query_string")
+        .is_none());
+    assert!(payload["candidates"][0]["extra_data"]
+        .get("request_path_and_query")
+        .is_none());
 }
 
 #[tokio::test]
-async fn admin_monitoring_trace_request_exposes_failed_candidate_upstream_response_boundary() {
+async fn admin_monitoring_trace_request_redacts_failed_candidate_response_payloads() {
     let mut candidate = sample_candidate(
         "cand-used",
         "request-1",
@@ -739,19 +742,18 @@ async fn admin_monitoring_trace_request_exposes_failed_candidate_upstream_respon
     let extra = &payload["candidates"][0]["extra_data"];
     assert_eq!(extra["upstream_response"]["status_code"], json!(302));
     assert_eq!(
-        extra["upstream_response"]["headers"]["location"],
-        json!("/")
+        extra["upstream_response"]["source"],
+        json!("upstream_response")
     );
-    assert_eq!(
-        extra["upstream_response"]["body"]["error"]["message"],
-        json!("redirect blocked")
-    );
+    assert!(extra["upstream_response"].get("headers").is_none());
+    assert!(extra["upstream_response"].get("body").is_none());
+    assert!(extra["upstream_response"].get("body_ref").is_none());
     assert!(extra.get("client_response").is_none());
     assert!(extra.get("provider_response").is_none());
 }
 
 #[tokio::test]
-async fn admin_monitoring_trace_request_prefers_ref_backed_usage_response_body() {
+async fn admin_monitoring_trace_request_does_not_hydrate_ref_backed_usage_response_body() {
     let mut candidate = sample_candidate(
         "cand-used",
         "request-ref-body",
@@ -832,30 +834,16 @@ async fn admin_monitoring_trace_request_prefers_ref_backed_usage_response_body()
         .expect("body should read");
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
     let upstream_response = &payload["candidates"][0]["extra_data"]["upstream_response"];
-    assert_eq!(
-        upstream_response["headers"],
-        json!({
-            "content-type": "application/json",
-            "x-request-id": "req_usage-cyber-risk-demo"
-        })
-    );
-    assert_eq!(
-        upstream_response["body"]["error"],
-        json!({
-            "type": "invalid_request",
-            "message": "This content was flagged for possible cybersecurity risk.",
-            "code": 400
-        })
-    );
-    assert!(upstream_response["body"].get("input").is_none());
-    assert_eq!(
-        upstream_response["body_ref"],
-        json!("usage://request/request-ref-body/response_body")
-    );
+    assert_eq!(upstream_response["status_code"], json!(400));
+    assert_eq!(upstream_response["source"], json!("upstream_response"));
+    assert_eq!(upstream_response["body_state"], json!("reference"));
+    assert!(upstream_response.get("headers").is_none());
+    assert!(upstream_response.get("body").is_none());
+    assert!(upstream_response.get("body_ref").is_none());
 }
 
 #[tokio::test]
-async fn admin_monitoring_trace_request_decodes_connect_json_response_body_refs() {
+async fn admin_monitoring_trace_request_does_not_expose_inline_connect_json_response_body() {
     let mut candidate = sample_candidate(
         "cand-used",
         "request-connect",
@@ -922,19 +910,11 @@ async fn admin_monitoring_trace_request_decodes_connect_json_response_body_refs(
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
     let upstream_response = &payload["candidates"][0]["extra_data"]["upstream_response"];
     assert_eq!(upstream_response["status_code"], json!(429));
-    assert_eq!(
-        upstream_response["body"]["error"]["code"],
-        json!("resource_exhausted")
-    );
-    assert_eq!(
-        upstream_response["body"]["error"]["message"],
-        json!("quota exhausted")
-    );
-    assert_eq!(
-        upstream_response["body_ref"],
-        json!("usage://request/request-connect/response_body")
-    );
+    assert_eq!(upstream_response["source"], json!("upstream_response"));
     assert_eq!(upstream_response["body_state"], json!("inline"));
+    assert!(upstream_response.get("headers").is_none());
+    assert!(upstream_response.get("body").is_none());
+    assert!(upstream_response.get("body_ref").is_none());
 }
 
 #[tokio::test]

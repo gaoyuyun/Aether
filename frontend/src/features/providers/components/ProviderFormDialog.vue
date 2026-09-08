@@ -123,16 +123,11 @@
         </div>
       </div>
 
-      <!-- 计费与限流 / 请求配置 -->
+      <!-- 请求配置 -->
       <div class="space-y-3">
-        <div class="grid grid-cols-2 gap-4">
-          <h3 class="text-sm font-medium border-b pb-2">
-            {{ legacyT('计费与限流') }}
-          </h3>
           <h3 class="text-sm font-medium border-b pb-2">
             {{ legacyT('请求配置') }}
           </h3>
-        </div>
         <div class="grid grid-cols-2 gap-4">
           <div class="space-y-1.5">
             <Label>{{ legacyT('上游成本模式') }}</Label>
@@ -351,19 +346,6 @@
 
         <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
           <div class="space-y-0.5">
-            <span class="text-sm font-medium">{{ legacyT('格式转换保持优先级') }}</span>
-            <p class="text-xs text-muted-foreground">
-              {{ legacyT('跨格式请求时保持原优先级排名，不降级到格式匹配的提供商之后') }}
-            </p>
-          </div>
-          <Switch
-            :model-value="form.keep_priority_on_conversion"
-            @update:model-value="(v: boolean) => form.keep_priority_on_conversion = v"
-          />
-        </div>
-
-        <div class="flex items-center justify-between p-3 border rounded-lg bg-muted/50">
-          <div class="space-y-0.5">
             <span class="text-sm font-medium">{{ legacyT('号池调度模式') }}</span>
             <p class="text-xs text-muted-foreground">
               {{ legacyT('启用后该提供商的密钥将由号池统一调度') }}
@@ -401,16 +383,16 @@
               for="codex-fingerprint-convergence"
               class="text-sm font-medium"
             >
-              {{ legacyT('Codex OAuth 指纹收敛') }}
+              {{ legacyT('Codex 指纹收敛') }}
             </Label>
             <p class="text-xs text-muted-foreground leading-relaxed">
-              {{ legacyT('统一同一 OAuth 账号的设备与会话标识；关闭时保持现有透传行为。') }}
+              {{ legacyT('统一同一 Codex 身份的设备与会话标识；关闭时保持现有透传行为。') }}
             </p>
           </div>
           <Switch
             id="codex-fingerprint-convergence"
             :model-value="form.codex_fingerprint_convergence_enabled"
-            :aria-label="legacyT('Codex OAuth 指纹收敛')"
+            :aria-label="legacyT('Codex 指纹收敛')"
             @update:model-value="(v: boolean) => form.codex_fingerprint_convergence_enabled = v"
           />
         </div>
@@ -546,7 +528,6 @@ const form = ref({
   quota_expires_at: '',
   quota_windows: [] as ProviderQuotaWindow[],
   provider_priority: 100,
-  keep_priority_on_conversion: false,  // 格式转换时是否保持优先级
   // 状态配置
   is_active: true,
   rate_limit: undefined as number | undefined,
@@ -584,7 +565,6 @@ function resetForm() {
     quota_expires_at: '',
     quota_windows: [],
     provider_priority: defaultPriority.value,
-    keep_priority_on_conversion: false,
     is_active: true,
     rate_limit: undefined,
     concurrent_limit: undefined,
@@ -623,7 +603,6 @@ function loadProviderData() {
     quota_expires_at: formatDateTimeLocalInput(props.provider.quota_expires_at),
     quota_windows: (props.provider.quota_windows ?? []).map(window => ({ ...window })),
     provider_priority: props.provider.provider_priority || 999,
-    keep_priority_on_conversion: props.provider.keep_priority_on_conversion ?? false,
     is_active: props.provider.is_active,
     rate_limit: undefined,
     concurrent_limit: undefined,
@@ -727,7 +706,6 @@ const handleSubmit = async () => {
       quota_windows: form.value.billing_type === 'monthly_quota'
         ? form.value.quota_windows.map(window => ({ ...window }))
         : undefined,
-      keep_priority_on_conversion: form.value.keep_priority_on_conversion,
       responses_websocket_enabled: form.value.responses_websocket_enabled,
       is_active: form.value.is_active,
       // 请求配置

@@ -101,6 +101,7 @@ aether-runtime = { path = "crates/aether-runtime/base" }
 aether-testkit = { path = "crates/aether-testing/testkit" }
 aes = "0.8"
 aes-gcm = "0.10"
+aws-lc-rs = { version = "1.16.2", default-features = false, features = ["alloc", "aws-lc-sys"] }
 async-stream = "0.3"
 async-trait = "0.1"
 axum = "0.8"
@@ -117,8 +118,9 @@ flate2 = "1"
 futures-util = "0.3"
 hmac = "0.12"
 http = "1"
-object_store = { version = "0.14", default-features = false, features = ["aws"] }
+object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "socks"] }
 redis = { version = "0.28", default-features = false, features = ["tokio-comp", "script", "streams", "connection-manager"] }
 regex = "1"

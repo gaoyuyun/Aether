@@ -207,8 +207,9 @@ impl BackgroundTaskReadRepository for SqliteBackgroundTaskRepository {
 impl BackgroundTaskWriteRepository for SqliteBackgroundTaskRepository {
     async fn upsert_run(
         &self,
-        run: UpsertBackgroundTaskRun,
+        mut run: UpsertBackgroundTaskRun,
     ) -> Result<StoredBackgroundTaskRun, DataLayerError> {
+        run.sanitize_for_persistence();
         run.validate()?;
         sqlx::query(
             r#"
@@ -307,8 +308,9 @@ ON CONFLICT(id) DO UPDATE SET
 
     async fn upsert_event(
         &self,
-        event: UpsertBackgroundTaskEvent,
+        mut event: UpsertBackgroundTaskEvent,
     ) -> Result<StoredBackgroundTaskEvent, DataLayerError> {
+        event.sanitize_for_persistence();
         event.validate()?;
         sqlx::query(
             r#"
@@ -361,7 +363,7 @@ fn map_run_row(row: &SqliteRow) -> Result<StoredBackgroundTaskRun, DataLayerErro
     let finished_at_unix_secs: Option<i64> = row.try_get("finished_at_unix_secs").map_sql_err()?;
     let updated_at_unix_secs: i64 = row.try_get("updated_at_unix_secs").map_sql_err()?;
 
-    Ok(StoredBackgroundTaskRun {
+    let mut run = StoredBackgroundTaskRun {
         id: row.try_get("id").map_sql_err()?,
         task_key: row.try_get("task_key").map_sql_err()?,
         kind: BackgroundTaskKind::from_database(&kind)?,
@@ -381,19 +383,23 @@ fn map_run_row(row: &SqliteRow) -> Result<StoredBackgroundTaskRun, DataLayerErro
         started_at_unix_secs: started_at_unix_secs.and_then(|value| u64::try_from(value).ok()),
         finished_at_unix_secs: finished_at_unix_secs.and_then(|value| u64::try_from(value).ok()),
         updated_at_unix_secs: u64::try_from(updated_at_unix_secs).unwrap_or_default(),
-    })
+    };
+    run.sanitize_persisted_data();
+    Ok(run)
 }
 
 fn map_event_row(row: &SqliteRow) -> Result<StoredBackgroundTaskEvent, DataLayerError> {
     let created_at_unix_secs: i64 = row.try_get("created_at_unix_secs").map_sql_err()?;
-    Ok(StoredBackgroundTaskEvent {
+    let mut event = StoredBackgroundTaskEvent {
         id: row.try_get("id").map_sql_err()?,
         run_id: row.try_get("run_id").map_sql_err()?,
         event_type: row.try_get("event_type").map_sql_err()?,
         message: row.try_get("message").map_sql_err()?,
         payload_json: parse_optional_json(row.try_get("payload_json").map_sql_err()?)?,
         created_at_unix_secs: u64::try_from(created_at_unix_secs).unwrap_or_default(),
-    })
+    };
+    event.sanitize_persisted_data();
+    Ok(event)
 }
 
 fn parse_optional_json(value: Option<String>) -> Result<Option<serde_json::Value>, DataLayerError> {
@@ -451,7 +457,11 @@ mod tests {
                 owner_instance: None,
                 progress_percent: 0,
                 progress_message: None,
-                payload_json: Some(json!({"partition": 7})),
+                payload_json: Some(json!({
+                    "partition": 7,
+                    "refresh_token": "sensitive-refresh-token",
+                    "nested": {"authorization": "Bearer sensitive"}
+                })),
                 result_json: None,
                 error_message: None,
                 cancel_requested: false,
@@ -471,7 +481,10 @@ mod tests {
                 run_id: run.id.clone(),
                 event_type: "queued".to_string(),
                 message: "task queued".to_string(),
-                payload_json: Some(json!({"attempt": 0})),
+                payload_json: Some(json!({
+                    "error_code": "provider_delete_failed",
+                    "error": "sensitive provider detail"
+                })),
                 created_at_unix_secs: 11,
             })
             .await
@@ -496,7 +509,11 @@ mod tests {
             .await
             .expect("background task events should list");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload_json, Some(json!({"attempt": 0})));
+        assert_eq!(events[0].message, "queued");
+        assert_eq!(
+            events[0].payload_json,
+            Some(json!({"error_code": "provider_delete_failed"}))
+        );
 
         assert!(repository
             .request_cancel("run-1", 20)

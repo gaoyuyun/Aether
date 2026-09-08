@@ -51,15 +51,16 @@ pub(crate) use aether_ai_formats::api::{
     resolve_claude_sync_spec, resolve_gemini_stream_spec, resolve_gemini_sync_spec,
     resolve_local_image_stream_spec, resolve_local_image_sync_spec,
     resolve_local_same_format_stream_spec, resolve_local_same_format_sync_spec,
-    resolve_openai_embedding_sync_spec, sanitize_request_path_and_query, AiControlPlanRequest,
-    CanonicalContentPart, CanonicalStreamEvent, CanonicalStreamFrame, ClaudeClientEmitter,
-    ExecutionRuntimeAuthContext, LocalCoreSyncErrorKind, LocalOpenAiImageSpec,
-    LocalSameFormatProviderFamily, LocalSameFormatProviderSpec, LocalStandardSourceFamily,
-    LocalStandardSourceMode, LocalStandardSpec, OpenAIChatClientEmitter,
-    OpenAIResponsesClientEmitter, StreamingStandardTerminalObserver, CLAUDE_CHAT_STREAM_PLAN_KIND,
-    CLAUDE_CLI_STREAM_PLAN_KIND, EXECUTION_RUNTIME_STREAM_DECISION_ACTION,
-    EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_CHAT_STREAM_PLAN_KIND,
-    GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND, GEMINI_FILES_DOWNLOAD_PLAN_KIND,
+    resolve_openai_embedding_sync_spec, sanitize_request_path_and_query,
+    sanitize_request_query_string, AiControlPlanRequest, CanonicalContentPart,
+    CanonicalStreamEvent, CanonicalStreamFrame, ClaudeClientEmitter, ExecutionRuntimeAuthContext,
+    LocalCoreSyncErrorKind, LocalOpenAiImageSpec, LocalSameFormatProviderFamily,
+    LocalSameFormatProviderSpec, LocalStandardSourceFamily, LocalStandardSourceMode,
+    LocalStandardSpec, OpenAIChatClientEmitter, OpenAIResponsesClientEmitter,
+    StreamingStandardTerminalObserver, CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CLI_STREAM_PLAN_KIND,
+    EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
+    GEMINI_CHAT_STREAM_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND,
+    GEMINI_FILES_DOWNLOAD_PLAN_KIND, GEMINI_INTERACTIONS_STREAM_PLAN_KIND,
     GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND,
     OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND,
     OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND,
@@ -69,10 +70,10 @@ pub(crate) use aether_ai_formats::api::{
     OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
 pub(crate) use aether_ai_formats::protocol::stream::CanonicalUsage as StreamingCanonicalUsage;
-pub(crate) use aether_ai_formats::CODEX_RESPONSES_LITE_HEADER;
 /// Codex client identity headers re-exported for out-of-crate probe binaries,
 /// which must reach `aether_ai_formats` through this seam.
 pub use aether_ai_formats::{CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_USER_AGENT};
+pub(crate) use aether_ai_formats::{CODEX_RESPONSES_LITE_HEADER, UPSTREAM_IS_STREAM_KEY};
 
 pub(crate) fn parse_direct_request_body(
     parts: &http::request::Parts,

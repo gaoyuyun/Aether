@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
-use async_trait::async_trait;
-
 use super::{
     request_candidate_lifecycle_would_regress, PublicHealthStatusCount, PublicHealthTimelineBucket,
     RequestCandidateReadRepository, RequestCandidateStatus, RequestCandidateWriteRepository,
     StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
 use crate::DataLayerError;
+use async_trait::async_trait;
+
+fn sanitize_stored_candidate(mut candidate: StoredRequestCandidate) -> StoredRequestCandidate {
+    candidate.sanitize_sensitive_diagnostics();
+    candidate
+}
 
 fn merge_extra_data(
     existing: Option<serde_json::Value>,
@@ -38,7 +42,7 @@ impl InMemoryRequestCandidateRepository {
         I: IntoIterator<Item = StoredRequestCandidate>,
     {
         let mut by_id = BTreeMap::new();
-        for item in items {
+        for item in items.into_iter().map(sanitize_stored_candidate) {
             by_id.insert(item.id.clone(), item);
         }
         Self {
@@ -60,6 +64,7 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
             .values()
             .filter(|row| row.request_id == request_id)
             .cloned()
+            .map(sanitize_stored_candidate)
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| {
             left.candidate_index
@@ -84,6 +89,7 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
             .expect("request candidate repository lock")
             .values()
             .cloned()
+            .map(sanitize_stored_candidate)
             .collect::<Vec<_>>();
         rows.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_unix_ms));
         rows.truncate(limit);
@@ -106,6 +112,7 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
             .values()
             .filter(|row| row.provider_id.as_deref() == Some(provider_id))
             .cloned()
+            .map(sanitize_stored_candidate)
             .collect::<Vec<_>>();
         rows.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_unix_ms));
         rows.truncate(limit);
@@ -141,6 +148,7 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
                     )
             })
             .cloned()
+            .map(sanitize_stored_candidate)
             .collect::<Vec<_>>();
         rows.sort_by_key(|entry| std::cmp::Reverse(entry.created_at_unix_ms));
         rows.truncate(limit);
@@ -294,8 +302,9 @@ impl RequestCandidateReadRepository for InMemoryRequestCandidateRepository {
 impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
     async fn upsert(
         &self,
-        candidate: UpsertRequestCandidateRecord,
+        mut candidate: UpsertRequestCandidateRecord,
     ) -> Result<StoredRequestCandidate, DataLayerError> {
+        candidate.sanitize_for_persistence();
         candidate.validate()?;
 
         let mut by_id = self
@@ -309,7 +318,8 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
                     && row.candidate_index == candidate.candidate_index
                     && row.retry_index == candidate.retry_index
             })
-            .cloned();
+            .cloned()
+            .map(sanitize_stored_candidate);
 
         let preserve_existing_lifecycle = existing.as_ref().is_some_and(|row| {
             request_candidate_lifecycle_would_regress(row.status, candidate.status)
@@ -336,29 +346,36 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
                 .map(|row| row.id.clone())
                 .unwrap_or_else(|| candidate.id.clone()),
             request_id: candidate.request_id.clone(),
-            user_id: candidate
-                .user_id
-                .or_else(|| existing.as_ref().and_then(|row| row.user_id.clone())),
-            api_key_id: candidate
-                .api_key_id
-                .or_else(|| existing.as_ref().and_then(|row| row.api_key_id.clone())),
-            username: candidate
-                .username
-                .or_else(|| existing.as_ref().and_then(|row| row.username.clone())),
-            api_key_name: candidate
-                .api_key_name
-                .or_else(|| existing.as_ref().and_then(|row| row.api_key_name.clone())),
+            user_id: existing
+                .as_ref()
+                .and_then(|row| row.user_id.clone())
+                .or(candidate.user_id),
+            api_key_id: existing
+                .as_ref()
+                .and_then(|row| row.api_key_id.clone())
+                .or(candidate.api_key_id),
+            username: existing
+                .as_ref()
+                .and_then(|row| row.username.clone())
+                .or(candidate.username),
+            api_key_name: existing
+                .as_ref()
+                .and_then(|row| row.api_key_name.clone())
+                .or(candidate.api_key_name),
             candidate_index: candidate.candidate_index,
             retry_index: candidate.retry_index,
-            provider_id: candidate
-                .provider_id
-                .or_else(|| existing.as_ref().and_then(|row| row.provider_id.clone())),
-            endpoint_id: candidate
-                .endpoint_id
-                .or_else(|| existing.as_ref().and_then(|row| row.endpoint_id.clone())),
-            key_id: candidate
-                .key_id
-                .or_else(|| existing.as_ref().and_then(|row| row.key_id.clone())),
+            provider_id: existing
+                .as_ref()
+                .and_then(|row| row.provider_id.clone())
+                .or(candidate.provider_id),
+            endpoint_id: existing
+                .as_ref()
+                .and_then(|row| row.endpoint_id.clone())
+                .or(candidate.endpoint_id),
+            key_id: existing
+                .as_ref()
+                .and_then(|row| row.key_id.clone())
+                .or(candidate.key_id),
             status: merged_status,
             skip_reason: candidate
                 .skip_reason
@@ -380,13 +397,7 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
                     .error_type
                     .or_else(|| existing.as_ref().and_then(|row| row.error_type.clone()))
             },
-            error_message: if preserve_existing_lifecycle {
-                existing.as_ref().and_then(|row| row.error_message.clone())
-            } else {
-                candidate
-                    .error_message
-                    .or_else(|| existing.as_ref().and_then(|row| row.error_message.clone()))
-            },
+            error_message: None,
             latency_ms: if preserve_existing_lifecycle {
                 existing.as_ref().and_then(|row| row.latency_ms)
             } else {
@@ -407,9 +418,10 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
                     .and_then(|row| row.required_capabilities.clone())
             }),
             created_at_unix_ms,
-            started_at_unix_ms: candidate
-                .started_at_unix_ms
-                .or_else(|| existing.as_ref().and_then(|row| row.started_at_unix_ms)),
+            started_at_unix_ms: existing
+                .as_ref()
+                .and_then(|row| row.started_at_unix_ms)
+                .or(candidate.started_at_unix_ms),
             finished_at_unix_ms: if preserve_existing_lifecycle {
                 existing.as_ref().and_then(|row| row.finished_at_unix_ms)
             } else {
@@ -418,6 +430,7 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
                     .or_else(|| existing.as_ref().and_then(|row| row.finished_at_unix_ms))
             },
         };
+        let stored = sanitize_stored_candidate(stored);
 
         by_id.insert(stored.id.clone(), stored.clone());
         Ok(stored)
@@ -532,6 +545,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_and_reads_sanitize_candidates_that_bypass_contract_constructors() {
+        let raw_candidate = StoredRequestCandidate {
+            id: "cand-raw".to_string(),
+            request_id: "req-raw".to_string(),
+            user_id: None,
+            api_key_id: None,
+            username: None,
+            api_key_name: None,
+            candidate_index: 0,
+            retry_index: 0,
+            provider_id: Some("provider-1".to_string()),
+            endpoint_id: Some("endpoint-1".to_string()),
+            key_id: None,
+            status: RequestCandidateStatus::Failed,
+            skip_reason: Some("secret=/private/path".to_string()),
+            is_cached: false,
+            status_code: Some(500),
+            error_type: Some("token=secret".to_string()),
+            error_message: Some("Bearer secret-token".to_string()),
+            latency_ms: Some(10),
+            concurrent_requests: Some(1),
+            extra_data: Some(json!({
+                "gateway_execution_runtime": true,
+                "request_headers": {"authorization": "Bearer secret-token"},
+                "request_body": {"password": "secret"}
+            })),
+            required_capabilities: Some(json!({
+                "streaming": "true",
+                "internal_capability": "secret"
+            })),
+            created_at_unix_ms: 100,
+            started_at_unix_ms: Some(100),
+            finished_at_unix_ms: Some(110),
+        };
+        let repository = InMemoryRequestCandidateRepository::seed(vec![raw_candidate.clone()]);
+
+        {
+            let stored = repository
+                .by_id
+                .read()
+                .expect("request candidate repository lock");
+            let candidate = stored
+                .get("cand-raw")
+                .expect("seeded candidate should exist");
+            assert!(candidate.error_message.is_none());
+            assert_eq!(candidate.skip_reason.as_deref(), Some("unclassified_skip"));
+            assert_eq!(candidate.error_type.as_deref(), Some("unclassified_error"));
+            assert_eq!(
+                candidate.extra_data,
+                Some(json!({"gateway_execution_runtime": true}))
+            );
+            assert_eq!(
+                candidate.required_capabilities,
+                Some(json!({"streaming": true}))
+            );
+        }
+
+        let mut bypassed_candidate = raw_candidate;
+        bypassed_candidate.id = "cand-bypassed".to_string();
+        bypassed_candidate.request_id = "req-bypassed".to_string();
+        repository
+            .by_id
+            .write()
+            .expect("request candidate repository lock")
+            .insert(bypassed_candidate.id.clone(), bypassed_candidate);
+
+        let rows = repository
+            .list_recent(10)
+            .await
+            .expect("list recent should succeed");
+        let candidate = rows
+            .iter()
+            .find(|candidate| candidate.id == "cand-bypassed")
+            .expect("bypassed candidate should be returned");
+        assert!(candidate.error_message.is_none());
+        assert_eq!(
+            candidate.extra_data,
+            Some(json!({"gateway_execution_runtime": true}))
+        );
+        assert_eq!(
+            candidate.required_capabilities,
+            Some(json!({"streaming": true}))
+        );
+
+        let merged = repository
+            .upsert(UpsertRequestCandidateRecord {
+                id: "cand-merged".to_string(),
+                request_id: "req-bypassed".to_string(),
+                user_id: None,
+                api_key_id: None,
+                username: None,
+                api_key_name: None,
+                candidate_index: 0,
+                retry_index: 0,
+                provider_id: None,
+                endpoint_id: None,
+                key_id: None,
+                status: RequestCandidateStatus::Success,
+                skip_reason: None,
+                is_cached: None,
+                status_code: Some(200),
+                error_type: None,
+                error_message: Some("Bearer new-secret".to_string()),
+                latency_ms: Some(12),
+                concurrent_requests: None,
+                extra_data: Some(json!({
+                    "stream_completed": true,
+                    "request_body": {"password": "new-secret"}
+                })),
+                required_capabilities: Some(json!({
+                    "vision": 1,
+                    "internal_capability": "new-secret"
+                })),
+                created_at_unix_ms: Some(100),
+                started_at_unix_ms: Some(100),
+                finished_at_unix_ms: Some(112),
+            })
+            .await
+            .expect("candidate merge should succeed");
+        assert_eq!(merged.id, "cand-bypassed");
+        assert!(merged.error_message.is_none());
+        assert_eq!(
+            merged.extra_data,
+            Some(json!({
+                "gateway_execution_runtime": true,
+                "stream_completed": true
+            }))
+        );
+        assert_eq!(merged.required_capabilities, Some(json!({"vision": true})));
+    }
+
+    #[tokio::test]
     async fn aggregates_finalized_health_data_by_endpoint_ids() {
         let repository = InMemoryRequestCandidateRepository::seed(vec![
             sample_candidate("cand-1", "req-1", 100_000),
@@ -594,7 +739,7 @@ mod tests {
                     "execution_strategy": "local_cross_format",
                     "provider_name": "primary",
                 })),
-                required_capabilities: None,
+                required_capabilities: Some(json!({"streaming": true})),
                 created_at_unix_ms: Some(100),
                 started_at_unix_ms: None,
                 finished_at_unix_ms: None,
@@ -608,15 +753,15 @@ mod tests {
             .upsert(UpsertRequestCandidateRecord {
                 id: "cand-1-replacement".to_string(),
                 request_id: "req-1".to_string(),
-                user_id: None,
-                api_key_id: None,
-                username: None,
-                api_key_name: None,
+                user_id: Some("attacker-user".to_string()),
+                api_key_id: Some("attacker-api-key".to_string()),
+                username: Some("mallory".to_string()),
+                api_key_name: Some("attacker-key".to_string()),
                 candidate_index: 0,
                 retry_index: 0,
-                provider_id: None,
-                endpoint_id: None,
-                key_id: None,
+                provider_id: Some("attacker-provider".to_string()),
+                endpoint_id: Some("attacker-endpoint".to_string()),
+                key_id: Some("attacker-provider-key".to_string()),
                 status: RequestCandidateStatus::Success,
                 skip_reason: None,
                 is_cached: None,
@@ -629,7 +774,7 @@ mod tests {
                     "provider_api_format": "openai:responses",
                     "provider_name": "updated",
                 })),
-                required_capabilities: None,
+                required_capabilities: Some(json!({"vision": true})),
                 created_at_unix_ms: None,
                 started_at_unix_ms: Some(101),
                 finished_at_unix_ms: Some(102),
@@ -638,6 +783,14 @@ mod tests {
             .expect("update should succeed");
         assert_eq!(updated.id, "cand-1");
         assert_eq!(updated.status, RequestCandidateStatus::Success);
+        assert_eq!(updated.user_id.as_deref(), Some("user-1"));
+        assert_eq!(updated.api_key_id.as_deref(), Some("api-key-1"));
+        assert!(updated.username.is_none());
+        assert!(updated.api_key_name.is_none());
+        assert_eq!(updated.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(updated.endpoint_id.as_deref(), Some("endpoint-1"));
+        assert_eq!(updated.key_id.as_deref(), Some("key-1"));
+        assert_eq!(updated.required_capabilities, Some(json!({"vision": true})));
         assert_eq!(updated.status_code, Some(200));
         assert_eq!(updated.latency_ms, Some(25));
         assert_eq!(
@@ -659,13 +812,13 @@ mod tests {
                 .extra_data
                 .as_ref()
                 .and_then(|value| value.get("provider_name")),
-            Some(&json!("updated"))
+            None
         );
         assert_eq!(updated.started_at_unix_ms, Some(101));
     }
 
     #[tokio::test]
-    async fn upsert_keeps_terminal_candidate_state_when_streaming_arrives_late() {
+    async fn upsert_keeps_first_terminal_candidate_fact_when_another_terminal_arrives_late() {
         let existing = StoredRequestCandidate::new(
             "cand-1".to_string(),
             "req-1".to_string(),
@@ -686,7 +839,7 @@ mod tests {
             Some("retryable upstream failure".to_string()),
             Some(45),
             Some(1),
-            Some(json!({"terminal": true})),
+            Some(json!({"stream_completed": true})),
             None,
             100,
             Some(101),
@@ -708,7 +861,7 @@ mod tests {
                 provider_id: None,
                 endpoint_id: None,
                 key_id: None,
-                status: RequestCandidateStatus::Streaming,
+                status: RequestCandidateStatus::Success,
                 skip_reason: None,
                 is_cached: None,
                 status_code: Some(200),
@@ -716,7 +869,7 @@ mod tests {
                 error_message: None,
                 latency_ms: Some(9_999),
                 concurrent_requests: Some(2),
-                extra_data: Some(json!({"late": true})),
+                extra_data: Some(json!({"gateway_execution_runtime": true})),
                 required_capabilities: None,
                 created_at_unix_ms: None,
                 started_at_unix_ms: Some(102),
@@ -729,16 +882,16 @@ mod tests {
         assert_eq!(updated.status, RequestCandidateStatus::Failed);
         assert_eq!(updated.status_code, Some(503));
         assert_eq!(updated.error_type.as_deref(), Some("upstream_error"));
-        assert_eq!(
-            updated.error_message.as_deref(),
-            Some("retryable upstream failure")
-        );
+        assert!(updated.error_message.is_none());
         assert_eq!(updated.latency_ms, Some(45));
         assert_eq!(updated.concurrent_requests, Some(2));
         assert_eq!(updated.finished_at_unix_ms, Some(145));
         assert_eq!(
             updated.extra_data,
-            Some(json!({"terminal": true, "late": true}))
+            Some(json!({
+                "gateway_execution_runtime": true,
+                "stream_completed": true
+            }))
         );
     }
 

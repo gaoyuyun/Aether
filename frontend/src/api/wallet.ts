@@ -124,6 +124,7 @@ export interface PaymentOrder {
   fulfillment_error?: string | null
   gateway_order_id: string | null
   gateway_response: Record<string, unknown> | null
+  has_gateway_response?: boolean
   status: string
   created_at: string
   paid_at: string | null
@@ -145,7 +146,7 @@ export interface RefundRequest {
   gateway_refund_id: string | null
   payout_method: string | null
   payout_reference: string | null
-  payout_proof: Record<string, unknown> | null
+  payout_proof?: Record<string, unknown> | null
   created_at: string
   updated_at: string
   processed_at: string | null
@@ -160,6 +161,7 @@ export interface WalletRechargeCreateRequest {
   pay_amount?: number
   pay_currency?: string
   exchange_rate?: number
+  idempotency_key?: string
 }
 
 export interface WalletRechargeOption {
@@ -177,9 +179,6 @@ export interface WalletRechargeOption {
 export interface WalletRefundCreateRequest {
   amount_usd: number
   payment_order_id?: string
-  source_type?: string
-  source_id?: string
-  refund_mode?: string
   reason?: string
   idempotency_key?: string
 }

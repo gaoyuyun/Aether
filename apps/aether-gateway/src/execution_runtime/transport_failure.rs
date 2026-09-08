@@ -30,6 +30,7 @@ pub(crate) struct StreamCandidateWatchdogProgress {
     precise_timeout_armed: AtomicBool,
     deadline_generation: AtomicU64,
     deadline_changed: Notify,
+    abandoned: AtomicBool,
 }
 
 tokio::task_local! {
@@ -74,6 +75,24 @@ impl StreamCandidateWatchdogProgress {
         }
         self.deadline_generation.fetch_add(1, Ordering::AcqRel);
         self.deadline_changed.notify_waiters();
+    }
+
+    /// The watchdog gave up waiting and settles this attempt itself.
+    ///
+    /// The attempt future is dropped once the watchdog returns, so its own
+    /// cancellation guard must stay out of the way instead of racing the
+    /// watchdog's terminal rows with a cancellation.
+    pub(crate) fn mark_abandoned(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
+    /// The watchdog watching the attempt on this task, if it runs under one.
+    pub(crate) fn current() -> Option<Arc<Self>> {
+        STREAM_CANDIDATE_WATCHDOG_PROGRESS.try_with(Arc::clone).ok()
     }
 
     pub(crate) async fn scope<F>(self: Arc<Self>, future: F) -> F::Output

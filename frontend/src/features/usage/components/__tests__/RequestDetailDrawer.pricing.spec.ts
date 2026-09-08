@@ -113,6 +113,58 @@ function buildFastTierDetail(): RequestDetail {
 }
 
 describe('RequestDetailDrawer settlement pricing', () => {
+  it('labels an unmetered OpenAI Live WebSocket detail without rendering zero usage as billing', async () => {
+    apiMocks.getRequestDetail.mockResolvedValue({
+      ...buildEmbeddingDetail(),
+      id: 'usage-live-ws-1',
+      request_id: 'req-live-ws-1',
+      tokens: { input: 0, output: 0, total: 0 },
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+      cost: { input: 0, output: 0, total: 0 },
+      total_cost: 0,
+      is_stream: true,
+      is_websocket: true,
+      websocket_transport: 'codex_live_sideband',
+      usage_available: false,
+    } satisfies RequestDetail)
+
+    let isOpen!: Ref<boolean>
+    const Host = defineComponent({
+      setup() {
+        isOpen = ref(false)
+        return () => h(RequestDetailDrawer, {
+          isOpen: isOpen.value,
+          requestId: 'usage-live-ws-1',
+        })
+      },
+    })
+
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(Host)
+    app.mount(root)
+    mountedApps.push({ app, root })
+
+    isOpen.value = true
+    await nextTick()
+
+    await vi.waitFor(() => {
+      const transport = document.body.querySelector<HTMLElement>('[data-usage-transport="websocket"]')
+      expect(transport?.textContent?.trim()).toBe('WS')
+      expect(transport?.title).toBe('OpenAI Live Sideband WebSocket')
+      expect(document.body.querySelector('[data-usage-transport="http"]')).toBeNull()
+      expect(document.body.querySelector('[data-request-lifecycle-status]')?.textContent?.trim())
+        .toBe('200')
+      expect(document.body.querySelector('[data-request-detail-usage-unavailable]')).not.toBeNull()
+    })
+
+    const totals = [...document.body.querySelectorAll<HTMLElement>('[data-request-detail-total-cost]')]
+    expect(totals.length).toBe(2)
+    expect(totals.every(total => total.textContent?.trim() === '不可用')).toBe(true)
+  })
+
   it('shows end-to-end latency while keeping output TPS scoped to candidate timing', async () => {
     apiMocks.getRequestDetail.mockResolvedValue({
       ...buildEmbeddingDetail(),
@@ -149,6 +201,8 @@ describe('RequestDetailDrawer settlement pricing', () => {
     await nextTick()
 
     await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-usage-transport="http"]')?.textContent?.trim())
+        .toBe('HTTP 流式')
       expect(document.body.textContent).toContain('10.12s / 10.63s')
       expect(document.body.textContent).toContain('95.1tps')
       expect(document.body.textContent).not.toContain('98.8tps')
@@ -179,6 +233,8 @@ describe('RequestDetailDrawer settlement pricing', () => {
     await nextTick()
 
     await vi.waitFor(() => {
+      expect(document.body.querySelector('[data-usage-transport="http"]')?.textContent?.trim())
+        .toBe('HTTP 标准')
       expect(document.body.textContent).toContain('输入 $0.1/M')
       expect(document.body.textContent).toContain('输出 -')
     })

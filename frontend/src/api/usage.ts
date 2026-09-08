@@ -34,6 +34,11 @@ export interface UsageRecord {
   end_to_end_time_ms?: number | null
   end_to_end_first_byte_time_ms?: number | null
   is_websocket?: boolean
+  websocket_transport?: string | null
+  usage_available?: boolean
+  usage_pricing_available?: boolean
+  input_audio_tokens?: number | null
+  output_audio_tokens?: number | null
   created_at: string
   updated_at?: string | null
   response_time_updated_at?: string | null
@@ -145,6 +150,21 @@ export interface UsageFilters {
 export interface UsageRequestOptions {
   skipCache?: boolean
 }
+
+export type UsageRecordStatusFilter =
+  | 'stream'
+  | 'standard'
+  | 'websocket'
+  | 'ws'
+  | 'active'
+  | 'pending'
+  | 'streaming'
+  | 'completed'
+  | 'failed'
+  | 'error'
+  | 'cancelled'
+  | 'has_fallback'
+  | 'has_retry'
 
 type UsageListResponse = {
   records?: unknown
@@ -497,7 +517,7 @@ export const usageApi = {
     model?: string
     provider?: string
     api_format?: string  // API 格式筛选（如 openai:chat, claude:messages）
-    status?: string // 'stream' | 'standard' | 'error'
+    status?: UsageRecordStatusFilter
     client_family?: string
     hide_unknown?: boolean
     include_total?: boolean
@@ -530,7 +550,7 @@ export const usageApi = {
     model?: string
     provider?: string
     api_format?: string
-    status?: string
+    status?: UsageRecordStatusFilter
     client_family?: string
     hide_unknown?: boolean
   }): Promise<number> {
@@ -587,6 +607,11 @@ export const usageApi = {
       endpoint_api_format?: string | null
       is_stream?: boolean | null
       is_websocket?: boolean | null
+      websocket_transport?: string | null
+      usage_available?: boolean | null
+      usage_pricing_available?: boolean | null
+      input_audio_tokens?: number | null
+      output_audio_tokens?: number | null
       upstream_is_stream?: boolean | null
       client_requested_stream?: boolean | null
       client_is_stream?: boolean | null

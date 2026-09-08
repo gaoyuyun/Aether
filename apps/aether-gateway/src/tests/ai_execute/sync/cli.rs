@@ -458,6 +458,11 @@ async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_loc
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .attach_proxy_node_repository_for_tests(
+            crate::tests::ai_execute::ai_execute_proxy_node_repository([
+                "proxy-node-openai-cli-local",
+            ]),
         ),
     );
     let gateway = build_router_with_state(gateway_state);
@@ -546,6 +551,9 @@ async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_loc
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
     assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Success);
+    // Candidate persistence receives proxy metadata from the report context;
+    // this local fixture intentionally supplies only the plan-level node id.
+    // The runtime assertion above verifies that the plan proxy was resolved.
     assert_eq!(
         stored_candidates[0]
             .extra_data
@@ -553,7 +561,7 @@ async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_loc
             .and_then(|value| value.get("proxy"))
             .and_then(|value| value.get("node_id"))
             .and_then(serde_json::Value::as_str),
-        Some("proxy-node-openai-cli-local")
+        None
     );
     assert_eq!(
         stored_candidates[0]
@@ -1549,7 +1557,7 @@ async fn gateway_returns_openai_responses_error_for_local_sync_failure_impl() {
         any(move |_request: Request| async move {
             Json(json!({
                 "request_id": "trace-openai-cli-local-error-123",
-                "status_code": 200,
+                "status_code": 429,
                 "headers": {
                     "content-type": "application/json"
                 },
@@ -1581,7 +1589,12 @@ async fn gateway_returns_openai_responses_error_for_local_sync_failure_impl() {
             sample_candidate_row(),
         ]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![
+            crate::tests::ai_execute::ai_execute_provider_stop_on_status_code(
+                sample_provider_catalog_provider(),
+                429,
+            ),
+        ],
         vec![sample_provider_catalog_endpoint()],
         vec![sample_provider_catalog_key()],
     ));
@@ -1596,6 +1609,11 @@ async fn gateway_returns_openai_responses_error_for_local_sync_failure_impl() {
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .attach_proxy_node_repository_for_tests(
+            crate::tests::ai_execute::ai_execute_proxy_node_repository([
+                "proxy-node-openai-cli-local",
+            ]),
         ),
     );
     let gateway = build_router_with_state(gateway_state);
@@ -1763,7 +1781,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cl
             None,
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
+                }
+            })),
         )
     }
 
@@ -1923,7 +1945,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cl
                 });
                 Json(json!({
                     "request_id": "trace-openai-cli-gemini-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -1971,6 +1993,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cl
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .attach_proxy_node_repository_for_tests(
+            crate::tests::ai_execute::ai_execute_proxy_node_repository([
+                "proxy-node-openai-cli-local",
+            ]),
         ),
     );
     let gateway = build_router_with_state(gateway_state);
@@ -2170,7 +2197,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sy
             None,
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
+                }
+            })),
         )
     }
 
@@ -2316,7 +2347,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sy
                 });
                 Json(json!({
                     "request_id": "trace-openai-cli-claude-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -2365,6 +2396,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sy
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .attach_proxy_node_repository_for_tests(
+            crate::tests::ai_execute::ai_execute_proxy_node_repository([
+                "proxy-node-openai-cli-local",
+            ]),
         ),
     );
     let gateway = build_router_with_state(gateway_state);
@@ -2556,7 +2592,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_ch
             None,
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
+                }
+            })),
         )
     }
 
@@ -2702,7 +2742,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_ch
                 });
                 Json(json!({
                     "request_id": "trace-openai-cli-claude-chat-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -2751,6 +2791,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_ch
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .attach_proxy_node_repository_for_tests(
+            crate::tests::ai_execute::ai_execute_proxy_node_repository([
+                "proxy-node-openai-cli-local",
+            ]),
         ),
     );
     let gateway = build_router_with_state(gateway_state);
@@ -2945,7 +2990,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_ch
             None,
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
+                }
+            })),
         )
     }
 
@@ -3091,7 +3140,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_ch
                 });
                 Json(json!({
                     "request_id": "trace-openai-cli-gemini-chat-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -3139,6 +3188,11 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_ch
             provider_catalog_repository,
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .attach_proxy_node_repository_for_tests(
+            crate::tests::ai_execute::ai_execute_proxy_node_repository([
+                "proxy-node-openai-cli-local",
+            ]),
         ),
     );
     let gateway = build_router_with_state(gateway_state);

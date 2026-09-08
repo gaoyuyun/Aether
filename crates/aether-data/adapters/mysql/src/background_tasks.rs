@@ -209,8 +209,9 @@ impl BackgroundTaskReadRepository for MysqlBackgroundTaskRepository {
 impl BackgroundTaskWriteRepository for MysqlBackgroundTaskRepository {
     async fn upsert_run(
         &self,
-        run: UpsertBackgroundTaskRun,
+        mut run: UpsertBackgroundTaskRun,
     ) -> Result<StoredBackgroundTaskRun, DataLayerError> {
+        run.sanitize_for_persistence();
         run.validate()?;
         sqlx::query(
             r#"
@@ -309,8 +310,9 @@ ON DUPLICATE KEY UPDATE
 
     async fn upsert_event(
         &self,
-        event: UpsertBackgroundTaskEvent,
+        mut event: UpsertBackgroundTaskEvent,
     ) -> Result<StoredBackgroundTaskEvent, DataLayerError> {
+        event.sanitize_for_persistence();
         event.validate()?;
         sqlx::query(
             r#"
@@ -358,7 +360,7 @@ fn map_run_row(row: &MySqlRow) -> Result<StoredBackgroundTaskRun, DataLayerError
     let finished_at_unix_secs: Option<i64> = row.try_get("finished_at_unix_secs").map_sql_err()?;
     let updated_at_unix_secs: i64 = row.try_get("updated_at_unix_secs").map_sql_err()?;
 
-    Ok(StoredBackgroundTaskRun {
+    let mut run = StoredBackgroundTaskRun {
         id: row.try_get("id").map_sql_err()?,
         task_key: row.try_get("task_key").map_sql_err()?,
         kind: BackgroundTaskKind::from_database(&kind)?,
@@ -381,12 +383,14 @@ fn map_run_row(row: &MySqlRow) -> Result<StoredBackgroundTaskRun, DataLayerError
         started_at_unix_secs: started_at_unix_secs.and_then(|value| u64::try_from(value).ok()),
         finished_at_unix_secs: finished_at_unix_secs.and_then(|value| u64::try_from(value).ok()),
         updated_at_unix_secs: u64::try_from(updated_at_unix_secs).unwrap_or_default(),
-    })
+    };
+    run.sanitize_persisted_data();
+    Ok(run)
 }
 
 fn map_event_row(row: &MySqlRow) -> Result<StoredBackgroundTaskEvent, DataLayerError> {
     let created_at_unix_secs: i64 = row.try_get("created_at_unix_secs").map_sql_err()?;
-    Ok(StoredBackgroundTaskEvent {
+    let mut event = StoredBackgroundTaskEvent {
         id: row.try_get("id").map_sql_err()?,
         run_id: row.try_get("run_id").map_sql_err()?,
         event_type: row.try_get("event_type").map_sql_err()?,
@@ -396,7 +400,9 @@ fn map_event_row(row: &MySqlRow) -> Result<StoredBackgroundTaskEvent, DataLayerE
             "payload_json",
         )?,
         created_at_unix_secs: u64::try_from(created_at_unix_secs).unwrap_or_default(),
-    })
+    };
+    event.sanitize_persisted_data();
+    Ok(event)
 }
 
 fn i64_from_usize(value: usize, label: &str) -> Result<i64, DataLayerError> {

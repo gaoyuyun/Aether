@@ -1,18 +1,33 @@
 import { describe, expect, it } from 'vitest'
-import { getOAuthIcon, getOAuthIconUrl } from '../oauth-icons'
 
-describe('OAuth icons', () => {
-  it('uses code-owned SVGs for built-in providers', () => {
-    expect(getOAuthIcon('github')).toContain('<svg')
-    expect(getOAuthIconUrl('github', 'https://example.com/override.png')).toBeNull()
+import { getOAuthIcon, OAUTH_ICONS } from '../oauth-icons'
+
+describe('getOAuthIcon', () => {
+  it('keeps built-in icons independent of configured URLs', () => {
+    expect(getOAuthIcon('github', 'https://attacker.example/icon.svg')).toBe(OAUTH_ICONS.github)
   })
 
-  it('accepts only absolute HTTPS image URLs without credentials', () => {
-    expect(getOAuthIconUrl('custom_oidc', 'https://cdn.example.com/icon.png'))
-      .toBe('https://cdn.example.com/icon.png')
-    expect(getOAuthIconUrl('custom_oidc', 'javascript:alert(1)')).toBeNull()
-    expect(getOAuthIconUrl('custom_oidc', 'http://example.com/icon.png')).toBeNull()
-    expect(getOAuthIconUrl('custom_oidc', 'https://user:pass@example.com/icon.png')).toBeNull()
-    expect(getOAuthIconUrl('custom_oidc', '/relative/icon.png')).toBeNull()
+  it('allows HTTPS and root-relative custom icons', () => {
+    expect(getOAuthIcon('custom', 'https://cdn.example/icon.svg')).toContain(
+      'src="https://cdn.example/icon.svg"',
+    )
+    expect(getOAuthIcon('custom', '/assets/oauth/custom.svg')).toContain(
+      'src="/assets/oauth/custom.svg"',
+    )
+  })
+
+  it.each([
+    'javascript:alert(1)',
+    'data:image/svg+xml,<svg onload=alert(1)>',
+    '//attacker.example/icon.svg',
+    'http://cdn.example/icon.svg',
+    'https://cdn.example/icon.svg" onerror="alert(1)',
+  ])('rejects executable or injectable custom icon URL %s', (iconUrl) => {
+    const rendered = getOAuthIcon('custom', iconUrl)
+
+    expect(rendered).toBe(OAUTH_ICONS.github)
+    expect(rendered).not.toContain('onerror')
+    expect(rendered).not.toContain('javascript:')
+    expect(rendered).not.toContain('data:')
   })
 })

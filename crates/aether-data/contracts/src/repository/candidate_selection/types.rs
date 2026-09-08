@@ -113,6 +113,27 @@ impl StoredMinimalCandidateSelectionRow {
     }
 }
 
+/// Evaluates the API-format scope on a provider-model mapping.
+///
+/// Codex Live was introduced after existing Codex model associations had
+/// already stored their source-model scope as `openai:responses`. Preserve
+/// those associations for the same Codex provider without treating the two
+/// formats as globally interchangeable. Endpoint and key permissions remain
+/// independently scoped to `codex:live`.
+pub fn provider_model_mapping_api_format_covers(
+    provider_type: &str,
+    mapping_api_format: &str,
+    requested_api_format: &str,
+) -> bool {
+    if aether_ai_formats::api_format_permission_covers(mapping_api_format, requested_api_format) {
+        return true;
+    }
+
+    provider_type.trim().eq_ignore_ascii_case("codex")
+        && aether_ai_formats::normalize_api_format_alias(requested_api_format) == "codex:live"
+        && aether_ai_formats::normalize_api_format_alias(mapping_api_format) == "openai:responses"
+}
+
 fn api_format_permission_covers(allowed: &str, requested: &str) -> bool {
     aether_ai_formats::api_format_permission_covers(allowed, requested)
 }
@@ -175,4 +196,38 @@ pub trait MinimalCandidateSelectionRepository:
 impl<T> MinimalCandidateSelectionRepository for T where
     T: MinimalCandidateSelectionReadRepository + Send + Sync
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_model_mapping_api_format_covers;
+
+    #[test]
+    fn legacy_responses_mapping_is_only_compatible_with_codex_live() {
+        assert!(provider_model_mapping_api_format_covers(
+            "codex",
+            "openai:responses",
+            "codex:live"
+        ));
+        assert!(provider_model_mapping_api_format_covers(
+            " CoDeX ",
+            "/v1/responses",
+            "codex:live"
+        ));
+
+        for provider_type in ["openai", "custom", "chatgpt_web"] {
+            assert!(!provider_model_mapping_api_format_covers(
+                provider_type,
+                "openai:responses",
+                "codex:live"
+            ));
+        }
+        for requested_api_format in ["openai:chat", "claude:messages", "openai:image"] {
+            assert!(!provider_model_mapping_api_format_covers(
+                "codex",
+                "openai:responses",
+                requested_api_format
+            ));
+        }
+    }
 }

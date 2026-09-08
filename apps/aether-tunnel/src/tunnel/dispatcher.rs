@@ -1,13 +1,14 @@
 //! Frame dispatcher: reads incoming WebSocket frames and routes them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -15,11 +16,26 @@ use tracing::{debug, error, info, warn};
 use crate::state::{AppState, ServerContext};
 
 use super::heartbeat::HeartbeatHandle;
-use super::protocol::{decompress_if_gzip, Frame, MsgType, RequestMeta};
+use super::protocol::{decompress_if_gzip_with_limit, Frame, MsgType, RequestMeta};
 use super::stream_handler;
 use super::stream_handler::StreamSendWindow;
 use super::writer::FrameSender;
 use aether_contracts::tunnel_security::SecureFrameCodec;
+
+const REQUEST_BODY_QUEUE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+static REQUEST_BODY_QUEUE_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(REQUEST_BODY_QUEUE_BUDGET_BYTES)));
+
+struct BudgetedFramePayload {
+    bytes: Bytes,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for BudgetedFramePayload {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamDispatchStatus {
@@ -32,6 +48,24 @@ enum StreamDispatchStatus {
 struct StreamDispatchTarget {
     body_tx: mpsc::Sender<Frame>,
     response_window: Arc<StreamSendWindow>,
+}
+
+/// A request stream is identified by a non-zero id and may only be opened
+/// once while its handler is active.  Replacing an entry in `streams` would
+/// orphan the old body channel while still spawning another handler, making
+/// the active-stream limit ineffective and allowing unbounded task growth.
+fn validate_request_stream_id(
+    streams: &HashMap<u32, StreamDispatchTarget>,
+    active_handler_ids: &HashSet<u32>,
+    stream_id: u32,
+) -> Result<(), &'static str> {
+    if stream_id == 0 {
+        return Err("invalid stream id");
+    }
+    if streams.contains_key(&stream_id) || active_handler_ids.contains(&stream_id) {
+        return Err("duplicate stream id");
+    }
+    Ok(())
 }
 
 /// Run the dispatcher loop, reading from the WebSocket stream.
@@ -70,6 +104,10 @@ where
 {
     // Active streams: stream_id -> body sender + response flow-control window.
     let mut streams: HashMap<u32, StreamDispatchTarget> = HashMap::new();
+    // A handler can outlive its routing entry when body dispatch fails. Keep
+    // its id reserved until the handler reports completion so a peer cannot
+    // reopen the same id and bypass the stream admission limit.
+    let mut active_handler_ids: HashSet<u32> = HashSet::new();
     // Track spawned stream handlers so we can wait for them on shutdown
     let mut handler_handles: Vec<JoinHandle<()>> = Vec::new();
     let (handler_finished_tx, mut handler_finished_rx) = mpsc::unbounded_channel::<u32>();
@@ -85,7 +123,7 @@ where
     let mut draining = *drain.borrow();
 
     let read_err = loop {
-        if draining && streams.is_empty() {
+        if draining && streams.is_empty() && active_handler_ids.is_empty() {
             info!("tunnel drained after in-flight streams completed");
             break None;
         }
@@ -109,8 +147,9 @@ where
             }
             finished = handler_finished_rx.recv() => {
                 if let Some(stream_id) = finished {
+                    active_handler_ids.remove(&stream_id);
                     streams.remove(&stream_id);
-                    if draining && streams.is_empty() {
+                    if draining && streams.is_empty() && active_handler_ids.is_empty() {
                         info!("tunnel drained after stream handler completion");
                         break None;
                     }
@@ -184,6 +223,20 @@ where
 
         match frame.msg_type {
             MsgType::RequestHeaders => {
+                if let Err(reason) =
+                    validate_request_stream_id(&streams, &active_handler_ids, frame.stream_id)
+                {
+                    warn!(
+                        stream_id = frame.stream_id,
+                        reason, "rejecting request headers with invalid stream id"
+                    );
+                    // Zero is reserved for connection-level control frames,
+                    // so do not emit a stream-scoped error using that id.
+                    if frame.stream_id != 0 {
+                        try_send_stream_error(&frame_tx, frame.stream_id, reason);
+                    }
+                    continue;
+                }
                 if draining {
                     if frame_tx
                         .try_send(Frame::new(
@@ -203,7 +256,10 @@ where
                 }
 
                 // Decompress if the frame is gzip-compressed, then parse metadata
-                let payload = match decompress_if_gzip(&frame) {
+                let payload = match decompress_if_gzip_with_limit(
+                    &frame,
+                    aether_contracts::tunnel::MAX_TUNNEL_RELAY_META_LEN,
+                ) {
                     Ok(p) => p,
                     Err(e) => {
                         warn!(stream_id = frame.stream_id, error = %e, "frame decompress failed");
@@ -233,7 +289,7 @@ where
                     }
                 };
 
-                if streams.len() >= max_streams {
+                if active_handler_ids.len() >= max_streams {
                     warn!(
                         stream_id = frame.stream_id,
                         "max concurrent streams reached"
@@ -267,6 +323,7 @@ where
                         response_window: Arc::clone(&response_window),
                     },
                 );
+                active_handler_ids.insert(frame.stream_id);
                 let request_headers_end_stream = frame.is_end_stream();
 
                 let state_clone = Arc::clone(&state);
@@ -321,7 +378,8 @@ where
                                 "tunnel request body dispatch stalled",
                             );
                         }
-                        if is_end && draining && streams.is_empty() {
+                        if is_end && draining && streams.is_empty() && active_handler_ids.is_empty()
+                        {
                             info!("tunnel drained after request body completion");
                             break None;
                         }
@@ -333,7 +391,7 @@ where
                 // Client-side cancellation or end
                 if let Some(target) = streams.remove(&frame.stream_id) {
                     let _ = dispatch_stream_frame(&target.body_tx, frame).await;
-                    if draining && streams.is_empty() {
+                    if draining && streams.is_empty() && active_handler_ids.is_empty() {
                         info!("tunnel drained after stream termination");
                         break None;
                     }
@@ -399,7 +457,7 @@ where
         if frames_since_cleanup >= 64 || handler_handles.len() > max_streams {
             handler_handles.retain(|h| !h.is_finished());
             frames_since_cleanup = 0;
-            if draining && streams.is_empty() {
+            if draining && streams.is_empty() && active_handler_ids.is_empty() {
                 info!("tunnel drained after cleanup");
                 break None;
             }
@@ -421,12 +479,18 @@ where
 
 async fn dispatch_stream_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> StreamDispatchStatus {
     let stream_id = frame.stream_id;
-    match tokio::time::timeout(stream_frame_dispatch_timeout(), tx.send(frame)).await {
-        Ok(Ok(())) => StreamDispatchStatus::Delivered,
-        Ok(Err(_)) => {
+    let dispatched = tokio::time::timeout(stream_frame_dispatch_timeout(), async {
+        let frame = attach_request_body_queue_budget(frame).await?;
+        tx.send(frame).await.ok()?;
+        Some(())
+    })
+    .await;
+    match dispatched {
+        Ok(Some(())) => StreamDispatchStatus::Delivered,
+        Ok(None) => {
             warn!(
                 stream_id,
-                "stream handler channel closed while dispatching tunnel frame"
+                "stream handler channel or request body budget closed while dispatching tunnel frame"
             );
             StreamDispatchStatus::Closed
         }
@@ -439,6 +503,50 @@ async fn dispatch_stream_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> Stream
             StreamDispatchStatus::TimedOut
         }
     }
+}
+
+async fn attach_request_body_queue_budget(frame: Frame) -> Option<Frame> {
+    attach_request_body_queue_budget_with(
+        frame,
+        Arc::clone(&REQUEST_BODY_QUEUE_BUDGET),
+        REQUEST_BODY_QUEUE_BUDGET_BYTES,
+    )
+    .await
+}
+
+async fn attach_request_body_queue_budget_with(
+    mut frame: Frame,
+    budget: Arc<Semaphore>,
+    budget_bytes: usize,
+) -> Option<Frame> {
+    if frame.msg_type != MsgType::RequestBody {
+        return Some(frame);
+    }
+    let permits = request_body_queue_permits(&frame, budget_bytes)?;
+    let permit = budget.acquire_many_owned(permits).await.ok()?;
+    frame.payload = Bytes::from_owner(BudgetedFramePayload {
+        bytes: frame.payload,
+        _permit: permit,
+    });
+    Some(frame)
+}
+
+fn request_body_queue_permits(frame: &Frame, budget_bytes: usize) -> Option<u32> {
+    let decoded_budget = if frame.is_gzip() {
+        aether_contracts::tunnel::MAX_TUNNEL_DECOMPRESSED_PAYLOAD_BYTES
+    } else {
+        0
+    };
+    let retained_bytes = frame
+        .payload
+        .len()
+        .checked_add(decoded_budget)?
+        .checked_add(size_of::<Frame>())?
+        .max(1);
+    if retained_bytes > budget_bytes {
+        return None;
+    }
+    u32::try_from(retained_bytes).ok()
 }
 
 /// Bound how long a single stream handler is allowed to block the shared
@@ -497,6 +605,7 @@ async fn drain_handlers(handles: Vec<JoinHandle<()>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_contracts::tunnel::{compress_payload, flags};
     use aether_runtime::bounded_queue;
 
     #[tokio::test]
@@ -532,6 +641,70 @@ mod tests {
             .await
             .expect("queued frame should still be present");
         assert_eq!(retained.payload, Bytes::from_static(b"first"));
+    }
+
+    #[tokio::test]
+    async fn request_body_queue_budget_releases_when_frame_is_dropped() {
+        const BUDGET_BYTES: usize = 4096;
+        let budget = Arc::new(Semaphore::new(BUDGET_BYTES));
+        let frame = Frame::new(
+            7,
+            MsgType::RequestBody,
+            0,
+            Bytes::from_static(b"request body"),
+        );
+        let permits = request_body_queue_permits(&frame, BUDGET_BYTES).expect("permit count");
+
+        let frame = attach_request_body_queue_budget_with(frame, Arc::clone(&budget), BUDGET_BYTES)
+            .await
+            .expect("frame should fit the queue budget");
+        assert_eq!(budget.available_permits(), BUDGET_BYTES - permits as usize);
+
+        drop(frame);
+        assert_eq!(budget.available_permits(), BUDGET_BYTES);
+    }
+
+    #[tokio::test]
+    async fn gzip_request_body_budget_follows_decoded_payload_lifetime() {
+        let (payload, frame_flags) = compress_payload(Bytes::from(vec![b'x'; 1024]));
+        assert_eq!(frame_flags, flags::GZIP_COMPRESSED);
+        let frame = Frame::new(7, MsgType::RequestBody, frame_flags, payload);
+        let required = request_body_queue_permits(&frame, REQUEST_BODY_QUEUE_BUDGET_BYTES)
+            .expect("gzip frame should fit the queue budget") as usize;
+        let budget = Arc::new(Semaphore::new(required));
+        let frame = attach_request_body_queue_budget_with(frame, Arc::clone(&budget), required)
+            .await
+            .expect("frame should acquire the entire local budget");
+        assert_eq!(budget.available_permits(), 0);
+
+        let decoded = stream_handler::decode_request_body_frame(frame)
+            .expect("gzip request body should decode");
+        assert_eq!(decoded, Bytes::from(vec![b'x'; 1024]));
+        assert_eq!(budget.available_permits(), 0);
+
+        drop(decoded);
+        assert_eq!(budget.available_permits(), required);
+    }
+
+    #[tokio::test]
+    async fn gzip_request_body_budget_releases_after_decode_error() {
+        let frame = Frame::new(
+            7,
+            MsgType::RequestBody,
+            flags::GZIP_COMPRESSED,
+            Bytes::from_static(b"not gzip"),
+        );
+        let required = request_body_queue_permits(&frame, REQUEST_BODY_QUEUE_BUDGET_BYTES)
+            .expect("gzip frame should fit the queue budget") as usize;
+        let budget = Arc::new(Semaphore::new(required));
+        let frame = attach_request_body_queue_budget_with(frame, Arc::clone(&budget), required)
+            .await
+            .expect("frame should acquire the entire local budget");
+        assert_eq!(budget.available_permits(), 0);
+
+        stream_handler::decode_request_body_frame(frame)
+            .expect_err("invalid gzip request body should fail");
+        assert_eq!(budget.available_permits(), required);
     }
 
     #[tokio::test]
@@ -580,5 +753,40 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!streams.contains_key(&7));
         assert!(streams.contains_key(&9));
+    }
+
+    #[test]
+    fn request_stream_id_rejects_zero_and_active_duplicates() {
+        let (tx, _rx) = mpsc::channel::<Frame>(1);
+        let streams = HashMap::from([(
+            7,
+            StreamDispatchTarget {
+                body_tx: tx,
+                response_window: Arc::new(StreamSendWindow::new(1024)),
+            },
+        )]);
+        let mut active_handler_ids = HashSet::from([7]);
+
+        assert_eq!(
+            validate_request_stream_id(&streams, &active_handler_ids, 0),
+            Err("invalid stream id")
+        );
+        assert_eq!(
+            validate_request_stream_id(&streams, &active_handler_ids, 7),
+            Err("duplicate stream id")
+        );
+        assert_eq!(
+            validate_request_stream_id(&streams, &active_handler_ids, 9),
+            Ok(())
+        );
+
+        // The routing entry may be removed after a dispatch failure while the
+        // handler is still running; its reservation must continue to reject
+        // a new request with the same id.
+        active_handler_ids.insert(11);
+        assert_eq!(
+            validate_request_stream_id(&HashMap::new(), &active_handler_ids, 11),
+            Err("duplicate stream id")
+        );
     }
 }

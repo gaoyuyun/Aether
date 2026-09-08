@@ -4,6 +4,7 @@ mod payload;
 mod request;
 
 pub(crate) use self::build::{
+    maybe_build_pinned_stream_local_same_format_provider_decision_payload,
     maybe_build_stream_local_same_format_provider_decision_payload,
     maybe_build_sync_local_same_format_provider_decision_payload,
 };

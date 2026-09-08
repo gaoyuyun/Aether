@@ -123,8 +123,8 @@
                   />
                   <span class="title-text">{{ currentGroupTitle }}</span>
                   <a
-                    v-if="currentAttempt.provider_website"
-                    :href="currentAttempt.provider_website"
+                    v-if="currentAttemptProviderWebsite"
+                    :href="currentAttemptProviderWebsite"
                     target="_blank"
                     rel="noopener noreferrer"
                     class="provider-link"
@@ -555,6 +555,7 @@ import JsonContentPanel from './JsonContentPanel.vue'
 import { ChevronLeft, ChevronRight, ExternalLink } from 'lucide-vue-next'
 import { requestTraceApi, type RequestTrace, type CandidateRecord, type CandidateProxyInfo, type ImageProgress } from '@/api/requestTrace'
 import { log } from '@/utils/logger'
+import { safeExternalWebUrl } from '@/utils/navigationSecurity'
 import { parseApiError } from '@/utils/errorParser'
 import { formatTokens } from '@/utils/format'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
@@ -1081,6 +1082,10 @@ const currentAttempt = computed(() => {
   if (!selectedGroup.value) return null
   return selectedGroup.value.allAttempts[selectedAttemptIndex.value] || selectedGroup.value.primary
 })
+
+const currentAttemptProviderWebsite = computed(() =>
+  safeExternalWebUrl(currentAttempt.value?.provider_website),
+)
 
 const currentAttemptTimeRange = computed<AttemptTimeRange | null>(() => {
   return resolveAttemptTimeRange(currentAttempt.value)

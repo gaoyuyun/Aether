@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::future::Future;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use aether_contracts::{
 use bytes::Bytes;
 use futures_util::Stream;
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::rt;
 use hyper::Response;
@@ -35,10 +34,9 @@ use tower_service::Service;
 
 use crate::config::Config;
 use crate::egress_proxy::{
-    connect_proxy_tcp, http_connect, socks5_connect, ProxyConnectOptions, UpstreamProxyConfig,
-    UpstreamProxyScheme,
+    connect_validated_target_via_proxy, ProxyConnectOptions, UpstreamProxyConfig,
 };
-use crate::target_filter::{self, DnsCache};
+use crate::target_filter::DnsCache;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -60,12 +58,75 @@ pub struct UpstreamClientPoolKey {
     pub profile_id: String,
     pub backend: String,
     pub http_mode: String,
+    pub validated_target: ValidatedUpstreamTarget,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ValidatedUpstreamTarget {
+    scheme: String,
+    host: String,
+    port: u16,
+    addrs: Vec<SocketAddr>,
+}
+
+impl ValidatedUpstreamTarget {
+    pub fn new(target_url: &url::Url, mut addrs: Vec<SocketAddr>) -> Result<Self, String> {
+        let scheme = target_url.scheme().to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Err(format!("unsupported upstream scheme {scheme}"));
+        }
+        let host = target_url
+            .host_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "missing host in upstream URL".to_string())?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        let port = target_url
+            .port_or_known_default()
+            .ok_or_else(|| "missing port in upstream URL".to_string())?;
+        if addrs.is_empty() {
+            return Err("validated upstream target has no addresses".to_string());
+        }
+        if addrs.iter().any(|addr| addr.port() != port) {
+            return Err("validated upstream target address has the wrong port".to_string());
+        }
+        addrs.sort_unstable();
+        addrs.dedup();
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            addrs,
+        })
+    }
+
+    fn ensure_matches_uri(&self, uri: &Uri) -> Result<(), io::Error> {
+        let scheme = uri
+            .scheme_str()
+            .ok_or_else(|| io::Error::other("missing scheme"))?;
+        let host = uri_host(uri)?;
+        let port = uri_port_or_default(uri, scheme)?;
+        if !scheme.eq_ignore_ascii_case(&self.scheme)
+            || !host.eq_ignore_ascii_case(&self.host)
+            || port != self.port
+        {
+            return Err(io::Error::other(
+                "upstream connector target does not match its validated origin",
+            ));
+        }
+        Ok(())
+    }
+
+    fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
+    }
 }
 
 #[derive(Clone)]
 pub struct UpstreamClientPool {
     config: Arc<Config>,
-    dns_cache: Arc<DnsCache>,
     clients: Arc<Mutex<HashMap<UpstreamClientPoolKey, UpstreamClientPoolEntry>>>,
     access_counter: Arc<AtomicU64>,
 }
@@ -77,10 +138,9 @@ struct UpstreamClientPoolEntry {
 }
 
 impl UpstreamClientPool {
-    pub fn new(config: Arc<Config>, dns_cache: Arc<DnsCache>) -> Self {
+    pub fn new(config: Arc<Config>, _dns_cache: Arc<DnsCache>) -> Self {
         Self {
             config,
-            dns_cache,
             clients: Arc::new(Mutex::new(HashMap::new())),
             access_counter: Arc::new(AtomicU64::new(0)),
         }
@@ -105,7 +165,7 @@ impl UpstreamClientPool {
                 .eq_ignore_ascii_case(TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE);
         let client = build_upstream_client_with_protocol(
             &self.config,
-            Arc::clone(&self.dns_cache),
+            key.validated_target.clone(),
             http1_only,
             h2c_prior_knowledge,
         )?;
@@ -156,6 +216,7 @@ pub fn upstream_client_pool_key(
     key_id: Option<&str>,
     profile: Option<&ResolvedTransportProfile>,
     http1_only: bool,
+    validated_target: ValidatedUpstreamTarget,
 ) -> UpstreamClientPoolKey {
     let profile_http_mode = profile
         .map(|profile| profile.http_mode.trim())
@@ -181,6 +242,7 @@ pub fn upstream_client_pool_key(
             .unwrap_or(DEFAULT_BACKEND)
             .to_string(),
         http_mode: http_mode.to_string(),
+        validated_target,
     }
 }
 
@@ -201,18 +263,6 @@ fn validate_proxy_transport_backend(backend: &str) -> Result<(), String> {
     Err(format!("unsupported transport profile backend: {backend}"))
 }
 
-pub fn http_proxy_authorization_header(proxy_url: Option<&str>) -> Option<String> {
-    let proxy = proxy_url
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| UpstreamProxyConfig::parse(value).ok())?;
-    if proxy.scheme() == UpstreamProxyScheme::Http {
-        proxy.basic_auth_header()
-    } else {
-        None
-    }
-}
-
 pub fn stream_request_body<S>(stream: S) -> UpstreamRequestBody
 where
     S: Stream<Item = Result<Frame<Bytes>, io::Error>> + Send + 'static,
@@ -220,9 +270,10 @@ where
     StreamBody::new(stream).boxed_unsync()
 }
 
+#[cfg(test)]
 pub fn full_request_body(body: Bytes) -> UpstreamRequestBody {
-    Full::new(body)
-        .map_err(|err: Infallible| match err {})
+    http_body_util::Full::new(body)
+        .map_err(|err: std::convert::Infallible| match err {})
         .boxed_unsync()
 }
 
@@ -241,18 +292,14 @@ pub struct RequestTiming {
     pub connection_reused: bool,
 }
 
-#[derive(Clone)]
-pub struct ValidatedResolver {
-    dns_cache: Arc<DnsCache>,
-    allow_private: bool,
+#[derive(Clone, Debug)]
+struct PinnedResolver {
+    target: ValidatedUpstreamTarget,
 }
 
-impl ValidatedResolver {
-    pub fn new(dns_cache: Arc<DnsCache>, allow_private: bool) -> Self {
-        Self {
-            dns_cache,
-            allow_private,
-        }
+impl PinnedResolver {
+    fn new(target: ValidatedUpstreamTarget) -> Self {
+        Self { target }
     }
 }
 
@@ -268,7 +315,7 @@ impl Iterator for ValidatedAddrs {
     }
 }
 
-impl Service<Name> for ValidatedResolver {
+impl Service<Name> for PinnedResolver {
     type Response = ValidatedAddrs;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -278,22 +325,16 @@ impl Service<Name> for ValidatedResolver {
     }
 
     fn call(&mut self, name: Name) -> Self::Future {
-        let dns_cache = Arc::clone(&self.dns_cache);
-        let allow_private = self.allow_private;
-        let host = name.as_str().to_string();
+        let requested_host = name.as_str().to_string();
+        let target = self.target.clone();
         Box::pin(async move {
-            if let Some(addrs) = dns_cache.get_by_host(&host).await {
-                return Ok(ValidatedAddrs {
-                    inner: (*addrs).clone().into_iter(),
-                });
+            if !requested_host.eq_ignore_ascii_case(&target.host) {
+                return Err(io::Error::other(
+                    "DNS request does not match the validated upstream host",
+                ));
             }
-
-            let resolved =
-                target_filter::resolve_public_addrs(&host, 0, allow_private, dns_cache.as_ref())
-                    .await
-                    .map_err(|err| io::Error::other(err.to_string()))?;
             Ok(ValidatedAddrs {
-                inner: resolved.into_iter(),
+                inner: target.addrs.into_iter(),
             })
         })
     }
@@ -301,9 +342,10 @@ impl Service<Name> for ValidatedResolver {
 
 #[derive(Clone)]
 pub struct InstrumentedConnector {
-    http: HttpConnector<ValidatedResolver>,
+    http: HttpConnector<PinnedResolver>,
     tls_config: Arc<ClientConfig>,
     proxy: Option<UpstreamProxyConfig>,
+    validated_target: ValidatedUpstreamTarget,
     connect_timeout: Duration,
     tcp_nodelay: bool,
     tcp_keepalive: Option<Duration>,
@@ -319,9 +361,13 @@ impl Service<Uri> for InstrumentedConnector {
     }
 
     fn call(&mut self, dst: Uri) -> Self::Future {
+        if let Err(error) = self.validated_target.ensure_matches_uri(&dst) {
+            return Box::pin(async move { Err(error.into()) });
+        }
         let scheme = dst.scheme_str().map(|value| value.to_ascii_lowercase());
         let tls_config = Arc::clone(&self.tls_config);
         if let Some(proxy) = self.proxy.clone() {
+            let validated_target = self.validated_target.clone();
             let options = ProxyConnectOptions {
                 connect_timeout: self.connect_timeout,
                 tcp_nodelay: self.tcp_nodelay,
@@ -330,7 +376,16 @@ impl Service<Uri> for InstrumentedConnector {
             };
             let connect_start = std::time::Instant::now();
             return Box::pin(async move {
-                connect_via_proxy(dst, scheme, tls_config, proxy, options, connect_start).await
+                connect_via_proxy(
+                    dst,
+                    scheme,
+                    tls_config,
+                    proxy,
+                    validated_target,
+                    options,
+                    connect_start,
+                )
+                .await
             });
         }
         let connecting = self.http.call(dst.clone());
@@ -381,39 +436,25 @@ async fn connect_via_proxy(
     scheme: Option<String>,
     tls_config: Arc<ClientConfig>,
     proxy: UpstreamProxyConfig,
+    validated_target: ValidatedUpstreamTarget,
     options: ProxyConnectOptions,
     connect_start: std::time::Instant,
 ) -> Result<TimedConn, BoxError> {
     let scheme = scheme.ok_or_else(|| io::Error::other("missing scheme"))?;
-    let target_host = uri_host(&dst)?;
-    let target_port = uri_port_or_default(&dst, &scheme)?;
-
-    let mut tcp = connect_proxy_tcp(
-        &proxy,
-        options.connect_timeout,
-        options.tcp_nodelay,
-        options.tcp_keepalive,
-        options.ip_family,
-    )
-    .await?;
-
-    match proxy.scheme() {
-        UpstreamProxyScheme::Http => {
-            if scheme == "https" {
-                http_connect(
-                    &mut tcp,
-                    &target_authority(&target_host, target_port),
-                    &proxy,
-                )
-                .await?;
-            } else if scheme != "http" {
-                return Err(io::Error::other(format!("unsupported scheme {scheme}")).into());
+    let mut last_error = None;
+    let mut connected = None;
+    for target_addr in validated_target.addrs().iter().copied() {
+        match connect_validated_target_via_proxy(&proxy, target_addr, options).await {
+            Ok(tcp) => {
+                connected = Some(tcp);
+                break;
             }
-        }
-        UpstreamProxyScheme::Socks5 | UpstreamProxyScheme::Socks5h => {
-            socks5_connect(&mut tcp, &proxy, &target_host, target_port).await?;
+            Err(error) => last_error = Some(error),
         }
     }
+    let tcp = connected.ok_or_else(|| {
+        last_error.unwrap_or_else(|| io::Error::other("validated upstream target has no addresses"))
+    })?;
 
     let connect_ms = connect_start.elapsed().as_millis() as u64;
 
@@ -421,7 +462,7 @@ async fn connect_via_proxy(
         "http" => Ok(TimedConn::new(
             MaybeHttpsStream::Http {
                 stream: TokioIo::new(tcp),
-                is_proxy: proxy.scheme() == UpstreamProxyScheme::Http,
+                is_proxy: false,
             },
             ConnectTiming {
                 connect_ms,
@@ -465,24 +506,13 @@ fn uri_port_or_default(uri: &Uri, scheme: &str) -> Result<u16, io::Error> {
         .ok_or_else(|| io::Error::other(format!("missing port for scheme {scheme}")))
 }
 
-fn target_authority(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
 fn build_upstream_client_with_protocol(
     config: &Config,
-    dns_cache: Arc<DnsCache>,
+    validated_target: ValidatedUpstreamTarget,
     http1_only: bool,
     h2c_prior_knowledge: bool,
 ) -> Result<UpstreamClient, String> {
-    let mut http = HttpConnector::new_with_resolver(ValidatedResolver::new(
-        dns_cache,
-        config.allow_private_targets,
-    ));
+    let mut http = HttpConnector::new_with_resolver(PinnedResolver::new(validated_target.clone()));
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(
         config.upstream_connect_timeout_secs,
@@ -499,6 +529,7 @@ fn build_upstream_client_with_protocol(
     let connector = InstrumentedConnector {
         http,
         tls_config: build_tls_config(http1_only),
+        validated_target,
         proxy: config
             .upstream_proxy_url
             .as_deref()
@@ -791,12 +822,19 @@ mod tests {
             header_fingerprint: None,
             extra: None,
         };
+        let target_url = url::Url::parse("https://example.com/").expect("target URL");
+        let validated_target = ValidatedUpstreamTarget::new(
+            &target_url,
+            vec![SocketAddr::from(([203, 0, 113, 10], 443))],
+        )
+        .expect("validated target");
         let pool_key = upstream_client_pool_key(
             Some("provider-1"),
             Some("endpoint-1"),
             Some("key-1"),
             Some(&profile),
             false,
+            validated_target,
         );
 
         assert_eq!(pool_key.provider_id, "provider-1");
@@ -852,25 +890,20 @@ mod tests {
         assert!(!clients.contains_key(&key_b));
     }
 
-    #[test]
-    fn http_proxy_authorization_header_uses_basic_auth_for_http_proxy() {
-        assert_eq!(
-            http_proxy_authorization_header(Some("http://user:pass@proxy.example:8080")).as_deref(),
-            Some("Basic dXNlcjpwYXNz")
-        );
-        assert_eq!(
-            http_proxy_authorization_header(Some("socks5h://user:pass@127.0.0.1:1080")),
-            None
-        );
-    }
-
     fn test_pool_key(key_id: &str) -> UpstreamClientPoolKey {
+        let target_url = url::Url::parse("https://example.com/").expect("target URL");
+        let validated_target = ValidatedUpstreamTarget::new(
+            &target_url,
+            vec![SocketAddr::from(([203, 0, 113, 10], 443))],
+        )
+        .expect("validated target");
         upstream_client_pool_key(
             Some("provider-1"),
             Some("endpoint-1"),
             Some(key_id),
             None,
             false,
+            validated_target,
         )
     }
 
@@ -892,10 +925,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires loopback listener support"]
-    async fn upstream_client_sends_http_requests_through_http_proxy() {
-        let (proxy_url, request_rx) = spawn_http_proxy().await;
-        let client = proxied_client(&proxy_url);
+    async fn http_proxy_connects_to_pinned_ip_and_preserves_origin_host() {
+        let pinned_addr = SocketAddr::from(([203, 0, 113, 77], 80));
+        let (proxy_url, connect_rx, request_rx) = spawn_http_proxy().await;
+        let client = proxied_client(&proxy_url, "http://example.com/", pinned_addr);
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri("http://example.com/tunnel-test")
@@ -910,21 +943,66 @@ mod tests {
             .await
             .expect("body should collect")
             .to_bytes();
+        let connect = connect_rx.await.expect("proxy should receive CONNECT");
         let raw_request = request_rx.await.expect("proxy should receive request");
 
         assert_eq!(status, hyper::StatusCode::OK);
         assert_eq!(&body[..], b"ok");
         assert!(
-            raw_request.starts_with("GET http://example.com/tunnel-test HTTP/1.1\r\n"),
+            connect.starts_with("CONNECT 203.0.113.77:80 HTTP/1.1\r\n"),
+            "unexpected proxy CONNECT: {connect:?}"
+        );
+        assert!(
+            raw_request.starts_with("GET /tunnel-test HTTP/1.1\r\n"),
             "unexpected proxy request: {raw_request:?}"
+        );
+        assert!(
+            raw_request
+                .to_ascii_lowercase()
+                .contains("\r\nhost: example.com\r\n"),
+            "original Host header should be preserved: {raw_request:?}"
         );
     }
 
     #[tokio::test]
-    #[ignore = "requires loopback listener support"]
-    async fn upstream_client_sends_http_requests_through_socks5h_proxy() {
-        let (proxy_url, target_rx, request_rx) = spawn_socks5h_proxy().await;
-        let client = proxied_client(&proxy_url);
+    async fn https_proxy_connects_to_pinned_ip_while_sni_uses_hostname() {
+        let pinned_addr = SocketAddr::from(([203, 0, 113, 78], 443));
+        let (proxy_url, connect_rx) = spawn_connect_only_http_proxy().await;
+        let client = proxied_client(&proxy_url, "https://sni.example/", pinned_addr);
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri("https://sni.example/secure")
+            .body(full_request_body(Bytes::new()))
+            .expect("request should build");
+
+        let _ = client.request(request).await;
+        let connect = connect_rx.await.expect("proxy should receive CONNECT");
+        assert!(
+            connect.starts_with("CONNECT 203.0.113.78:443 HTTP/1.1\r\n"),
+            "unexpected proxy CONNECT: {connect:?}"
+        );
+        let uri: Uri = "https://sni.example/secure".parse().expect("URI");
+        match resolve_server_name(&uri).expect("server name") {
+            ServerName::DnsName(name) => assert_eq!(name.as_ref(), "sni.example"),
+            other => panic!("expected DNS SNI, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_connects_to_pinned_ip_and_preserves_origin_host() {
+        assert_socks_proxy_uses_pinned_ip("socks5").await;
+    }
+
+    #[tokio::test]
+    async fn socks5h_proxy_connects_to_pinned_ip_and_preserves_origin_host() {
+        assert_socks_proxy_uses_pinned_ip("socks5h").await;
+    }
+
+    async fn assert_socks_proxy_uses_pinned_ip(scheme: &str) {
+        let pinned_addr = SocketAddr::from(([203, 0, 113, 79], 80));
+        let (proxy_addr, target_rx, request_rx) = spawn_socks5_proxy().await;
+        let proxy_url = format!("{scheme}://{proxy_addr}");
+        let client = proxied_client(&proxy_url, "http://example.com/", pinned_addr);
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri("http://example.com/socks-test")
@@ -944,14 +1022,24 @@ mod tests {
             .expect("SOCKS proxy should receive HTTP request");
 
         assert_eq!(&body[..], b"ok");
-        assert_eq!(target, ("example.com".to_string(), 80));
+        assert_eq!(target, pinned_addr);
         assert!(
             raw_request.starts_with("GET /socks-test HTTP/1.1\r\n"),
             "unexpected SOCKS tunneled request: {raw_request:?}"
         );
+        assert!(
+            raw_request
+                .to_ascii_lowercase()
+                .contains("\r\nhost: example.com\r\n"),
+            "original Host header should be preserved: {raw_request:?}"
+        );
     }
 
-    fn proxied_client(proxy_url: &str) -> UpstreamClient {
+    fn proxied_client(
+        proxy_url: &str,
+        target_url: &str,
+        pinned_addr: SocketAddr,
+    ) -> UpstreamClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = Config::try_parse_from([
             "aether-tunnel",
@@ -967,23 +1055,32 @@ mod tests {
             "2",
         ])
         .expect("config should parse");
-        build_upstream_client_with_protocol(
-            &config,
-            Arc::new(DnsCache::new(Duration::from_secs(60), 16)),
-            true,
-            false,
-        )
-        .expect("client should build")
+        let target_url = url::Url::parse(target_url).expect("target URL should parse");
+        let validated_target = ValidatedUpstreamTarget::new(&target_url, vec![pinned_addr])
+            .expect("target should validate");
+        build_upstream_client_with_protocol(&config, validated_target, true, false)
+            .expect("client should build")
     }
 
-    async fn spawn_http_proxy() -> (String, tokio::sync::oneshot::Receiver<String>) {
+    async fn spawn_http_proxy() -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("local addr should exist");
+        let (connect_tx, connect_rx) = tokio::sync::oneshot::channel();
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("proxy should accept");
+            let connect = read_http_headers(&mut stream).await;
+            let _ = connect_tx.send(connect);
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("CONNECT response should write");
             let request = read_http_headers(&mut stream).await;
             let _ = request_tx.send(request);
             stream
@@ -991,12 +1088,30 @@ mod tests {
                 .await
                 .expect("proxy response should write");
         });
-        (format!("http://{addr}"), request_rx)
+        (format!("http://{addr}"), connect_rx, request_rx)
     }
 
-    async fn spawn_socks5h_proxy() -> (
-        String,
-        tokio::sync::oneshot::Receiver<(String, u16)>,
+    async fn spawn_connect_only_http_proxy() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should exist");
+        let (connect_tx, connect_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("proxy should accept");
+            let connect = read_http_headers(&mut stream).await;
+            let _ = connect_tx.send(connect);
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("CONNECT response should write");
+        });
+        (format!("http://{addr}"), connect_rx)
+    }
+
+    async fn spawn_socks5_proxy() -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<SocketAddr>,
         tokio::sync::oneshot::Receiver<String>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1018,26 +1133,25 @@ mod tests {
                 .await
                 .expect("SOCKS method should write");
 
-            let mut request_head = [0u8; 5];
+            let mut request_head = [0u8; 4];
             stream
                 .read_exact(&mut request_head)
                 .await
                 .expect("SOCKS request head should read");
-            assert_eq!(&request_head[..4], &[0x05, 0x01, 0x00, 0x03]);
-            let len = request_head[4] as usize;
-            let mut host = vec![0u8; len];
+            assert_eq!(request_head, [0x05, 0x01, 0x00, 0x01]);
+            let mut ip = [0u8; 4];
             stream
-                .read_exact(&mut host)
+                .read_exact(&mut ip)
                 .await
-                .expect("SOCKS host should read");
+                .expect("SOCKS IPv4 target should read");
             let mut port = [0u8; 2];
             stream
                 .read_exact(&mut port)
                 .await
                 .expect("SOCKS port should read");
-            let host = String::from_utf8(host).expect("SOCKS host should be UTF-8");
             let port = u16::from_be_bytes(port);
-            let _ = target_tx.send((host, port));
+            let target = SocketAddr::from((ip, port));
+            let _ = target_tx.send(target);
             stream
                 .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await
@@ -1050,7 +1164,7 @@ mod tests {
                 .await
                 .expect("SOCKS tunneled response should write");
         });
-        (format!("socks5h://{addr}"), target_rx, request_rx)
+        (addr, target_rx, request_rx)
     }
 
     async fn read_http_headers(stream: &mut TcpStream) -> String {

@@ -251,6 +251,14 @@ export interface RequestDetail {
   price_per_request?: number  // 按次计费价格
   request_type: string
   is_stream: boolean
+  is_websocket?: boolean
+  websocket_transport?: string | null
+  usage_available?: boolean
+  usage_pricing_available?: boolean
+  input_audio_tokens?: number | null
+  output_audio_tokens?: number | null
+  live_session?: Record<string, unknown> | null
+  realtime_session?: Record<string, unknown> | null
   upstream_is_stream?: boolean
   client_requested_stream?: boolean
   client_is_stream?: boolean

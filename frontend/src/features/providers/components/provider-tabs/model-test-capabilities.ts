@@ -24,6 +24,8 @@ export type ModelTestKeySource = {
 }
 
 const MODEL_TEST_UNSUPPORTED_API_FORMATS = new Set([
+  'openai:realtime',
+  'codex:live',
   'openai:video',
   'gemini:video',
   'gemini:files',

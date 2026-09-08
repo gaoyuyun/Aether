@@ -65,14 +65,14 @@ http.workspace = true
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-pool", "server-auto", "service", "tokio"] }
-ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-ring"] }
+ldap3 = { version = "0.12.1", default-features = false, features = ["sync", "tls-rustls-ring"] }
 libc = "0.2"
 md-5 = "0.10"
 object_store.workspace = true
 parking_lot = "0.12"
+percent-encoding.workspace = true
 regex.workspace = true
 reqwest.workspace = true
-rsa = "0.9.10"
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -86,6 +86,7 @@ sysinfo = "0.32"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs", "compression-gzip", "set-header"] }
 tracing.workspace = true
@@ -102,4 +103,5 @@ tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [dev-dependencies]
 aether-test-support.workspace = true
+aws-lc-rs.workspace = true
 tracing-subscriber.workspace = true

@@ -440,18 +440,33 @@ fn read_key_account_quota_exhaustion_map(
     candidates
         .iter()
         .map(|candidate| {
-            let exhausted = provider_skip_exhausted_accounts
-                .get(candidate.provider_id.as_str())
-                .copied()
-                .unwrap_or(false)
-                && provider_key_rpm_states
-                    .get(candidate.key_id.as_str())
-                    .is_some_and(|key| {
-                        admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(
+            let exhausted = provider_key_rpm_states
+                .get(candidate.key_id.as_str())
+                .is_some_and(|key| {
+                    let account_exhausted =
+                        admin_provider_pool_pure::admin_pool_key_model_quota_exhausted(
                             key,
                             candidate.provider_type.as_str(),
+                            candidate.selected_provider_model_name.as_str(),
                         )
-                    });
+                        .unwrap_or_else(|| {
+                            admin_provider_pool_pure::admin_pool_key_account_quota_exhausted(
+                                key,
+                                candidate.provider_type.as_str(),
+                            )
+                        });
+                    let hard_blocked =
+                        admin_provider_pool_pure::admin_pool_key_model_quota_hard_blocked(
+                            key,
+                            candidate.provider_type.as_str(),
+                            candidate.selected_provider_model_name.as_str(),
+                        );
+                    let skip_configured = provider_skip_exhausted_accounts
+                        .get(candidate.provider_id.as_str())
+                        .copied()
+                        .unwrap_or(false);
+                    hard_blocked || (skip_configured && account_exhausted)
+                });
             (candidate.key_id.clone(), exhausted)
         })
         .collect()

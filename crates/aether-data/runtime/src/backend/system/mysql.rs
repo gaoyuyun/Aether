@@ -392,7 +392,11 @@ ON DUPLICATE KEY UPDATE
         add_aggregate_import_count(&mut summary.stats_daily_api_key, existing.is_some());
     }
 
-    tx.commit().await.map_sql_err()?;
+    if mode == AdminSystemUsageAggregateImportMode::ValidateError {
+        tx.rollback().await.map_sql_err()?;
+    } else {
+        tx.commit().await.map_sql_err()?;
+    }
     Ok(summary)
 }
 
@@ -445,6 +449,34 @@ LIMIT 1
                 .and_then(parse_json_value)
         })
         .transpose()
+    }
+
+    pub async fn compare_and_set_system_config_string_value(
+        &self,
+        key: &str,
+        expected: &str,
+        replacement: &str,
+    ) -> Result<bool, DataLayerError> {
+        let now = current_unix_secs();
+        let replacement =
+            serialize_json_value(&serde_json::Value::String(replacement.to_string()))?;
+        let result = sqlx::query(
+            r#"
+UPDATE system_configs
+SET value = ?, updated_at = ?
+WHERE `key` = ?
+  AND JSON_TYPE(value) = 'STRING'
+  AND BINARY JSON_UNQUOTE(value) = BINARY ?
+"#,
+        )
+        .bind(replacement)
+        .bind(now as i64)
+        .bind(key)
+        .bind(expected)
+        .execute(self.pool())
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn upsert_system_config_value(
@@ -501,6 +533,7 @@ ORDER BY `key` ASC
 INSERT INTO system_configs (id, `key`, value, description, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
+    `key` = VALUES(`key`),
     value = VALUES(value),
     description = COALESCE(VALUES(description), description),
     updated_at = VALUES(updated_at)

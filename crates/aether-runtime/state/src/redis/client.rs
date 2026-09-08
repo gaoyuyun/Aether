@@ -17,10 +17,44 @@ pub(crate) const REDIS_COMMAND_LATENCY_BUCKETS_MS: [u64; 12] =
     [1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
 const REDIS_COMMAND_LATENCY_BUCKET_COUNT: usize = REDIS_COMMAND_LATENCY_BUCKETS_MS.len() + 1;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RedisClientConfig {
     pub url: String,
     pub key_prefix: Option<String>,
+}
+
+impl std::fmt::Debug for RedisClientConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedisClientConfig")
+            .field("url", &redact_redis_url_for_debug(&self.url))
+            .field("key_prefix_len", &self.key_prefix.as_ref().map(String::len))
+            .finish()
+    }
+}
+
+fn redact_redis_url_for_debug(raw: &str) -> String {
+    const MAX_DEBUG_URL_CHARS: usize = 512;
+    let raw = raw.trim();
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return format!("[invalid-redis-url len={}]", raw.len());
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    let rendered = url.to_string();
+    if rendered.chars().count() <= MAX_DEBUG_URL_CHARS {
+        rendered
+    } else {
+        format!(
+            "{}...",
+            rendered
+                .chars()
+                .take(MAX_DEBUG_URL_CHARS.saturating_sub(3))
+                .collect::<String>()
+        )
+    }
 }
 
 impl RedisClientConfig {
@@ -464,6 +498,25 @@ mod tests {
         let _client = factory
             .connect_lazy()
             .expect("lazy redis client should build");
+    }
+
+    #[test]
+    fn redis_config_debug_redacts_url_credentials_and_query() {
+        let config = RedisClientConfig {
+            url: "redis://redis-user:redis-password@redis.example/0?token=redis-secret".into(),
+            key_prefix: Some("tenant-secret".into()),
+        };
+        let debug = format!("{config:?}");
+        for secret in [
+            "redis-user",
+            "redis-password",
+            "redis-secret",
+            "tenant-secret",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("redis.example"));
+        assert!(debug.contains("key_prefix_len"));
     }
 
     #[test]

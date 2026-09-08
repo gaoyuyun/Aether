@@ -1,5 +1,6 @@
 use std::sync::RwLock;
 
+use aether_data_contracts::repository::candidate_selection::provider_model_mapping_api_format_covers;
 use async_trait::async_trait;
 
 use super::{
@@ -242,9 +243,13 @@ fn row_matches_requested_model(
             .is_some_and(|mappings| {
                 mappings.iter().any(|mapping| {
                     mapping.api_formats.as_ref().is_none_or(|formats| {
-                        formats
-                            .iter()
-                            .any(|value| api_format_scope_covers(value, api_format))
+                        formats.iter().any(|value| {
+                            provider_model_mapping_api_format_covers(
+                                &row.provider_type,
+                                value,
+                                api_format,
+                            )
+                        })
                     }) && mapping.endpoint_ids.as_ref().is_none_or(|endpoint_ids| {
                         endpoint_ids
                             .iter()
@@ -298,18 +303,14 @@ fn mapping_scope_matches(
     api_format: &str,
 ) -> bool {
     mapping.api_formats.as_ref().is_none_or(|formats| {
-        formats
-            .iter()
-            .any(|value| api_format_scope_covers(value, api_format))
+        formats.iter().any(|value| {
+            provider_model_mapping_api_format_covers(&row.provider_type, value, api_format)
+        })
     }) && mapping.endpoint_ids.as_ref().is_none_or(|endpoint_ids| {
         endpoint_ids
             .iter()
             .any(|endpoint_id| endpoint_id == &row.endpoint_id)
     })
-}
-
-fn api_format_scope_covers(allowed: &str, requested: &str) -> bool {
-    aether_ai_formats::api_format_permission_covers(allowed, requested)
 }
 
 fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format: &str) -> bool {
@@ -325,6 +326,7 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
                         | "openai:responses:compact"
                         | "openai:search"
                         | "openai:image"
+                        | "codex:live"
                 )
         }
         "chatgpt_web" => {
@@ -494,6 +496,70 @@ mod tests {
             rows[0].key_api_formats,
             Some(vec!["openai:responses".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn codex_live_accepts_oauth_keys_without_accepting_api_keys() {
+        let mut oauth = sample_row("codex-live-oauth", "codex:live", "gpt-live", 10);
+        oauth.provider_type = "codex".to_string();
+        oauth.key_auth_type = "oauth".to_string();
+
+        let mut api_key = oauth.clone();
+        api_key.provider_id = "codex-live-api-key".to_string();
+        api_key.endpoint_id = "endpoint-codex-live-api-key".to_string();
+        api_key.key_id = "key-codex-live-api-key".to_string();
+        api_key.model_id = "model-codex-live-api-key".to_string();
+        api_key.key_auth_type = "api_key".to_string();
+        api_key.provider_priority = 20;
+
+        let repository =
+            InMemoryMinimalCandidateSelectionReadRepository::seed(vec![api_key, oauth]);
+        let rows = repository
+            .list_for_exact_api_format_and_requested_model("codex:live", "gpt-live")
+            .await
+            .expect("Codex Live candidate should load");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_id, "codex-live-oauth");
+        assert_eq!(rows[0].key_auth_type, "oauth");
+    }
+
+    #[tokio::test]
+    async fn codex_live_reuses_only_codex_legacy_responses_model_mappings() {
+        let legacy_row = |provider_id: &str, provider_type: &str, auth_type: &str| {
+            let mut row = sample_row(
+                provider_id,
+                "codex:live",
+                &format!("global-{provider_id}"),
+                10,
+            );
+            row.provider_type = provider_type.to_string();
+            row.key_auth_type = auth_type.to_string();
+            row.key_api_formats = Some(vec!["codex:live".to_string()]);
+            row.model_provider_model_name = format!("upstream-{provider_id}");
+            row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+                name: "legacy-live-alias".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            }]);
+            row
+        };
+        let repository = InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            legacy_row("codex-provider", "codex", "oauth"),
+            legacy_row("openai-provider", "openai", "api_key"),
+            legacy_row("custom-provider", "custom", "api_key"),
+        ]);
+
+        let rows = repository
+            .list_for_exact_api_format_and_requested_model("codex:live", "legacy-live-alias")
+            .await
+            .expect("legacy Codex Live mapping should resolve");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_id, "codex-provider");
+        assert_eq!(rows[0].provider_type, "codex");
     }
 
     #[tokio::test]

@@ -920,6 +920,30 @@ mod tests {
     }
 
     #[test]
+    fn mysql_column_type_override_can_select_binary_collation() {
+        let mut schema = announcements_schema();
+        schema
+            .tables
+            .get_mut("announcements")
+            .expect("fixture table exists")
+            .columns
+            .first_mut()
+            .expect("fixture id column exists")
+            .driver
+            .mysql = Some(DriverColumnOverride {
+            sql_type: Some(
+                "VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin".to_string(),
+            ),
+            default: None,
+            nullable: None,
+        });
+
+        let mysql_sql = mysql::emit_schema(&schema);
+        assert!(mysql_sql
+            .contains("`id` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL"));
+    }
+
+    #[test]
     fn extracts_create_table_names_across_driver_quoting() {
         let tables = extract_create_table_names(
             r#"

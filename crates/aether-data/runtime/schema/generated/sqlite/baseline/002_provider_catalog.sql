@@ -441,6 +441,7 @@ CREATE TABLE IF NOT EXISTS routing_groups (
     description TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     is_system_default INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0,
     config_json TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
@@ -449,6 +450,7 @@ CREATE TABLE IF NOT EXISTS routing_groups (
     UNIQUE (name)
 );
 CREATE INDEX IF NOT EXISTS routing_groups_system_default_idx ON routing_groups (is_system_default, enabled);
+CREATE INDEX IF NOT EXISTS routing_groups_enabled_sort_idx ON routing_groups (enabled, sort_order, name, id);
 
 CREATE TABLE IF NOT EXISTS routing_group_bindings (
     id TEXT PRIMARY KEY NOT NULL,

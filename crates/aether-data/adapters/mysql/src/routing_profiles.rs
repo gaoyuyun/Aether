@@ -15,6 +15,7 @@ SELECT
   description,
   enabled,
   is_system_default,
+  sort_order,
   config_json,
   version,
   created_at,
@@ -61,10 +62,12 @@ impl MysqlRoutingGroupRepository {
 #[async_trait]
 impl RoutingGroupReadRepository for MysqlRoutingGroupRepository {
     async fn list_routing_groups(&self) -> Result<Vec<StoredRoutingGroup>, DataLayerError> {
-        let rows = sqlx::query(&format!("{ROUTING_GROUP_SELECT} ORDER BY name ASC, id ASC"))
-            .fetch_all(&self.pool)
-            .await
-            .map_sql_err()?;
+        let rows = sqlx::query(&format!(
+            "{ROUTING_GROUP_SELECT} ORDER BY enabled DESC, sort_order ASC, name ASC, id ASC"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_sql_err()?;
         rows.iter().map(map_group_row).collect()
     }
 
@@ -173,10 +176,10 @@ impl RoutingGroupWriteRepository for MysqlRoutingGroupRepository {
         sqlx::query(
             r#"
 INSERT INTO routing_groups (
-  id, name, description, enabled, is_system_default, config_json,
+  id, name, description, enabled, is_system_default, sort_order, config_json,
   version, created_at, updated_at, published_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&group.id)
@@ -184,6 +187,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(&group.description)
         .bind(group.enabled)
         .bind(group.is_system_default)
+        .bind(group.sort_order)
         .bind(json_to_string(
             &group.config_json,
             "routing_groups.config_json",
@@ -241,6 +245,7 @@ SET name = ?,
     description = ?,
     enabled = ?,
     is_system_default = ?,
+    sort_order = ?,
     config_json = ?,
     version = ?,
     updated_at = ?,
@@ -252,6 +257,7 @@ WHERE id = ?
         .bind(&group.description)
         .bind(group.enabled)
         .bind(group.is_system_default)
+        .bind(group.sort_order)
         .bind(json_to_string(
             &group.config_json,
             "routing_groups.config_json",
@@ -460,6 +466,7 @@ fn map_group_row(row: &MySqlRow) -> Result<StoredRoutingGroup, DataLayerError> {
         description: row.try_get("description").map_sql_err()?,
         enabled: row.try_get("enabled").map_sql_err()?,
         is_system_default: row.try_get("is_system_default").map_sql_err()?,
+        sort_order: row.try_get("sort_order").map_sql_err()?,
         config_json: json_from_string(
             row.try_get("config_json").map_sql_err()?,
             "routing_groups.config_json",

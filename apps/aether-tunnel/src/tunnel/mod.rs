@@ -231,8 +231,14 @@ fn mix_u64(mut x: u64) -> u64 {
 mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Once};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use aether_contracts::tunnel::{
+        sign_tunnel_relay_request, tunnel_relay_payload_digest, TUNNEL_RELAY_AUTH_NONCE_HEADER,
+        TUNNEL_RELAY_AUTH_PAYLOAD_HEADER, TUNNEL_RELAY_AUTH_SENDER_HEADER,
+        TUNNEL_RELAY_AUTH_SIGNATURE_HEADER, TUNNEL_RELAY_AUTH_TIMESTAMP_HEADER,
+        TUNNEL_RELAY_OWNER_INSTANCE_HEADER,
+    };
     use aether_gateway::{build_router_with_state, AppState as GatewayAppState};
     use arc_swap::ArcSwap;
     use axum::Router;
@@ -303,7 +309,11 @@ mod tests {
             .await
             .expect("gateway should start");
 
-        let state = sample_state(sample_config(&gateway_base_url));
+        let mut tunnel_config = sample_config(&gateway_base_url);
+        tunnel_config.tunnel_security = crate::config::TunnelSecurity::NonTlsRequired;
+        tunnel_config.tunnel_encryption_key =
+            Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".to_string());
+        let state = sample_state(tunnel_config);
         let server = sample_server(&state, "node-recovery");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let tunnel_task = tokio::spawn({
@@ -370,12 +380,45 @@ mod tests {
         gateway_base_url: &str,
         node_id: &str,
     ) -> Option<(StatusCode, String)> {
+        let payload = relay_probe_envelope();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should be after epoch")
+            .as_secs();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let digest = tunnel_relay_payload_digest(&payload, &[]);
+        let signature = sign_tunnel_relay_request(
+            b"tunnel-reconnect-test-secret-at-least-32-bytes",
+            "tunnel-reconnect-test-client",
+            "tunnel-reconnect-test-gateway",
+            node_id,
+            "",
+            false,
+            timestamp,
+            &nonce,
+            &digest,
+        );
         let response = reqwest::Client::new()
             .post(format!(
                 "{gateway_base_url}/api/internal/tunnel/relay/{node_id}"
             ))
             .header("content-type", "application/octet-stream")
-            .body(relay_probe_envelope())
+            .header(
+                TUNNEL_RELAY_AUTH_SENDER_HEADER,
+                "tunnel-reconnect-test-client",
+            )
+            .header(
+                TUNNEL_RELAY_OWNER_INSTANCE_HEADER,
+                "tunnel-reconnect-test-gateway",
+            )
+            .header(TUNNEL_RELAY_AUTH_TIMESTAMP_HEADER, timestamp)
+            .header(TUNNEL_RELAY_AUTH_NONCE_HEADER, nonce)
+            .header(
+                TUNNEL_RELAY_AUTH_PAYLOAD_HEADER,
+                digest.encode_header_value(),
+            )
+            .header(TUNNEL_RELAY_AUTH_SIGNATURE_HEADER, signature)
+            .body(payload)
             .send()
             .await
             .ok()?;
@@ -411,10 +454,38 @@ mod tests {
     async fn start_gateway_on_port(
         port: u16,
     ) -> Result<(GatewayAppState, tokio::task::JoinHandle<()>), std::io::Error> {
-        let state = GatewayAppState::new().expect("gateway test state should build");
+        // The embedded gateway now fails closed when relay authentication is
+        // not configured. Keep this integration fixture explicitly authenticated.
+        let previous_secret = std::env::var_os("AETHER_TUNNEL_RELAY_AUTH_SECRET");
+        let previous_instance = std::env::var_os("AETHER_GATEWAY_INSTANCE_ID");
+        std::env::set_var(
+            "AETHER_TUNNEL_RELAY_AUTH_SECRET",
+            "tunnel-reconnect-test-secret-at-least-32-bytes",
+        );
+        std::env::set_var(
+            "AETHER_GATEWAY_INSTANCE_ID",
+            "tunnel-reconnect-test-gateway",
+        );
+        let mut state = GatewayAppState::new().expect("gateway test state should build");
+        aether_gateway::configure_test_tunnel_security(
+            &mut state,
+            "node-recovery",
+            "test-generation-1",
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        );
+        restore_test_env("AETHER_TUNNEL_RELAY_AUTH_SECRET", previous_secret);
+        restore_test_env("AETHER_GATEWAY_INSTANCE_ID", previous_instance);
         let router = build_router_with_state(state.clone());
         let handle = spawn_router_on_port(port, router).await?;
         Ok((state, handle))
+    }
+
+    fn restore_test_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 
     async fn start_gateway_on_port_retry(
@@ -483,6 +554,7 @@ mod tests {
             tunnel_encryption_key: config.tunnel_encryption_key.clone(),
             node_name: config.node_name.clone(),
             node_id: Arc::new(std::sync::RwLock::new(node_id.to_string())),
+            tunnel_generation: "test-generation-1".to_string(),
             aether_client: Arc::new(AetherClient::new(
                 &config,
                 &config.aether_url,

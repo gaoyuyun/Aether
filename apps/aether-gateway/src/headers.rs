@@ -17,30 +17,54 @@ const MAX_REQUEST_BODY_MB_ENV: &str = "AETHER_MAX_REQUEST_BODY_MB";
 const MAX_REDACTED_SYNC_RESPONSE_BODY_MB_ENV: &str = "AETHER_MAX_REDACTED_SYNC_RESPONSE_BODY_MB";
 const MAX_INTERNAL_BUFFERED_BODY_MB_ENV: &str = "AETHER_MAX_INTERNAL_BUFFERED_BODY_MB";
 const TRUSTED_PROXY_CIDRS_ENV: &str = "AETHER_TRUSTED_PROXY_CIDRS";
+const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_REDACTED_SYNC_RESPONSE_BODY_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_INTERNAL_BUFFERED_BODY_BYTES: u64 = 64 * 1024 * 1024;
+// A finite ceiling remains in force even when an operator uses the historical
+// `0`/oversized value to request an effectively unlimited body.  This protects
+// direct execution-runtime and internal aggregation paths that do not hold a
+// frontdoor body-budget permit.  It does not apply to streaming bodies.
+const MAX_CONFIGURED_BUFFERED_BODY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_REQUEST_CONTENT_ENCODINGS: usize = 8;
 
-/// Optional operator cap applied after Content-Encoding decoding, and to
-/// uncompressed bodies as-is. Unset, zero, or invalid values disable the cap.
-static MAX_REQUEST_BODY_BYTES: LazyLock<u64> =
-    LazyLock::new(|| body_limit_bytes_from_env(MAX_REQUEST_BODY_MB_ENV));
+/// Operator cap applied after Content-Encoding decoding, and to uncompressed
+/// bodies as-is. A configured zero disables the optional lower cap, while the
+/// finite safety ceiling still prevents an unbounded allocation.
+static MAX_REQUEST_BODY_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    body_limit_bytes_from_env(MAX_REQUEST_BODY_MB_ENV, DEFAULT_MAX_REQUEST_BODY_BYTES)
+});
 
-static MAX_REDACTED_SYNC_RESPONSE_BODY_BYTES: LazyLock<u64> =
-    LazyLock::new(|| body_limit_bytes_from_env(MAX_REDACTED_SYNC_RESPONSE_BODY_MB_ENV));
+static MAX_REDACTED_SYNC_RESPONSE_BODY_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    body_limit_bytes_from_env(
+        MAX_REDACTED_SYNC_RESPONSE_BODY_MB_ENV,
+        DEFAULT_MAX_REDACTED_SYNC_RESPONSE_BODY_BYTES,
+    )
+});
 
-static MAX_INTERNAL_BUFFERED_BODY_BYTES: LazyLock<u64> =
-    LazyLock::new(|| body_limit_bytes_from_env(MAX_INTERNAL_BUFFERED_BODY_MB_ENV));
+static MAX_INTERNAL_BUFFERED_BODY_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    body_limit_bytes_from_env(
+        MAX_INTERNAL_BUFFERED_BODY_MB_ENV,
+        DEFAULT_MAX_INTERNAL_BUFFERED_BODY_BYTES,
+    )
+});
 
-fn body_limit_bytes_from_env(name: &str) -> u64 {
+fn body_limit_bytes_from_env(name: &str, default_bytes: u64) -> u64 {
     let value = std::env::var(name).ok();
-    body_limit_bytes(value.as_deref())
+    body_limit_bytes(value.as_deref(), default_bytes)
 }
 
-fn body_limit_bytes(value: Option<&str>) -> u64 {
-    value
-        .map(str::trim)
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(|value| value.saturating_mul(1024 * 1024))
-        .unwrap_or(u64::MAX)
+fn body_limit_bytes(value: Option<&str>, default_bytes: u64) -> u64 {
+    let configured = match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("0") => MAX_CONFIGURED_BUFFERED_BODY_BYTES,
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) if value > 0 => value
+                .checked_mul(1024 * 1024)
+                .unwrap_or(MAX_CONFIGURED_BUFFERED_BODY_BYTES),
+            _ => default_bytes,
+        },
+        None => default_bytes,
+    };
+    configured.min(MAX_CONFIGURED_BUFFERED_BODY_BYTES)
 }
 
 static TRUSTED_PROXY_CIDRS: LazyLock<Vec<String>> = LazyLock::new(|| {
@@ -62,7 +86,9 @@ pub(crate) fn max_redacted_sync_response_body_bytes() -> u64 {
 }
 
 pub(crate) fn max_internal_buffered_body_bytes() -> usize {
-    usize::try_from(*MAX_INTERNAL_BUFFERED_BODY_BYTES).unwrap_or(usize::MAX)
+    usize::try_from(*MAX_INTERNAL_BUFFERED_BODY_BYTES)
+        .unwrap_or(usize::MAX)
+        .min(usize::try_from(MAX_CONFIGURED_BUFFERED_BODY_BYTES).unwrap_or(usize::MAX))
 }
 
 pub(crate) fn extract_or_generate_trace_id(headers: &http::HeaderMap) -> String {
@@ -86,13 +112,24 @@ pub(crate) fn header_value_u64(headers: &http::HeaderMap, key: &str) -> Option<u
 pub(crate) struct RequestOrigin {
     pub(crate) client_ip: Option<String>,
     pub(crate) user_agent: Option<String>,
+    pub(crate) forwarded_headers_trusted: bool,
 }
 
 pub(crate) fn request_origin_from_headers(headers: &http::HeaderMap) -> RequestOrigin {
     RequestOrigin {
+        client_ip: None,
+        user_agent: header_value_str(headers, http::header::USER_AGENT.as_str())
+            .map(|value| truncate_chars(value.as_str(), 1_000)),
+        forwarded_headers_trusted: false,
+    }
+}
+
+pub(crate) fn request_origin_from_trusted_headers(headers: &http::HeaderMap) -> RequestOrigin {
+    RequestOrigin {
         client_ip: client_ip_from_headers(headers),
         user_agent: header_value_str(headers, http::header::USER_AGENT.as_str())
             .map(|value| truncate_chars(value.as_str(), 1_000)),
+        forwarded_headers_trusted: true,
     }
 }
 
@@ -104,6 +141,7 @@ pub(crate) fn request_origin_from_headers_and_remote_addr(
         client_ip: Some(effective_client_ip(headers, remote_addr).to_string()),
         user_agent: header_value_str(headers, http::header::USER_AGENT.as_str())
             .map(|value| truncate_chars(value.as_str(), 1_000)),
+        forwarded_headers_trusted: trusted_proxy_ip(remote_addr.ip()),
     }
 }
 
@@ -113,30 +151,35 @@ pub(crate) fn effective_client_ip(headers: &http::HeaderMap, remote_addr: &Socke
         return remote_ip;
     }
 
-    if let Some(real_ip) =
-        header_value_str(headers, "x-real-ip").and_then(|value| value.parse::<IpAddr>().ok())
-    {
-        return real_ip;
-    }
-
-    let forwarded_ips = header_value_str(headers, "x-forwarded-for")
-        .map(|value| {
-            value
-                .split(',')
-                .filter_map(|segment| segment.trim().parse::<IpAddr>().ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    forwarded_ips
+    let forwarded_ips = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|segment| segment.trim().parse::<IpAddr>().ok())
+        .collect::<Vec<_>>();
+    if let Some(client_ip) = forwarded_ips
         .iter()
         .rev()
         .copied()
         .find(|ip| !trusted_proxy_ip(*ip))
-        .or_else(|| forwarded_ips.first().copied())
-        .unwrap_or(remote_ip)
+    {
+        return client_ip;
+    }
+
+    let mut real_ip_values = headers.get_all("x-real-ip").iter();
+    let real_ip = real_ip_values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    if real_ip_values.next().is_none() {
+        return real_ip.unwrap_or(remote_ip);
+    }
+
+    remote_ip
 }
 
-fn trusted_proxy_ip(ip: IpAddr) -> bool {
+pub(crate) fn trusted_proxy_ip(ip: IpAddr) -> bool {
     TRUSTED_PROXY_CIDRS
         .iter()
         .any(|pattern| ip_or_cidr_matches(pattern, ip))
@@ -269,30 +312,81 @@ pub(crate) fn should_skip_upstream_passthrough_header(name: &str) -> bool {
 }
 
 pub(crate) fn should_skip_response_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "x-aether-control-executed"
-            | "x-aether-control-action"
-    )
+    let name = name.to_ascii_lowercase();
+    name == "set-cookie"
+        || name.starts_with("x-aether-")
+        // CORS is a gateway policy. If an upstream can supply these fields,
+        // it can opt an otherwise-disallowed browser origin into reading a
+        // credentialed gateway response after the CORS middleware declines
+        // to add its own headers.
+        || name.starts_with("access-control-")
+        // Browser security policy is owned by the gateway.  Besides weakening
+        // active-content protections, an upstream-controlled report-only
+        // policy / Reporting API endpoint can make a browser disclose gateway
+        // URLs and diagnostics to an attacker-controlled collector.
+        || name.starts_with("content-security-policy")
+        // These response headers are interpreted by common reverse proxies
+        // and application servers as privileged internal redirects or local
+        // file-send instructions. Upstream providers are untrusted at this
+        // boundary and must not be able to make the gateway's front proxy
+        // fetch an internal URL or disclose a local file.
+        || name.starts_with("x-accel-")
+        || matches!(
+            name.as_str(),
+            "accept-ch"
+                | "alt-svc"
+                | "authentication-info"
+                | "connection"
+                | "clear-site-data"
+                | "content-length"
+                | "critical-ch"
+                | "keep-alive"
+                | "nel"
+                | "proxy-authenticate"
+                | "proxy-authentication-info"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "referrer-policy"
+                | "refresh"
+                | "report-to"
+                | "reporting-endpoints"
+                | "strict-transport-security"
+                | "te"
+                | "timing-allow-origin"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "x-content-type-options"
+                | "x-httpd-send-file"
+                | "x-lighttpd-send-file"
+                | "x-litespeed-location"
+                | "x-reproxy-url"
+                | "x-send-file"
+                | "x-sendfile"
+                | "x-sendfile2"
+        )
 }
 
 pub(crate) fn collect_control_headers(headers: &http::HeaderMap) -> BTreeMap<String, String> {
+    let connection_declared = aether_http::connection_declared_header_names(
+        headers
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
     headers
         .iter()
         .filter_map(|(name, value)| {
+            let normalized = name.as_str().to_ascii_lowercase();
+            if normalized == http::header::CONNECTION.as_str()
+                || connection_declared.contains(&normalized)
+            {
+                return None;
+            }
             value
                 .to_str()
                 .ok()
-                .map(|value| (name.as_str().to_ascii_lowercase(), value.trim().to_string()))
+                .map(|value| (normalized, value.trim().to_string()))
         })
         .collect()
 }
@@ -305,6 +399,8 @@ pub(crate) fn is_json_request(headers: &http::HeaderMap) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestBodyNormalizationError {
+    InvalidBodyFraming,
+    AmbiguousBodyFraming,
     UnsupportedContentEncoding(String),
     DecodeFailed { encoding: String, reason: String },
     DecompressedBodyTooLarge { encoding: String, limit_bytes: u64 },
@@ -314,6 +410,9 @@ pub(crate) enum RequestBodyNormalizationError {
 impl RequestBodyNormalizationError {
     pub(crate) fn client_message(&self) -> String {
         match self {
+            Self::InvalidBodyFraming | Self::AmbiguousBodyFraming => {
+                "Invalid request body framing".to_string()
+            }
             Self::UnsupportedContentEncoding(encoding) => {
                 format!("Unsupported request Content-Encoding: {encoding}")
             }
@@ -334,6 +433,7 @@ impl RequestBodyNormalizationError {
 
     pub(crate) fn http_status(&self) -> http::StatusCode {
         match self {
+            Self::InvalidBodyFraming | Self::AmbiguousBodyFraming => http::StatusCode::BAD_REQUEST,
             Self::DecompressedBodyTooLarge { .. } | Self::RequestBodyTooLarge { .. } => {
                 http::StatusCode::PAYLOAD_TOO_LARGE
             }
@@ -347,6 +447,8 @@ impl RequestBodyNormalizationError {
 impl fmt::Display for RequestBodyNormalizationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBodyFraming => write!(f, "invalid request body framing"),
+            Self::AmbiguousBodyFraming => write!(f, "ambiguous request body framing"),
             Self::UnsupportedContentEncoding(encoding) => {
                 write!(f, "unsupported request Content-Encoding: {encoding}")
             }
@@ -412,8 +514,8 @@ pub(crate) fn check_request_content_length_with_limit(
     headers: &http::HeaderMap,
     limit: u64,
 ) -> Result<(), RequestBodyNormalizationError> {
-    let declared = header_value_str(headers, http::header::CONTENT_LENGTH.as_str())
-        .and_then(|value| value.trim().parse::<u64>().ok());
+    validate_request_body_framing(headers)?;
+    let declared = declared_request_content_length(headers)?;
     if declared.is_some_and(|value| value > limit) {
         return Err(RequestBodyNormalizationError::RequestBodyTooLarge { limit_bytes: limit });
     }
@@ -432,6 +534,7 @@ pub(crate) fn decoded_request_body_bytes_with_limit<'a>(
     body_bytes: &'a [u8],
     limit: u64,
 ) -> Result<Cow<'a, [u8]>, RequestBodyNormalizationError> {
+    validate_request_body_framing(headers)?;
     let encodings = request_content_encodings(headers);
     if encodings.is_empty() {
         if body_bytes.len() as u64 > limit {
@@ -448,17 +551,73 @@ pub(crate) fn decoded_request_body_bytes_with_limit<'a>(
 }
 
 fn request_content_encodings(headers: &http::HeaderMap) -> Vec<String> {
-    header_value_str(headers, http::header::CONTENT_ENCODING.as_str())
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_ascii_lowercase)
-                .filter(|value| value != "identity")
-                .collect()
-        })
-        .unwrap_or_default()
+    headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .flat_map(|value| value.to_str().unwrap_or_default().split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .filter(|value| value != "identity")
+        .collect()
+}
+
+fn validate_request_body_framing(
+    headers: &http::HeaderMap,
+) -> Result<(), RequestBodyNormalizationError> {
+    let _ = declared_request_content_length(headers)?;
+    if headers.contains_key(http::header::CONTENT_LENGTH)
+        && headers.contains_key(http::header::TRANSFER_ENCODING)
+    {
+        return Err(RequestBodyNormalizationError::AmbiguousBodyFraming);
+    }
+    let mut encoding_count = 0usize;
+    if headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .nth(1)
+        .is_some()
+    {
+        return Err(RequestBodyNormalizationError::AmbiguousBodyFraming);
+    }
+    for value in headers.get_all(http::header::CONTENT_ENCODING).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| RequestBodyNormalizationError::InvalidBodyFraming)?;
+        for encoding in value.split(',') {
+            if encoding.trim().is_empty() {
+                return Err(RequestBodyNormalizationError::InvalidBodyFraming);
+            }
+            encoding_count = encoding_count.saturating_add(1);
+            if encoding_count > MAX_REQUEST_CONTENT_ENCODINGS {
+                return Err(RequestBodyNormalizationError::InvalidBodyFraming);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn declared_request_content_length(
+    headers: &http::HeaderMap,
+) -> Result<Option<u64>, RequestBodyNormalizationError> {
+    let mut values = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(RequestBodyNormalizationError::AmbiguousBodyFraming);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| RequestBodyNormalizationError::InvalidBodyFraming)?
+        .trim();
+    if value.is_empty() || value.contains(',') {
+        return Err(RequestBodyNormalizationError::AmbiguousBodyFraming);
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| RequestBodyNormalizationError::InvalidBodyFraming)
 }
 
 fn decode_single_request_body(
@@ -594,8 +753,59 @@ mod tests {
     use super::{
         decoded_request_body_bytes, effective_client_ip, normalize_request_body_headers_and_bytes,
         request_origin_from_headers, request_origin_from_headers_and_remote_addr,
+        request_origin_from_trusted_headers, should_skip_response_header,
         tls_fingerprint_from_headers, RequestBodyNormalizationError, RequestOrigin,
     };
+
+    #[test]
+    fn upstream_response_header_filter_blocks_privileged_server_control_headers() {
+        for name in [
+            "set-cookie",
+            "Set-Cookie",
+            "x-aether-control-executed",
+            "X-Aether-Future-Control",
+            "Access-Control-Allow-Origin",
+            "Access-Control-Allow-Credentials",
+            "Access-Control-Expose-Headers",
+            "Accept-CH",
+            "Alt-Svc",
+            "Authentication-Info",
+            "Content-Security-Policy",
+            "Content-Security-Policy-Report-Only",
+            "Clear-Site-Data",
+            "Content-Length",
+            "Critical-CH",
+            "NEL",
+            "Proxy-Authentication-Info",
+            "Referrer-Policy",
+            "Refresh",
+            "Report-To",
+            "Reporting-Endpoints",
+            "Strict-Transport-Security",
+            "Timing-Allow-Origin",
+            "X-Content-Type-Options",
+            "X-Accel-Redirect",
+            "x-accel-expires",
+            "X-Sendfile",
+            "X-Sendfile2",
+            "X-Send-File",
+            "X-HTTPD-Send-File",
+            "X-LIGHTTPD-send-file",
+            "X-LiteSpeed-Location",
+            "X-Reproxy-URL",
+        ] {
+            assert!(
+                should_skip_response_header(name),
+                "upstream response header should be blocked: {name}"
+            );
+        }
+        assert!(!should_skip_response_header("content-type"));
+        assert!(!should_skip_response_header("x-proxy-timing"));
+        // WWW-Authenticate is an end-to-end challenge used by legitimate
+        // provider APIs (for example Bearer realm/error challenges). It is not
+        // a proxy control header and must remain available to SDK clients.
+        assert!(!should_skip_response_header("WWW-Authenticate"));
+    }
     use flate2::{
         write::{DeflateEncoder, GzEncoder, ZlibEncoder},
         Compression,
@@ -608,7 +818,7 @@ mod tests {
     };
 
     #[test]
-    fn request_origin_prefers_first_forwarded_for_ip() {
+    fn trusted_request_origin_prefers_first_forwarded_for_ip() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
@@ -621,12 +831,14 @@ mod tests {
         );
 
         assert_eq!(
-            request_origin_from_headers(&headers),
+            request_origin_from_trusted_headers(&headers),
             RequestOrigin {
                 client_ip: Some("203.0.113.8".to_string()),
                 user_agent: Some("Claude-Code/1.0".to_string()),
+                forwarded_headers_trusted: true,
             }
         );
+        assert_eq!(request_origin_from_headers(&headers).client_ip, None);
     }
 
     #[test]
@@ -652,6 +864,21 @@ mod tests {
             effective_client_ip(&headers, &remote_addr),
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4))
         );
+        assert!(
+            request_origin_from_headers_and_remote_addr(&headers, &remote_addr)
+                .forwarded_headers_trusted
+        );
+    }
+
+    #[test]
+    fn request_origin_does_not_trust_forwarded_metadata_from_public_peer() {
+        let headers = HeaderMap::new();
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+
+        assert!(
+            !request_origin_from_headers_and_remote_addr(&headers, &remote_addr)
+                .forwarded_headers_trusted
+        );
     }
 
     #[test]
@@ -666,6 +893,51 @@ mod tests {
         assert_eq!(
             effective_client_ip(&headers, &remote_addr),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))
+        );
+    }
+
+    #[test]
+    fn effective_client_ip_does_not_trust_all_trusted_forwarded_chain() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("127.0.0.2, 127.0.0.3"),
+        );
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+
+        assert_eq!(
+            effective_client_ip(&headers, &remote_addr),
+            remote_addr.ip(),
+            "a chain containing only trusted proxy addresses cannot establish the client IP"
+        );
+    }
+
+    #[test]
+    fn effective_client_ip_prefers_forwarded_chain_over_conflicting_real_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.8, 127.0.0.2"),
+        );
+        headers.insert("x-real-ip", HeaderValue::from_static("198.51.100.4"));
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+
+        assert_eq!(
+            effective_client_ip(&headers, &remote_addr),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))
+        );
+    }
+
+    #[test]
+    fn effective_client_ip_rejects_ambiguous_real_ip_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-real-ip", HeaderValue::from_static("198.51.100.4"));
+        headers.append("x-real-ip", HeaderValue::from_static("203.0.113.8"));
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+
+        assert_eq!(
+            effective_client_ip(&headers, &remote_addr),
+            remote_addr.ip()
         );
     }
 
@@ -862,31 +1134,90 @@ mod tests {
     }
 
     #[test]
-    fn body_limits_default_to_unlimited() {
-        assert_eq!(super::body_limit_bytes(None), u64::MAX);
-        assert_eq!(super::body_limit_bytes(Some("0")), u64::MAX);
-        assert_eq!(super::body_limit_bytes(Some("invalid")), u64::MAX);
+    fn request_body_framing_rejects_duplicate_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.append(http::header::CONTENT_LENGTH, HeaderValue::from_static("4"));
+        headers.append(http::header::CONTENT_LENGTH, HeaderValue::from_static("4"));
+
+        let err = super::check_request_content_length_with_limit(&headers, 10)
+            .expect_err("duplicate Content-Length fields must be rejected");
+        assert_eq!(err, RequestBodyNormalizationError::AmbiguousBodyFraming);
+    }
+
+    #[test]
+    fn request_body_framing_rejects_content_length_and_transfer_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("4"));
+        headers.insert(
+            http::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+
+        let err = super::decoded_request_body_bytes_with_limit(&headers, b"body", 10)
+            .expect_err("Content-Length and Transfer-Encoding must not be combined");
+        assert_eq!(err, RequestBodyNormalizationError::AmbiguousBodyFraming);
+    }
+
+    #[test]
+    fn request_body_framing_rejects_duplicate_content_encoding_fields() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        headers.append(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+
+        let err = super::decoded_request_body_bytes_with_limit(&headers, b"body", 10)
+            .expect_err("duplicate Content-Encoding fields must be rejected");
+        assert_eq!(err, RequestBodyNormalizationError::AmbiguousBodyFraming);
+    }
+
+    #[test]
+    fn body_limits_use_safe_default_and_finite_unlimited_override() {
+        let default = 64 * 1024 * 1024;
+        assert_eq!(super::body_limit_bytes(None, default), default);
+        assert_eq!(super::body_limit_bytes(Some("invalid"), default), default);
+        assert_eq!(
+            super::body_limit_bytes(Some("0"), default),
+            super::MAX_CONFIGURED_BUFFERED_BODY_BYTES
+        );
+        assert_eq!(
+            super::body_limit_bytes(Some("999999999999"), default),
+            super::MAX_CONFIGURED_BUFFERED_BODY_BYTES
+        );
     }
 
     #[test]
     fn positive_body_limit_is_converted_from_mibibytes() {
-        assert_eq!(super::body_limit_bytes(Some(" 8 ")), 8 * 1024 * 1024);
+        assert_eq!(
+            super::body_limit_bytes(Some(" 8 "), 64 * 1024 * 1024),
+            8 * 1024 * 1024
+        );
     }
 
     #[test]
-    fn unlimited_limit_accepts_declared_and_buffered_body() {
+    fn finite_unlimited_limit_rejects_values_above_safety_ceiling() {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::CONTENT_LENGTH,
-            HeaderValue::from_static("18446744073709551615"),
+            HeaderValue::from_static("268435457"),
         );
-        super::check_request_content_length_with_limit(&headers, u64::MAX)
-            .expect("unlimited mode should accept every representable content length");
+        super::check_request_content_length_with_limit(
+            &headers,
+            super::MAX_CONFIGURED_BUFFERED_BODY_BYTES,
+        )
+        .expect_err("body above the finite safety ceiling should be rejected");
 
-        let body = b"body larger than the former default is admitted by the unlimited sentinel";
-        let decoded =
-            super::decoded_request_body_bytes_with_limit(&HeaderMap::new(), body, u64::MAX)
-                .expect("unlimited mode should accept buffered bytes");
+        let body = b"body remains bounded by the finite safety ceiling";
+        let decoded = super::decoded_request_body_bytes_with_limit(
+            &HeaderMap::new(),
+            body,
+            super::MAX_CONFIGURED_BUFFERED_BODY_BYTES,
+        )
+        .expect("body within the finite safety ceiling should pass");
         assert_eq!(decoded.as_ref(), body);
     }
 
@@ -933,13 +1264,15 @@ mod tests {
     }
 
     #[test]
-    fn request_origin_uses_real_ip_after_empty_forwarded_for_segments() {
+    fn trusted_request_origin_uses_real_ip_after_empty_forwarded_for_segments() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static(" , unknown "));
         headers.insert("x-real-ip", HeaderValue::from_static("198.51.100.4"));
 
         assert_eq!(
-            request_origin_from_headers(&headers).client_ip.as_deref(),
+            request_origin_from_trusted_headers(&headers)
+                .client_ip
+                .as_deref(),
             Some("198.51.100.4")
         );
     }

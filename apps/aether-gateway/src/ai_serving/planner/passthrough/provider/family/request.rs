@@ -42,7 +42,7 @@ use super::{
 };
 use crate::ai_serving::planner::standard::{
     codex_model_capabilities_for_transport, openai_provider_request_contract_failure_extra_data,
-    same_format_provider_request_body_failure_extra_data,
+    openai_responses_reasoning_replay_policy, same_format_provider_request_body_failure_extra_data,
 };
 
 pub(crate) fn resolve_same_format_provider_transport_unsupported_reason_for_trace(
@@ -180,12 +180,18 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             }
         };
     let effective_headers = input.effective_headers(&parts.headers);
+    let reasoning_replay_policy = openai_responses_reasoning_replay_policy(
+        prepared.transport.provider.provider_type.as_str(),
+        prepared.transport.endpoint.base_url.as_str(),
+        prepared.mapped_model.as_str(),
+    );
     let redaction = resolve_provider_chat_pii_redaction(
         state,
         parts,
         body_json,
         &input.auth_context,
         spec.api_format,
+        reasoning_replay_policy,
         &attempt.candidate_id,
     )
     .await?;
@@ -205,6 +211,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             prepared.kiro_auth.as_ref(),
             prepared.is_claude_code,
             false,
+            reasoning_replay_policy,
         )
     else {
         mark_skipped_local_same_format_provider_candidate_with_extra_data(
@@ -269,7 +276,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         source_model,
     );
     if let Err(violation) =
-        crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities(
+        crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
             &mut base_provider_request_body,
             crate::ai_serving::OpenAiProviderRequestFinalization {
                 source_api_format: spec.api_format,
@@ -285,6 +292,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
                 ),
             },
             codex_model_capabilities.as_ref(),
+            reasoning_replay_policy,
         )
     {
         mark_skipped_local_same_format_provider_candidate_with_extra_data(

@@ -24,9 +24,7 @@ fn parse_args() -> (u64, i32) {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    let days: u64 = value("--days")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(52);
+    let days: u64 = value("--days").and_then(|v| v.parse().ok()).unwrap_or(52);
     let tz: i32 = value("--tz").and_then(|v| v.parse().ok()).unwrap_or(480);
     (days, tz)
 }
@@ -72,22 +70,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Warm the OS page cache with one throwaway run, then measure.
-    let _ = reader.list_dashboard_daily_breakdown(&breakdown_query).await?;
+    let _ = reader
+        .list_dashboard_daily_breakdown(&breakdown_query)
+        .await?;
     let _ = reader.summarize_dashboard_usage(&summary_query).await?;
 
     let t0 = std::time::Instant::now();
-    let pre_rows = reader.list_dashboard_daily_breakdown(&breakdown_query).await?;
+    let pre_rows = reader
+        .list_dashboard_daily_breakdown(&breakdown_query)
+        .await?;
     let pre_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Restore the hourly rows and re-measure through the fast path.
-    sqlx::raw_sql("INSERT INTO stats_hourly_model_provider \
+    sqlx::raw_sql(
+        "INSERT INTO stats_hourly_model_provider \
                     SELECT * FROM stats_hourly_model_provider_benchmark_backup; \
-                  DROP TABLE stats_hourly_model_provider_benchmark_backup;")
-        .execute(&pool)
-        .await?;
+                  DROP TABLE stats_hourly_model_provider_benchmark_backup;",
+    )
+    .execute(&pool)
+    .await?;
 
     let t0 = std::time::Instant::now();
-    let fast_rows = reader.list_dashboard_daily_breakdown(&breakdown_query).await?;
+    let fast_rows = reader
+        .list_dashboard_daily_breakdown(&breakdown_query)
+        .await?;
     let fast_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let close = |left: f64, right: f64| {
@@ -109,10 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let summary = reader.summarize_dashboard_usage(&summary_query).await?;
     let summary_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    println!(
-        "{:<44} {:>12} {:>10}",
-        "query", "latency(ms)", "rows/gate"
-    );
+    println!("{:<44} {:>12} {:>10}", "query", "latency(ms)", "rows/gate");
     println!(
         "{:<44} {:>12.1} {:>10}",
         "daily-stats BEFORE (raw merge, tz!=0)",
@@ -125,10 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fast_ms,
         fast_rows.len()
     );
-    println!(
-        "{:<44} {:>12.1} {:>10}",
-        "speedup", pre_ms / fast_ms, "x"
-    );
+    println!("{:<44} {:>12.1} {:>10}", "speedup", pre_ms / fast_ms, "x");
     println!(
         "{:<44} {:>12} {:>10}",
         "fast path matches raw rows",

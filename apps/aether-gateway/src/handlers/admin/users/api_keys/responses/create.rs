@@ -12,7 +12,9 @@ use super::super::helpers::{
 use super::super::paths::admin_user_id_from_api_keys_path;
 
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
+use crate::handlers::admin::shared::mark_sensitive_admin_response_no_store;
 use crate::handlers::shared::normalize_optional_api_key_concurrent_limit;
+use crate::handlers::shared::seal_auth_api_key_secret;
 use crate::GatewayError;
 use axum::{
     body::Body,
@@ -162,7 +164,16 @@ pub(crate) async fn build_admin_create_user_api_key_response(
         };
 
     let plaintext_key = generate_admin_user_api_key_plaintext();
-    let Some(key_encrypted) = state.encrypt_catalog_secret_with_fallbacks(&plaintext_key) else {
+    let api_key_id = uuid::Uuid::new_v4().to_string();
+    let key_hash = hash_admin_user_api_key(&plaintext_key);
+    let Ok(key_encrypted) = seal_auth_api_key_secret(
+        state.app(),
+        &target_user_id,
+        &api_key_id,
+        &key_hash,
+        false,
+        &plaintext_key,
+    ) else {
         return Ok((
             http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "detail": "API密钥加密失败" })),
@@ -173,8 +184,8 @@ pub(crate) async fn build_admin_create_user_api_key_response(
     let Some(created) = state
         .create_user_api_key(aether_data::repository::auth::CreateUserApiKeyRecord {
             user_id: target_user_id.clone(),
-            api_key_id: uuid::Uuid::new_v4().to_string(),
-            key_hash: hash_admin_user_api_key(&plaintext_key),
+            api_key_id,
+            key_hash,
             key_encrypted: Some(key_encrypted),
             name: Some(name.clone()),
             allowed_providers,
@@ -197,28 +208,30 @@ pub(crate) async fn build_admin_create_user_api_key_response(
         return Ok(build_admin_users_data_unavailable_response());
     };
 
-    Ok(attach_audit_response(
-        Json(json!({
-            "id": created.api_key_id,
-            "key": plaintext_key,
-            "name": created.name,
-            "key_display": masked_user_api_key_display(state, created.key_encrypted.as_deref()),
-            "rate_limit": created.rate_limit,
-            "concurrent_limit": created.concurrent_limit,
-            "ip_rules": created.ip_rules,
-            "allowed_providers": created.allowed_providers,
-            "allowed_api_formats": created.allowed_api_formats,
-            "allowed_models": created.allowed_models,
-            "expires_at": format_optional_unix_secs_iso8601(created.expires_at_unix_secs),
-            "last_used_at": format_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
-            "created_at": format_optional_unix_secs_iso8601(created.created_at_unix_secs),
-            "feature_settings": created.feature_settings,
-            "message": "API Key创建成功，请妥善保存完整密钥",
-        }))
-        .into_response(),
-        "admin_user_api_key_created",
-        "create_user_api_key",
-        "user_api_key",
-        &created.api_key_id,
+    Ok(mark_sensitive_admin_response_no_store(
+        attach_audit_response(
+            Json(json!({
+                "id": created.api_key_id,
+                "key": plaintext_key,
+                "name": created.name,
+                    "key_display": masked_user_api_key_display(state, &created),
+                "rate_limit": created.rate_limit,
+                "concurrent_limit": created.concurrent_limit,
+                "ip_rules": created.ip_rules,
+                "allowed_providers": created.allowed_providers,
+                "allowed_api_formats": created.allowed_api_formats,
+                "allowed_models": created.allowed_models,
+                "expires_at": format_optional_unix_secs_iso8601(created.expires_at_unix_secs),
+                "last_used_at": format_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
+                "created_at": format_optional_unix_secs_iso8601(created.created_at_unix_secs),
+                "feature_settings": created.feature_settings,
+                "message": "API Key创建成功，请妥善保存完整密钥",
+            }))
+            .into_response(),
+            "admin_user_api_key_created",
+            "create_user_api_key",
+            "user_api_key",
+            &created.api_key_id,
+        ),
     ))
 }

@@ -221,8 +221,9 @@ impl RequestCandidateReadRepository for SqliteRequestCandidateRepository {
 impl RequestCandidateWriteRepository for SqliteRequestCandidateRepository {
     async fn upsert(
         &self,
-        candidate: UpsertRequestCandidateRecord,
+        mut candidate: UpsertRequestCandidateRecord,
     ) -> Result<StoredRequestCandidate, DataLayerError> {
+        candidate.sanitize_for_persistence();
         candidate.validate()?;
         let mut tx = self.pool.begin().await.map_sql_err()?;
         match upsert_candidate_in_transaction(&mut tx, candidate).await {
@@ -239,12 +240,13 @@ impl RequestCandidateWriteRepository for SqliteRequestCandidateRepository {
 
     async fn upsert_many(
         &self,
-        candidates: Vec<UpsertRequestCandidateRecord>,
+        mut candidates: Vec<UpsertRequestCandidateRecord>,
     ) -> Result<usize, DataLayerError> {
         if candidates.is_empty() {
             return Ok(0);
         }
-        for candidate in &candidates {
+        for candidate in &mut candidates {
+            candidate.sanitize_for_persistence();
             candidate.validate()?;
         }
 
@@ -641,30 +643,8 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
       THEN request_candidates.status_code
     ELSE COALESCE(excluded.status_code, request_candidates.status_code)
   END,
-  error_type = CASE
-    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
-      AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
-      THEN request_candidates.error_type
-    WHEN request_candidates.status = 'pending'
-      AND excluded.status IN ('available', 'unused')
-      THEN request_candidates.error_type
-    WHEN request_candidates.status = 'streaming'
-      AND excluded.status IN ('available', 'unused', 'pending')
-      THEN request_candidates.error_type
-    ELSE COALESCE(excluded.error_type, request_candidates.error_type)
-  END,
-  error_message = CASE
-    WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
-      AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
-      THEN request_candidates.error_message
-    WHEN request_candidates.status = 'pending'
-      AND excluded.status IN ('available', 'unused')
-      THEN request_candidates.error_message
-    WHEN request_candidates.status = 'streaming'
-      AND excluded.status IN ('available', 'unused', 'pending')
-      THEN request_candidates.error_message
-    ELSE COALESCE(excluded.error_message, request_candidates.error_message)
-  END,
+  error_type = excluded.error_type,
+  error_message = NULL,
   latency_ms = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND excluded.status IN ('available', 'unused', 'pending', 'streaming')
@@ -736,9 +716,10 @@ ON CONFLICT(request_id, candidate_index, retry_index) DO UPDATE SET
 }
 
 fn merge_candidate(
-    candidate: UpsertRequestCandidateRecord,
+    mut candidate: UpsertRequestCandidateRecord,
     existing: Option<StoredRequestCandidate>,
 ) -> Result<StoredRequestCandidate, DataLayerError> {
+    candidate.sanitize_for_persistence();
     let preserve_existing_lifecycle = existing.as_ref().is_some_and(|value| {
         request_candidate_lifecycle_would_regress(value.status, candidate.status)
     });
@@ -750,15 +731,11 @@ fn merge_candidate(
     } else {
         candidate.status
     };
-    let created_at_unix_ms = candidate
-        .created_at_unix_ms
+    let created_at_unix_ms = existing
+        .as_ref()
+        .map(|value| value.created_at_unix_ms)
         .filter(|value| *value > 1000)
-        .or_else(|| {
-            existing
-                .as_ref()
-                .map(|value| value.created_at_unix_ms)
-                .filter(|value| *value > 1000)
-        })
+        .or_else(|| candidate.created_at_unix_ms.filter(|value| *value > 1000))
         .or(candidate.started_at_unix_ms)
         .or(candidate.finished_at_unix_ms)
         .unwrap_or_else(current_unix_ms);
@@ -773,35 +750,36 @@ fn merge_candidate(
     StoredRequestCandidate::new(
         id,
         candidate.request_id,
-        candidate
-            .user_id
-            .or_else(|| existing.as_ref().and_then(|value| value.user_id.clone())),
-        candidate
-            .api_key_id
-            .or_else(|| existing.as_ref().and_then(|value| value.api_key_id.clone())),
-        candidate
-            .username
-            .or_else(|| existing.as_ref().and_then(|value| value.username.clone())),
-        candidate.api_key_name.or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|value| value.api_key_name.clone())
-        }),
+        existing
+            .as_ref()
+            .and_then(|value| value.user_id.clone())
+            .or(candidate.user_id),
+        existing
+            .as_ref()
+            .and_then(|value| value.api_key_id.clone())
+            .or(candidate.api_key_id),
+        existing
+            .as_ref()
+            .and_then(|value| value.username.clone())
+            .or(candidate.username),
+        existing
+            .as_ref()
+            .and_then(|value| value.api_key_name.clone())
+            .or(candidate.api_key_name),
         to_i32(candidate.candidate_index)?,
         to_i32(candidate.retry_index)?,
-        candidate.provider_id.or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|value| value.provider_id.clone())
-        }),
-        candidate.endpoint_id.or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|value| value.endpoint_id.clone())
-        }),
-        candidate
-            .key_id
-            .or_else(|| existing.as_ref().and_then(|value| value.key_id.clone())),
+        existing
+            .as_ref()
+            .and_then(|value| value.provider_id.clone())
+            .or(candidate.provider_id),
+        existing
+            .as_ref()
+            .and_then(|value| value.endpoint_id.clone())
+            .or(candidate.endpoint_id),
+        existing
+            .as_ref()
+            .and_then(|value| value.key_id.clone())
+            .or(candidate.key_id),
         merged_status,
         candidate.skip_reason.or_else(|| {
             existing
@@ -829,17 +807,7 @@ fn merge_candidate(
                 .error_type
                 .or_else(|| existing.as_ref().and_then(|value| value.error_type.clone()))
         },
-        if preserve_existing_lifecycle {
-            existing
-                .as_ref()
-                .and_then(|value| value.error_message.clone())
-        } else {
-            candidate.error_message.or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|value| value.error_message.clone())
-            })
-        },
+        None,
         if preserve_existing_lifecycle {
             match existing.as_ref().and_then(|value| value.latency_ms) {
                 Some(value) => Some(to_i32_u64(value)?),
@@ -869,9 +837,10 @@ fn merge_candidate(
                 .and_then(|value| value.required_capabilities.clone())
         }),
         u64_to_i64(created_at_unix_ms, "request candidate created_at")?,
-        candidate
-            .started_at_unix_ms
-            .or_else(|| existing.as_ref().and_then(|value| value.started_at_unix_ms))
+        existing
+            .as_ref()
+            .and_then(|value| value.started_at_unix_ms)
+            .or(candidate.started_at_unix_ms)
             .map(|value| u64_to_i64(value, "request candidate started_at"))
             .transpose()?,
         if preserve_existing_lifecycle {
@@ -1297,45 +1266,147 @@ mod tests {
             .await
             .expect("sqlite migrations should run");
 
-        let repository = SqliteRequestCandidateRepository::new(pool);
+        let repository = SqliteRequestCandidateRepository::new(pool.clone());
         let created = repository
             .upsert(sample_upsert(
                 "candidate-1",
                 RequestCandidateStatus::Pending,
-                Some(json!({"a": 1})),
+                Some(json!({"gateway_execution_runtime": true})),
                 1_000_000,
             ))
             .await
             .expect("candidate should insert");
         assert_eq!(created.request_id, "request-1");
+        sqlx::query(
+            "UPDATE request_candidates SET skip_reason = ?, error_type = ?, error_message = ?, extra_data = ?, required_capabilities = ? WHERE request_id = ?",
+        )
+        .bind("legacy skip reason with tenant-secret")
+        .bind("legacy_error_type_with_token")
+        .bind("Bearer legacy-secret")
+        .bind(r#"{"gateway_execution_runtime":true,"request_body":{"password":"secret"}}"#)
+        .bind(r#"{"streaming":true,"internal_capability":"secret"}"#)
+        .bind("request-1")
+        .execute(&pool)
+        .await
+        .expect("legacy diagnostics should be injected for the conflict test");
 
         let updated = repository
             .upsert(sample_upsert(
                 "candidate-replacement",
                 RequestCandidateStatus::Success,
-                Some(json!({"b": 2})),
+                Some(json!({"stream_completed": true})),
                 1_000_500,
             ))
             .await
             .expect("candidate should update");
         assert_eq!(updated.id, "candidate-1");
-        assert_eq!(updated.extra_data, Some(json!({"a": 1, "b": 2})));
-
-        let late_streaming = repository
-            .upsert(sample_upsert(
-                "candidate-late-streaming",
-                RequestCandidateStatus::Streaming,
-                Some(json!({"late": true})),
-                1_000_250,
-            ))
-            .await
-            .expect("late streaming candidate should not regress terminal status");
-        assert_eq!(late_streaming.id, "candidate-1");
-        assert_eq!(late_streaming.status, RequestCandidateStatus::Success);
-        assert_eq!(late_streaming.finished_at_unix_ms, Some(1_000_502));
         assert_eq!(
-            late_streaming.extra_data,
-            Some(json!({"a": 1, "b": 2, "late": true}))
+            updated.extra_data,
+            Some(json!({
+                "gateway_execution_runtime": true,
+                "stream_completed": true
+            }))
+        );
+        let raw = sqlx::query(
+            "SELECT skip_reason, error_type, error_message, extra_data, required_capabilities FROM request_candidates WHERE request_id = ?",
+        )
+        .bind("request-1")
+        .fetch_one(&pool)
+        .await
+        .expect("raw candidate diagnostics should load");
+        assert!(
+            sqlx::Row::try_get::<Option<String>, _>(&raw, "error_message")
+                .expect("error_message should decode")
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::Row::try_get::<Option<String>, _>(&raw, "skip_reason")
+                .expect("skip_reason should decode")
+                .as_deref(),
+            Some("unclassified_skip")
+        );
+        assert_eq!(
+            sqlx::Row::try_get::<Option<String>, _>(&raw, "error_type")
+                .expect("error_type should decode")
+                .as_deref(),
+            Some("unclassified_error")
+        );
+        let raw_extra = sqlx::Row::try_get::<Option<String>, _>(&raw, "extra_data")
+            .expect("extra_data should decode")
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+        assert_eq!(raw_extra, updated.extra_data);
+        let raw_capabilities =
+            sqlx::Row::try_get::<Option<String>, _>(&raw, "required_capabilities")
+                .expect("required_capabilities should decode")
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+        assert_eq!(raw_capabilities, Some(json!({"streaming": true})));
+
+        sqlx::query(
+            "UPDATE request_candidates SET skip_reason = ?, error_type = ? WHERE request_id = ?",
+        )
+        .bind("pool_cooldown")
+        .bind(" FirstByteTimeout ")
+        .bind("request-1")
+        .execute(&pool)
+        .await
+        .expect("known legacy diagnostics should be injected for the regression test");
+        let mut late = sample_upsert(
+            "candidate-late-terminal",
+            RequestCandidateStatus::Failed,
+            Some(json!({"cache_1h": true})),
+            1_000_250,
+        );
+        late.user_id = Some("attacker-user".to_string());
+        late.api_key_id = Some("attacker-api-key".to_string());
+        late.username = Some("mallory".to_string());
+        late.api_key_name = Some("attacker-key".to_string());
+        late.provider_id = Some("attacker-provider".to_string());
+        late.endpoint_id = Some("attacker-endpoint".to_string());
+        late.key_id = Some("attacker-provider-key".to_string());
+        late.error_type = Some("upstream5xx".to_string());
+        let late_terminal = repository
+            .upsert(late)
+            .await
+            .expect("late terminal candidate should not replace the first terminal fact");
+        assert_eq!(late_terminal.id, "candidate-1");
+        assert_eq!(late_terminal.status, RequestCandidateStatus::Success);
+        assert_eq!(late_terminal.user_id.as_deref(), Some("user-1"));
+        assert_eq!(late_terminal.api_key_id.as_deref(), Some("key-1"));
+        assert_eq!(late_terminal.provider_id.as_deref(), Some("provider-1"));
+        assert_eq!(late_terminal.endpoint_id.as_deref(), Some("endpoint-1"));
+        assert_eq!(late_terminal.key_id.as_deref(), Some("provider-key-1"));
+        assert_eq!(late_terminal.skip_reason.as_deref(), Some("pool_cooldown"));
+        assert_eq!(
+            late_terminal.error_type.as_deref(),
+            Some("first_byte_timeout")
+        );
+        assert_eq!(late_terminal.finished_at_unix_ms, Some(1_000_502));
+        assert_eq!(
+            late_terminal.extra_data,
+            Some(json!({
+                "cache_1h": true,
+                "gateway_execution_runtime": true,
+                "stream_completed": true
+            }))
+        );
+        let raw = sqlx::query(
+            "SELECT skip_reason, error_type FROM request_candidates WHERE request_id = ?",
+        )
+        .bind("request-1")
+        .fetch_one(&pool)
+        .await
+        .expect("raw candidate classifications should load");
+        assert_eq!(
+            sqlx::Row::try_get::<Option<String>, _>(&raw, "skip_reason")
+                .expect("skip_reason should decode")
+                .as_deref(),
+            Some("pool_cooldown")
+        );
+        assert_eq!(
+            sqlx::Row::try_get::<Option<String>, _>(&raw, "error_type")
+                .expect("error_type should decode")
+                .as_deref(),
+            Some("first_byte_timeout")
         );
 
         assert_eq!(
@@ -1531,7 +1602,7 @@ INSERT INTO usage_settlement_snapshots (
         let mut initial = sample_upsert(
             "initial",
             RequestCandidateStatus::Pending,
-            Some(json!({"initial": true})),
+            Some(json!({"gateway_execution_runtime": true})),
             3_000_000,
         );
         initial.request_id = request_id.clone();
@@ -1553,12 +1624,23 @@ INSERT INTO usage_settlement_snapshots (
                 } else {
                     RequestCandidateStatus::Streaming
                 };
-                let mut extra_data = serde_json::Map::new();
-                extra_data.insert(format!("writer_{writer}"), json!(writer));
+                let extra_data = match writer {
+                    0 => json!({"stream_completed": true}),
+                    1 => json!({"cache_1h": true}),
+                    2 => json!({"first_byte_time_ms": 2}),
+                    3 => json!({"pool_key_index": 3}),
+                    4 => json!({"priority_slot": 4}),
+                    5 => json!({"ranking_index": 5}),
+                    6 => json!({"phase": "provider_request"}),
+                    7 => json!({"provider_api_format": "openai:responses"}),
+                    8 => json!({"client_api_format": "openai:chat"}),
+                    9 => json!({"execution_strategy": "local_cross_format"}),
+                    _ => unreachable!("writer index is bounded by WRITERS"),
+                };
                 let mut candidate = sample_upsert(
                     format!("writer-{writer}").as_str(),
                     status,
-                    Some(serde_json::Value::Object(extra_data)),
+                    Some(extra_data),
                     3_100_000 + u64::try_from(writer).expect("writer index should fit") * 10,
                 );
                 candidate.request_id = request_id;
@@ -1586,18 +1668,22 @@ INSERT INTO usage_settlement_snapshots (
         assert_eq!(candidate.status, RequestCandidateStatus::Success);
         assert_eq!(candidate.latency_ms, Some(123));
         assert_eq!(candidate.finished_at_unix_ms, Some(3_100_002));
-        let extra_data = candidate
-            .extra_data
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-            .expect("merged extra data should be an object");
-        assert_eq!(extra_data.get("initial"), Some(&json!(true)));
-        for writer in 0..WRITERS {
-            assert_eq!(
-                extra_data.get(format!("writer_{writer}").as_str()),
-                Some(&json!(writer))
-            );
-        }
+        assert_eq!(
+            candidate.extra_data,
+            Some(json!({
+                "cache_1h": true,
+                "client_api_format": "openai:chat",
+                "execution_strategy": "local_cross_format",
+                "first_byte_time_ms": 2,
+                "gateway_execution_runtime": true,
+                "phase": "provider_request",
+                "pool_key_index": 3,
+                "priority_slot": 4,
+                "provider_api_format": "openai:responses",
+                "ranking_index": 5,
+                "stream_completed": true
+            }))
+        );
 
         drop(repository);
         pool.close().await;
@@ -1622,14 +1708,14 @@ INSERT INTO usage_settlement_snapshots (
         let mut pending = sample_upsert(
             "batch-first",
             RequestCandidateStatus::Pending,
-            Some(json!({"pending": true})),
+            Some(json!({"gateway_execution_runtime": true})),
             4_000_000,
         );
         pending.request_id = request_id.to_string();
         let mut streaming = sample_upsert(
             "batch-second",
             RequestCandidateStatus::Streaming,
-            Some(json!({"streaming": true})),
+            Some(json!({"stream_completed": true})),
             4_000_100,
         );
         streaming.request_id = request_id.to_string();
@@ -1637,7 +1723,7 @@ INSERT INTO usage_settlement_snapshots (
         let mut success = sample_upsert(
             "batch-third",
             RequestCandidateStatus::Success,
-            Some(json!({"success": true})),
+            Some(json!({"cache_1h": true})),
             4_000_200,
         );
         success.request_id = request_id.to_string();
@@ -1645,7 +1731,7 @@ INSERT INTO usage_settlement_snapshots (
         let mut late_pending = sample_upsert(
             "batch-fourth",
             RequestCandidateStatus::Pending,
-            Some(json!({"late": true})),
+            Some(json!({"first_byte_time_ms": 42})),
             4_000_300,
         );
         late_pending.request_id = request_id.to_string();
@@ -1674,10 +1760,10 @@ INSERT INTO usage_settlement_snapshots (
         assert_eq!(
             candidate.extra_data,
             Some(json!({
-                "pending": true,
-                "streaming": true,
-                "success": true,
-                "late": true
+                "cache_1h": true,
+                "first_byte_time_ms": 42,
+                "gateway_execution_runtime": true,
+                "stream_completed": true
             }))
         );
 

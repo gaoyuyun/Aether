@@ -346,10 +346,12 @@ fn normalize_upgrade_target(raw: String) -> Option<String> {
         .strip_prefix("tunnel-v")
         .or_else(|| trimmed.strip_prefix("proxy-v"))
         .unwrap_or(trimmed);
-    if normalized == CURRENT_VERSION {
+    let target = semver::Version::parse(normalized).ok()?;
+    let current = semver::Version::parse(CURRENT_VERSION).ok()?;
+    if target <= current {
         return None;
     }
-    Some(normalized.to_string())
+    Some(target.to_string())
 }
 
 fn maybe_trigger_upgrade(version: Option<String>) {
@@ -402,7 +404,10 @@ mod tests {
     use arc_swap::ArcSwap;
     use clap::Parser;
 
-    use super::{build_heartbeat_payload, handle_ack, AckDecision, HeartbeatSnapshot};
+    use super::{
+        build_heartbeat_payload, handle_ack, normalize_upgrade_target, AckDecision,
+        HeartbeatSnapshot, CURRENT_VERSION,
+    };
     use crate::registration::client::AetherClient;
     use crate::runtime::DynamicConfig;
     use crate::state::{AppState, ServerContext, TunnelMetrics, TunnelRequestMetrics};
@@ -429,6 +434,7 @@ mod tests {
             tunnel_encryption_key: config.tunnel_encryption_key.clone(),
             node_name: config.node_name.clone(),
             node_id: Arc::new(RwLock::new("node-123".to_string())),
+            tunnel_generation: "test-generation-1".to_string(),
             aether_client: Arc::new(AetherClient::new(
                 &config,
                 &config.aether_url,
@@ -487,6 +493,24 @@ mod tests {
             }
         ));
         assert_eq!(server.dynamic.load().heartbeat_interval, 9);
+    }
+
+    #[test]
+    fn remote_upgrade_accepts_only_strict_semver_upgrades() {
+        let current = semver::Version::parse(CURRENT_VERSION).expect("package version is semver");
+        let target = semver::Version::new(current.major + 1, 0, 0);
+
+        assert_eq!(
+            normalize_upgrade_target(format!("tunnel-v{target}")),
+            Some(target.to_string())
+        );
+        assert_eq!(normalize_upgrade_target(CURRENT_VERSION.to_string()), None);
+        assert_eq!(normalize_upgrade_target("0.0.1".to_string()), None);
+        assert_eq!(
+            normalize_upgrade_target("1.2.3/../../payload".to_string()),
+            None
+        );
+        assert_eq!(normalize_upgrade_target("latest".to_string()), None);
     }
 
     #[tokio::test]

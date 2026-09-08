@@ -90,6 +90,21 @@ pub(crate) async fn maybe_build_stream_local_same_format_provider_decision_paylo
     body_json: &serde_json::Value,
     plan_kind: &str,
 ) -> Result<Option<AiExecutionDecision>, GatewayError> {
+    maybe_build_pinned_stream_local_same_format_provider_decision_payload(
+        state, parts, trace_id, decision, body_json, plan_kind, None,
+    )
+    .await
+}
+
+pub(crate) async fn maybe_build_pinned_stream_local_same_format_provider_decision_payload(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    body_json: &serde_json::Value,
+    plan_kind: &str,
+    pinned_candidate: Option<(&str, &str, &str)>,
+) -> Result<Option<AiExecutionDecision>, GatewayError> {
     let Some(spec) = resolve_stream_spec(plan_kind) else {
         return Ok(None);
     };
@@ -141,6 +156,18 @@ pub(crate) async fn maybe_build_stream_local_same_format_provider_decision_paylo
             )
             .await?
         {
+            if pinned_candidate.is_some_and(|(provider_id, endpoint_id, key_id)| {
+                payload.provider_id.as_deref() != Some(provider_id)
+                    || payload.endpoint_id.as_deref() != Some(endpoint_id)
+                    || payload.key_id.as_deref() != Some(key_id)
+            }) {
+                crate::orchestration::release_pool_key_lease_from_report_context(
+                    state,
+                    payload.report_context.as_ref(),
+                )
+                .await;
+                continue;
+            }
             return Ok(Some(payload));
         }
     }

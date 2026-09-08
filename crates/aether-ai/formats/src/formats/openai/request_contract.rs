@@ -27,13 +27,63 @@ pub fn finalize_openai_provider_request(
     body: &mut Value,
     finalization: OpenAiProviderRequestFinalization<'_>,
 ) -> Result<(), OpenAiProviderRequestContractViolation> {
-    finalize_openai_provider_request_with_codex_model_capabilities(body, finalization, None)
+    finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
+        body,
+        finalization,
+        None,
+        super::responses::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+    )
 }
 
 pub fn finalize_openai_provider_request_with_codex_model_capabilities(
     body: &mut Value,
     finalization: OpenAiProviderRequestFinalization<'_>,
     model_capabilities: Option<&super::responses::codex::CodexResponsesModelCapabilities>,
+) -> Result<(), OpenAiProviderRequestContractViolation> {
+    finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
+        body,
+        finalization,
+        model_capabilities,
+        super::responses::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
+    )
+}
+
+pub fn finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
+    body: &mut Value,
+    finalization: OpenAiProviderRequestFinalization<'_>,
+    model_capabilities: Option<&super::responses::codex::CodexResponsesModelCapabilities>,
+    reasoning_replay_policy: super::responses::OpenAiResponsesReasoningReplayPolicy,
+) -> Result<(), OpenAiProviderRequestContractViolation> {
+    finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy_inner(
+        body,
+        finalization,
+        model_capabilities,
+        reasoning_replay_policy,
+        false,
+    )
+}
+
+pub fn finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy_for_websocket_continuation(
+    body: &mut Value,
+    finalization: OpenAiProviderRequestFinalization<'_>,
+    model_capabilities: Option<&super::responses::codex::CodexResponsesModelCapabilities>,
+    reasoning_replay_policy: super::responses::OpenAiResponsesReasoningReplayPolicy,
+) -> Result<(), OpenAiProviderRequestContractViolation> {
+    finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy_inner(
+        body,
+        finalization,
+        model_capabilities,
+        reasoning_replay_policy,
+        true,
+    )
+}
+
+fn finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy_inner(
+    body: &mut Value,
+    finalization: OpenAiProviderRequestFinalization<'_>,
+    model_capabilities: Option<&super::responses::codex::CodexResponsesModelCapabilities>,
+    reasoning_replay_policy: super::responses::OpenAiResponsesReasoningReplayPolicy,
+    websocket_continuation: bool,
 ) -> Result<(), OpenAiProviderRequestContractViolation> {
     let is_codex_reasoning_endpoint = finalization
         .provider_type
@@ -54,15 +104,27 @@ pub fn finalize_openai_provider_request_with_codex_model_capabilities(
         .flatten();
     match crate::normalize_api_format_alias(finalization.source_api_format).as_str() {
         "openai:responses" | "openai:responses:compact" => {
-            super::responses::codex::apply_codex_openai_responses_special_body_edits_with_source_model_and_capabilities(
-                body,
-                finalization.provider_type,
-                finalization.provider_api_format,
-                finalization.provider_model,
-                finalization.source_model,
-                model_capabilities,
-                finalization.body_rules,
-            );
+            if websocket_continuation {
+                super::responses::codex::apply_codex_openai_responses_websocket_continuation_body_edits_with_source_model_and_capabilities(
+                    body,
+                    finalization.provider_type,
+                    finalization.provider_api_format,
+                    finalization.provider_model,
+                    finalization.source_model,
+                    model_capabilities,
+                    finalization.body_rules,
+                );
+            } else {
+                super::responses::codex::apply_codex_openai_responses_special_body_edits_with_source_model_and_capabilities(
+                    body,
+                    finalization.provider_type,
+                    finalization.provider_api_format,
+                    finalization.provider_model,
+                    finalization.source_model,
+                    model_capabilities,
+                    finalization.body_rules,
+                );
+            }
         }
         _ => {
             super::responses::codex::apply_codex_openai_responses_chat_body_edits_with_source_model_and_capabilities(
@@ -80,10 +142,18 @@ pub fn finalize_openai_provider_request_with_codex_model_capabilities(
         body,
         finalization.provider_api_format,
     );
-    super::responses::strip_incompatible_openai_responses_reasoning_items(
+    super::responses::strip_incompatible_openai_responses_reasoning_items_with_policy(
         body,
         finalization.provider_api_format,
+        reasoning_replay_policy,
     );
+    if finalization
+        .provider_api_format
+        .trim()
+        .eq_ignore_ascii_case("openai:responses")
+    {
+        super::responses::normalize_openai_responses_message_item_ids(body);
+    }
     crate::enforce_request_body_stream_field(
         body,
         finalization.provider_api_format,
@@ -311,10 +381,21 @@ mod tests {
 
     #[test]
     fn finalization_strips_non_replayable_responses_reasoning_history() {
+        let gemini_carrier =
+            crate::formats::openai::responses::encode_gemini_tool_signature_carrier(
+                "opaque-gemini-thought-signature",
+            )
+            .expect("Gemini signature carrier");
         let mut body = json!({
             "model": "gpt-5.4",
             "input": [
                 {"type": "reasoning", "id": "rs_provider_123", "summary": []},
+                {
+                    "type": "reasoning",
+                    "id": "rs_aether_55070860f6d45c6b8f6fa11efd9dff8a",
+                    "summary": [],
+                    "encrypted_content": gemini_carrier
+                },
                 {
                     "type": "reasoning",
                     "id": "item_72d3bd8d367d01977ace23f1",
@@ -343,6 +424,39 @@ mod tests {
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["id"], "rs_provider_123");
         assert_eq!(input[1]["type"], "message");
+    }
+
+    #[test]
+    fn finalization_repairs_legacy_responses_message_ids_for_same_format_upstream() {
+        let mut body = json!({
+            "model": "gpt-5.4",
+            "input": [{
+                "type": "message",
+                "id": "1c938e58-32a8-4d28-9c34-538d78076895_msg",
+                "role": "assistant",
+                "content": [{"type": "input_text", "text": "previous answer"}]
+            }]
+        });
+
+        finalize_openai_provider_request(
+            &mut body,
+            OpenAiProviderRequestFinalization {
+                source_api_format: "openai:responses",
+                provider_api_format: "openai:responses",
+                provider_type: "codex",
+                provider_model: "gpt-5.4",
+                source_model: "gpt-5.4",
+                body_rules: None,
+                upstream_is_stream: false,
+                require_body_stream_field: false,
+            },
+        )
+        .expect("legacy message IDs should be repaired before provider validation");
+
+        let repaired_id = body["input"][0]["id"]
+            .as_str()
+            .expect("message ID should be a string");
+        assert!(repaired_id.starts_with("msg_"));
     }
 
     #[test]

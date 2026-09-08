@@ -1,8 +1,8 @@
 mod memory;
 
 pub use aether_data_contracts::repository::auth_modules::{
-    AuthModuleReadRepository, AuthModuleWriteRepository, StoredLdapModuleConfig,
-    StoredOAuthProviderModuleConfig,
+    AuthModuleReadRepository, AuthModuleWriteRepository, CompareAndSwapLdapConfigResult,
+    LdapBindPasswordUpdate, StoredLdapModuleConfig, StoredOAuthProviderModuleConfig,
 };
 #[cfg(feature = "mysql")]
 pub use aether_data_mysql::{MysqlAuthModuleReadRepository, MysqlAuthModuleRepository};

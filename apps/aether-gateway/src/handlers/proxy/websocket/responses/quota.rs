@@ -13,10 +13,14 @@ use super::ownership::{
     await_owned_responses_websocket_plan, begin_responses_websocket_turn_with_planned_lease,
     spawn_owned_responses_websocket_plan, OwnedResponsesWebSocketDecision,
 };
-use super::request::{build_planning_parts, planned_response_create_event};
+use super::request::{
+    build_planning_parts, planned_response_create_event, ResponsesLiteStaticConfig,
+};
 use super::state::BoundResponsesConnection;
 use super::turn::{prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome};
-use super::upstream::{bind_responses_upstream, close_bound_upstream};
+use super::upstream::{
+    bind_responses_upstream, close_bound_upstream, ResponsesWebSocketUpstreamBindError,
+};
 use crate::clock::current_unix_secs;
 use crate::handlers::proxy::websocket::ingress::WebSocketRequestContext;
 use crate::handlers::proxy::websocket::session::WEBSOCKET_LOG_TRANSPORT;
@@ -101,9 +105,17 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     state: &AppState,
     context: &WebSocketRequestContext,
     _previous_settled: PreviousAttemptSettled,
-) -> bool {
+) -> Result<bool, ()> {
+    // `LogicalTurn::client_event` is intentionally redacted before it is
+    // retained for replay.  The binding, however, keeps the hash of the raw
+    // client-side Responses Lite tools/instructions so a later continuation
+    // can compare the client's plaintext configuration before redaction.
+    // Preserve that chain identity across this transparent rebind instead of
+    // replacing it with the hash `bind_responses_upstream` derives from the
+    // redacted replay event.
+    let responses_lite_static_config = bound.responses_lite_static_config.clone();
     let Some(active) = bound.turn_state.logical_mut() else {
-        return false;
+        return Ok(false);
     };
     if let Some(reason) = active.quota_retry_block_reason() {
         debug!(
@@ -118,7 +130,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             reason,
             "gateway will not transparently replay an unsafe Responses WebSocket turn"
         );
-        return false;
+        return Ok(false);
     }
     active.retry_attempted = true;
     active.turn_attempt = active.turn_attempt.saturating_add(1);
@@ -132,11 +144,14 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             trace_id = %context.trace_id,
             "gateway refused to retry a WebSocket turn without its live authorization snapshot"
         );
-        return false;
+        return Ok(false);
     };
     let turn_index = active.turn_index;
     let logical_turn_id = active.logical_turn_id.clone();
+    let codex_fingerprint_context = active.codex_fingerprint_context.clone();
     let turn_attempt = active.turn_attempt;
+    let plan_usage_permit = active.plan_usage_permit.clone();
+    let plan_usage_policy_snapshot = active.plan_usage_policy_snapshot.clone();
 
     let retry_exclusion_until_unix_secs = bound
         .pending_adapter_drain
@@ -144,7 +159,13 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     let exhausted_key = record_exhausted_bound_key(bound, retry_exclusion_until_unix_secs);
     let exhausted_key_id = exhausted_key.as_ref().map(|(key_id, _)| key_id.clone());
 
-    let planning_parts = build_planning_parts(context);
+    let mut planning_parts = build_planning_parts(context);
+    if let Some(codex_fingerprint_context) = codex_fingerprint_context.as_ref() {
+        crate::ai_serving::codex_context::restore_codex_logical_turn_context(
+            &mut planning_parts,
+            codex_fingerprint_context,
+        );
+    }
     let turn_request_id = Uuid::new_v4().to_string();
     let now_unix_secs = current_unix_secs();
     let excluded_key_ids = bound.exhausted_exclusions.key_ids(now_unix_secs);
@@ -176,7 +197,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 exhausted_key_id = ?exhausted_key_id,
                 "gateway could not find an alternate Responses WebSocket provider after quota exhaustion"
             );
-            return false;
+            return Ok(false);
         }
         Err(error) => {
             warn!(
@@ -189,7 +210,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error = ?error,
                 "gateway could not plan an alternate Responses WebSocket provider after quota exhaustion"
             );
-            return false;
+            return Ok(false);
         }
     };
     let OwnedResponsesWebSocketDecision {
@@ -211,14 +232,16 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             key_id = ?decision.key_id,
             "gateway rejected an alternate Responses WebSocket plan that reused the exhausted key"
         );
-        return false;
+        return Ok(false);
     }
-    let provider_event = match planned_response_create_event(&decision, &client_event).and_then(
-        |event| {
-            serde_json::from_str::<Value>(&event)
-                .map_err(|_| "response_create_serialization_failed")
-        },
-    ) {
+    let provider_event = match planned_response_create_event(
+        &decision,
+        &normalization,
+        &client_event,
+    )
+    .and_then(|event| {
+        serde_json::from_str::<Value>(&event).map_err(|_| "response_create_serialization_failed")
+    }) {
         Ok(event) => event,
         Err(code) => {
             planned_lease.release().await;
@@ -231,9 +254,10 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error_code = code,
                 "gateway could not rebuild a Responses response.create for transparent quota retry"
             );
-            return false;
+            return Ok(false);
         }
     };
+    let replacement_provider_store = provider_event.get("store") == Some(&Value::Bool(true));
     let turn_decision = prepare_responses_websocket_turn_decision(
         &decision,
         turn_request_id,
@@ -252,6 +276,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         &turn_control.decision,
         turn_decision,
         &client_event,
+        plan_usage_policy_snapshot,
         planned_lease,
     )
     .await
@@ -267,7 +292,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error = ?error,
                 "gateway could not start usage and audit tracking for transparent quota retry"
             );
-            return false;
+            return Ok(false);
         }
     };
     let mut replacement = match bind_responses_upstream(
@@ -275,11 +300,41 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         normalization,
         &client_event,
         adapter,
+        plan_usage_permit.as_ref(),
+        |state| turn.record_upstream_request_state(state),
     )
     .await
     {
         Ok(connection) => connection,
-        Err(code) => {
+        Err(ResponsesWebSocketUpstreamBindError::PlanUsagePermitLost) => {
+            turn.release_plan_usage_cost_before_upstream_send(
+                state,
+                "transparent_retry_plan_usage_permit_lost",
+            )
+            .await;
+            queue_turn_finalization(
+                bound,
+                state,
+                turn,
+                ResponsesWebSocketTurnOutcome::connection_admission_lost(),
+            )
+            .await;
+            warn!(
+                event_name = "responses_websocket_quota_retry_plan_usage_concurrency_lost",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                trace_id = %context.trace_id,
+                "gateway stopped a transparent Responses WebSocket retry before its upstream send after the subscription plan concurrency lease became unhealthy"
+            );
+            return Err(());
+        }
+        Err(ResponsesWebSocketUpstreamBindError::Transport(code)) => {
+            turn.release_plan_usage_cost_before_upstream_send(
+                state,
+                "transparent_retry_rebind_failed",
+            )
+            .await;
             queue_turn_finalization(
                 bound,
                 state,
@@ -296,11 +351,10 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
                 error_code = code,
                 "gateway could not bind an alternate Responses WebSocket provider after quota exhaustion"
             );
-            return false;
+            return Ok(false);
         }
     };
 
-    turn.mark_upstream_request_sent();
     turn.set_provider_response_headers(replacement.upstream_response_headers.clone());
     let replacement_upstream = replacement
         .upstream
@@ -309,19 +363,37 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
     if let Some(mut previous_upstream) = bound.upstream.replace(replacement_upstream) {
         close_upstream_socket(&mut previous_upstream, None).await;
     }
+    // The replacement socket has no access to response IDs cached only on
+    // the exhausted physical connection. Continuation turns are never quota
+    // replayed, so clearing here cannot discard the active turn's parent.
+    bound.continuation_response_ids.clear();
     let previous_key_id = bound.decision_template.key_id.clone();
     bound.adapter = replacement.adapter;
     bound.client_model = replacement.client_model;
     bound.provider_model = replacement.provider_model;
     bound.decision_template = replacement.decision_template;
     bound.body_normalization = replacement.body_normalization;
+    bound.responses_lite_static_config = responses_lite_static_config_after_rebind(
+        responses_lite_static_config,
+        replacement.responses_lite_static_config,
+    );
     bound.binding_identity = replacement.binding_identity;
     // 同一个 logical turn 的下一个 attempt 就位。状态不符时把 attempt 交回
     // drop guard 结算并让调用方走「透明重试失败」分支，不静默丢弃一条已经写了
     // pending usage 行、占着 candidate 和 pool key lease 的 attempt。
     if let Err(orphan) = bound.turn_state.resume(turn) {
+        let mut orphan = orphan;
+        orphan
+            .release_plan_usage_cost_before_upstream_send(
+                state,
+                "transparent_retry_state_handoff_failed",
+            )
+            .await;
         drop(orphan);
-        return false;
+        return Ok(false);
+    }
+    if let Some(logical) = bound.turn_state.logical_mut() {
+        logical.provider_store = replacement_provider_store;
     }
     bound.upstream_response_headers = replacement.upstream_response_headers;
     bound.pending_adapter_drain = None;
@@ -338,7 +410,14 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         key_id = ?bound.decision_template.key_id,
         "gateway transparently rebound a Responses WebSocket turn after quota exhaustion"
     );
-    true
+    Ok(true)
+}
+
+fn responses_lite_static_config_after_rebind(
+    previous: Option<ResponsesLiteStaticConfig>,
+    replacement: Option<ResponsesLiteStaticConfig>,
+) -> Option<ResponsesLiteStaticConfig> {
+    replacement.map(|replacement| previous.unwrap_or(replacement))
 }
 
 pub(super) fn is_usage_limit_error_event(event: &Value) -> bool {
@@ -373,5 +452,99 @@ pub(super) fn mark_active_response_retry_unsafe(
 ) {
     if let Some(active) = bound.turn_state.logical_mut() {
         active.mark_retry_unsafe(reason);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::responses_lite_static_config_after_rebind;
+    use crate::handlers::proxy::websocket::responses::request::{
+        prepare_responses_lite_continuation, ResponsesLiteStaticConfig,
+    };
+
+    #[test]
+    fn quota_rebind_preserves_the_raw_responses_lite_static_hash() {
+        let raw = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "instructions": "Contact alice@example.com before using the tool",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up alice@example.com",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "input": [{"role": "user", "content": "hello"}]
+        });
+        let redacted_replay = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "instructions": "Contact <EMAIL_2> before using the tool",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up <EMAIL_1>",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "input": [{"role": "user", "content": "hello"}]
+        });
+        let raw_static_config = ResponsesLiteStaticConfig::from_response_create(&raw);
+        let redacted_static_config =
+            ResponsesLiteStaticConfig::from_response_create(&redacted_replay);
+        assert_ne!(raw_static_config, redacted_static_config);
+
+        let rebound_static_config = responses_lite_static_config_after_rebind(
+            Some(raw_static_config.clone()),
+            Some(redacted_static_config),
+        )
+        .expect("the replacement still uses Responses Lite");
+        assert_eq!(rebound_static_config, raw_static_config);
+
+        let continuation = json!({
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "previous_response_id": "resp_after_quota_retry",
+            "instructions": "Contact alice@example.com before using the tool",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up alice@example.com",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok"
+            }]
+        });
+        let prepared = prepare_responses_lite_continuation(&continuation, &rebound_static_config)
+            .expect("an unchanged plaintext continuation must survive a quota retry");
+        assert!(prepared.get("tools").is_none());
+        assert!(prepared.get("instructions").is_none());
+    }
+
+    #[test]
+    fn quota_rebind_still_tracks_the_replacement_contract() {
+        let raw = ResponsesLiteStaticConfig::from_response_create(&json!({
+            "type": "response.create",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        }));
+        let replacement = ResponsesLiteStaticConfig::from_response_create(&json!({
+            "type": "response.create",
+            "instructions": "replacement"
+        }));
+
+        assert_eq!(
+            responses_lite_static_config_after_rebind(Some(raw), None),
+            None,
+            "a non-Lite replacement must clear the Lite chain marker"
+        );
+        assert_eq!(
+            responses_lite_static_config_after_rebind(None, Some(replacement.clone())),
+            Some(replacement),
+            "a newly selected Lite contract has no earlier raw hash to preserve"
+        );
     }
 }

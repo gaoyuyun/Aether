@@ -1,12 +1,13 @@
 use crate::contracts::{
     ApiOperation, CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CHAT_SYNC_PLAN_KIND,
     CLAUDE_CLI_STREAM_PLAN_KIND, CLAUDE_CLI_SYNC_PLAN_KIND, CLAUDE_COUNT_TOKENS_SYNC_PLAN_KIND,
-    CLAUDE_COUNT_TOKENS_SYNC_SUCCESS_REPORT_KIND, GEMINI_CHAT_STREAM_PLAN_KIND,
-    GEMINI_CHAT_SYNC_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_CLI_SYNC_PLAN_KIND,
-    GEMINI_EMBEDDING_SYNC_PLAN_KIND, GEMINI_EMBEDDING_SYNC_SUCCESS_REPORT_KIND,
-    GEMINI_INTERACTIONS_STREAM_PLAN_KIND, GEMINI_INTERACTIONS_STREAM_SUCCESS_REPORT_KIND,
-    GEMINI_INTERACTIONS_SYNC_PLAN_KIND, GEMINI_INTERACTIONS_SYNC_SUCCESS_REPORT_KIND,
-    OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_SEARCH_SYNC_PLAN_KIND,
+    CLAUDE_COUNT_TOKENS_SYNC_SUCCESS_REPORT_KIND, CODEX_LIVE_STREAM_PLAN_KIND,
+    GEMINI_CHAT_STREAM_PLAN_KIND, GEMINI_CHAT_SYNC_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND,
+    GEMINI_CLI_SYNC_PLAN_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND,
+    GEMINI_EMBEDDING_SYNC_SUCCESS_REPORT_KIND, GEMINI_INTERACTIONS_STREAM_PLAN_KIND,
+    GEMINI_INTERACTIONS_STREAM_SUCCESS_REPORT_KIND, GEMINI_INTERACTIONS_SYNC_PLAN_KIND,
+    GEMINI_INTERACTIONS_SYNC_SUCCESS_REPORT_KIND, OPENAI_EMBEDDING_SYNC_PLAN_KIND,
+    OPENAI_REALTIME_STREAM_PLAN_KIND, OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_SEARCH_SYNC_PLAN_KIND,
     OPENAI_SEARCH_SYNC_SUCCESS_REPORT_KIND,
 };
 
@@ -114,6 +115,22 @@ pub fn resolve_sync_spec(plan_kind: &str) -> Option<LocalSameFormatProviderSpec>
 
 pub fn resolve_stream_spec(plan_kind: &str) -> Option<LocalSameFormatProviderSpec> {
     match plan_kind {
+        CODEX_LIVE_STREAM_PLAN_KIND => Some(LocalSameFormatProviderSpec {
+            api_format: "codex:live",
+            decision_kind: CODEX_LIVE_STREAM_PLAN_KIND,
+            report_kind: "codex_live_websocket_success",
+            family: LocalSameFormatProviderFamily::Standard,
+            require_streaming: true,
+            operation: None,
+        }),
+        OPENAI_REALTIME_STREAM_PLAN_KIND => Some(LocalSameFormatProviderSpec {
+            api_format: "openai:realtime",
+            decision_kind: OPENAI_REALTIME_STREAM_PLAN_KIND,
+            report_kind: "openai_realtime_websocket_success",
+            family: LocalSameFormatProviderFamily::Standard,
+            require_streaming: true,
+            operation: None,
+        }),
         CLAUDE_CHAT_STREAM_PLAN_KIND => Some(LocalSameFormatProviderSpec {
             api_format: "claude:messages",
             decision_kind: CLAUDE_CHAT_STREAM_PLAN_KIND,
@@ -176,6 +193,24 @@ mod tests {
         assert_eq!(spec.api_format, "gemini:generate_content");
         assert_eq!(spec.report_kind, "gemini_cli_stream_success");
         assert!(spec.require_streaming);
+    }
+
+    #[test]
+    fn resolves_openai_realtime_websocket_same_format_spec() {
+        let spec = resolve_stream_spec("openai_realtime_stream").expect("spec");
+        assert_eq!(spec.api_format, "openai:realtime");
+        assert_eq!(spec.report_kind, "openai_realtime_websocket_success");
+        assert!(spec.require_streaming);
+        assert_eq!(spec.family, super::LocalSameFormatProviderFamily::Standard);
+    }
+
+    #[test]
+    fn resolves_codex_live_websocket_same_format_spec() {
+        let spec = resolve_stream_spec("codex_live_stream").expect("spec");
+        assert_eq!(spec.api_format, "codex:live");
+        assert_eq!(spec.report_kind, "codex_live_websocket_success");
+        assert!(spec.require_streaming);
+        assert_eq!(spec.family, super::LocalSameFormatProviderFamily::Standard);
     }
 
     #[test]

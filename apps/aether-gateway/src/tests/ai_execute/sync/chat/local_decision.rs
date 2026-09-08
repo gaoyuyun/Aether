@@ -1738,6 +1738,9 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
             Some(serde_json::json!({
                 "claude_code_advanced": {
                     "cli_only_enabled": false
+                },
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
                 }
             })),
         )
@@ -1911,7 +1914,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
                 });
                 Json(json!({
                     "request_id": "trace-openai-chat-claude-cli-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -1944,7 +1947,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
             sample_candidate_row(),
         ]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![
+            crate::tests::ai_execute::ai_execute_provider_stop_on_status_code(
+                sample_provider_catalog_provider(),
+                429,
+            ),
+        ],
         vec![sample_provider_catalog_endpoint()],
         vec![sample_provider_catalog_key()],
     ));
@@ -2189,7 +2197,11 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
             None,
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
+                }
+            })),
         )
     }
 
@@ -2366,7 +2378,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
                 });
                 Json(json!({
                     "request_id": "trace-openai-chat-gemini-cli-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -2398,7 +2410,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
             sample_candidate_row(),
         ]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![
+            crate::tests::ai_execute::ai_execute_provider_stop_on_status_code(
+                sample_provider_catalog_provider(),
+                429,
+            ),
+        ],
         vec![sample_provider_catalog_endpoint()],
         vec![sample_provider_catalog_key()],
     ));
@@ -2619,7 +2636,11 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
             None,
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
+                }
+            })),
         )
     }
 
@@ -2782,7 +2803,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
                 });
                 Json(json!({
                     "request_id": "trace-openai-chat-claude-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -2815,7 +2836,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
             sample_candidate_row(),
         ]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![
+            crate::tests::ai_execute::ai_execute_provider_stop_on_status_code(
+                sample_provider_catalog_provider(),
+                429,
+            ),
+        ],
         vec![sample_provider_catalog_endpoint()],
         vec![sample_provider_catalog_key()],
     ));
@@ -3028,7 +3054,11 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
             None,
             Some(20.0),
             None,
-            None,
+            Some(serde_json::json!({
+                "failover_rules": {
+                    "stop_on_status_codes": [429]
+                }
+            })),
         )
     }
 
@@ -3224,7 +3254,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
                 });
                 Json(json!({
                     "request_id": "trace-openai-chat-gemini-local-error-123",
-                    "status_code": 200,
+                    "status_code": 429,
                     "headers": {
                         "content-type": "application/json"
                     },
@@ -3256,7 +3286,12 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
             sample_candidate_row(),
         ]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider_catalog_provider()],
+        vec![
+            crate::tests::ai_execute::ai_execute_provider_stop_on_status_code(
+                sample_provider_catalog_provider(),
+                429,
+            ),
+        ],
         vec![sample_provider_catalog_endpoint()],
         vec![sample_provider_catalog_key()],
     ));
@@ -3732,6 +3767,11 @@ async fn gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_g
             provider_catalog_repository,
             Arc::new(InMemoryRequestCandidateRepository::default()),
             DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .attach_proxy_node_repository_for_tests(
+            crate::tests::ai_execute::ai_execute_proxy_node_repository([
+                "proxy-node-openai-custom-path",
+            ]),
         ),
     );
     let gateway = build_router_with_state(gateway_state);

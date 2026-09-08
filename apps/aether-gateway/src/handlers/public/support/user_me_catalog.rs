@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
     build_admin_endpoint_health_status_payload, build_auth_error_response, query_param_value,
-    resolve_authenticated_local_user, sanitize_public_model_config_for_user, AppState,
+    resolve_authenticated_local_user, sanitize_public_model_capabilities,
+    sanitize_public_model_config_for_user, sanitize_public_tiered_pricing, AppState,
     GatewayPublicRequestContext, USERS_ME_AVAILABLE_MODELS_FETCH_LIMIT,
 };
 
@@ -29,10 +30,18 @@ fn build_users_me_available_model_payload(
     hide_mapping_config: bool,
     usage_count: u64,
 ) -> serde_json::Value {
-    let config = if hide_mapping_config {
-        sanitize_public_model_config_for_user(model.config)
+    let (default_tiered_pricing, supported_capabilities, config) = if hide_mapping_config {
+        (
+            sanitize_public_tiered_pricing(model.default_tiered_pricing),
+            sanitize_public_model_capabilities(model.supported_capabilities),
+            sanitize_public_model_config_for_user(model.config),
+        )
     } else {
-        model.config
+        (
+            model.default_tiered_pricing,
+            model.supported_capabilities,
+            model.config,
+        )
     };
     json!({
         "id": model.id,
@@ -40,8 +49,8 @@ fn build_users_me_available_model_payload(
         "display_name": model.display_name,
         "is_active": model.is_active,
         "default_price_per_request": model.default_price_per_request,
-        "default_tiered_pricing": model.default_tiered_pricing,
-        "supported_capabilities": model.supported_capabilities,
+        "default_tiered_pricing": default_tiered_pricing,
+        "supported_capabilities": supported_capabilities,
         "config": config,
         "usage_count": usage_count,
     })

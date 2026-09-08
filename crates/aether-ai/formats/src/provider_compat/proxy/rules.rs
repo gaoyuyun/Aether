@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::OnceLock,
 };
 
@@ -193,6 +193,73 @@ pub fn body_rules_have_enabled_rules(rules: Option<&Value>) -> bool {
         .any(|rule| rule.as_object().is_some_and(body_rule_is_enabled))
 }
 
+/// Returns the normalized request-header names that can affect enabled body
+/// rules.
+///
+/// Callers that persist a body-normalization identity should bind only these
+/// values, rather than every incidental ingress header. Dynamic proxy headers
+/// such as request IDs and forwarding hops do not change the provider body
+/// unless an enabled, locally supported condition actually reads them.
+pub fn body_rules_request_header_dependencies(rules: Option<&Value>) -> BTreeSet<String> {
+    let Some(rules) = rules.and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    let mut dependencies = BTreeSet::new();
+    for rule in rules {
+        let Some(rule) = rule.as_object() else {
+            continue;
+        };
+        if !body_rule_is_enabled(rule) {
+            continue;
+        }
+        let Some(condition) = rule.get("condition").filter(|value| !value.is_null()) else {
+            continue;
+        };
+        if condition_is_locally_supported(condition) {
+            collect_condition_request_header_dependencies(condition, &mut dependencies);
+        }
+    }
+    dependencies
+}
+
+fn collect_condition_request_header_dependencies(
+    condition: &Value,
+    dependencies: &mut BTreeSet<String>,
+) {
+    let Some(condition) = condition.as_object() else {
+        return;
+    };
+    if let Some(children) = condition.get("all").and_then(Value::as_array) {
+        for child in children {
+            collect_condition_request_header_dependencies(child, dependencies);
+        }
+        return;
+    }
+    if let Some(children) = condition.get("any").and_then(Value::as_array) {
+        for child in children {
+            collect_condition_request_header_dependencies(child, dependencies);
+        }
+        return;
+    }
+
+    let source = condition
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("body");
+    if !condition_source_is_headers(source) {
+        return;
+    }
+    if let Some(path) = condition
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        dependencies.insert(path.to_ascii_lowercase());
+    }
+}
+
 pub fn body_rules_handle_path(rules: Option<&Value>, path: &str) -> bool {
     let Some(target_path) = parse_body_path(path) else {
         return false;
@@ -245,7 +312,7 @@ pub fn apply_local_body_rules(
     rules: Option<&Value>,
     original_body: Option<&Value>,
 ) -> bool {
-    apply_local_body_rules_inner(body, rules, original_body, None)
+    apply_local_body_rules_inner(body, rules, original_body, None, None)
 }
 
 pub fn apply_local_body_rules_with_request_headers(
@@ -259,7 +326,48 @@ pub fn apply_local_body_rules_with_request_headers(
         rules,
         original_body,
         request_headers.map(ConditionHeaders::Request),
+        None,
     )
+}
+
+/// Applies body rules and reports whether an enabled, condition-matching rule
+/// actually handled `path`.
+///
+/// This differs from [`body_rules_handle_path`], which intentionally answers a
+/// static configuration question and therefore cannot account for per-request
+/// conditions. WebSocket framing uses this variant before deciding whether it
+/// may restore a client protocol field after provider normalization.
+pub fn apply_local_body_rules_with_request_headers_and_track_path(
+    body: &mut Value,
+    rules: Option<&Value>,
+    original_body: Option<&Value>,
+    request_headers: Option<&http::HeaderMap>,
+    path: &str,
+) -> Option<bool> {
+    let target = parse_body_path(path)?;
+    let mut tracker = AppliedBodyRulePath {
+        target,
+        handled: false,
+    };
+    apply_local_body_rules_inner(
+        body,
+        rules,
+        original_body,
+        request_headers.map(ConditionHeaders::Request),
+        Some(&mut tracker),
+    )
+    .then_some(tracker.handled)
+}
+
+struct AppliedBodyRulePath {
+    target: Vec<BodyPathSegment>,
+    handled: bool,
+}
+
+impl AppliedBodyRulePath {
+    fn observe(&mut self, path: &[BodyPathSegment]) {
+        self.handled |= path_matches(path, &self.target);
+    }
 }
 
 fn apply_local_body_rules_inner(
@@ -267,6 +375,7 @@ fn apply_local_body_rules_inner(
     rules: Option<&Value>,
     original_body: Option<&Value>,
     request_headers: Option<ConditionHeaders<'_>>,
+    mut tracker: Option<&mut AppliedBodyRulePath>,
 ) -> bool {
     let Some(rules) = rules else {
         return true;
@@ -331,7 +440,11 @@ fn apply_local_body_rules_inner(
                     } else {
                         value_template.clone()
                     };
-                    let _ = set_nested_value(body, &target_path, value);
+                    if set_nested_value(body, &target_path, value) {
+                        if let Some(tracker) = tracker.as_deref_mut() {
+                            tracker.observe(&target_path);
+                        }
+                    }
                 }
             }
             Some("drop") => {
@@ -354,7 +467,11 @@ fn apply_local_body_rules_inner(
                         reverse: true,
                     },
                 ) {
-                    let _ = delete_nested_value(body, &target_path);
+                    if delete_nested_value(body, &target_path) {
+                        if let Some(tracker) = tracker.as_deref_mut() {
+                            tracker.observe(&target_path);
+                        }
+                    }
                 }
             }
             Some("rename") => {
@@ -375,7 +492,12 @@ fn apply_local_body_rules_inner(
                 if has_wildcard(&from) || has_wildcard(&to) {
                     continue;
                 }
-                let _ = rename_nested_value(body, &from, &to);
+                if rename_nested_value(body, &from, &to) {
+                    if let Some(tracker) = tracker.as_deref_mut() {
+                        tracker.observe(&from);
+                        tracker.observe(&to);
+                    }
+                }
             }
             Some("append") => {
                 let Some(path) = rule
@@ -401,6 +523,9 @@ fn apply_local_body_rules_inner(
                     if let Some(target) = get_nested_value_mut(body, &target_path) {
                         if let Some(values) = target.as_array_mut() {
                             values.push(value.clone());
+                            if let Some(tracker) = tracker.as_deref_mut() {
+                                tracker.observe(&target_path);
+                            }
                         }
                     }
                 }
@@ -424,6 +549,9 @@ fn apply_local_body_rules_inner(
                     if let Some(values) = target.as_array_mut() {
                         let insert_index = normalize_insert_index(values.len(), index);
                         values.insert(insert_index, value);
+                        if let Some(tracker) = tracker.as_deref_mut() {
+                            tracker.observe(&path);
+                        }
                     }
                 }
             }
@@ -474,6 +602,9 @@ fn apply_local_body_rules_inner(
                             pattern.replacen(&current, count, replacement).to_string()
                         };
                         *target = Value::String(replaced);
+                        if let Some(tracker) = tracker.as_deref_mut() {
+                            tracker.observe(&target_path);
+                        }
                     }
                 }
             }
@@ -1331,9 +1462,10 @@ fn rename_nested_value(
 mod tests {
     use super::{
         apply_local_body_rules, apply_local_body_rules_with_request_headers,
-        apply_local_header_rules, apply_local_header_rules_with_request_headers,
-        body_rules_are_locally_supported, body_rules_handle_path, body_rules_have_enabled_rules,
-        header_rules_are_locally_supported, header_rules_have_enabled_rules,
+        apply_local_body_rules_with_request_headers_and_track_path, apply_local_header_rules,
+        apply_local_header_rules_with_request_headers, body_rules_are_locally_supported,
+        body_rules_handle_path, body_rules_have_enabled_rules, header_rules_are_locally_supported,
+        header_rules_have_enabled_rules,
     };
 
     #[test]
@@ -1781,5 +1913,49 @@ mod tests {
         assert!(!body_rules_handle_path(Some(&rules), "tools[2].kind"));
         assert!(!body_rules_handle_path(Some(&rules), "tools[3].kind"));
         assert!(!body_rules_handle_path(Some(&rules), "instructions"));
+    }
+
+    #[test]
+    fn body_rule_path_tracking_requires_the_rule_condition_to_apply() {
+        let rules = serde_json::json!([{
+            "action": "set",
+            "path": "store",
+            "value": false,
+            "condition": {"path": "metadata.mode", "op": "eq", "value": "enforce"}
+        }]);
+
+        let skipped_original = serde_json::json!({
+            "store": true,
+            "metadata": {"mode": "observe"}
+        });
+        let mut skipped = skipped_original.clone();
+        assert_eq!(
+            apply_local_body_rules_with_request_headers_and_track_path(
+                &mut skipped,
+                Some(&rules),
+                Some(&skipped_original),
+                None,
+                "store",
+            ),
+            Some(false)
+        );
+        assert_eq!(skipped["store"], true);
+
+        let applied_original = serde_json::json!({
+            "store": false,
+            "metadata": {"mode": "enforce"}
+        });
+        let mut applied = applied_original.clone();
+        assert_eq!(
+            apply_local_body_rules_with_request_headers_and_track_path(
+                &mut applied,
+                Some(&rules),
+                Some(&applied_original),
+                None,
+                "store",
+            ),
+            Some(true),
+            "setting the existing value still counts as rule ownership"
+        );
     }
 }

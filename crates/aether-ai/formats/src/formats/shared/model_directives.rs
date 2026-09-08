@@ -641,6 +641,10 @@ pub fn claude_model_uses_adaptive_effort(model: &str) -> bool {
 }
 
 pub fn gemini_model_uses_thinking_level(model: &str) -> bool {
+    gemini_model_supports_mixed_tools(model)
+}
+
+pub(crate) fn gemini_model_supports_mixed_tools(model: &str) -> bool {
     model
         .trim()
         .to_ascii_lowercase()

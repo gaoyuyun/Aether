@@ -74,7 +74,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -106,7 +105,8 @@ use self::model_mapping::{
     provider_query_resolve_global_effective_model,
 };
 use self::summary::{
-    provider_query_candidate_summary_payload, provider_query_test_attempt_payload,
+    provider_query_candidate_summary_payload, provider_query_error_projection,
+    provider_query_success_response_body, provider_query_test_attempt_payload,
 };
 
 pub(crate) const ADMIN_PROVIDER_QUERY_LOCAL_TEST_MODEL_MESSAGE: &str =
@@ -209,7 +209,9 @@ fn provider_query_test_candidate_trace_extra_data(
         "admin_model_test": {
             "provider_type": provider.provider_type,
             "endpoint_api_format": candidate.endpoint.api_format,
-            "endpoint_base_url": candidate.endpoint.base_url,
+            "endpoint_base_url": aether_admin::provider::redaction::admin_secret_safe_url(
+                Some(&candidate.endpoint.base_url)
+            ),
             "effective_model": candidate.effective_model,
         }
     })
@@ -386,6 +388,7 @@ async fn provider_query_finish_test_candidate_trace(
         "skipped" => RequestCandidateStatus::Skipped,
         _ => RequestCandidateStatus::Failed,
     };
+    let projected_error_message = provider_query_error_projection(execution);
     provider_query_persist_test_candidate_trace(
         state,
         trace_id,
@@ -395,7 +398,7 @@ async fn provider_query_finish_test_candidate_trace(
         status,
         ProviderQueryTestTraceUpdate {
             skip_reason: execution.skip_reason.as_deref(),
-            error_message: execution.error_message.as_deref(),
+            error_message: projected_error_message.as_deref(),
             status_code: execution.status_code,
             latency_ms: execution.latency_ms,
             finished_at_unix_ms: Some(current_unix_ms()),
@@ -1646,11 +1649,19 @@ async fn provider_query_reconcile_fixed_provider_endpoints_for_test_model(
 fn provider_query_decode_execution_body(
     result: &aether_contracts::ExecutionResult,
 ) -> Option<Vec<u8>> {
+    const MAX_PROVIDER_QUERY_RESULT_BODY_BYTES: usize = 64 * 1024 * 1024;
     result
         .body
         .as_ref()
         .and_then(|body| body.body_bytes_b64.as_deref())
-        .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+        .and_then(|value| {
+            crate::execution_runtime::transport::decode_base64_body_with_limit(
+                value,
+                crate::headers::max_internal_buffered_body_bytes()
+                    .min(MAX_PROVIDER_QUERY_RESULT_BODY_BYTES),
+            )
+            .ok()
+        })
 }
 
 fn provider_query_execution_json_body(result: &aether_contracts::ExecutionResult) -> Option<Value> {
@@ -3152,7 +3163,7 @@ async fn provider_query_execute_standard_test_candidate(
         | "openai:rerank"
         | "jina:rerank" => {
             let Some(mut provider_request_body) =
-                crate::ai_serving::build_standard_request_body_with_model_directives_and_request_headers(
+                crate::ai_serving::build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
                     &request_body,
                     client_api_format,
                     request_model,
@@ -3164,6 +3175,11 @@ async fn provider_query_execute_standard_test_candidate(
                     Some(candidate.key.id.as_str()),
                     Some(&incoming_request_headers),
                     false,
+                    crate::ai_serving::openai_responses_reasoning_replay_policy(
+                        transport.provider.provider_type.as_str(),
+                        transport.endpoint.base_url.as_str(),
+                        request_model,
+                    ),
                 )
             else {
                 return Ok(provider_query_skipped_execution_outcome(
@@ -3208,7 +3224,7 @@ async fn provider_query_execute_standard_test_candidate(
     if matches!(
         normalized_provider_api_format.as_str(),
         "openai:chat" | "openai:responses" | "openai:responses:compact" | "openai:search"
-    ) && crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities(
+    ) && crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
         &mut provider_request_body,
         crate::ai_serving::OpenAiProviderRequestFinalization {
             source_api_format: client_api_format,
@@ -3221,6 +3237,11 @@ async fn provider_query_execute_standard_test_candidate(
             require_body_stream_field,
         },
         codex_model_capabilities.as_ref(),
+        crate::ai_serving::openai_responses_reasoning_replay_policy(
+            transport.provider.provider_type.as_str(),
+            transport.endpoint.base_url.as_str(),
+            request_model,
+        ),
     )
     .is_err()
     {
@@ -3918,7 +3939,7 @@ async fn build_admin_provider_query_kiro_failover_response(
             total_attempts += 1;
         }
         let is_success = execution.status == "success";
-        let response_body = execution.response_body.clone();
+        let response_body = provider_query_success_response_body(&execution);
         attempts.push(provider_query_test_attempt_payload(
             candidate_index,
             candidate,

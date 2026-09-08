@@ -50,6 +50,82 @@ pub(crate) struct WebSocketIngressSpec {
     pub(crate) route_unavailable_message: &'static str,
 }
 
+pub(crate) enum AuthenticatedAiWebSocketUpgradePreparation {
+    Ready(AuthenticatedAiWebSocketUpgrade),
+    Rejected(Response<Body>),
+}
+
+/// Authenticated HTTP Upgrade state retained while an adapter performs any
+/// protocol-specific preflight that must complete before status 101 is sent.
+pub(crate) struct AuthenticatedAiWebSocketUpgrade {
+    state: AppState,
+    context: WebSocketRequestContext,
+    request_permit: Option<aether_runtime::AdmissionPermit>,
+}
+
+impl AuthenticatedAiWebSocketUpgrade {
+    pub(crate) fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    pub(crate) fn context(&self) -> &WebSocketRequestContext {
+        &self.context
+    }
+
+    pub(crate) fn rejection_response(
+        &self,
+        status: StatusCode,
+        message: &str,
+    ) -> Result<Response<Body>, GatewayError> {
+        build_local_http_error_response(
+            self.context.trace_id.as_str(),
+            Some(&self.context.decision),
+            status,
+            message,
+        )
+    }
+
+    pub(crate) fn into_response<F, Fut>(
+        self,
+        ws: WebSocketUpgrade,
+        limits: WebSocketSessionLimits,
+        run_session: F,
+    ) -> Response<Body>
+    where
+        F: FnOnce(WebSocket, AppState, WebSocketRequestContext) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.into_response_with(ws, limits, (), move |socket, state, context, ()| {
+            run_session(socket, state, context)
+        })
+    }
+
+    pub(crate) fn into_response_with<P, F, Fut>(
+        self,
+        ws: WebSocketUpgrade,
+        limits: WebSocketSessionLimits,
+        prepared: P,
+        run_session: F,
+    ) -> Response<Body>
+    where
+        P: Send + 'static,
+        F: FnOnce(WebSocket, AppState, WebSocketRequestContext, P) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let Self {
+            state,
+            context,
+            request_permit,
+        } = self;
+        ws.max_frame_size(limits.max_frame_size)
+            .max_message_size(limits.max_message_size)
+            .on_upgrade(move |socket| async move {
+                drop(request_permit);
+                run_session(socket, state, context, prepared).await;
+            })
+    }
+}
+
 /// Performs the HTTP-only part of an AI WebSocket request.
 ///
 /// The ordinary request permit covers only the HTTP Upgrade window. A
@@ -69,6 +145,21 @@ where
     F: FnOnce(WebSocket, AppState, WebSocketRequestContext) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    match prepare_authenticated_ai_websocket(state, remote_addr, headers, uri, spec).await? {
+        AuthenticatedAiWebSocketUpgradePreparation::Ready(prepared) => {
+            Ok(prepared.into_response(ws, limits, run_session))
+        }
+        AuthenticatedAiWebSocketUpgradePreparation::Rejected(response) => Ok(response),
+    }
+}
+
+pub(crate) async fn prepare_authenticated_ai_websocket(
+    state: AppState,
+    remote_addr: SocketAddr,
+    headers: HeaderMap,
+    uri: Uri,
+    spec: WebSocketIngressSpec,
+) -> Result<AuthenticatedAiWebSocketUpgradePreparation, GatewayError> {
     let trace_id = extract_or_generate_trace_id(&headers);
     let client_ip = effective_client_ip(&headers, &remote_addr);
     if state.admin_security_ip_blacklisted(client_ip).await? {
@@ -77,7 +168,8 @@ where
             None,
             StatusCode::FORBIDDEN,
             "当前 IP 已被禁止访问",
-        );
+        )
+        .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected);
     }
 
     let request_context = crate::control::resolve_public_request_context(
@@ -94,10 +186,12 @@ where
             None,
             StatusCode::NOT_FOUND,
             spec.route_unavailable_message,
-        );
+        )
+        .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected);
     };
     if let Some(rejection) = trusted_auth_local_rejection(Some(&decision), &headers) {
-        return build_local_auth_rejection_response(&trace_id, Some(&decision), &rejection);
+        return build_local_auth_rejection_response(&trace_id, Some(&decision), &rejection)
+            .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected);
     }
     // Browsers attach cookies to WebSocket handshakes automatically and the
     // WebSocket API does not let callers add an Authorization header.  A
@@ -119,14 +213,16 @@ where
             &trace_id,
             Some(&decision),
             &GatewayLocalAuthRejection::InvalidApiKey,
-        );
+        )
+        .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected);
     }
     let Some(auth_context) = decision.auth_context.as_ref() else {
         return build_local_auth_rejection_response(
             &trace_id,
             Some(&decision),
             &GatewayLocalAuthRejection::InvalidApiKey,
-        );
+        )
+        .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected);
     };
     if !auth_context.access_allowed
         || auth_context.user_id.trim().is_empty()
@@ -136,7 +232,8 @@ where
             &trace_id,
             Some(&decision),
             &GatewayLocalAuthRejection::InvalidApiKey,
-        );
+        )
+        .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected);
     }
     if !ip_rules_allow(auth_context.ip_rules.as_deref(), client_ip) {
         return build_local_auth_rejection_response(
@@ -145,7 +242,8 @@ where
             &GatewayLocalAuthRejection::IpNotAllowed {
                 remote_ip: client_ip.to_string(),
             },
-        );
+        )
+        .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected);
     }
 
     let request_permit = match state.try_acquire_request_permit().await {
@@ -157,6 +255,7 @@ where
                 Some(uri.path()),
                 error,
             )
+            .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected)
         }
     };
     let websocket_connection_permit = match state.try_acquire_websocket_connection_permit().await {
@@ -168,6 +267,7 @@ where
                 Some(uri.path()),
                 error,
             )
+            .map(AuthenticatedAiWebSocketUpgradePreparation::Rejected)
         }
     };
 
@@ -188,13 +288,13 @@ where
         decision,
         websocket_connection_permit,
     };
-    Ok(ws
-        .max_frame_size(limits.max_frame_size)
-        .max_message_size(limits.max_message_size)
-        .on_upgrade(move |socket| async move {
-            drop(request_permit);
-            run_session(socket, state, context).await;
-        }))
+    Ok(AuthenticatedAiWebSocketUpgradePreparation::Ready(
+        AuthenticatedAiWebSocketUpgrade {
+            state,
+            context,
+            request_permit,
+        },
+    ))
 }
 
 fn websocket_credential_carrier_is_allowed(carrier: Option<GatewayCredentialCarrier>) -> bool {
@@ -353,7 +453,7 @@ impl WebSocketConnectionLog {
             spec,
             trace_id: context.trace_id.clone(),
             remote_addr: context.remote_addr,
-            path: context.uri.path().to_string(),
+            path: websocket_log_path(context.uri.path()),
             route_class: context
                 .decision
                 .route_class
@@ -392,6 +492,17 @@ impl WebSocketConnectionLog {
     }
 }
 
+fn websocket_log_path(path: &str) -> String {
+    if path
+        .strip_prefix("/v1/live/")
+        .is_some_and(|call_id| !call_id.is_empty())
+    {
+        "/v1/live/{call_id}".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 impl Drop for WebSocketConnectionLog {
     fn drop(&mut self) {
         info!(
@@ -424,7 +535,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri};
 
     use super::{
-        websocket_credential_carrier_is_allowed, websocket_planning_headers, websocket_planning_uri,
+        websocket_credential_carrier_is_allowed, websocket_log_path, websocket_planning_headers,
+        websocket_planning_uri,
     };
     use crate::control::GatewayCredentialCarrier;
 
@@ -523,5 +635,14 @@ mod tests {
         ] {
             assert!(websocket_credential_carrier_is_allowed(carrier));
         }
+    }
+
+    #[test]
+    fn live_sideband_access_logs_do_not_retain_the_opaque_call_id() {
+        assert_eq!(websocket_log_path("/v1/live"), "/v1/live");
+        assert_eq!(
+            websocket_log_path("/v1/live/rtc_secret_opaque"),
+            "/v1/live/{call_id}"
+        );
     }
 }

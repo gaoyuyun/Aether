@@ -73,7 +73,7 @@ INNER JOIN LATERAL (
       (
         LOWER(BTRIM(p.provider_type)) = 'codex'
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-        AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
+        AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image', 'codex:live')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -158,7 +158,7 @@ WHERE p.is_active = TRUE
     (
       LOWER(BTRIM(p.provider_type)) = 'codex'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
+      AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image', 'codex:live')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -336,7 +336,7 @@ INNER JOIN LATERAL (
       (
         LOWER(BTRIM(p.provider_type)) = 'codex'
         AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-        AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
+        AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image', 'codex:live')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -422,7 +422,7 @@ WHERE p.is_active = TRUE
     (
       LOWER(BTRIM(p.provider_type)) = 'codex'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
+      AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image', 'codex:live')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -608,7 +608,7 @@ WHERE p.is_active = TRUE
     (
       LOWER(BTRIM(p.provider_type)) = 'codex'
       AND LOWER(BTRIM(pak.auth_type)) = 'oauth'
-      AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image')
+      AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:search', 'openai:image', 'codex:live')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'
@@ -971,6 +971,17 @@ impl SqlxMinimalCandidateSelectionReadRepository {
     }
 }
 
+const PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_MARKER: &str =
+    "__AETHER_PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH__";
+const PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_SQL: &str = r#"(
+  LOWER(BTRIM(fmt.value)) = ANY($3::text[])
+  OR (
+    LOWER(BTRIM(p.provider_type)) = 'codex'
+    AND LOWER($4) = 'codex:live'
+    AND LOWER(BTRIM(fmt.value)) IN ('openai:responses', '/v1/responses')
+  )
+)"#;
+
 fn requested_model_selection_sql() -> String {
     LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL
         .replace(
@@ -996,7 +1007,7 @@ fn requested_model_selection_sql() -> String {
             OR EXISTS (
               SELECT 1
               FROM jsonb_array_elements_text(mapping.value -> 'api_formats') AS fmt(value)
-              WHERE LOWER(BTRIM(fmt.value)) = ANY($3::text[])
+              WHERE __AETHER_PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH__
             )
           )
           AND (
@@ -1054,7 +1065,7 @@ fn requested_model_selection_sql() -> String {
               OR EXISTS (
                 SELECT 1
                 FROM jsonb_array_elements_text(mapping.value -> 'api_formats') AS fmt(value)
-                WHERE LOWER(BTRIM(fmt.value)) = ANY($3::text[])
+                WHERE __AETHER_PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH__
               )
             )
             AND (
@@ -1087,7 +1098,7 @@ fn requested_model_selection_sql() -> String {
             OR EXISTS (
               SELECT 1
               FROM jsonb_array_elements_text(mapping.value -> 'api_formats') AS fmt(value)
-              WHERE LOWER(BTRIM(fmt.value)) = ANY($3::text[])
+              WHERE __AETHER_PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH__
             )
           )
           AND (
@@ -1102,6 +1113,10 @@ fn requested_model_selection_sql() -> String {
       )
     )
   )"#,
+        )
+        .replace(
+            PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_MARKER,
+            PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_SQL,
         )
         .replace(
             "ORDER BY\n  provider_priority ASC,",
@@ -1240,11 +1255,11 @@ fn map_candidate_selection_row(
         key_name: row.try_get("key_name").map_postgres_err()?,
         key_auth_type: row.try_get("key_auth_type").map_postgres_err()?,
         key_is_active: row.try_get("key_is_active").map_postgres_err()?,
-        key_api_formats: parse_string_list(
+        key_api_formats: parse_key_policy_string_list(
             row.try_get("key_api_formats").map_postgres_err()?,
             "provider_api_keys.api_formats",
         )?,
-        key_allowed_models: parse_string_list(
+        key_allowed_models: parse_key_policy_string_list(
             row.try_get("key_allowed_models").map_postgres_err()?,
             "provider_api_keys.allowed_models",
         )?,
@@ -1284,6 +1299,79 @@ fn parse_string_list(
         return Ok(None);
     };
     parse_string_list_value(&value, field_name)
+}
+
+fn parse_key_policy_string_list(
+    value: Option<serde_json::Value>,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, DataLayerError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    parse_key_policy_string_list_value(&value, field_name)
+}
+
+fn parse_key_policy_string_list_value(
+    value: &serde_json::Value,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, DataLayerError> {
+    match value {
+        serde_json::Value::Null => Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} contains JSON null; use SQL NULL for an unset policy"
+        ))),
+        serde_json::Value::Array(array) => {
+            parse_key_policy_string_list_array(array, field_name).map(Some)
+        }
+        serde_json::Value::String(raw) => parse_embedded_key_policy_string_list(raw, field_name),
+        _ => Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} is not a JSON array"
+        ))),
+    }
+}
+
+fn parse_embedded_key_policy_string_list(
+    raw: &str,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, DataLayerError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} contains an empty string"
+        )));
+    }
+    if raw.eq_ignore_ascii_case("null") {
+        return Err(DataLayerError::UnexpectedValue(format!(
+            "{field_name} contains stringified JSON null; use SQL NULL for an unset policy"
+        )));
+    }
+
+    if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(raw) {
+        return parse_key_policy_string_list_value(&decoded, field_name);
+    }
+
+    Ok(Some(vec![raw.to_string()]))
+}
+
+fn parse_key_policy_string_list_array(
+    array: &[serde_json::Value],
+    field_name: &str,
+) -> Result<Vec<String>, DataLayerError> {
+    let mut items = Vec::with_capacity(array.len());
+    for item in array {
+        let Some(item) = item.as_str() else {
+            return Err(DataLayerError::UnexpectedValue(format!(
+                "{field_name} contains a non-string item"
+            )));
+        };
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(DataLayerError::UnexpectedValue(format!(
+                "{field_name} contains an empty item"
+            )));
+        }
+        items.push(item.to_string());
+    }
+    Ok(items)
 }
 
 fn parse_string_list_value(
@@ -1490,15 +1578,17 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        parse_provider_model_mappings, parse_string_list, pool_key_candidate_selection_sql,
-        requested_model_selection_page_sql, requested_model_selection_sql,
-        SqlxMinimalCandidateSelectionReadRepository,
+        parse_key_policy_string_list, parse_provider_model_mappings, parse_string_list,
+        pool_key_candidate_selection_sql, requested_model_selection_page_sql,
+        requested_model_selection_sql, SqlxMinimalCandidateSelectionReadRepository,
         LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL, LIST_FOR_EXACT_API_FORMAT_SQL,
-        LIST_POOL_KEYS_FOR_GROUP_SQL,
+        LIST_POOL_KEYS_FOR_GROUP_SQL, PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_MARKER,
+        PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_SQL,
     };
     use crate::{PostgresPoolConfig, PostgresPoolFactory};
     use aether_data_contracts::repository::candidate_selection::{
-        StoredPoolKeyCandidateOrder, StoredProviderModelMapping,
+        provider_model_mapping_api_format_covers, StoredPoolKeyCandidateOrder,
+        StoredProviderModelMapping,
     };
 
     #[tokio::test]
@@ -1563,6 +1653,50 @@ mod tests {
             assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'chatgpt_web'"));
             assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer')"));
             assert!(sql.contains("'chatgpt_web',"));
+        }
+    }
+
+    #[test]
+    fn candidate_selection_sql_allows_codex_live_oauth_auth() {
+        let requested_model_sql = requested_model_selection_sql();
+        for sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+            LIST_POOL_KEYS_FOR_GROUP_SQL,
+            requested_model_sql.as_str(),
+        ] {
+            assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'codex'"));
+            assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) = 'oauth'"));
+            assert!(sql.contains("'codex:live'"));
+        }
+    }
+
+    #[test]
+    fn requested_model_sql_scopes_legacy_responses_mapping_to_codex_live() {
+        let sql = requested_model_selection_sql();
+        let compatibility = PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_SQL;
+
+        assert_eq!(sql.matches(compatibility).count(), 3);
+        assert!(!sql.contains(PROVIDER_MODEL_MAPPING_API_FORMAT_MATCH_MARKER));
+        assert!(compatibility.contains("LOWER(BTRIM(p.provider_type)) = 'codex'"));
+        assert!(compatibility.contains("LOWER($4) = 'codex:live'"));
+        for legacy_responses_alias in ["openai:responses", "/v1/responses"] {
+            assert!(provider_model_mapping_api_format_covers(
+                "codex",
+                legacy_responses_alias,
+                "codex:live"
+            ));
+            assert!(compatibility.contains(&format!("'{legacy_responses_alias}'")));
+        }
+        assert!(!LIST_FOR_EXACT_API_FORMAT_SQL.contains(compatibility));
+        assert!(!LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL.contains(compatibility));
+        assert!(!LIST_POOL_KEYS_FOR_GROUP_SQL.contains(compatibility));
+        for permission_sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+            LIST_POOL_KEYS_FOR_GROUP_SQL,
+        ] {
+            assert!(!permission_sql.contains("'/v1/responses'"));
         }
     }
 
@@ -1684,6 +1818,29 @@ mod tests {
             .expect("single string should parse");
 
         assert_eq!(parsed, Some(vec!["gpt-5.2".to_string()]));
+    }
+
+    #[test]
+    fn malformed_key_policy_never_degrades_to_unrestricted() {
+        for value in [
+            json!(null),
+            json!("null"),
+            json!(""),
+            json!(["openai:chat", null]),
+        ] {
+            assert!(
+                parse_key_policy_string_list(Some(value), "provider_api_keys.api_formats",)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            parse_key_policy_string_list(
+                Some(json!(["openai:chat"])),
+                "provider_api_keys.api_formats",
+            )
+            .expect("valid key policy should parse"),
+            Some(vec!["openai:chat".to_string()])
+        );
     }
 
     #[test]

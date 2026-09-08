@@ -9,7 +9,7 @@ use aether_ai_serving::{
 use aether_dispatch_core::{DispatchSequence, DispatchSequenceItem};
 use aether_routing_core::{
     rank_vector_for_candidate, CandidateKind, ResolvedRoutingPolicy, RoutingCandidateFacts,
-    RoutingCandidateTrace, RoutingDecisionTrace,
+    RoutingCandidateTrace, RoutingDecisionTrace, RoutingExecutionPolicy,
 };
 use aether_scheduler_core::{
     ClientSessionAffinity, SchedulerMinimalCandidateSelectionCandidate, SchedulerRankingOutcome,
@@ -47,13 +47,12 @@ use crate::cache::{
 use crate::clock::current_unix_ms;
 use crate::dispatch::refs::dispatch_ref_for_local_candidate;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
-use crate::orchestration::{local_attempt_slot_count, ExecutionAttemptIdentity};
+use crate::orchestration::{ExecutionAttemptIdentity, POOL_KEY_RETRY_INDEX_STRIDE};
 use crate::scheduler::candidate::is_auth_api_key_concurrency_limit_skip_reason;
 use crate::scheduler::config::SchedulerSchedulingMode;
 use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::{AppState, GatewayError};
 
-const POOL_KEY_RETRY_INDEX_STRIDE: u32 = 100;
 const AUTH_API_KEY_CONCURRENCY_WAIT_BUDGET: Duration = Duration::from_millis(100);
 const AUTH_API_KEY_CONCURRENCY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -79,6 +78,13 @@ type DecorateSkippedCandidateFn<'a> = Arc<
 #[async_trait]
 pub(crate) trait LocalExecutionAttemptSource<T>: Send {
     async fn next_execution_attempt(&mut self) -> Result<Option<T>, GatewayError>;
+
+    /// Returns the request-scoped execution behaviour selected by routing.
+    /// Execution wrappers use this snapshot before consuming the first
+    /// attempt, avoiding a second lookup against mutable system settings.
+    fn routing_execution_policy(&self) -> Option<RoutingExecutionPolicy> {
+        None
+    }
 
     async fn drain_execution_attempts(&mut self) -> Result<Vec<T>, GatewayError>;
 
@@ -480,10 +486,6 @@ where
     type Attempt = LocalExecutionCandidateAttempt;
     type ExtraData = Value;
     type Error = Infallible;
-
-    fn attempt_slot_count(&self, candidate: &Self::Candidate) -> u32 {
-        local_attempt_slot_count(&candidate.transport)
-    }
 
     fn build_extra_data(&self, candidate: &Self::Candidate) -> Option<Self::ExtraData> {
         available_candidate_extra_data_with_dispatch_ref(candidate, &self.build_extra_data)
@@ -1242,9 +1244,7 @@ async fn scheduler_cache_affinity_enabled(
     state: PlannerAppState<'_>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> bool {
-    scheduler_ordering_config_for_routing_policy(state, routing_policy)
-        .await
-        .scheduling_mode
+    scheduler_ordering_config_for_routing_policy(routing_policy).scheduling_mode
         == SchedulerSchedulingMode::CacheAffinity
 }
 
@@ -1611,7 +1611,8 @@ async fn persist_available_local_execution_candidate_at_index<F>(
 where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
 {
-    let attempt_slots = local_attempt_slot_count(&candidate.transport).max(1);
+    // Exactly one attempt is materialized per candidate; same-key retries are
+    // derived lazily by the attempt loop after a failure.
     let extra_data = ai_candidate_extra_data_with_ranking(
         available_candidate_base_extra_data_with_dispatch_ref(&candidate, build_extra_data),
         candidate.ranking.as_ref(),
@@ -1626,53 +1627,34 @@ where
         Some(candidate_index),
         extra_data,
     );
-    let should_persist = should_persist_available_local_candidate(&candidate);
-    let mut attempts = Vec::with_capacity(attempt_slots as usize);
-    let mut owned_candidate = Some(candidate);
+    let retry_index = effective_retry_index(0, candidate.orchestration.pool_key_index);
+    let generated_candidate_id = Uuid::new_v4().to_string();
+    let candidate_id = if should_persist_available_local_candidate(&candidate) {
+        state
+            .persist_available_local_candidate(
+                trace_id,
+                context.user_id,
+                context.api_key_id,
+                &candidate.candidate,
+                candidate_index,
+                retry_index,
+                generated_candidate_id.as_str(),
+                context.required_capabilities,
+                extra_data,
+                current_unix_ms(),
+                context.error_context,
+            )
+            .await
+    } else {
+        generated_candidate_id
+    };
 
-    for retry_index in 0..attempt_slots {
-        let candidate_ref = owned_candidate
-            .as_ref()
-            .expect("candidate should remain available until final retry");
-        let generated_candidate_id = Uuid::new_v4().to_string();
-        let candidate_id = if should_persist {
-            state
-                .persist_available_local_candidate(
-                    trace_id,
-                    context.user_id,
-                    context.api_key_id,
-                    &candidate_ref.candidate,
-                    candidate_index,
-                    effective_retry_index(retry_index, candidate_ref.orchestration.pool_key_index),
-                    generated_candidate_id.as_str(),
-                    context.required_capabilities,
-                    extra_data.clone(),
-                    current_unix_ms(),
-                    context.error_context,
-                )
-                .await
-        } else {
-            generated_candidate_id
-        };
-
-        let candidate = if retry_index + 1 == attempt_slots {
-            owned_candidate
-                .take()
-                .expect("final retry should consume owned candidate")
-        } else {
-            candidate_ref.clone()
-        };
-        let retry_index =
-            effective_retry_index(retry_index, candidate.orchestration.pool_key_index);
-        attempts.push(LocalExecutionCandidateAttempt {
-            eligible: candidate,
-            candidate_index,
-            retry_index,
-            candidate_id,
-        });
-    }
-
-    attempts
+    vec![LocalExecutionCandidateAttempt {
+        eligible: candidate,
+        candidate_index,
+        retry_index,
+        candidate_id,
+    }]
 }
 
 fn available_candidate_extra_data_with_dispatch_ref<F>(
@@ -1841,6 +1823,7 @@ fn routing_trace_for_candidate(
                     CandidateKind::Provider => Some(candidate.key_id.clone()),
                     CandidateKind::PoolGroup => None,
                 },
+                api_format: Some(candidate.endpoint_api_format.clone()),
                 provider_priority: candidate.provider_priority,
                 key_priority: candidate
                     .key_global_priority_for_format
@@ -1924,32 +1907,15 @@ fn build_unpersisted_local_execution_candidate_attempts(
     candidate: EligibleLocalExecutionCandidate,
     candidate_index: u32,
 ) -> VecDeque<LocalExecutionCandidateAttempt> {
-    let attempt_slots = local_attempt_slot_count(&candidate.transport).max(1);
-    let mut attempts = VecDeque::with_capacity(attempt_slots as usize);
-    let mut owned_candidate = Some(candidate);
-
-    for retry_index in 0..attempt_slots {
-        let candidate = if retry_index + 1 == attempt_slots {
-            owned_candidate
-                .take()
-                .expect("final retry should consume owned candidate")
-        } else {
-            owned_candidate
-                .as_ref()
-                .expect("candidate should remain available until final retry")
-                .clone()
-        };
-        let retry_index =
-            effective_retry_index(retry_index, candidate.orchestration.pool_key_index);
-        attempts.push_back(LocalExecutionCandidateAttempt {
-            eligible: candidate,
-            candidate_index,
-            retry_index,
-            candidate_id: Uuid::new_v4().to_string(),
-        });
-    }
-
-    attempts
+    // One attempt per candidate; same-key retries are derived lazily by the
+    // attempt loop after a failure.
+    let retry_index = effective_retry_index(0, candidate.orchestration.pool_key_index);
+    VecDeque::from([LocalExecutionCandidateAttempt {
+        eligible: candidate,
+        candidate_index,
+        retry_index,
+        candidate_id: Uuid::new_v4().to_string(),
+    }])
 }
 
 async fn persist_pool_group_exhaustion_skipped_candidate(
@@ -2277,6 +2243,8 @@ mod tests {
                 pool_key_index,
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
+                // These tests cover persistence shape, not same-key retries.
+                sticky_key_attempts: Some(1),
             },
             ranking: None,
         }
@@ -2358,16 +2326,11 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].key_id.as_deref(), Some("normal-key"));
         assert_eq!(stored[0].candidate_index, 2);
-        assert_eq!(
-            stored[0]
-                .extra_data
-                .as_ref()
-                .and_then(|value| value.get("dispatch_ref"))
-                .and_then(|value| value.get("SingleKey"))
-                .and_then(|value| value.get("key"))
-                .and_then(|value| value.get("key_id")),
-            Some(&json!("normal-key"))
-        );
+        assert!(stored[0]
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("dispatch_ref"))
+            .is_none());
     }
 
     #[test]
@@ -2515,14 +2478,23 @@ mod tests {
 
         assert!(should_cache_resolved_candidate_page(&cursor));
 
-        let fixed_order_app = AppState::new()
-            .expect("state should build")
-            .with_data_state_for_tests(
-                GatewayDataState::disabled().with_system_config_values_for_tests([(
-                    "scheduling_mode".to_string(),
-                    json!("fixed_order"),
-                )]),
-            );
+        let fixed_order_app = AppState::new().expect("state should build");
+        let fixed_order_policy = ResolvedRoutingPolicy {
+            group_id: Some("routing-group-fixed-order".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
+            ranking_overlay: Default::default(),
+            mutation_plan: Default::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        };
         let mut page_cursor = LocalCandidatePreselectionPageCursor::new(
             PlannerAppState::new(&fixed_order_app),
             &model_directive_policy,
@@ -2532,7 +2504,7 @@ mod tests {
             true,
             None,
             &auth_snapshot,
-            None,
+            Some(&fixed_order_policy),
             None,
             None,
             false,
@@ -2550,7 +2522,7 @@ mod tests {
             auth_snapshot,
             client_session_affinity: None,
             required_capabilities: None,
-            routing_policy: None,
+            routing_policy: Some(fixed_order_policy),
             sticky_session_token: None,
             request_auth_channel: None,
             skipped_user_id: "user-1".to_string(),
@@ -2648,16 +2620,11 @@ mod tests {
         );
         assert_eq!(stored[1].key_id.as_deref(), Some("normal-key"));
         assert_eq!(stored[1].candidate_index, 1);
-        assert_eq!(
-            stored[1]
-                .extra_data
-                .as_ref()
-                .and_then(|value| value.get("dispatch_ref"))
-                .and_then(|value| value.get("SingleKey"))
-                .and_then(|value| value.get("key"))
-                .and_then(|value| value.get("key_id")),
-            Some(&json!("normal-key"))
-        );
+        assert!(stored[1]
+            .extra_data
+            .as_ref()
+            .and_then(|value| value.get("dispatch_ref"))
+            .is_none());
     }
 
     #[test]
@@ -2727,7 +2694,7 @@ mod tests {
             .as_ref()
             .and_then(serde_json::Value::as_object)
             .expect("ranking metadata should persist as object extra data");
-        assert_eq!(extra_data.get("existing"), Some(&json!("value")));
+        assert!(extra_data.get("existing").is_none());
         assert_eq!(
             extra_data.get("ranking_mode"),
             Some(&json!("CacheAffinity"))
@@ -2740,14 +2707,7 @@ mod tests {
             Some(&json!("cached_affinity"))
         );
         assert_eq!(extra_data.get("demoted_by"), Some(&json!("cross_format")));
-        assert_eq!(
-            extra_data
-                .get("dispatch_ref")
-                .and_then(|value| value.get("SingleKey"))
-                .and_then(|value| value.get("key"))
-                .and_then(|value| value.get("key_id")),
-            Some(&json!("ranked-key"))
-        );
+        assert!(extra_data.get("dispatch_ref").is_none());
     }
 
     #[tokio::test]
@@ -3085,7 +3045,7 @@ mod tests {
             .as_ref()
             .and_then(serde_json::Value::as_object)
             .expect("skipped ranking metadata should persist");
-        assert_eq!(extra_data.get("existing"), Some(&json!("value")));
+        assert!(extra_data.get("existing").is_none());
         assert_eq!(
             extra_data.get("ranking_mode"),
             Some(&json!("CacheAffinity"))
