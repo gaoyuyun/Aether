@@ -170,12 +170,13 @@ Linux/macOS 可运行 `sudo aether-tunnel upgrade [version]`。自更新只接�
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
-| `--upstream-connect-timeout-secs` | `AETHER_TUNNEL_UPSTREAM_CONNECT_TIMEOUT_SECS` | `30` | 上游建连超时（秒） |
+| `--upstream-connect-timeout-secs` | `AETHER_TUNNEL_UPSTREAM_CONNECT_TIMEOUT` | `30` | 上游建连超时（秒） |
 | `--upstream-pool-max-idle-per-host` | `AETHER_TUNNEL_UPSTREAM_POOL_MAX_IDLE_PER_HOST` | `64` | 每 Host 最大空闲连接数 |
-| `--upstream-pool-idle-timeout-secs` | `AETHER_TUNNEL_UPSTREAM_POOL_IDLE_TIMEOUT_SECS` | `300` | 连接池空闲超时（秒） |
-| `--upstream-tcp-keepalive-secs` | `AETHER_TUNNEL_UPSTREAM_TCP_KEEPALIVE_SECS` | `60` | TCP keepalive（秒，0 关闭） |
+| `--upstream-pool-idle-timeout-secs` | `AETHER_TUNNEL_UPSTREAM_POOL_IDLE_TIMEOUT` | `300` | 连接池空闲超时（秒） |
+| `--upstream-tcp-keepalive-secs` | `AETHER_TUNNEL_UPSTREAM_TCP_KEEPALIVE` | `60` | TCP keepalive（秒，0 关闭） |
 | `--upstream-tcp-nodelay` | `AETHER_TUNNEL_UPSTREAM_TCP_NODELAY` | `true` | 启用 TCP_NODELAY |
 | `--upstream-proxy-url` | `AETHER_TUNNEL_UPSTREAM_PROXY_URL` | 空 | 仅 provider 上游请求使用的出口代理 |
+| `--upstream-proxy-remote-dns` | `AETHER_TUNNEL_UPSTREAM_PROXY_REMOTE_DNS` | `false` | 显式信任 HTTP/SOCKS5h 代理解析供应商域名并执行目标 IP 访问控制；需重启 |
 
 启用 `follow_redirects` 后，同源 307/308 会在请求体不超过 5 MiB 时重放。首个上游请求始终流式传输；超过重放预算时不会拒绝或截断原请求，而是将 307/308 响应原样返回给调用方。
 
@@ -185,14 +186,38 @@ Linux/macOS 可运行 `sudo aether-tunnel upgrade [version]`。自更新只接�
 upstream_proxy_url = "socks5h://microwarp:1080"
 ```
 
+默认仍由隧道本机解析供应商域名、执行端口/IP ACL，再把已校验的 IP 交给代理；仅配置
+`socks5h://` 不会跳过本地 DNS。这保留现有的防 DNS 重绑定及内网访问边界。
+
+如果隧道本机 DNS 不可用、被污染或返回不可路由的 Fake-IP，可显式委托**受信任且配置了
+目的地址访问控制的代理**解析域名。在 TOML 顶层（第一个 `[[servers]]` 之前）配置：
+
+```toml
+upstream_proxy_url = "socks5h://microwarp:1080"
+upstream_proxy_remote_dns = true
+```
+
+也可启用环境变量 `AETHER_TUNNEL_UPSTREAM_PROXY_REMOTE_DNS=true`、CLI 参数
+`--upstream-proxy-remote-dns` 或 setup 中的 `Proxy Remote DNS` 开关，保存后重启。
+该模式仅支持 `http://` 和 `socks5h://`，不支持本地解析语义的 `socks5://`；未配置代理时
+启动会报错。域名原样交给 HTTP CONNECT/SOCKS5h，HTTP Host 和 TLS SNI/证书校验仍使用
+原域名，不会在失败时偷偷回退到本地 DNS。
+
+**安全边界：**普通 HTTP CONNECT/SOCKS5 不能让隧道校验代理最终解析出的目标 IP，因此
+启用该模式代表把域名目标的 IP ACL 委托给代理，而不只是换一个 DNS 服务器。隧道仍检查
+端口、URL 凭据/fragment、`localhost` 和 IP 字面地址；默认继续拒绝私网/保留 IP 字面地址。
+这不需要打开 `allow_private_targets`。代理本身的域名仍需本地解析；如果本地 DNS 完全
+不可用，使用代理 IP 地址或修复本地解析。代理 DNS、TCP、CONNECT/SOCKS 和 TLS 握手共同
+受 `upstream_connect_timeout_secs` 限制。
+
 如果需要让 Aether 管理 API 和 WebSocket tunnel 也走代理，使用 `aether_outbound_proxy_url`。
 
 #### Aether API 客户端
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
-| `--aether-request-timeout-secs` | `AETHER_TUNNEL_AETHER_REQUEST_TIMEOUT_SECS` | `10` | 请求总超时（秒） |
-| `--aether-connect-timeout-secs` | `AETHER_TUNNEL_AETHER_CONNECT_TIMEOUT_SECS` | `10` | 建连超时（秒） |
+| `--aether-request-timeout-secs` | `AETHER_TUNNEL_AETHER_REQUEST_TIMEOUT` | `10` | 请求总超时（秒） |
+| `--aether-connect-timeout-secs` | `AETHER_TUNNEL_AETHER_CONNECT_TIMEOUT` | `10` | 建连超时（秒） |
 | `--aether-outbound-proxy-url` | `AETHER_TUNNEL_AETHER_OUTBOUND_PROXY_URL` | 空 | Aether 注册、心跳和 WebSocket tunnel 回连使用的出口代理（默认不走代理） |
 | `--aether-retry-max-attempts` | `AETHER_TUNNEL_AETHER_RETRY_MAX_ATTEMPTS` | `3` | 最大重试次数 |
 
@@ -201,7 +226,7 @@ upstream_proxy_url = "socks5h://microwarp:1080"
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
 | `--allow-private-targets` | `AETHER_TUNNEL_ALLOW_PRIVATE_TARGETS` | `false` | 默认拦截 private/reserved 目标地址；仅在明确需要访问内网服务时设为 `true`，且仅影响重启后的进程 |
-| `--dns-cache-ttl-secs` | `AETHER_TUNNEL_DNS_CACHE_TTL_SECS` | `60` | DNS 缓存 TTL（秒） |
+| `--dns-cache-ttl-secs` | `AETHER_TUNNEL_DNS_CACHE_TTL` | `60` | DNS 缓存 TTL（秒） |
 | `--dns-cache-capacity` | `AETHER_TUNNEL_DNS_CACHE_CAPACITY` | `1024` | DNS 缓存容量（条目数） |
 
 #### 日志

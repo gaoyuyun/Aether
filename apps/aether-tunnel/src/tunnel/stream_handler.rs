@@ -1276,6 +1276,40 @@ fn resolve_redirect<B>(
     }
 }
 
+async fn resolve_upstream_target(
+    current_url: &url::Url,
+    allowed_ports: &std::collections::HashSet<u16>,
+    allow_private_targets: bool,
+    proxy_remote_dns: bool,
+    dns_cache: &target_filter::DnsCache,
+) -> Result<upstream_client::ValidatedUpstreamTarget, String> {
+    validate_tunnel_upstream_url(current_url, allow_private_targets).map_err(str::to_string)?;
+    let host = current_url
+        .host_str()
+        .ok_or_else(|| "missing host in URL".to_string())?;
+    let port = current_url
+        .port_or_known_default()
+        .ok_or_else(|| "missing port in URL".to_string())?;
+    let addresses = if proxy_remote_dns {
+        match target_filter::validate_target_literal(
+            host,
+            port,
+            allowed_ports,
+            allow_private_targets,
+        )
+        .map_err(|_| "upstream target blocked".to_string())?
+        {
+            Some(address) => vec![address],
+            None => return upstream_client::ValidatedUpstreamTarget::proxy_resolved(current_url),
+        }
+    } else {
+        target_filter::validate_target(host, port, allowed_ports, allow_private_targets, dns_cache)
+            .await
+            .map_err(|_| "upstream target blocked".to_string())?
+    };
+    upstream_client::ValidatedUpstreamTarget::new(current_url, addresses)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_upstream_request(
     state: &AppState,
@@ -1288,24 +1322,19 @@ async fn execute_upstream_request(
     timeout: Duration,
     http1_only: bool,
 ) -> Result<UpstreamResponseContext, String> {
-    let host = current_url
-        .host_str()
-        .ok_or_else(|| "missing host in URL".to_string())?;
-    let port = current_url.port_or_known_default().unwrap_or(443);
-
     let dns_start = Instant::now();
-    let validated_addrs = {
+    let validated_target = {
         let allowed_ports = Arc::clone(&server.dynamic.load().allowed_ports);
-        match target_filter::validate_target(
-            host,
-            port,
+        match resolve_upstream_target(
+            current_url,
             &allowed_ports,
             state.config.allow_private_targets,
+            state.config.upstream_proxy_remote_dns,
             &state.dns_cache,
         )
         .await
         {
-            Ok(addrs) => addrs,
+            Ok(target) => target,
             Err(_error) => {
                 server.metrics.dns_failures.fetch_add(1, Ordering::Release);
                 // Keep the detailed filter error out of the tunnel response;
@@ -1316,9 +1345,6 @@ async fn execute_upstream_request(
         }
     };
     let dns_ms = dns_start.elapsed().as_millis() as u64;
-
-    let validated_target =
-        upstream_client::ValidatedUpstreamTarget::new(current_url, validated_addrs)?;
 
     let client_key = upstream_client::upstream_client_pool_key(
         meta.provider_id.as_deref(),
@@ -2326,6 +2352,89 @@ fn build_prefixed_request_body(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn remote_dns_target_resolution_skips_local_dns_and_keeps_literal_acl() {
+        let cache = target_filter::DnsCache::new(Duration::from_secs(60), 16);
+        let ports = [80, 443].into_iter().collect();
+        let url = url::Url::parse("https://remote-dns-test.invalid/path").unwrap();
+        let target = resolve_upstream_target(&url, &ports, false, true, &cache)
+            .await
+            .expect("trusted proxy should receive an unresolved hostname");
+        assert!(target.uses_proxy_dns());
+        assert!(cache.get("remote-dns-test.invalid", 443).await.is_none());
+
+        for address in ["https://8.8.8.8/", "https://[2606:4700:4700::1111]/"] {
+            let target = resolve_upstream_target(
+                &url::Url::parse(address).unwrap(),
+                &ports,
+                false,
+                true,
+                &cache,
+            )
+            .await
+            .unwrap();
+            assert!(!target.uses_proxy_dns(), "IP literals must remain pinned");
+        }
+
+        for address in [
+            "https://127.0.0.1/",
+            "https://10.0.0.1/",
+            "https://198.18.0.1/",
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://localhost/",
+            "https://LOCALHOST./",
+            "https://remote-dns-test.invalid:25/",
+            "https://user:secret@remote-dns-test.invalid/",
+            "https://remote-dns-test.invalid/#fragment",
+            "ftp://remote-dns-test.invalid/",
+        ] {
+            assert!(
+                resolve_upstream_target(
+                    &url::Url::parse(address).unwrap(),
+                    &ports,
+                    false,
+                    true,
+                    &cache,
+                )
+                .await
+                .is_err(),
+                "target should remain blocked: {address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_dns_targets_stay_pinned_and_separate_from_remote_dns_targets() {
+        let cache = target_filter::DnsCache::new(Duration::from_secs(60), 16);
+        let ports = [443].into_iter().collect();
+        let url = url::Url::parse("https://remote-dns-test.invalid/").unwrap();
+        cache
+            .insert(
+                "remote-dns-test.invalid",
+                443,
+                Arc::new(vec!["8.8.8.8:443".parse().unwrap()]),
+            )
+            .await;
+        let strict = resolve_upstream_target(&url, &ports, false, false, &cache)
+            .await
+            .unwrap();
+        let remote = resolve_upstream_target(&url, &ports, false, true, &cache)
+            .await
+            .unwrap();
+        assert!(!strict.uses_proxy_dns());
+        assert!(remote.uses_proxy_dns());
+        assert_ne!(strict, remote);
+
+        let private_url = url::Url::parse("http://[::1]/").unwrap();
+        let private_ports = [80].into_iter().collect();
+        let explicitly_allowed =
+            resolve_upstream_target(&private_url, &private_ports, true, true, &cache)
+                .await
+                .unwrap();
+        assert!(!explicitly_allowed.uses_proxy_dns());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn window_updates_wait_for_capacity_instead_of_disappearing() {
         let (high_tx, mut high_rx) = aether_runtime::bounded_queue(1);
@@ -3820,6 +3929,7 @@ mod tests {
             upstream_tcp_keepalive_secs: 60,
             upstream_tcp_nodelay: true,
             upstream_proxy_url: None,
+            upstream_proxy_remote_dns: false,
             legacy_redirect_replay_budget_bytes_ignored: None,
             emit_proxy_timing_header: true,
             log_level: "info".to_string(),

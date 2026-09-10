@@ -23,6 +23,9 @@ use crate::formats::shared::stream_core::common::{
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
 
+const PROVIDER_STREAM_FINISH_ERROR_MESSAGE: &str =
+    "Upstream stream ended with finish reason: error";
+
 #[derive(Default)]
 pub struct StreamingStandardFormatMatrix {
     provider: Option<ProviderStreamParser>,
@@ -129,7 +132,7 @@ impl StreamingStandardFormatMatrix {
             {
                 if !canonical_stream_finish_reason_is_supported(finish_reason) {
                     self.terminated = true;
-                    out.extend(client.emit_unsupported_finish_reason(finish_reason)?);
+                    out.extend(client.emit_finish_reason_error(finish_reason)?);
                     break;
                 }
             }
@@ -388,7 +391,13 @@ impl StreamingStandardTerminalObserver {
                 if let Some(parser_error) = finish_reason
                     .as_deref()
                     .filter(|reason| !canonical_stream_finish_reason_is_supported(reason))
-                    .map(|reason| format!("unsupported provider stream finish reason: {reason}"))
+                    .map(|reason| {
+                        if reason.trim() == "error" {
+                            PROVIDER_STREAM_FINISH_ERROR_MESSAGE.to_string()
+                        } else {
+                            format!("unsupported provider stream finish reason: {reason}")
+                        }
+                    })
                 {
                     summary.parser_error.get_or_insert(parser_error);
                 }
@@ -660,17 +669,28 @@ impl ClientStreamEmitter {
         self.emit_error(error_body)
     }
 
-    fn emit_unsupported_finish_reason(
+    fn emit_finish_reason_error(
         &mut self,
         finish_reason: &str,
     ) -> Result<Vec<u8>, AiSurfaceFinalizeError> {
+        let (message, code) = if finish_reason.trim() == "error" {
+            (
+                PROVIDER_STREAM_FINISH_ERROR_MESSAGE.to_string(),
+                "stream_terminal_error",
+            )
+        } else {
+            (
+                format!(
+                    "Unsupported provider stream finish reason cannot be converted losslessly: field $.finish_reason = {}",
+                    serde_json::json!(finish_reason)
+                ),
+                "unsupported_finish_reason",
+            )
+        };
         let Some(error_body) = build_core_error_body_for_client_format(
             self.api_format(),
-            &format!(
-                "Unsupported provider stream finish reason cannot be converted losslessly: field $.finish_reason = {}",
-                serde_json::json!(finish_reason)
-            ),
-            Some("unsupported_finish_reason"),
+            &message,
+            Some(code),
             LocalCoreSyncErrorKind::ServerError,
         ) else {
             return Ok(Vec::new());
@@ -2119,6 +2139,163 @@ mod tests {
         assert!(sse.contains("\"name\":\"local_shell\""), "{sse}");
         assert!(sse.contains("\\\"command\\\":[\\\"pwd\\\"]"), "{sse}");
         assert!(sse.contains("\"stop_reason\":\"tool_use\""), "{sse}");
+    }
+
+    #[test]
+    fn terminal_observer_treats_claude_error_finish_reason_as_upstream_failure() {
+        for upstream_message in [None, Some("Provider temporarily overloaded")] {
+            let context = report_context("claude:messages", "claude:messages");
+            let mut observer = StreamingStandardTerminalObserver::default();
+            observer
+                .push_line(
+                    &context,
+                    data_line(json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_error_finish",
+                            "model": "claude-sonnet-4-5",
+                            "usage": {
+                                "input_tokens": 22,
+                                "cache_read_input_tokens": 7,
+                                "cache_creation_input_tokens": 3,
+                                "cache_creation": { "ephemeral_5m_input_tokens": 3 }
+                            }
+                        }
+                    })),
+                )
+                .expect("message start should be observed");
+            if let Some(message) = upstream_message {
+                observer
+                    .push_line(
+                        &context,
+                        data_line(json!({
+                            "type": "error",
+                            "error": { "type": "overloaded_error", "message": message }
+                        })),
+                    )
+                    .expect("upstream error should be observed");
+            }
+            observer
+                .push_line(
+                    &context,
+                    data_line(json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "error" },
+                        "usage": { "output_tokens": 5 }
+                    })),
+                )
+                .expect("error finish reason should be observed");
+            let summary = observer
+                .finish(&context)
+                .expect("terminal observation should finish")
+                .expect("failed stream should have a summary");
+
+            assert!(summary.observed_finish);
+            assert_eq!(summary.finish_reason.as_deref(), Some("error"));
+            assert_eq!(
+                summary.parser_error.as_deref(),
+                Some(upstream_message.unwrap_or("Upstream stream ended with finish reason: error"))
+            );
+            let usage = summary
+                .standardized_usage
+                .expect("usage should be retained");
+            assert_eq!(usage.input_tokens, 22);
+            assert_eq!(usage.output_tokens, 5);
+            assert_eq!(usage.cache_read_tokens, 7);
+            assert_eq!(usage.cache_creation_tokens, 3);
+            assert_eq!(usage.cache_creation_ephemeral_5m_tokens, 3);
+        }
+    }
+
+    #[test]
+    fn transforms_claude_error_finish_reason_to_terminal_errors() {
+        let cases = [
+            (
+                "openai:chat",
+                "data: {\"error\":",
+                "\"code\":\"stream_terminal_error\"",
+            ),
+            (
+                "openai:responses",
+                "event: response.failed\n",
+                "\"code\":\"stream_terminal_error\"",
+            ),
+            (
+                "claude:messages",
+                "event: error\n",
+                "\"code\":\"stream_terminal_error\"",
+            ),
+            (
+                "gemini:generate_content",
+                "data: {\"error\":",
+                "\"status\":\"INTERNAL\"",
+            ),
+        ];
+        for (client_api_format, prefix, marker) in cases {
+            let context = report_context("claude:messages", client_api_format);
+            let mut matrix = StreamingStandardFormatMatrix::default();
+            let mut output = matrix
+                .transform_line(
+                    &context,
+                    data_line(json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "text_delta", "text": "Partial answer" }
+                    })),
+                )
+                .expect("partial response should be emitted");
+            output.extend(
+                matrix
+                    .transform_line(
+                        &context,
+                        data_line(json!({
+                            "type": "message_delta",
+                            "delta": { "stop_reason": "error" },
+                            "usage": { "output_tokens": 5 }
+                        })),
+                    )
+                    .expect("error finish reason should emit a terminal error"),
+            );
+            let sse = String::from_utf8(output).expect("sse should be utf8");
+
+            assert!(sse.contains("Partial answer"), "{client_api_format}: {sse}");
+            assert!(sse.contains(prefix), "{client_api_format}: {sse}");
+            assert!(sse.contains(marker), "{client_api_format}: {sse}");
+            assert!(
+                sse.contains("Upstream stream ended with finish reason: error"),
+                "{client_api_format}: {sse}"
+            );
+            assert!(
+                !sse.contains("unsupported_finish_reason"),
+                "{client_api_format}: {sse}"
+            );
+            assert!(
+                !sse.contains("response.completed"),
+                "{client_api_format}: {sse}"
+            );
+            assert!(
+                !sse.contains("\"stop_reason\":\"end_turn\""),
+                "{client_api_format}: {sse}"
+            );
+            assert!(
+                !sse.contains("\"finish_reason\":\"stop\""),
+                "{client_api_format}: {sse}"
+            );
+            assert!(matrix
+                .transform_line(
+                    &context,
+                    data_line(json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "end_turn" }
+                    }))
+                )
+                .expect("events after the error should be ignored")
+                .is_empty());
+            assert!(matrix
+                .finish(&context)
+                .expect("failed matrix should stay terminated")
+                .is_empty());
+        }
     }
 
     #[test]

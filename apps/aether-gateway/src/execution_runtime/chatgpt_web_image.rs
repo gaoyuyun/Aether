@@ -68,7 +68,6 @@ const CHATGPT_WEB_IMAGE_PUBLIC_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const CHATGPT_WEB_IMAGE_PUBLIC_READ_TIMEOUT_MS: u64 = 30_000;
 const CHATGPT_WEB_IMAGE_PUBLIC_TOTAL_TIMEOUT_MS: u64 = 300_000;
 const CHATGPT_WEB_OPAQUE_ID_MAX_BYTES: usize = 256;
-const CHATGPT_WEB_IMAGE_MAX_RESOLVED_ADDRESSES: usize = 32;
 const CHATGPT_WEB_IMAGE_MAX_UPLOAD_URL_BYTES: usize = 64 * 1024;
 const CHATGPT_WEB_IMAGE_UPLOAD_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
 const CHATGPT_WEB_IMAGE_MAX_PROMPT_BYTES: usize = 32 * 1024;
@@ -1334,24 +1333,18 @@ async fn resolve_public_web_image_addrs(
             "ChatGPT-Web image URL is missing a port".to_string(),
         )
     })?;
-    let resolved = if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![SocketAddr::new(ip, port)]
-    } else {
-        tokio::time::timeout(lookup_timeout, tokio::net::lookup_host((host, port)))
-            .await
-            .map_err(|_| {
-                ExecutionRuntimeTransportError::UpstreamRequest(
-                    "ChatGPT-Web image URL DNS resolution timed out".to_string(),
-                )
-            })?
-            .map_err(|err| {
-                ExecutionRuntimeTransportError::UpstreamRequest(format!(
-                    "ChatGPT-Web image URL DNS resolution failed: {err}"
-                ))
-            })?
-            .take(CHATGPT_WEB_IMAGE_MAX_RESOLVED_ADDRESSES)
-            .collect::<Vec<_>>()
-    };
+    let resolved = aether_http::lookup_host_with_limits(host, port, lookup_timeout)
+        .await
+        .map_err(|error| {
+            let message = match error.kind() {
+                std::io::ErrorKind::TimedOut => "ChatGPT-Web image URL DNS resolution timed out",
+                std::io::ErrorKind::InvalidData => {
+                    "ChatGPT-Web image URL DNS resolution returned too many addresses"
+                }
+                _ => "ChatGPT-Web image URL DNS resolution failed",
+            };
+            ExecutionRuntimeTransportError::UpstreamRequest(message.to_string())
+        })?;
     if resolved.is_empty() {
         return Err(ExecutionRuntimeTransportError::UpstreamRequest(
             "ChatGPT-Web image URL DNS resolution returned no addresses".to_string(),

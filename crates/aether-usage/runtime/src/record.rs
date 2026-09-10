@@ -221,6 +221,13 @@ fn lifecycle_status_and_billing(
         }
         UsageEventType::Completed => ("completed", "pending"),
         UsageEventType::Failed => ("failed", "void"),
+        UsageEventType::Cancelled
+            if aether_data_contracts::repository::usage::cancelled_request_fee_is_billable(
+                request_metadata,
+            ) =>
+        {
+            ("cancelled", "pending")
+        }
         UsageEventType::Cancelled => ("cancelled", "void"),
     }
 }
@@ -489,6 +496,31 @@ mod tests {
         assert_eq!(record.status_code, Some(499));
         assert_eq!(record.response_time_ms, Some(200));
         assert_eq!(record.first_byte_time_ms, Some(50));
+    }
+
+    #[test]
+    fn cancelled_request_fee_keeps_cancelled_status_and_pending_billing() {
+        let event = UsageEvent::new(
+            UsageEventType::Cancelled,
+            "req-cancelled-fee",
+            UsageEventData {
+                provider_name: "OpenAI".to_string(),
+                model: "gpt-5".to_string(),
+                total_cost_usd: Some(0.02),
+                actual_total_cost_usd: Some(0.01),
+                request_metadata: Some(serde_json::json!({"cancelled_request_fee": true})),
+                ..Default::default()
+            },
+        );
+        let record = build_upsert_usage_record_from_event(&event).unwrap();
+        assert_eq!(record.status, "cancelled");
+        assert_eq!(record.billing_status, "pending");
+        assert_eq!(record.total_cost_usd, Some(0.02));
+        assert_eq!(record.actual_total_cost_usd, Some(0.01));
+        assert_eq!(
+            record.request_metadata.unwrap()["cancelled_request_fee"],
+            true
+        );
     }
 
     #[test]

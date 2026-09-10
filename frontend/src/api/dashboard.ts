@@ -481,11 +481,12 @@ export const dashboardApi = {
     return options.signal ? fetchDetail() : cachedRequest(cacheKey, fetchDetail, cacheTtlMs)
   },
 
-  async getRequestBody(requestId: string, field: RequestBodyField, signal?: AbortSignal) {
+  async getRequestBody(requestId: string, field: RequestBodyField, signal?: AbortSignal, onProgress?: (loaded: number) => void) {
     const response = await apiClient.get<ArrayBuffer>(`/api/admin/usage/${requestId}`, {
       params: { include_bodies: true, body_field: field, body_format: 'raw' },
       responseType: 'arraybuffer',
       signal,
+      ...(onProgress ? { onDownloadProgress: (event: { loaded: number }) => onProgress(event.loaded) } : {}),
     })
     const encoding = response.headers['x-aether-body-encoding']
     if ((encoding !== 'gzip' && encoding !== 'json') || response.headers['x-aether-usage-id'] !== requestId || response.headers['x-aether-body-field'] !== field) {

@@ -951,7 +951,18 @@ pub fn sanitize_request_candidate_extra_data_for_persistence(
         ("error_flow", &["message"][..]),
         (
             "failure_diagnostic",
-            &["path", "field_path", "message", "type", "reason"][..],
+            &[
+                "path",
+                "field_path",
+                "message",
+                "type",
+                "reason",
+                "details",
+                "stage",
+                "source_format",
+                "target_format",
+                "safe_to_show",
+            ][..],
         ),
         (
             "request_conversion_error",
@@ -2562,7 +2573,7 @@ mod tests {
         let raw = json!({
             "upstream_response": {"status_code": 400, "body": "错误内容".repeat(20_000)},
             "error_flow": {"status_code": 400, "message": "private upstream failure"},
-            "failure_diagnostic": {"path": "$.input", "message": "private conversion failure"},
+            "failure_diagnostic": {"path": "$.input", "message": "private conversion failure", "safe_to_show": false, "stage": "request", "details": {"code": "invalid_enum_value", "actual": "private-value"}},
             "request_body": {"input": "private prompt"}
         });
         let admin = super::sanitize_request_candidate_extra_data_for_persistence(Some(raw))
@@ -2573,6 +2584,12 @@ mod tests {
         assert!(body.len() <= 65_536);
         assert!(body.ends_with("...[truncated]"));
         assert!(admin.get("request_body").is_none());
+        assert_eq!(admin["failure_diagnostic"]["safe_to_show"], false);
+        assert_eq!(admin["failure_diagnostic"]["stage"], "request");
+        assert_eq!(
+            admin["failure_diagnostic"]["details"]["code"],
+            "invalid_enum_value"
+        );
         assert_eq!(
             super::sanitize_request_candidate_extra_data_for_persistence(Some(admin.clone())),
             Some(admin.clone()),

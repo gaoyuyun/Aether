@@ -128,6 +128,8 @@ export interface CandidateRecord {
 }
 
 export interface RequestTrace {
+  gateway_version?: string | null
+  diagnostic_request?: { usage_id: string, body_state?: string | null } | null
   request_id: string
   request_path?: string
   request_query_string?: string
@@ -161,7 +163,7 @@ export const requestTraceApi = {
     const response = await apiClient.get<RequestTrace>(`/api/admin/monitoring/trace/${requestId}`, {
       params: { attempted_only: attemptedOnly },
     })
-    return response.data
+    return { ...response.data, gateway_version: response.headers?.['x-aether-build-version'] ?? response.data.gateway_version ?? null }
   },
 
   /**

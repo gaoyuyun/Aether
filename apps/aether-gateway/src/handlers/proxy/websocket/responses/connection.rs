@@ -68,7 +68,12 @@ pub(super) async fn relay_bound_connection(
     state: &AppState,
     context: &WebSocketRequestContext,
 ) {
+    let mut client_connected = true;
     loop {
+        if !client_connected && !bound.turn_state.response_in_flight() {
+            close_bound_upstream(bound).await;
+            break;
+        }
         let active_turn_deadline = bound.turn_state.attempt().map(|turn| turn.deadline());
         tokio::select! {
             _ = wait_for_optional_deadline(active_turn_deadline.map(|deadline| deadline.deadline)) => {
@@ -100,8 +105,12 @@ pub(super) async fn relay_bound_connection(
                 ).await;
                 break;
             }
-            client_message = client_socket.next() => {
+            client_message = client_socket.next(), if client_connected => {
                 let Some(client_message) = client_message else {
+                    if retain_disconnected_turn(bound) {
+                        client_connected = false;
+                        continue;
+                    }
                     finalize_active_turn(
                         bound,
                         state,
@@ -111,6 +120,10 @@ pub(super) async fn relay_bound_connection(
                     break;
                 };
                 let Ok(client_message) = client_message else {
+                    if retain_disconnected_turn(bound) {
+                        client_connected = false;
+                        continue;
+                    }
                     warn!(
                         event_name = "responses_websocket_client_receive_failed",
                         log_type = "ops",
@@ -127,6 +140,12 @@ pub(super) async fn relay_bound_connection(
                     close_bound_upstream(bound).await;
                     break;
                 };
+                if matches!(client_message, AxumWsMessage::Close(_))
+                    && retain_disconnected_turn(bound)
+                {
+                    client_connected = false;
+                    continue;
+                }
                 match Box::pin(forward_client_message(
                     client_message,
                     bound,
@@ -559,6 +578,7 @@ pub(super) async fn relay_bound_connection(
                 let mut relay_send_error = None;
                 let mut relay_serialization_failed = false;
                 match relay_directive {
+                    _ if !client_connected => {}
                     Some(ResponsesWebSocketRelayDirective::ForwardOriginal) => {
                         let client_frame = match parsed_upstream_frame.as_ref().map(|frame| {
                             bound
@@ -673,6 +693,10 @@ pub(super) async fn relay_bound_connection(
                     break;
                 }
                 if let Some(error) = relay_send_error {
+                    if terminal_outcome.is_none() && retain_disconnected_turn(bound) {
+                        client_connected = false;
+                        continue;
+                    }
                     warn!(
                         event_name = "responses_websocket_client_send_failed",
                         log_type = "ops",
@@ -735,6 +759,20 @@ pub(super) async fn relay_bound_connection(
             }
         }
     }
+}
+
+fn retain_disconnected_turn(bound: &mut BoundResponsesConnection) -> bool {
+    if bound
+        .turn_state
+        .attempt()
+        .is_none_or(|attempt| attempt.cancel_on_client_disconnect())
+    {
+        return false;
+    }
+    bound
+        .turn_state
+        .record_client_delivery_aborted(CLIENT_DELIVERY_FAILED_REASON);
+    true
 }
 
 struct PendingContinuationRegistration {

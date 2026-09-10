@@ -28,6 +28,8 @@ const ROUTING_POOL_PRESETS: &[&str] = &[
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RoutingValidationError {
+    #[error("routing failover rules are invalid: {0}")]
+    InvalidFailoverRules(String),
     #[error("routing rule id is empty")]
     EmptyRuleId,
     #[error("duplicate routing rule id: {0}")]
@@ -69,6 +71,8 @@ pub enum RoutingValidationError {
 pub fn validate_routing_group_config(
     config: &RoutingGroupConfig,
 ) -> Result<(), RoutingValidationError> {
+    crate::validate_routing_failover_rules(&config.default_policy.execution_policy.failover_rules)
+        .map_err(RoutingValidationError::InvalidFailoverRules)?;
     let mut rule_ids = BTreeSet::new();
     for model_policy in &config.model_policies {
         if model_policy.model.trim().is_empty() {

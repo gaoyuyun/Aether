@@ -737,6 +737,7 @@ mod tests {
             upstream_tcp_keepalive_secs: 60,
             upstream_tcp_nodelay: true,
             upstream_proxy_url: None,
+            upstream_proxy_remote_dns: false,
             legacy_redirect_replay_budget_bytes_ignored: None,
             emit_proxy_timing_header: true,
             log_level: "info".to_string(),

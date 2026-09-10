@@ -196,11 +196,12 @@ impl AppState {
     {
         let session = session.into();
         #[cfg(test)]
-        if self.auth_session_store.is_some() && self.auth_user_store.is_some() {
+        if let (Some(session_store), Some(user_store)) = (
+            self.auth_session_store.as_ref(),
+            self.auth_user_store.as_ref(),
+        ) {
             let existing = {
-                self.auth_user_store
-                    .as_ref()
-                    .expect("checked auth user store")
+                user_store
                     .lock()
                     .expect("auth user store should lock")
                     .get(&session.user_id)
@@ -217,12 +218,7 @@ impl AppState {
             let Some(existing) = existing else {
                 return Ok(None);
             };
-            let mut users = self
-                .auth_user_store
-                .as_ref()
-                .expect("checked auth user store")
-                .lock()
-                .expect("auth user store should lock");
+            let mut users = user_store.lock().expect("auth user store should lock");
             let user = users.entry(session.user_id.clone()).or_insert(existing);
             if user.password_hash.as_deref() != Some(expected_password_hash)
                 || !user.auth_source.eq_ignore_ascii_case("local")
@@ -238,10 +234,7 @@ impl AppState {
                 .or(session.last_seen_at)
                 .unwrap_or_else(chrono::Utc::now);
             user.last_login_at = Some(now);
-            let mut sessions = self
-                .auth_session_store
-                .as_ref()
-                .expect("checked auth session store")
+            let mut sessions = session_store
                 .lock()
                 .expect("auth session store should lock");
             for existing in sessions.values_mut() {

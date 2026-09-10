@@ -137,6 +137,16 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
                     };
                     ([("content-type", if streaming { "text/event-stream" } else { "application/json" })], Body::from_stream(body)).into_response()
                 }
+                6 => {
+                    let body = async_stream::stream! {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"data: {\"id\":\"partial\",\"object\":\"chat.completion.chunk\",\"model\":\"quota-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial output\"},\"finish_reason\":null}]}\n\n"
+                        ));
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        yield Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected disconnect after business output"));
+                    };
+                    ([("content-type", "text/event-stream")], Body::from_stream(body)).into_response()
+                }
                 _ => completion("monthly-a", streaming),
             }
         }
@@ -211,7 +221,7 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
         .send().await.unwrap();
     let status = first.status();
     let body = first.text().await.unwrap();
-    let committed_stream_error = stream && matches!(failure, 3 | 5);
+    let committed_stream_error = stream && failure == 6;
     if !fallback {
         assert!(status.is_server_error(), "{status} {body}");
     } else {
@@ -220,6 +230,7 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
             "stream={stream} failure={failure}: {status} {body}"
         );
         if committed_stream_error {
+            assert!(body.contains("partial output"), "{body}");
             assert!(body.contains("\"error\""), "{body}");
         } else {
             assert!(body.contains("fallback-b"), "expected fallback: {body}");
@@ -377,7 +388,8 @@ fn monthly_quota_recovers_after_http_timeout_and_stream_failover() {
                 .unwrap()
                 .block_on(async {
                     // 1: HTTP 500, 2: response headers timeout, 3: body disconnect,
-                    // 4: connection refused, 5: response body timeout.
+                    // 4: connection refused, 5: response body timeout,
+                    // 6: disconnect after business output has committed the stream.
                     for (stream, failure, fallback) in [
                         (false, 1, true),
                         (false, 2, true),
@@ -388,8 +400,10 @@ fn monthly_quota_recovers_after_http_timeout_and_stream_failover() {
                         (true, 3, true),
                         (true, 4, true),
                         (true, 5, true),
+                        (true, 6, true),
                         (false, 1, false),
                         (true, 1, false),
+                        (true, 3, false),
                     ] {
                         run_case(stream, failure, fallback).await;
                     }

@@ -274,7 +274,13 @@ mod tests {
                 "priority_mode": "provider",
                 "scheduling_mode": "cache_affinity",
                 "keep_priority_on_conversion": false,
-                "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS
+                "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS,
+                "max_transfer_count": 0,
+                "max_transfer_timeout_seconds": 0,
+                "failover_rules": {
+                    "success_failover_patterns": [],
+                    "error_stop_patterns": []
+                }
             })
         );
 
@@ -323,7 +329,13 @@ mod tests {
                 "priority_mode": "provider",
                 "scheduling_mode": "cache_affinity",
                 "keep_priority_on_conversion": false,
-                "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS
+                "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS,
+                "max_transfer_count": 0,
+                "max_transfer_timeout_seconds": 0,
+                "failover_rules": {
+                    "success_failover_patterns": [],
+                    "error_stop_patterns": []
+                }
             })
         );
     }

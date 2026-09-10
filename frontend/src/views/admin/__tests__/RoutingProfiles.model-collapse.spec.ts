@@ -107,6 +107,12 @@ vi.mock('@/components/common', async () => {
 vi.mock('@/features/routing/components', async () => {
   const { defineComponent, h } = await import('vue')
   return {
+    RoutingFailoverPolicyEditor: defineComponent({
+      setup(_, { expose }) {
+        expose({ commitJsonDrafts: () => true })
+        return () => h('div', { 'data-testid': 'routing-failover-editor' })
+      },
+    }),
     RoutingPriorityPolicyEditor: defineComponent({
       setup() {
         return () => h('div', { 'data-testid': 'model-policy-editor' })

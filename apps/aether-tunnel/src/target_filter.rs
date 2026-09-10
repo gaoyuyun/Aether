@@ -226,21 +226,34 @@ pub async fn validate_target(
     allow_private: bool,
     dns_cache: &DnsCache,
 ) -> Result<Vec<SocketAddr>, FilterError> {
-    // Port whitelist check
+    if let Some(address) = validate_target_literal(host, port, allowed_ports, allow_private)? {
+        return Ok(vec![address]);
+    }
+
+    resolve_public_addrs(host, port, allow_private, dns_cache).await
+}
+
+pub(crate) fn validate_target_literal(
+    host: &str,
+    port: u16,
+    allowed_ports: &HashSet<u16>,
+    allow_private: bool,
+) -> Result<Option<SocketAddr>, FilterError> {
     if !allowed_ports.contains(&port) {
         return Err(FilterError::PortNotAllowed(port));
     }
 
     // Try parsing as IP directly (no DNS needed)
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    if let Some(ip) = aether_http::parse_ip_literal_host(host) {
         if !allow_private && is_private_ip(&ip) {
             return Err(FilterError::PrivateIp(ip));
         }
-        return Ok(vec![SocketAddr::new(ip, port)]);
+        return Ok(Some(SocketAddr::new(ip, port)));
     }
-
-    // Resolve and return the exact addresses authorized for this request.
-    resolve_public_addrs(host, port, allow_private, dns_cache).await
+    if !allow_private && host.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
+        return Err(FilterError::NoPublicAddrs(host.to_string()));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

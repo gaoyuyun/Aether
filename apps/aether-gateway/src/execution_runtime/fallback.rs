@@ -14,7 +14,7 @@ fn sync_plan_kind_disables_local_candidate_failover(plan_kind: &str) -> bool {
     )
 }
 
-fn openai_image_success_disables_local_success_failover(
+pub(super) fn openai_image_success_disables_local_success_failover(
     plan: &ExecutionPlan,
     status_code: u16,
 ) -> bool {
@@ -1036,6 +1036,7 @@ mod tests {
             policy,
             LocalFailoverPolicy {
                 max_retries: Some(1),
+                routing_rules: Default::default(),
                 max_transfer_count: 0,
                 max_transfer_timeout_seconds: 0,
                 stop_status_codes: [503].into_iter().collect(),

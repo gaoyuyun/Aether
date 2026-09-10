@@ -313,6 +313,10 @@ pub fn build_admin_monitoring_trace_request_payload_response_with_key_accounts(
         "total_candidates": trace.total_candidates,
         "final_status": trace.final_status,
         "total_latency_ms": trace.total_latency_ms,
+        "diagnostic_request": usage.filter(|usage| admin_monitoring_usage_matches_trace(usage, &trace.request_id)).map(|usage| json!({
+            "usage_id": usage.id,
+            "body_state": usage.request_body_state.map(|state| state.as_str()),
+        })),
         "candidates": candidates,
     }))
     .into_response()
@@ -338,6 +342,7 @@ pub fn build_admin_monitoring_trace_request_candidate_payload_with_key_accounts(
     item.sanitize_for_admin();
     let candidate = &item.candidate;
     let sanitized_extra_data = build_admin_monitoring_trace_candidate_extra_data(
+        &candidate.id,
         candidate.extra_data.as_ref(),
         candidate.status_code,
         usage,
@@ -519,6 +524,7 @@ fn build_admin_monitoring_trace_candidate_ranking(existing: Option<&Value>) -> V
 }
 
 fn build_admin_monitoring_trace_candidate_extra_data(
+    candidate_id: &str,
     existing: Option<&Value>,
     candidate_status_code: Option<u16>,
     usage: Option<&StoredRequestUsageAudit>,
@@ -528,6 +534,19 @@ fn build_admin_monitoring_trace_candidate_extra_data(
 
     if let Some(usage) = usage {
         let extra_object = extra_data.get_or_insert_with(serde_json::Map::new);
+        if usage.routing_candidate_id() == Some(candidate_id) {
+            extra_object.insert("diagnostic_context".to_string(), json!({
+            "usage_id": usage.id,
+            "model": usage.model,
+            "target_model": usage.target_model,
+            "body_states": {
+                "request_body": usage.request_body_state.map(|state| state.as_str()),
+                "provider_request_body": usage.provider_request_body_state.map(|state| state.as_str()),
+                "response_body": usage.response_body_state.map(|state| state.as_str()),
+                "client_response_body": usage.client_response_body_state.map(|state| state.as_str()),
+            }
+            }));
+        }
         if let Some(first_byte_time_ms) = usage.first_byte_time_ms {
             extra_object
                 .entry("first_byte_time_ms".to_string())
@@ -578,8 +597,21 @@ fn build_admin_monitoring_trace_candidate_extra_data(
         }
     }
 
-    sanitize_request_candidate_extra_data_for_persistence(extra_data.map(Value::Object))
-        .unwrap_or(Value::Null)
+    let diagnostic_context = extra_data
+        .as_mut()
+        .and_then(|extra| extra.remove("diagnostic_context"));
+    let mut sanitized =
+        sanitize_request_candidate_extra_data_for_persistence(extra_data.map(Value::Object))
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+    if let Some(context) = diagnostic_context {
+        sanitized.insert("diagnostic_context".to_string(), context);
+    }
+    if sanitized.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(sanitized)
+    }
 }
 
 fn admin_monitoring_trace_response_data(

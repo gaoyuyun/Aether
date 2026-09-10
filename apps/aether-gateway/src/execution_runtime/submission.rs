@@ -527,7 +527,13 @@ fn classify_local_sync_error_kind(
     {
         return LocalCoreSyncErrorKind::Overloaded;
     }
-    if (500..600).contains(&status_code) {
+    if (500..600).contains(&status_code)
+        || raw_type.is_some_and(|value| {
+            ["server_error", "internal_error", "api_error"]
+                .iter()
+                .any(|kind| value.trim().eq_ignore_ascii_case(kind))
+        })
+    {
         return LocalCoreSyncErrorKind::ServerError;
     }
     LocalCoreSyncErrorKind::InvalidRequest
@@ -674,6 +680,13 @@ pub(crate) async fn submit_local_core_error_or_sync_finalize(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn success_http_status_does_not_misclassify_explicit_server_errors_as_bad_requests() {
+        for error_type in ["server_error", "internal_error", "api_error"] {
+            let body = serde_json::json!({ "error": { "type": error_type, "message": "failed" } });
+            assert_eq!(super::resolve_local_sync_error_status_code(200, &body), 500);
+        }
+    }
     use axum::body::to_bytes;
     use serde_json::json;
 

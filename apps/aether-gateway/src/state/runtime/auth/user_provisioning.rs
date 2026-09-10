@@ -802,7 +802,7 @@ impl AppState {
             }
             return Ok(Some(LdapAuthProvisioningResult {
                 user,
-                owned_wallet_id: initialized.created.then(|| initialized.wallet.id),
+                owned_wallet_id: initialized.created.then_some(initialized.wallet.id),
             }));
         }
 

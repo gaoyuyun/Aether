@@ -6,8 +6,10 @@ use aether_data_contracts::repository::settlement::{
     UsagePolicyCostReservationState, UsageSettlementInput, BILLING_PLANS_ENABLED_METADATA_KEY,
     WALLET_BILLING_ENABLED_METADATA_KEY,
 };
-use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
 use aether_data_contracts::repository::usage::PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY;
+use aether_data_contracts::repository::usage::{
+    cancelled_request_fee_is_billable, StoredRequestUsageAudit,
+};
 use aether_data_contracts::{DataLayerError, DataLayerError::InvalidInput};
 use async_trait::async_trait;
 
@@ -40,6 +42,11 @@ pub async fn reconcile_usage_policy_cost_for_event(
     }
     let terminal_state = match event.event_type {
         UsageEventType::Completed => UsagePolicyCostReservationState::Finalized,
+        UsageEventType::Cancelled
+            if cancelled_request_fee_is_billable(event.data.request_metadata.as_ref()) =>
+        {
+            UsagePolicyCostReservationState::Finalized
+        }
         UsageEventType::Failed | UsageEventType::Cancelled => {
             UsagePolicyCostReservationState::Released
         }
@@ -108,7 +115,10 @@ pub async fn settle_usage_if_needed(
             usage.user_id.as_deref().and_then(non_empty_trimmed),
             usage_policy_reservation_token(usage),
         ) {
-            let (terminal_state, actual_cost_units) = if usage.status == "completed" {
+            let (terminal_state, actual_cost_units) = if usage.status == "completed"
+                || (usage.status == "cancelled"
+                    && cancelled_request_fee_is_billable(usage.request_metadata.as_ref()))
+            {
                 (
                     UsagePolicyCostReservationState::Finalized,
                     nonnegative_usd_to_usage_policy_cost_units(
@@ -137,7 +147,10 @@ pub async fn settle_usage_if_needed(
         }
     }
 
-    if usage.status == "cancelled" || usage.billing_status != "pending" {
+    if usage.billing_status != "pending"
+        || (usage.status == "cancelled"
+            && !cancelled_request_fee_is_billable(usage.request_metadata.as_ref()))
+    {
         return Ok(());
     }
     let input = UsageSettlementInput {
@@ -443,6 +456,61 @@ mod tests {
             reconciliations[0].terminal_state,
             UsagePolicyCostReservationState::Released
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_fee_settles_wallet_and_finalizes_cost_reservation() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.status = "cancelled".to_string();
+        usage.status_code = Some(499);
+        usage.request_metadata.as_mut().unwrap()["cancelled_request_fee"] = json!(true);
+        settle_usage_if_needed(&writer, &usage).await.unwrap();
+        let inputs = writer.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].status, "cancelled");
+        assert_eq!(inputs[0].actual_total_cost_usd, usage.actual_total_cost_usd);
+        let reconciliations = writer.reconciliations.lock().unwrap();
+        assert_eq!(reconciliations.len(), 1);
+        assert_eq!(
+            reconciliations[0].terminal_state,
+            UsagePolicyCostReservationState::Finalized
+        );
+        assert_eq!(reconciliations[0].actual_cost_units, 75_000_000);
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_fee_event_finalizes_cost_reservation() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let event = UsageEvent::new(
+            UsageEventType::Cancelled,
+            "req-cancelled-fee",
+            UsageEventData {
+                user_id: Some("user-1".to_string()),
+                actual_total_cost_usd: Some(0.01),
+                request_metadata: Some(json!({
+                    "cancelled_request_fee": true,
+                    "plan_usage_reservation_token": "server-token"
+                })),
+                ..Default::default()
+            },
+        );
+        reconcile_usage_policy_cost_for_event(&writer, &event)
+            .await
+            .unwrap();
+        let reconciliations = writer.reconciliations.lock().unwrap();
+        assert_eq!(reconciliations.len(), 1);
+        assert_eq!(
+            reconciliations[0].terminal_state,
+            UsagePolicyCostReservationState::Finalized
+        );
+        assert_eq!(reconciliations[0].actual_cost_units, 1_000_000);
     }
 
     #[tokio::test]

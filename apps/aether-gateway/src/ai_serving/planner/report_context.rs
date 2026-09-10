@@ -118,7 +118,7 @@ pub(crate) fn build_local_execution_report_context(
     insert_pool_key_lease_report_context_fields(&mut extra_fields, parts.pool_key_lease);
     insert_scheduler_affinity_policy_report_context_field(&mut extra_fields, parts.routing_policy);
     if let Some(policy) = parts.routing_policy {
-        if let Ok(value) = serde_json::to_value(policy.execution_policy) {
+        if let Ok(value) = serde_json::to_value(&policy.execution_policy) {
             extra_fields.insert(ROUTING_EXECUTION_POLICY_REPORT_FIELD.to_string(), value);
         }
     }

@@ -3713,9 +3713,9 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
         scores[0].hard_state.schedulable(),
         "OAuth completion should replace AuthInvalid with a schedulable score"
     );
-    let decrypted_api_key = decrypt_persisted_provider_api_key(&persisted);
+    let decrypted_api_key = decrypt_persisted_provider_api_key(persisted);
     assert_eq!(decrypted_api_key, "new-codex-access-token");
-    let decrypted_auth_config = decrypt_persisted_provider_auth_config(&persisted);
+    let decrypted_auth_config = decrypt_persisted_provider_auth_config(persisted);
     let auth_config: serde_json::Value =
         serde_json::from_str(&decrypted_auth_config).expect("auth config json should parse");
     assert_eq!(auth_config["provider_type"], "codex");

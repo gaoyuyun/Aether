@@ -24,6 +24,20 @@ describe('routingPolicy', () => {
 
     expect(config.default_policy.priority_mode).toBe('provider')
     expect(config.default_policy.scheduling_mode).toBe('cache_affinity')
+    expect(config.default_policy.cancel_on_client_disconnect).toBe(false)
+  })
+
+  it('preserves cancellation policy across model scheduling edits', () => {
+    const config = createEmptyRoutingGroupConfig()
+    config.default_policy.cancel_on_client_disconnect = true
+    const updated = upsertModelSchedulingRule(config, 'gpt-5', {
+      priority_mode: 'global_key',
+      scheduling_mode: 'fixed_order',
+    })
+    expect(normalizeRoutingGroupConfig(updated).default_policy.cancel_on_client_disconnect).toBe(true)
+    expect(getModelScheduling(updated, 'gpt-5').cancel_on_client_disconnect).toBe(true)
+    expect(getModelScheduling(updated, 'other-model').cancel_on_client_disconnect).toBe(true)
+    expect(createEmptyRoutingGroupConfig().default_policy.cancel_on_client_disconnect).toBe(false)
   })
 
   it('drops the legacy group model allowlist while normalizing config', () => {
@@ -77,7 +91,7 @@ describe('routingPolicy', () => {
     expect(createEmptyRoutingGroupConfig().default_policy.sticky_key_attempts).toBe(2)
     expect(normalizeRoutingGroupConfig({}).default_policy.sticky_key_attempts).toBe(2)
     expect(normalizeRoutingGroupConfig({
-      default_policy: { priority_mode: 'provider', scheduling_mode: 'cache_affinity', keep_priority_on_conversion: false, sticky_key_attempts: 3, enable_cf_heartbeat: false, cyber_continue_failover: false },
+      default_policy: { ...createEmptyRoutingGroupConfig().default_policy, priority_mode: 'provider', scheduling_mode: 'cache_affinity', keep_priority_on_conversion: false, sticky_key_attempts: 3, enable_cf_heartbeat: false, cyber_continue_failover: false, cancel_on_client_disconnect: false },
     }).default_policy.sticky_key_attempts).toBe(3)
     expect(normalizeStickyKeyAttempts('5')).toBe(5)
     expect(normalizeStickyKeyAttempts(-1)).toBe(2)

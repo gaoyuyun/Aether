@@ -1,8 +1,8 @@
 use aether_data_contracts::repository::billing::StoredBillingModelContext;
 use aether_data_contracts::repository::usage::{
     extract_provider_cache_ttl_minutes_from_metadata, resolve_provider_cache_ttl_minutes,
-    resolve_provider_service_tier_from_request_capture, USAGE_AVAILABLE_METADATA_KEY,
-    USAGE_PRICING_AVAILABLE_METADATA_KEY,
+    resolve_provider_service_tier_from_request_capture, CANCELLED_REQUEST_FEE_METADATA_KEY,
+    USAGE_AVAILABLE_METADATA_KEY, USAGE_PRICING_AVAILABLE_METADATA_KEY,
 };
 use aether_data_contracts::DataLayerError;
 use aether_usage_runtime::{UsageEvent, UsageEventType};
@@ -49,6 +49,18 @@ pub async fn enrich_usage_event_with_billing(
     data: &dyn BillingModelContextLookup,
     event: &mut UsageEvent,
 ) -> Result<(), DataLayerError> {
+    if matches!(event.event_type, UsageEventType::Cancelled) {
+        event.data.total_cost_usd = Some(0.0);
+        event.data.actual_total_cost_usd = Some(0.0);
+        if let Some(metadata) = event
+            .data
+            .request_metadata
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            metadata.remove(CANCELLED_REQUEST_FEE_METADATA_KEY);
+        }
+    }
     // Session transports such as Codex Live expose lifecycle telemetry but no
     // authoritative token/cost object. Do not run request-based pricing with
     // zero default tokens: that would turn "unknown" into a fabricated charge.
@@ -98,7 +110,10 @@ pub async fn enrich_usage_event_with_billing(
         }
     }
 
-    if !matches!(event.event_type, UsageEventType::Completed) {
+    if !matches!(
+        event.event_type,
+        UsageEventType::Completed | UsageEventType::Cancelled
+    ) {
         event.data.total_cost_usd = Some(0.0);
         event.data.actual_total_cost_usd = Some(0.0);
         return Ok(());
@@ -222,7 +237,10 @@ fn calculate_billing_computation(
     } else {
         usage_event_image_count(&event.data).unwrap_or(0)
     };
-    let request_count = if failed {
+    let cancelled = matches!(event.event_type, UsageEventType::Cancelled);
+    let request_count = if cancelled {
+        1
+    } else if failed {
         0
     } else if is_image_usage && image_count > 0 {
         image_count
@@ -230,7 +248,7 @@ fn calculate_billing_computation(
         1
     };
     let processing_tiers = usage_event_processing_tiers(&event.data);
-    let input = BillingUsageInput {
+    let mut input = BillingUsageInput {
         task_type: if is_image_usage {
             "image".to_string()
         } else {
@@ -269,6 +287,16 @@ fn calculate_billing_computation(
         cache_ttl_minutes: usage_event_provider_cache_ttl_minutes(&event.data)
             .or(pricing.provider_api_key_cache_ttl_minutes),
     };
+
+    if cancelled {
+        input.input_tokens = 0;
+        input.output_tokens = 0;
+        input.cache_creation_tokens = 0;
+        input.cache_creation_ephemeral_5m_tokens = 0;
+        input.cache_creation_ephemeral_1h_tokens = 0;
+        input.cache_read_tokens = 0;
+        input.image_count = 0;
+    }
 
     BillingService::new()
         .calculate(pricing, &input)
@@ -389,9 +417,32 @@ fn apply_billing_computation(
     pricing: &BillingModelPricingSnapshot,
     computation: BillingComputation,
 ) -> Result<(), DataLayerError> {
+    let cancelled = matches!(event.event_type, UsageEventType::Cancelled);
+    if cancelled
+        && !computation
+            .pricing_resolution
+            .price_per_request
+            .is_some_and(|price| price > 0.0)
+    {
+        return Ok(());
+    }
     event.data.total_cost_usd = Some(computation.cost_result.cost);
     event.data.actual_total_cost_usd = Some(computation.actual_total_cost);
-    merge_billing_snapshot_metadata(&mut event.data.request_metadata, pricing, &computation)
+    merge_billing_snapshot_metadata(&mut event.data.request_metadata, pricing, &computation)?;
+    if cancelled {
+        if let Some(metadata) = event
+            .data
+            .request_metadata
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            metadata.insert(
+                CANCELLED_REQUEST_FEE_METADATA_KEY.to_string(),
+                Value::Bool(true),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn map_pricing_context(context: StoredBillingModelContext) -> BillingModelPricingSnapshot {
@@ -1425,8 +1476,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_usage_event_remains_unbilled() {
-        let lookup = TestLookup {
+    async fn cancelled_usage_bills_only_configured_request_fee() {
+        for (request_type, request_price) in
+            [("chat", None), ("chat", Some(0.02)), ("image", Some(0.02))]
+        {
+            let lookup = TestLookup {
             name_context: Some(
                 StoredBillingModelContext::new(
                     "provider-1".to_string(),
@@ -1437,7 +1491,7 @@ mod tests {
                     "global-model-1".to_string(),
                     "gpt-5".to_string(),
                     None,
-                    Some(0.02),
+                    request_price,
                     Some(json!({"tiers":[{"up_to":null,"input_price_per_1m":3.0,"output_price_per_1m":15.0,"cache_creation_price_per_1m":3.75,"cache_read_price_per_1m":0.30}]})),
                     Some("model-1".to_string()),
                     Some("gpt-5-upstream".to_string()),
@@ -1449,61 +1503,69 @@ mod tests {
             ),
             model_id_context: None,
         };
-        let mut event = UsageEvent::new(
-            UsageEventType::Cancelled,
-            "req-billing-cancelled-1",
-            UsageEventData {
-                provider_name: "OpenAI".to_string(),
-                model: "gpt-5".to_string(),
-                provider_id: Some("provider-1".to_string()),
-                provider_api_key_id: Some("key-1".to_string()),
-                request_type: Some("chat".to_string()),
-                api_format: Some("openai:responses".to_string()),
-                endpoint_api_format: Some("openai:responses".to_string()),
-                input_tokens: Some(1_000),
-                output_tokens: Some(500),
-                cache_read_input_tokens: Some(100),
-                status_code: Some(499),
-                ..UsageEventData::default()
-            },
-        );
+            let mut event = UsageEvent::new(
+                UsageEventType::Cancelled,
+                "req-billing-cancelled-1",
+                UsageEventData {
+                    provider_name: "OpenAI".to_string(),
+                    model: "gpt-5".to_string(),
+                    provider_id: Some("provider-1".to_string()),
+                    provider_api_key_id: Some("key-1".to_string()),
+                    request_type: Some(request_type.to_string()),
+                    api_format: Some("openai:responses".to_string()),
+                    endpoint_api_format: Some("openai:responses".to_string()),
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(500),
+                    cache_read_input_tokens: Some(100),
+                    status_code: Some(499),
+                    request_metadata: Some(
+                        json!({"cancelled_request_fee": true, "image_count": 3}),
+                    ),
+                    ..UsageEventData::default()
+                },
+            );
 
-        enrich_usage_event_with_billing(&lookup, &mut event)
-            .await
-            .expect("billing should succeed");
+            enrich_usage_event_with_billing(&lookup, &mut event)
+                .await
+                .expect("billing should succeed");
 
-        assert_eq!(event.data.total_cost_usd, Some(0.0));
-        assert_eq!(event.data.actual_total_cost_usd, Some(0.0));
-        assert_eq!(
-            event
-                .data
-                .request_metadata
-                .as_ref()
-                .and_then(|value| value.get("billing_snapshot"))
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str),
-            None
-        );
-        assert_eq!(
-            event
-                .data
-                .request_metadata
-                .as_ref()
-                .and_then(|value| value.get("billing_dimensions"))
-                .and_then(|value| value.get("input_tokens"))
-                .and_then(Value::as_i64),
-            None
-        );
-        assert_eq!(
-            event
-                .data
-                .request_metadata
-                .as_ref()
-                .and_then(|value| value.get("billing_dimensions"))
-                .and_then(|value| value.get("cache_read_tokens"))
-                .and_then(Value::as_i64),
-            None
-        );
+            let expected_cost = request_price.unwrap_or(0.0);
+            assert_eq!(event.data.total_cost_usd, Some(expected_cost));
+            assert_eq!(event.data.actual_total_cost_usd, Some(expected_cost * 0.5));
+            assert_eq!(event.data.input_tokens, Some(1_000));
+            assert_eq!(event.data.output_tokens, Some(500));
+            let metadata = event.data.request_metadata.as_ref().unwrap();
+            assert_eq!(
+                aether_data_contracts::repository::usage::cancelled_request_fee_is_billable(Some(
+                    metadata
+                )),
+                request_price.is_some()
+            );
+            if request_price.is_some() {
+                assert_eq!(
+                    metadata.pointer("/billing_snapshot/cost_breakdown/request_cost"),
+                    Some(&json!(expected_cost))
+                );
+                assert_eq!(
+                    metadata.pointer("/billing_dimensions/input_tokens"),
+                    Some(&json!(0))
+                );
+                assert_eq!(
+                    metadata.pointer("/billing_dimensions/output_tokens"),
+                    Some(&json!(0))
+                );
+                assert_eq!(
+                    metadata.pointer("/billing_dimensions/cache_read_tokens"),
+                    Some(&json!(0))
+                );
+                assert_eq!(
+                    metadata.pointer("/billing_dimensions/request_count"),
+                    Some(&json!(1))
+                );
+            } else {
+                assert!(metadata.get("billing_snapshot").is_none());
+            }
+        }
     }
 
     #[tokio::test]

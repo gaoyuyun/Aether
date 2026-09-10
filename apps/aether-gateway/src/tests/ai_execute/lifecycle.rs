@@ -1,7 +1,7 @@
 use super::{
     any, build_router_with_state, build_state_with_execution_runtime_override, json, start_server,
     Arc, Body, Bytes, HeaderValue, Infallible, Json, Mutex, Request, Response, Router, StatusCode,
-    TRACE_ID_HEADER,
+    LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER, TRACE_ID_HEADER,
 };
 
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
@@ -53,6 +53,24 @@ fn hash_api_key(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+async fn build_cancelling_gateway(state: crate::AppState) -> Router {
+    state
+        .data
+        .update_routing_group(
+            "system-default",
+            aether_data_contracts::repository::routing_profiles::UpdateRoutingGroupRecord {
+                config_json: Some(json!({"default_policy": {"cancel_on_client_disconnect": true}})),
+                version: Some(2),
+                updated_at: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("routing policy should update")
+        .expect("default strategy should exist");
+    build_router_with_state(state)
 }
 
 fn sample_local_openai_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
@@ -386,7 +404,7 @@ async fn gateway_stops_execution_runtime_stream_when_client_disconnects_impl() {
         vec![sample_local_openai_key()],
     ));
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
-    let gateway = build_router_with_state(
+    let gateway = build_cancelling_gateway(
         build_state_with_execution_runtime_override(execution_runtime_url)
             .with_data_state_for_tests(
                 GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
@@ -397,7 +415,7 @@ async fn gateway_stops_execution_runtime_stream_when_client_disconnects_impl() {
                     DEVELOPMENT_ENCRYPTION_KEY,
                 ),
             ),
-    );
+    ).await;
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -469,7 +487,7 @@ async fn gateway_settles_stream_attempt_when_client_disconnects_before_first_byt
         vec![sample_local_openai_key()],
     ));
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
-    let gateway = build_router_with_state(
+    let gateway = build_cancelling_gateway(
         build_state_with_execution_runtime_override(execution_runtime_url)
             .with_data_state_for_tests(
                 GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
@@ -480,7 +498,7 @@ async fn gateway_settles_stream_attempt_when_client_disconnects_before_first_byt
                     DEVELOPMENT_ENCRYPTION_KEY,
                 ),
             ),
-    );
+    ).await;
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let request = reqwest::Client::new()
@@ -633,35 +651,59 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
-        Some("text/event-stream")
+        Some("application/json")
     );
-    let body_text = response.text().await.expect("response body should read");
-    assert!(body_text.contains("\"rate_limit_error\""));
-    assert!(body_text.contains("\"slow down\""));
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("execution_runtime_candidates_exhausted")
+    );
+    let body_json: serde_json::Value = response.json().await.expect("response body should parse");
+    assert_eq!(body_json["error"]["type"], "http_error");
+    let stored_candidates = request_candidate_repository
+        .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
+        .await
+        .expect("request candidate trace should read");
+    let failed_candidate = stored_candidates
+        .iter()
+        .find(|candidate| candidate.status == RequestCandidateStatus::Failed)
+        .expect("prefetched error should mark the attempted candidate as failed");
+    assert!(stored_candidates
+        .iter()
+        .all(|candidate| candidate.status != RequestCandidateStatus::Success));
+    assert_eq!(failed_candidate.status_code, Some(429));
+    assert_eq!(
+        failed_candidate.error_type.as_deref(),
+        Some("rate_limit_error")
+    );
+    assert_eq!(failed_candidate.error_message.as_deref(), Some("slow down"));
+    assert!(failed_candidate.finished_at_unix_ms.is_some());
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
 
     let candidates = request_candidate_repository
         .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
         .await
         .expect("request candidates should read");
-    let terminal_candidate = candidates
+    let attempt_candidate = candidates
         .iter()
         .find(|candidate| candidate.status == RequestCandidateStatus::Failed)
         .expect("embedded prefetch error should record a failed candidate");
     assert_eq!(
-        terminal_candidate
+        attempt_candidate
             .extra_data
             .as_ref()
             .and_then(|value| value.get("request_lifecycle"))
             .and_then(serde_json::Value::as_str),
-        Some("request_terminal"),
-        "the candidate whose embedded error was sent to the client owns request termination"
+        None,
+        "a retried embedded error does not own the gateway's final exhaustion response"
     );
 
     gateway_handle.abort();
