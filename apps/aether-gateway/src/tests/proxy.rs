@@ -1076,7 +1076,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider_with_request_timeout(
             "provider-owner",
-            Some(0.1),
+            Some(2.0),
         )],
         vec![sample_endpoint("endpoint-owner", "provider-owner")],
         vec![sample_bound_key(

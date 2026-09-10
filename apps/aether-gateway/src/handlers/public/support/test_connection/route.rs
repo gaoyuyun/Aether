@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -10,6 +10,10 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::execution_runtime::transport::{
+    validate_execution_upstream_url, ExecutionSafeDnsResolver,
+};
+
 use super::test_connection_shared::select_test_connection_provider;
 use super::{
     provider_catalog_key_supports_format, query_param_value, AppState, GatewayPublicRequestContext,
@@ -18,96 +22,14 @@ use super::{
 const DEFAULT_NON_STREAM_TOTAL_TIMEOUT_MS: u64 = 300_000;
 const MAX_TEST_CONNECTION_RESPONSE_BYTES: usize = 256 * 1024;
 
-#[cfg(test)]
 fn build_test_connection_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .no_proxy()
+        .dns_resolver(Arc::new(ExecutionSafeDnsResolver))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .http2_adaptive_window(true)
         .build()
-}
-
-#[derive(Debug)]
-struct ResolvedTestConnectionTarget {
-    url: reqwest::Url,
-    host: String,
-    addresses: Vec<SocketAddr>,
-}
-
-/// Resolve the provider endpoint once and pin reqwest to that answer.  The
-/// test-connection route is reachable through the public front door, so it
-/// must not perform an unbounded DNS lookup on every connect (which would
-/// permit DNS rebinding into private/reserved networks).
-async fn resolve_test_connection_target(
-    raw_url: &str,
-    allow_private_targets: bool,
-) -> Result<ResolvedTestConnectionTarget, &'static str> {
-    let url = reqwest::Url::parse(raw_url).map_err(|_| "provider endpoint URL is invalid")?;
-    let literal_loopback = aether_http::url_has_literal_loopback_host(&url);
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("provider endpoint must be an HTTP(S) URL without credentials or fragment");
-    }
-    let host = url
-        .host_str()
-        .ok_or("provider endpoint is missing a host")?
-        .to_string();
-    let literal_ip = host.parse::<IpAddr>().ok();
-    let port = url
-        .port_or_known_default()
-        .ok_or("provider endpoint is missing a port")?;
-    let addresses = if let Some(ip) = literal_ip {
-        vec![SocketAddr::new(ip, port)]
-    } else {
-        aether_http::lookup_host_with_limits(
-            host.as_str(),
-            port,
-            aether_http::DEFAULT_DNS_LOOKUP_TIMEOUT,
-        )
-        .await
-        .map_err(|_| "provider endpoint DNS resolution failed")?
-    };
-    if addresses.is_empty() {
-        return Err("provider endpoint DNS resolution returned no addresses");
-    }
-    let has_private_answer = addresses
-        .iter()
-        .any(|address| aether_http::is_private_or_reserved_ip(address.ip()));
-    // `allow_private_targets` is only enabled for in-process test fixtures.
-    // Keep that escape hatch narrowly scoped to literal loopback URLs whose
-    // every DNS answer is loopback; otherwise a test-only build (or an
-    // accidentally reused helper) could turn this public route into a
-    // private-network HTTP client.
-    let test_loopback_target = allow_private_targets
-        && literal_loopback
-        && addresses.iter().all(|address| address.ip().is_loopback());
-    if has_private_answer && !test_loopback_target {
-        return Err("provider endpoint resolves to a private or reserved address");
-    }
-    Ok(ResolvedTestConnectionTarget {
-        url,
-        host,
-        addresses,
-    })
-}
-
-fn build_pinned_test_connection_client(
-    target: &ResolvedTestConnectionTarget,
-) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .http2_adaptive_window(true);
-    if target.host.parse::<IpAddr>().is_err() {
-        builder = builder.resolve_to_addrs(&target.host, &target.addresses);
-    }
-    builder.build()
 }
 
 pub(super) async fn maybe_build_local_test_connection_route_response(
@@ -384,18 +306,14 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
         );
     }
 
-    // Resolve and pin the endpoint before constructing the request.  This
-    // keeps the public health-check route subject to the same DNS/SSRF
-    // boundary as the main execution transport.  Unit-test fixtures may use
-    // loopback listeners; production requests never opt into private targets.
-    let target = match resolve_test_connection_target(&upstream_url, cfg!(test)).await {
-        Ok(target) => target,
+    let upstream_url = match validate_execution_upstream_url(&upstream_url) {
+        Ok(url) => url,
         Err(reason) => {
             tracing::warn!(
                 event_name = "provider_test_connection_target_rejected",
                 provider_id = %provider.id,
                 endpoint_id = %endpoint.id,
-                reason,
+                reason = %reason,
                 "provider connection test target was rejected"
             );
             return Some(
@@ -407,7 +325,7 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
             );
         }
     };
-    let test_client = match build_pinned_test_connection_client(&target) {
+    let test_client = match build_test_connection_client() {
         Ok(client) => client,
         Err(_) => {
             return Some(
@@ -419,7 +337,7 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
             );
         }
     };
-    let mut upstream_request = test_client.post(target.url);
+    let mut upstream_request = test_client.post(upstream_url);
     for (name, value) in &provider_request_headers {
         upstream_request = upstream_request.header(name, value);
     }
@@ -495,7 +413,7 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_test_connection_client, resolve_test_connection_target};
+    use super::{build_test_connection_client, validate_execution_upstream_url};
     use axum::{
         body::Body,
         http::{header, Request, StatusCode},
@@ -567,74 +485,59 @@ mod tests {
         redirected_server.abort();
     }
 
-    #[tokio::test]
-    async fn test_connection_target_rejects_private_addresses_in_production_mode() {
+    #[test]
+    fn test_connection_target_rejects_private_literals_like_provider_requests() {
         for raw_url in [
-            "http://127.0.0.1:8080/v1/chat/completions",
             "http://10.0.0.1/v1/chat/completions",
             "http://169.254.169.254/v1/chat/completions",
             "https://10.0.0.1/v1/chat/completions",
+            "https://127.0.0.1/v1/chat/completions",
             "https://[::1]/v1/chat/completions",
-            "https://localhost/v1/chat/completions",
+            "https://198.18.78.41/v1/chat/completions",
         ] {
             assert!(
-                resolve_test_connection_target(raw_url, false)
-                    .await
-                    .is_err(),
+                validate_execution_upstream_url(raw_url).is_err(),
                 "private provider target should be rejected: {raw_url}"
             );
         }
     }
 
-    #[tokio::test]
-    async fn test_connection_target_accepts_public_http_and_https_addresses() {
-        for allow_private_targets in [false, true] {
-            for (raw_url, expected_port) in [
-                ("http://8.8.8.8/v1/chat", 80),
-                ("http://8.8.8.8:8080/v1/chat", 8080),
-                ("https://8.8.8.8/v1/chat", 443),
-            ] {
-                let target = resolve_test_connection_target(raw_url, allow_private_targets)
-                    .await
-                    .expect("public HTTP(S) provider target should resolve");
-                assert_eq!(target.url.as_str(), raw_url);
-                assert_eq!(target.host, "8.8.8.8");
-                assert_eq!(target.addresses.len(), 1);
-                assert_eq!(target.addresses[0].ip().to_string(), "8.8.8.8");
-                assert_eq!(target.addresses[0].port(), expected_port);
-            }
+    #[test]
+    fn test_connection_target_accepts_public_http_and_https_addresses() {
+        for (raw_url, expected_port) in [
+            ("http://8.8.8.8/v1/chat", 80),
+            ("http://8.8.8.8:8080/v1/chat", 8080),
+            ("https://8.8.8.8/v1/chat", 443),
+            ("https://[2606:4700:4700::1111]/v1/chat", 443),
+        ] {
+            let url = validate_execution_upstream_url(raw_url)
+                .expect("public HTTP(S) provider target should be valid");
+            assert_eq!(url.as_str(), raw_url);
+            assert_eq!(url.port_or_known_default(), Some(expected_port));
         }
     }
 
     #[tokio::test]
-    async fn test_connection_target_allows_loopback_only_for_test_fixtures() {
-        let target = resolve_test_connection_target("http://127.0.0.1:8080/v1/chat", true)
-            .await
-            .expect("test fixture target should resolve");
-        assert_eq!(target.host, "127.0.0.1");
-        assert_eq!(target.addresses.len(), 1);
-        assert!(
-            resolve_test_connection_target("http://10.0.0.1/v1/chat", true)
-                .await
-                .is_err(),
-            "test mode must not make private non-loopback HTTP endpoints acceptable"
-        );
-        assert!(
-            resolve_test_connection_target("https://10.0.0.1/v1/chat", true)
-                .await
-                .is_err(),
-            "test mode must not make private non-loopback endpoints acceptable"
-        );
-        assert!(
-            resolve_test_connection_target("http://localhost:8080/v1/chat", true)
-                .await
-                .is_ok(),
-            "literal localhost should remain available for local fixtures"
-        );
+    async fn test_connection_target_defers_dns_and_accepts_provider_loopback_urls() {
+        for raw_url in [
+            "http://127.0.0.1:8080/v1/chat",
+            "http://[::1]:8080/v1/chat",
+            "http://localhost:8080/v1/chat",
+            "https://provider-dns.invalid/v1/chat",
+        ] {
+            let url = validate_execution_upstream_url(raw_url)
+                .expect("target validation must not depend on the current DNS answer");
+            let request = build_test_connection_client()
+                .expect("client should build without DNS")
+                .post(url)
+                .build()
+                .expect("provider request should build without DNS");
+            assert_eq!(request.url().as_str(), raw_url);
+        }
     }
 
-    #[tokio::test]
-    async fn test_connection_target_rejects_url_credentials_and_fragments() {
+    #[test]
+    fn test_connection_target_rejects_url_credentials_and_fragments() {
         for raw_url in [
             "https://user:pass@example.com/v1/chat",
             "https://example.com/v1/chat#fragment",
@@ -643,9 +546,7 @@ mod tests {
             "ftp://example.com/v1/chat",
         ] {
             assert!(
-                resolve_test_connection_target(raw_url, false)
-                    .await
-                    .is_err(),
+                validate_execution_upstream_url(raw_url).is_err(),
                 "unsafe provider target should be rejected: {raw_url}"
             );
         }

@@ -58,6 +58,7 @@ async fn admin_monitoring_trace_request_returns_local_payload() {
         .expect("route should be handled locally");
 
     assert_eq!(response.status(), http::StatusCode::OK);
+    assert!(response.headers().contains_key("x-aether-build-version"));
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body should read");
@@ -93,6 +94,15 @@ async fn admin_monitoring_trace_request_resolves_usage_id_to_header_trace_id() {
             Some(33),
             Some(200),
         ),
+        sample_candidate(
+            "cand-other-attempt",
+            "trace-1",
+            1,
+            RequestCandidateStatus::Failed,
+            Some(100),
+            Some(20),
+            Some(502),
+        ),
     ]));
     let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider()],
@@ -110,6 +120,8 @@ async fn admin_monitoring_trace_request_resolves_usage_id_to_header_trace_id() {
         100,
     );
     usage.id = "usage-row-1".to_string();
+    usage.request_body_state = Some(UsageBodyCaptureState::Reference);
+    usage.response_body_state = Some(UsageBodyCaptureState::Reference);
     usage.candidate_id = Some("cand-used".to_string());
     usage.request_headers = Some(json!({
         "x-trace-id": "trace-1"
@@ -140,6 +152,17 @@ async fn admin_monitoring_trace_request_resolves_usage_id_to_header_trace_id() {
         .expect("body should read");
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
     assert_eq!(payload["request_id"], json!("trace-1"));
+    assert_eq!(payload["diagnostic_request"]["usage_id"], "usage-row-1");
+    assert_eq!(
+        payload["candidates"][0]["extra_data"]["diagnostic_context"]["usage_id"],
+        "usage-row-1"
+    );
+    assert_eq!(
+        payload["candidates"][0]["extra_data"]["diagnostic_context"]["body_states"]
+            ["response_body"],
+        "reference"
+    );
+    assert!(payload["candidates"][1]["extra_data"]["diagnostic_context"].is_null());
     assert_eq!(payload["candidates"][0]["id"], json!("cand-used"));
     assert_eq!(
         payload["candidates"][0]["extra_data"]["first_byte_time_ms"],

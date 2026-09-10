@@ -27,6 +27,9 @@ use aether_data_contracts::repository::global_models::{
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_data_contracts::repository::routing_profiles::{
+    RoutingGroupLookupKey, UpdateRoutingGroupRecord,
+};
 use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageAuditListQuery};
 use aether_gateway::{build_router_with_state, AppState, GatewayDataConfig, UsageRuntimeConfig};
 use aether_testkit::SpawnedServer;
@@ -493,8 +496,7 @@ async fn disabling_the_downstream_key_is_enforced_on_the_next_turn_of_the_same_s
     Ok(())
 }
 
-/// A client that walks away before the provider produced anything must settle
-/// as a void row: nothing was produced, so nothing is billed.
+/// Immediate cancellation voids token billing before the provider completes.
 ///
 /// This is the path with no protocol event to announce it: the relay loop owns
 /// the turn, and losing the client is an exit the upstream never reports.
@@ -508,7 +510,14 @@ async fn disabling_the_downstream_key_is_enforced_on_the_next_turn_of_the_same_s
 /// `a_closed_client_socket_before_any_terminal_still_voids_the_bill`.
 #[tokio::test]
 async fn client_disconnect_before_any_provider_output_settles_a_void_row() -> Result<(), BoxError> {
-    let harness = Harness::start(UpstreamBehavior::StallAfterCreated).await?;
+    let harness = Harness::start_configured(
+        UpstreamBehavior::StallAfterCreated,
+        ProviderFixture::SingleOpenAiKey,
+        PiiRedaction::Disabled,
+        true,
+        None,
+    )
+    .await?;
     let mut client = harness.connect().await?;
 
     client
@@ -541,6 +550,73 @@ async fn client_disconnect_before_any_provider_output_settles_a_void_row() -> Re
     );
     assert_eq!(audit.status_code, Some(499));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_disconnect_defaults_to_completing_and_billing_the_turn() -> Result<(), BoxError> {
+    let harness = Harness::start(UpstreamBehavior::CompleteAfterRelease).await?;
+    let mut client = harness.connect().await?;
+    client
+        .send(response_create(json!({"input": "finish without client"})))
+        .await?;
+    receive_event(&mut client, "response.created").await?;
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness.upstream.release_completion.notify_one();
+    let audits = harness
+        .usage_audits_where(1, "completed disconnected turn", |audit| {
+            audit.status == "completed" && audit.billing_status == "settled"
+        })
+        .await?;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].input_tokens, INPUT_TOKENS);
+    assert_eq!(audits[0].output_tokens, OUTPUT_TOKENS);
+    assert_eq!(audits[0].status_code, Some(200));
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_disconnect_still_settles_the_per_request_fee_when_aborted() -> Result<(), BoxError>
+{
+    let harness = Harness::start_configured(
+        UpstreamBehavior::StallAfterCreated,
+        ProviderFixture::SingleOpenAiKey,
+        PiiRedaction::Disabled,
+        true,
+        Some(0.02),
+    )
+    .await?;
+    let mut client = harness.connect().await?;
+    client
+        .send(response_create(json!({"input": "cancel with request fee"})))
+        .await?;
+    receive_event(&mut client, "response.created").await?;
+    drop(client);
+    let audits = harness
+        .usage_audits_where(1, "cancelled request fee settlement", |audit| {
+            audit.status == "cancelled" && audit.billing_status == "settled"
+        })
+        .await?;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].status_code, Some(499));
+    assert_eq!(audits[0].total_tokens, 0);
+    assert_eq!(audits[0].total_cost_usd, 0.02);
+    assert_eq!(audits[0].actual_total_cost_usd, 0.02);
+    let backends = DataBackends::from_config(DataLayerConfig::from_database(
+        harness.database.config.clone(),
+    ))?;
+    let detail = backends
+        .read()
+        .usage()
+        .ok_or("usage reader unavailable")?
+        .find_by_request_id(&audits[0].request_id)
+        .await?
+        .ok_or("usage detail unavailable")?;
+    assert_eq!(
+        detail.request_metadata.as_ref().unwrap()["cancelled_request_fee"],
+        true
+    );
     Ok(())
 }
 
@@ -853,6 +929,16 @@ impl Harness {
         fixture: ProviderFixture,
         redaction: PiiRedaction,
     ) -> Result<Self, BoxError> {
+        Self::start_configured(behavior, fixture, redaction, false, None).await
+    }
+
+    async fn start_configured(
+        behavior: UpstreamBehavior,
+        fixture: ProviderFixture,
+        redaction: PiiRedaction,
+        cancel_on_client_disconnect: bool,
+        request_price: Option<f64>,
+    ) -> Result<Self, BoxError> {
         let upstream = Arc::new(MockUpstreamState::new(behavior));
         let upstream_server =
             SpawnedServer::start(mock_upstream_router(Arc::clone(&upstream))).await?;
@@ -865,6 +951,19 @@ impl Harness {
             redaction,
         )
         .await?;
+
+        if let Some(price) = request_price {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&database.config.url)
+                .await?;
+            sqlx::query("UPDATE models SET price_per_request = ? WHERE id = ?")
+                .bind(price)
+                .bind(PROVIDER_MODEL_ID)
+                .execute(&pool)
+                .await?;
+            pool.close().await;
+        }
 
         let data_config = GatewayDataConfig::from_database_config(database.config.clone())
             .with_encryption_key(DEVELOPMENT_ENCRYPTION_KEY);
@@ -879,6 +978,32 @@ impl Harness {
                 ..UsageRuntimeConfig::default()
             })?;
         state.ensure_system_default_routing_group().await?;
+        if cancel_on_client_disconnect {
+            let backends =
+                DataBackends::from_config(DataLayerConfig::from_database(database.config.clone()))?;
+            let mut group = backends
+                .read()
+                .routing_groups()
+                .ok_or("routing reader unavailable")?
+                .find_routing_group(RoutingGroupLookupKey::SystemDefault)
+                .await?
+                .ok_or("default routing group unavailable")?;
+            group.config_json["default_policy"]["cancel_on_client_disconnect"] = json!(true);
+            backends
+                .write()
+                .routing_groups()
+                .ok_or("routing writer unavailable")?
+                .update_routing_group(
+                    &group.id,
+                    UpdateRoutingGroupRecord {
+                        config_json: Some(group.config_json),
+                        version: Some(group.version + 1),
+                        updated_at: group.updated_at + 1,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+        }
         let gateway_server = SpawnedServer::start(build_router_with_state(state)).await?;
         let websocket_url = format!(
             "{}/v1/responses",
@@ -1095,6 +1220,7 @@ where
 enum UpstreamBehavior {
     /// Announce, stream one delta, and complete — the ordinary turn.
     CompleteEveryTurn,
+    CompleteAfterRelease,
     /// Announce the response and then go quiet, leaving the turn in flight.
     StallAfterCreated,
     /// Announce the response and then hang up mid-turn.
@@ -1120,6 +1246,7 @@ struct MockUpstreamState {
     events: Mutex<Vec<Value>>,
     authorization_headers: Mutex<Vec<Option<String>>>,
     handshakes: Mutex<Vec<ObservedUpstreamHandshake>>,
+    release_completion: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone)]
@@ -1136,6 +1263,7 @@ impl MockUpstreamState {
             events: Mutex::new(Vec::new()),
             authorization_headers: Mutex::new(Vec::new()),
             handshakes: Mutex::new(Vec::new()),
+            release_completion: tokio::sync::Notify::new(),
         }
     }
 
@@ -1217,6 +1345,15 @@ async fn run_mock_upstream(
                             break;
                         }
                     }
+                    UpstreamBehavior::CompleteAfterRelease => {
+                        if send_mock_created(&mut socket, &response_id).await.is_err() {
+                            break;
+                        }
+                        state.release_completion.notified().await;
+                        if send_mock_turn(&mut socket, &response_id).await.is_err() {
+                            break;
+                        }
+                    }
                     UpstreamBehavior::StallAfterCreated => {
                         if send_mock_created(&mut socket, &response_id).await.is_err() {
                             break;
@@ -1267,10 +1404,13 @@ async fn run_mock_upstream(
                     }
                 }
             }
-            AxumWsMessage::Ping(payload) => {
-                if socket.send(AxumWsMessage::Pong(payload)).await.is_err() {
-                    break;
-                }
+            AxumWsMessage::Ping(payload)
+                if socket
+                    .send(AxumWsMessage::Pong(payload.clone()))
+                    .await
+                    .is_err() =>
+            {
+                break;
             }
             AxumWsMessage::Close(_) => break,
             _ => {}

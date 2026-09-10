@@ -292,7 +292,7 @@ mod tests {
         assert!(controls.is_err());
 
         let template = "{{value}}".repeat(100_000);
-        let variables = BTreeMap::from([(String::from("value"), String::from("x".repeat(64)))]);
+        let variables = BTreeMap::from([(String::from("value"), "x".repeat(64))]);
         let error = render_admin_email_template_html(&template, &variables)
             .expect_err("rendered output must remain bounded");
         assert!(format!("{error:?}").contains("exceeds"));

@@ -148,6 +148,12 @@ vi.mock('@/components/common', async () => {
 vi.mock('@/features/routing/components', async () => {
   const { defineComponent, h } = await import('vue')
   return {
+    RoutingFailoverPolicyEditor: defineComponent({
+      setup(_, { expose }) {
+        expose({ commitJsonDrafts: () => true })
+        return () => h('div', { 'data-testid': 'routing-failover-editor' })
+      },
+    }),
     RoutingPriorityPolicyEditor: defineComponent({
       setup: () => () => h('div', { 'data-testid': 'routing-policy-editor' }),
     }),
@@ -176,6 +182,10 @@ function routingGroup(
         enable_cf_heartbeat: false,
         cyber_continue_failover: false,
         sticky_key_attempts: 2,
+        cancel_on_client_disconnect: false,
+        max_transfer_count: 0,
+        max_transfer_timeout_seconds: 0,
+        failover_rules: { success_failover_patterns: [], error_stop_patterns: [] },
       },
       model_policies: [],
       rules: [],

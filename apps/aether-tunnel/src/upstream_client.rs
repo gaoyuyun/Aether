@@ -34,7 +34,8 @@ use tower_service::Service;
 
 use crate::config::Config;
 use crate::egress_proxy::{
-    connect_validated_target_via_proxy, ProxyConnectOptions, UpstreamProxyConfig,
+    connect_target_via_proxy, connect_validated_target_via_proxy, ProxyConnectOptions,
+    UpstreamProxyConfig,
 };
 use crate::target_filter::DnsCache;
 
@@ -66,11 +67,42 @@ pub struct ValidatedUpstreamTarget {
     scheme: String,
     host: String,
     port: u16,
-    addrs: Vec<SocketAddr>,
+    resolution: UpstreamTargetResolution,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum UpstreamTargetResolution {
+    Pinned(Vec<SocketAddr>),
+    ProxyDns,
 }
 
 impl ValidatedUpstreamTarget {
     pub fn new(target_url: &url::Url, mut addrs: Vec<SocketAddr>) -> Result<Self, String> {
+        if addrs.is_empty() {
+            return Err("validated upstream target has no addresses".to_string());
+        }
+        addrs.sort_unstable();
+        addrs.dedup();
+        Self::with_resolution(target_url, UpstreamTargetResolution::Pinned(addrs))
+    }
+
+    pub(crate) fn proxy_resolved(target_url: &url::Url) -> Result<Self, String> {
+        if !matches!(target_url.host(), Some(url::Host::Domain(_))) {
+            return Err("IP literal targets must use pinned addresses".to_string());
+        }
+        Self::with_resolution(target_url, UpstreamTargetResolution::ProxyDns)
+    }
+
+    fn with_resolution(
+        target_url: &url::Url,
+        resolution: UpstreamTargetResolution,
+    ) -> Result<Self, String> {
+        if !target_url.username().is_empty()
+            || target_url.password().is_some()
+            || target_url.fragment().is_some()
+        {
+            return Err("upstream target must not contain credentials or a fragment".to_string());
+        }
         let scheme = target_url.scheme().to_ascii_lowercase();
         if !matches!(scheme.as_str(), "http" | "https") {
             return Err(format!("unsupported upstream scheme {scheme}"));
@@ -86,19 +118,16 @@ impl ValidatedUpstreamTarget {
         let port = target_url
             .port_or_known_default()
             .ok_or_else(|| "missing port in upstream URL".to_string())?;
-        if addrs.is_empty() {
-            return Err("validated upstream target has no addresses".to_string());
+        if let UpstreamTargetResolution::Pinned(addrs) = &resolution {
+            if addrs.iter().any(|addr| addr.port() != port) {
+                return Err("validated upstream target address has the wrong port".to_string());
+            }
         }
-        if addrs.iter().any(|addr| addr.port() != port) {
-            return Err("validated upstream target address has the wrong port".to_string());
-        }
-        addrs.sort_unstable();
-        addrs.dedup();
         Ok(Self {
             scheme,
             host,
             port,
-            addrs,
+            resolution,
         })
     }
 
@@ -119,8 +148,8 @@ impl ValidatedUpstreamTarget {
         Ok(())
     }
 
-    fn addrs(&self) -> &[SocketAddr] {
-        &self.addrs
+    pub(crate) fn uses_proxy_dns(&self) -> bool {
+        matches!(self.resolution, UpstreamTargetResolution::ProxyDns)
     }
 }
 
@@ -333,9 +362,14 @@ impl Service<Name> for PinnedResolver {
                     "DNS request does not match the validated upstream host",
                 ));
             }
-            Ok(ValidatedAddrs {
-                inner: target.addrs.into_iter(),
-            })
+            match target.resolution {
+                UpstreamTargetResolution::Pinned(addrs) => Ok(ValidatedAddrs {
+                    inner: addrs.into_iter(),
+                }),
+                UpstreamTargetResolution::ProxyDns => Err(io::Error::other(
+                    "proxy-resolved target must not fall back to local DNS",
+                )),
+            }
         })
     }
 }
@@ -376,16 +410,25 @@ impl Service<Uri> for InstrumentedConnector {
             };
             let connect_start = std::time::Instant::now();
             return Box::pin(async move {
-                connect_via_proxy(
-                    dst,
-                    scheme,
-                    tls_config,
-                    proxy,
-                    validated_target,
-                    options,
-                    connect_start,
+                tokio::time::timeout(
+                    options.connect_timeout,
+                    connect_via_proxy(
+                        dst,
+                        scheme,
+                        tls_config,
+                        proxy,
+                        validated_target,
+                        options,
+                        connect_start,
+                    ),
                 )
                 .await
+                .map_err(|_| {
+                    Box::new(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream proxy connection timed out",
+                    )) as BoxError
+                })?
             });
         }
         let connecting = self.http.call(dst.clone());
@@ -441,20 +484,40 @@ async fn connect_via_proxy(
     connect_start: std::time::Instant,
 ) -> Result<TimedConn, BoxError> {
     let scheme = scheme.ok_or_else(|| io::Error::other("missing scheme"))?;
-    let mut last_error = None;
-    let mut connected = None;
-    for target_addr in validated_target.addrs().iter().copied() {
-        match connect_validated_target_via_proxy(&proxy, target_addr, options).await {
-            Ok(tcp) => {
-                connected = Some(tcp);
-                break;
+    let tcp = match &validated_target.resolution {
+        UpstreamTargetResolution::ProxyDns => {
+            if !proxy.supports_remote_target_dns() {
+                return Err(
+                    io::Error::other("upstream proxy does not support remote target DNS").into(),
+                );
             }
-            Err(error) => last_error = Some(error),
+            connect_target_via_proxy(
+                &proxy,
+                &validated_target.host,
+                validated_target.port,
+                options,
+            )
+            .await?
         }
-    }
-    let tcp = connected.ok_or_else(|| {
-        last_error.unwrap_or_else(|| io::Error::other("validated upstream target has no addresses"))
-    })?;
+        UpstreamTargetResolution::Pinned(addrs) => {
+            let mut last_error = None;
+            let mut connected = None;
+            for target_addr in addrs.iter().copied() {
+                match connect_validated_target_via_proxy(&proxy, target_addr, options).await {
+                    Ok(tcp) => {
+                        connected = Some(tcp);
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            connected.ok_or_else(|| {
+                last_error.unwrap_or_else(|| {
+                    io::Error::other("validated upstream target has no addresses")
+                })
+            })?
+        }
+    };
 
     let connect_ms = connect_start.elapsed().as_millis() as u64;
 
@@ -512,6 +575,24 @@ fn build_upstream_client_with_protocol(
     http1_only: bool,
     h2c_prior_knowledge: bool,
 ) -> Result<UpstreamClient, String> {
+    let proxy = config
+        .upstream_proxy_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(UpstreamProxyConfig::parse)
+        .transpose()?;
+    if validated_target.uses_proxy_dns()
+        && (!config.upstream_proxy_remote_dns
+            || !proxy
+                .as_ref()
+                .is_some_and(UpstreamProxyConfig::supports_remote_target_dns))
+    {
+        return Err(
+            "proxy-resolved upstream requires explicit remote DNS and an HTTP or SOCKS5h proxy"
+                .to_string(),
+        );
+    }
     let mut http = HttpConnector::new_with_resolver(PinnedResolver::new(validated_target.clone()));
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(
@@ -530,13 +611,7 @@ fn build_upstream_client_with_protocol(
         http,
         tls_config: build_tls_config(http1_only),
         validated_target,
-        proxy: config
-            .upstream_proxy_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(UpstreamProxyConfig::parse)
-            .transpose()?,
+        proxy,
         connect_timeout: Duration::from_secs(config.upstream_connect_timeout_secs),
         tcp_nodelay: config.upstream_tcp_nodelay,
         tcp_keepalive: (config.upstream_tcp_keepalive_secs > 0)
@@ -1033,6 +1108,239 @@ mod tests {
                 .contains("\r\nhost: example.com\r\n"),
             "original Host header should be preserved: {raw_request:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_http_proxy_resolves_hostname_without_local_dns() {
+        let (proxy_url, connect_rx, request_rx) = spawn_http_proxy().await;
+        let client = remote_dns_client(&proxy_url, "http://remote-dns-test.invalid/");
+        let request = hyper::Request::builder()
+            .uri("http://remote-dns-test.invalid/remote-dns")
+            .body(full_request_body(Bytes::new()))
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), client.request(request))
+            .await
+            .unwrap()
+            .expect("proxy should resolve the target without local DNS");
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "ok"
+        );
+        assert!(connect_rx
+            .await
+            .unwrap()
+            .starts_with("CONNECT remote-dns-test.invalid:80 HTTP/1.1\r\n"));
+        let request = request_rx.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /remote-dns http/1.1\r\n"));
+        assert!(request.contains("\r\nhost: remote-dns-test.invalid\r\n"));
+    }
+
+    #[tokio::test]
+    async fn trusted_socks5h_proxy_receives_hostname_not_a_locally_resolved_ip() {
+        let (proxy_url, target_rx, request_rx) = spawn_remote_dns_socks_proxy().await;
+        let client = remote_dns_client(&proxy_url, "http://remote-dns-test.invalid/");
+        let request = hyper::Request::builder()
+            .uri("http://remote-dns-test.invalid/remote-dns")
+            .body(full_request_body(Bytes::new()))
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), client.request(request))
+            .await
+            .unwrap()
+            .expect("SOCKS proxy should receive the unresolved target");
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "ok"
+        );
+        assert_eq!(
+            target_rx.await.unwrap(),
+            ("remote-dns-test.invalid".to_string(), 80)
+        );
+        assert!(request_rx
+            .await
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("\r\nhost: remote-dns-test.invalid\r\n"));
+    }
+
+    #[tokio::test]
+    async fn remote_dns_https_preserves_hostname_for_connect_and_sni() {
+        let (proxy_url, connect_rx) = spawn_connect_only_http_proxy().await;
+        let client = remote_dns_client(&proxy_url, "https://remote-dns-test.invalid/");
+        let uri: Uri = "https://remote-dns-test.invalid/secure".parse().unwrap();
+        let request = hyper::Request::builder()
+            .uri(uri.clone())
+            .body(full_request_body(Bytes::new()))
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), client.request(request))
+            .await
+            .unwrap();
+        assert!(connect_rx
+            .await
+            .unwrap()
+            .starts_with("CONNECT remote-dns-test.invalid:443 HTTP/1.1\r\n"));
+        match resolve_server_name(&uri).unwrap() {
+            ServerName::DnsName(name) => assert_eq!(name.as_ref(), "remote-dns-test.invalid"),
+            other => panic!("expected hostname for TLS verification, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_dns_targets_cannot_fall_back_to_local_dns_or_change_origin() {
+        let url = url::Url::parse("https://remote-dns-test.invalid/").unwrap();
+        let target = ValidatedUpstreamTarget::proxy_resolved(&url).unwrap();
+        let mut resolver = PinnedResolver::new(target.clone());
+        let error = resolver
+            .call("remote-dns-test.invalid".parse().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("must not fall back to local DNS"));
+        for uri in [
+            "http://remote-dns-test.invalid/",
+            "https://another-target.invalid/",
+            "https://remote-dns-test.invalid:8443/",
+        ] {
+            assert!(target.ensure_matches_uri(&uri.parse().unwrap()).is_err());
+        }
+        for url in ["http://127.0.0.1/", "https://[::1]/"] {
+            assert!(
+                ValidatedUpstreamTarget::proxy_resolved(&url::Url::parse(url).unwrap()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_dns_clients_require_opt_in_and_do_not_share_pinned_pool_entries() {
+        let mut config = remote_dns_config("http://127.0.0.1:8080");
+        let url = url::Url::parse("https://remote-dns-test.invalid/").unwrap();
+        let remote = ValidatedUpstreamTarget::proxy_resolved(&url).unwrap();
+        config.upstream_proxy_remote_dns = false;
+        assert!(build_upstream_client_with_protocol(&config, remote.clone(), true, false).is_err());
+        config.upstream_proxy_remote_dns = true;
+        for proxy in [None, Some("socks5://127.0.0.1:1080")] {
+            config.upstream_proxy_url = proxy.map(str::to_string);
+            assert!(
+                build_upstream_client_with_protocol(&config, remote.clone(), true, false).is_err()
+            );
+        }
+        config.upstream_proxy_url = Some("http://127.0.0.1:8080".to_string());
+        let pinned =
+            ValidatedUpstreamTarget::new(&url, vec!["8.8.8.8:443".parse().unwrap()]).unwrap();
+        let remote_key = upstream_client_pool_key(None, None, None, None, false, remote);
+        let pinned_key = upstream_client_pool_key(None, None, None, None, false, pinned);
+        assert_ne!(remote_key, pinned_key);
+        let pool = UpstreamClientPool::new(
+            Arc::new(config),
+            Arc::new(DnsCache::new(Duration::from_secs(60), 16)),
+        );
+        pool.get_or_build(remote_key).unwrap();
+        pool.get_or_build(pinned_key).unwrap();
+        assert_eq!(pool.clients.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_dns_proxy_connect_timeout_covers_connect_and_tls_handshakes() {
+        for tls in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_headers(&mut stream).await;
+                if tls {
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+            let target_url = if tls {
+                "https://remote-dns-test.invalid/"
+            } else {
+                "http://remote-dns-test.invalid/"
+            };
+            let client = remote_dns_client(&proxy_url, target_url);
+            let request = hyper::Request::builder()
+                .uri(target_url)
+                .body(full_request_body(Bytes::new()))
+                .unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), client.request(request)).await;
+            server.abort();
+            let error = result
+                .expect("configured connect timeout must include proxy and TLS handshakes")
+                .unwrap_err();
+            assert!(error.is_connect());
+        }
+    }
+
+    fn remote_dns_config(proxy_url: &str) -> Config {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Config::parse_from([
+            "aether-tunnel",
+            "--aether-url",
+            "https://example.com",
+            "--management-token",
+            "ae_test",
+            "--node-name",
+            "tunnel-test",
+            "--upstream-proxy-url",
+            proxy_url,
+            "--upstream-proxy-remote-dns",
+            "--upstream-connect-timeout-secs",
+            "1",
+        ])
+    }
+
+    fn remote_dns_client(proxy_url: &str, target_url: &str) -> UpstreamClient {
+        let config = remote_dns_config(proxy_url);
+        let target =
+            ValidatedUpstreamTarget::proxy_resolved(&url::Url::parse(target_url).unwrap()).unwrap();
+        build_upstream_client_with_protocol(&config, target, true, false).unwrap()
+    }
+
+    async fn spawn_remote_dns_socks_proxy() -> (
+        String,
+        tokio::sync::oneshot::Receiver<(String, u16)>,
+        tokio::sync::oneshot::Receiver<String>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("socks5h://{}", listener.local_addr().unwrap());
+        let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x01, 0x00]);
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..4], &[0x05, 0x01, 0x00, 0x03]);
+            let mut hostname = vec![0; header[4] as usize];
+            stream.read_exact(&mut hostname).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            target_tx
+                .send((String::from_utf8(hostname).unwrap(), port))
+                .unwrap();
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            request_tx
+                .send(read_http_headers(&mut stream).await)
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        (proxy_url, target_rx, request_rx)
     }
 
     fn proxied_client(

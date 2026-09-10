@@ -848,6 +848,13 @@ fn websocket_auth_rejection_error(rejection: GatewayLocalAuthRejection) -> Gatew
 }
 
 impl ResponsesProviderAttempt {
+    pub(super) fn cancel_on_client_disconnect(&self) -> bool {
+        crate::orchestration::routing_execution_policy_from_report_context(
+            self.lifecycle.report_context(),
+        )
+        .is_some_and(|policy| policy.cancel_on_client_disconnect)
+    }
+
     /// Releases all per-turn capacity before terminal persistence starts.
     /// Provider-pool runtime tokens normally use an awaited removal. The
     /// bounded wait prevents a broken runtime backend from stalling the relay;

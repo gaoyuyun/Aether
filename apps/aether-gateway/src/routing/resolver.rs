@@ -57,7 +57,7 @@ pub(crate) fn resolve_gateway_routing_policy(
 
     let config = serde_json::from_value::<RoutingGroupConfig>(input.group_config_json.clone())
         .map_err(|_| invalid_routing_group_config())?;
-    resolve_routing_policy(
+    let policy = resolve_routing_policy(
         &config,
         RoutingPolicyInput {
             group_id: input.group_id,
@@ -73,7 +73,9 @@ pub(crate) fn resolve_gateway_routing_policy(
             phase: input.phase,
         },
     )
-    .map_err(routing_policy_error)
+    .map_err(routing_policy_error)?;
+    crate::request_lifecycle::configure_client_disconnect(policy.execution_policy.clone());
+    Ok(policy)
 }
 
 pub(crate) fn resolve_gateway_static_default_routing_policy(
@@ -82,6 +84,7 @@ pub(crate) fn resolve_gateway_static_default_routing_policy(
     let Some(default_policy) = static_default_policy_fields(input.group_config_json)? else {
         return Ok(None);
     };
+    crate::request_lifecycle::configure_client_disconnect(default_policy.execution_policy.clone());
 
     Ok(Some(ResolvedRoutingPolicy {
         group_id: input.group_id.map(str::to_string),
@@ -142,28 +145,11 @@ fn static_default_policy_fields(
             .ok_or_else(invalid_routing_group_config)?,
         None => DEFAULT_STICKY_KEY_ATTEMPTS,
     };
-    let enable_cf_heartbeat = routing_bool_field(
-        default_policy.get("enable_cf_heartbeat"),
-        "enable_cf_heartbeat",
-    )?;
-    // Older strategies stored separate image/text heartbeat flags. Treat
-    // either legacy flag as enabling the unified CF heartbeat setting while
-    // allowing newly saved strategies to use only the canonical key.
-    let legacy_image_heartbeat = routing_bool_field(
-        default_policy.get("enable_openai_image_sync_heartbeat"),
-        "enable_openai_image_sync_heartbeat",
-    )?;
-    let legacy_text_heartbeat = routing_bool_field(
-        default_policy.get("enable_standard_text_sync_heartbeat"),
-        "enable_standard_text_sync_heartbeat",
-    )?;
-    let execution_policy = aether_routing_core::RoutingExecutionPolicy {
-        enable_cf_heartbeat: enable_cf_heartbeat || legacy_image_heartbeat || legacy_text_heartbeat,
-        cyber_continue_failover: routing_bool_field(
-            default_policy.get("cyber_continue_failover"),
-            "cyber_continue_failover",
-        )?,
-    };
+    let execution_policy: aether_routing_core::RoutingExecutionPolicy =
+        serde_json::from_value(Value::Object(default_policy.clone()))
+            .map_err(|_| invalid_routing_group_config())?;
+    aether_routing_core::validate_routing_failover_rules(&execution_policy.failover_rules)
+        .map_err(|_| invalid_routing_group_config())?;
 
     Ok(Some(RoutingDefaultPolicy {
         priority_mode,
@@ -172,13 +158,6 @@ fn static_default_policy_fields(
         sticky_key_attempts,
         execution_policy,
     }))
-}
-
-fn routing_bool_field(value: Option<&Value>, _field: &str) -> Result<bool, GatewayError> {
-    match value {
-        Some(value) => value.as_bool().ok_or_else(invalid_routing_group_config),
-        None => Ok(false),
-    }
 }
 
 fn routing_array_field_is_missing_or_empty(
@@ -238,7 +217,14 @@ mod tests {
             "default_policy": {
                 "priority_mode": "global_key",
                 "scheduling_mode": "load_balance",
-                "keep_priority_on_conversion": true
+                "keep_priority_on_conversion": true,
+                "cancel_on_client_disconnect": true,
+                "max_transfer_count": 3,
+                "max_transfer_timeout_seconds": 90,
+                "failover_rules": {
+                    "success_failover_patterns": [{"pattern": "(?i)capacity.*exhausted"}],
+                    "error_stop_patterns": [{"status_codes": [400]}]
+                }
             },
             "allowed_models": ["legacy-model"],
             "model_policies": [],
@@ -274,6 +260,19 @@ mod tests {
         .expect("full policy should resolve");
 
         assert_eq!(static_policy, full_policy);
+        assert_eq!(static_policy.execution_policy.max_transfer_count, 3);
+        assert_eq!(
+            static_policy.execution_policy.max_transfer_timeout_seconds,
+            90
+        );
+        assert_eq!(
+            static_policy
+                .execution_policy
+                .failover_rules
+                .error_stop_patterns
+                .len(),
+            1
+        );
         assert_eq!(
             static_policy.priority_mode,
             RoutingSetPriorityMode::GlobalKey

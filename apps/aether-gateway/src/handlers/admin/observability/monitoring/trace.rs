@@ -67,13 +67,19 @@ pub(super) async fn build_admin_monitoring_trace_request_response(
     let key_accounts =
         build_admin_monitoring_key_account_display_map(admin_state, &resolved.trace).await?;
 
-    Ok(
-        build_admin_monitoring_trace_request_payload_response_with_key_accounts(
-            &resolved.trace,
-            resolved.usage.as_ref(),
-            &key_accounts,
-        ),
-    )
+    let mut response = build_admin_monitoring_trace_request_payload_response_with_key_accounts(
+        &resolved.trace,
+        resolved.usage.as_ref(),
+        &key_accounts,
+    );
+    if let Ok(version) = axum::http::HeaderValue::from_str(
+        option_env!("AETHER_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+    ) {
+        response
+            .headers_mut()
+            .insert("x-aether-build-version", version);
+    }
+    Ok(response)
 }
 
 async fn resolve_admin_monitoring_trace(

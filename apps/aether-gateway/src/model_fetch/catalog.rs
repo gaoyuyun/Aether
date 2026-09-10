@@ -3083,7 +3083,7 @@ mod tests {
         .await
         .expect("stale LKG read must not wait for retention lock");
         assert_eq!(stale.snapshot(TEST_PROVIDER_ID, TEST_KEY_ID), Some(&seeded));
-        assert_eq!(stale.stale_targets(), &[target.clone()]);
+        assert_eq!(stale.stale_targets(), std::slice::from_ref(&target));
         assert_eq!(runtime.execution_count(), 1);
 
         assert!(runtime
@@ -3111,7 +3111,7 @@ mod tests {
         let load = load_one(&runtime, &client_version).await;
 
         assert_eq!(load.snapshot(TEST_PROVIDER_ID, TEST_KEY_ID), Some(&seeded));
-        assert_eq!(load.stale_targets(), &[target.clone()]);
+        assert_eq!(load.stale_targets(), std::slice::from_ref(&target));
         assert!(runtime
             .state
             .kv_get(&catalog_lkg_key(&target, client_version.as_str()))
@@ -3142,7 +3142,7 @@ mod tests {
 
         let load = load_one(&runtime, &client_version).await;
         assert_eq!(load.snapshot(TEST_PROVIDER_ID, TEST_KEY_ID), Some(&seeded));
-        assert_eq!(load.stale_targets(), &[target.clone()]);
+        assert_eq!(load.stale_targets(), std::slice::from_ref(&target));
         assert_eq!(runtime.execution_count(), 1);
     }
 

@@ -2665,7 +2665,7 @@ FOR UPDATE
         let order_payment_provider: Option<String> = get(&order_row, "payment_provider")?;
         let order_payment_channel: Option<String> = get(&order_row, "payment_channel")?;
         let order_pay_currency: Option<String> = get(&order_row, "pay_currency")?;
-        let order_gateway_order_id: Option<String> = get(&order_row, "gateway_order_id")?;
+        let order_gateway_order_id = payment_order_gateway_id(&order_row)?;
         let order_kind: String = get(&order_row, "order_kind")?;
         let order_amount_usd: f64 = get(&order_row, "amount_usd")?;
         let order_pay_amount: Option<f64> = get(&order_row, "pay_amount")?;
@@ -6506,7 +6506,7 @@ fn map_payment_order_row(row: &MySqlRow) -> Result<StoredAdminPaymentOrder, Data
         payment_method: get(row, "payment_method")?,
         payment_provider: get(row, "payment_provider")?,
         order_kind: get(row, "order_kind")?,
-        gateway_order_id: get(row, "gateway_order_id")?,
+        gateway_order_id: payment_order_gateway_id(row)?,
         gateway_response: optional_json(
             get(row, "gateway_response")?,
             "payment_orders.gateway_response",
@@ -6726,6 +6726,21 @@ fn map_daily_usage_row(row: &MySqlRow) -> Result<StoredWalletDailyUsageLedger, D
             "wallet_daily_usage_ledgers.aggregated_at",
         )?,
     })
+}
+
+fn payment_order_gateway_id(row: &MySqlRow) -> Result<Option<String>, DataLayerError> {
+    // SQLx treats VARCHAR with a binary collation as VARBINARY. Read its UTF-8
+    // bytes without changing the column's case-sensitive identity or indexes.
+    let bytes: Option<Vec<u8>> = get(row, "gateway_order_id")?;
+    bytes
+        .map(|bytes| {
+            String::from_utf8(bytes).map_err(|error| {
+                DataLayerError::UnexpectedValue(format!(
+                    "payment_orders.gateway_order_id contains invalid UTF-8: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn get<T>(row: &MySqlRow, field: &str) -> Result<T, DataLayerError>

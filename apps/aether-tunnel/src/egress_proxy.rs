@@ -142,6 +142,13 @@ impl UpstreamProxyConfig {
         self.scheme == UpstreamProxyScheme::Socks5h
     }
 
+    pub(crate) fn supports_remote_target_dns(&self) -> bool {
+        matches!(
+            self.scheme,
+            UpstreamProxyScheme::Http | UpstreamProxyScheme::Socks5h
+        )
+    }
+
     pub(crate) fn basic_auth_header(&self) -> Option<String> {
         let username = self.username()?;
         let mut credentials = String::with_capacity(
@@ -445,7 +452,7 @@ pub(crate) async fn socks5_target_address(
     remote_dns: bool,
 ) -> io::Result<Vec<u8>> {
     let mut request = vec![0x05, 0x01, 0x00];
-    if let Ok(ip) = target_host.parse::<IpAddr>() {
+    if let Some(ip) = aether_http::parse_ip_literal_host(target_host) {
         push_socks5_ip_address(&mut request, ip);
     } else if remote_dns {
         let host = target_host.as_bytes();
@@ -523,6 +530,19 @@ fn non_empty_url_part(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn socks_proxy_encodes_bracketed_ipv6_as_an_ip_for_both_dns_modes() {
+        for remote_dns in [false, true] {
+            let expected = socks5_target_address("::1", 443, remote_dns).await.unwrap();
+            let actual = socks5_target_address("[::1]", 443, remote_dns)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(&actual[..4], &[5, 1, 0, 4]);
+            assert_eq!(&actual[20..], &443u16.to_be_bytes());
+        }
+    }
 
     #[test]
     fn parses_http_proxy_with_default_port() {

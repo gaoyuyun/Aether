@@ -1035,7 +1035,7 @@ pub(crate) async fn proxy_request(
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     request: Request,
 ) -> Result<Response<Body>, GatewayError> {
-    crate::request_diagnostics::scope_request_diagnostics(Box::pin(proxy_request_inner(
+    crate::request_lifecycle::run_request(Box::pin(proxy_request_inner(
         state,
         remote_addr,
         request,
@@ -3228,7 +3228,7 @@ mod tests {
     async fn request_body_buffer_caps_decompressed_body_at_shared_budget() {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder
-            .write_all(&vec![b'a'; 128])
+            .write_all(&[b'a'; 128])
             .expect("test gzip body should encode");
         let encoded = encoder.finish().expect("test gzip body should finish");
         assert!(

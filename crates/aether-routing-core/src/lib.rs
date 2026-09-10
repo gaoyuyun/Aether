@@ -1,5 +1,6 @@
 mod actions;
 mod conditions;
+mod failover;
 mod model;
 mod mutations;
 mod policy;
@@ -12,6 +13,10 @@ pub use actions::{
     RoutingSchedulingMode, RoutingSetPriorityMode,
 };
 pub use conditions::{RoutingCondition, RoutingConditionContext, RoutingConditionOp};
+pub use failover::{
+    validate_routing_failover_rules, RoutingFailoverRule, RoutingFailoverRules,
+    MAX_ROUTING_FAILOVER_PATTERN_BYTES, MAX_ROUTING_FAILOVER_RULES,
+};
 pub use model::{
     RoutingDefaultPolicy, RoutingExecutionPolicy, RoutingGroupBinding, RoutingGroupBindingSubject,
     RoutingGroupConfig, RoutingGroupRecord, RoutingGroupVersionRecord, RoutingModelPolicy,

@@ -199,10 +199,7 @@ pub(crate) fn normalize_ldap_transport_server_url(raw: &str, use_starttls: bool)
         // Gateway unit/integration fixtures use an in-process mock endpoint. Keep
         // this exception behind the gateway test configuration; production code
         // always uses the strict parser without custom schemes.
-        return aether_admin::system::normalize_ldap_transport_server_url_for_tests(
-            raw,
-            use_starttls,
-        );
+        aether_admin::system::normalize_ldap_transport_server_url_for_tests(raw, use_starttls)
     }
     #[cfg(not(test))]
     {

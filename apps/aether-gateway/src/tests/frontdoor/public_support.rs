@@ -2704,9 +2704,9 @@ fn set_test_env_var(key: &'static str, value: &str) -> TestEnvVarGuard {
 }
 
 #[cfg(test)]
-fn payment_callback_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+fn payment_callback_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
 }
 
 const TEST_PAYMENT_CALLBACK_SECRET: &str = "test-callback-secret-0123456789abcdef";
@@ -12434,9 +12434,7 @@ async fn gateway_does_not_report_logout_success_when_session_revoke_is_rejected(
 
 #[tokio::test]
 async fn gateway_handles_payment_callback_route_locally_without_proxying_upstream() {
-    let _env_lock = payment_callback_env_lock()
-        .lock()
-        .expect("payment callback test env lock should not be poisoned");
+    let _env_lock = payment_callback_env_lock().lock().await;
     let _secret_guard = set_test_env_var("PAYMENT_CALLBACK_SECRET", TEST_PAYMENT_CALLBACK_SECRET);
     let now = Utc::now();
     let user = StoredUserAuthRecord::new(
@@ -12579,9 +12577,7 @@ async fn gateway_handles_payment_callback_route_locally_without_proxying_upstrea
 
 #[tokio::test]
 async fn gateway_rejects_payment_callback_with_mismatched_payment_method_locally() {
-    let _env_lock = payment_callback_env_lock()
-        .lock()
-        .expect("payment callback test env lock should not be poisoned");
+    let _env_lock = payment_callback_env_lock().lock().await;
     let _secret_guard = set_test_env_var("PAYMENT_CALLBACK_SECRET", TEST_PAYMENT_CALLBACK_SECRET);
     let now = Utc::now();
     let user = StoredUserAuthRecord::new(

@@ -62,6 +62,7 @@ flate2.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 http.workspace = true
+http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-pool", "server-auto", "service", "tokio"] }

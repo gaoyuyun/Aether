@@ -89,7 +89,7 @@ pub fn resolve_routing_policy(
         scheduling_mode: config.default_policy.scheduling_mode,
         keep_priority_on_conversion: config.default_policy.keep_priority_on_conversion,
         sticky_key_attempts: config.default_policy.sticky_key_attempts,
-        execution_policy: config.default_policy.execution_policy,
+        execution_policy: config.default_policy.execution_policy.clone(),
         ranking_overlay: RankingOverlay::default(),
         mutation_plan: MutationPlan::default(),
         pool_policy_overrides: BTreeMap::new(),

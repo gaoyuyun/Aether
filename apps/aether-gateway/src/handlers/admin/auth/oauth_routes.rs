@@ -339,57 +339,6 @@ async fn build_admin_oauth_test_payload(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        is_fixed_linuxdo_oauth_origin, resolve_public_admin_oauth_endpoint,
-        validate_public_admin_oauth_resolved_addrs,
-    };
-    use std::net::SocketAddr;
-
-    #[tokio::test]
-    async fn oauth_test_endpoint_rejects_loopback_https_targets_before_connecting() {
-        let url = reqwest::Url::parse("https://127.0.0.1/oauth/token").expect("URL");
-
-        assert!(resolve_public_admin_oauth_endpoint(&url).await.is_err());
-    }
-
-    #[test]
-    fn linuxdo_builtin_origin_allows_only_benchmarking_addresses() {
-        let fixed = reqwest::Url::parse("https://connect.linux.do/oauth2/token")
-            .expect("LinuxDo URL should parse");
-        let fake = SocketAddr::from(([198, 18, 75, 234], 443));
-        assert!(is_fixed_linuxdo_oauth_origin(&fixed));
-        assert!(validate_public_admin_oauth_resolved_addrs(&fixed, &[fake], true).is_ok());
-        assert!(validate_public_admin_oauth_resolved_addrs(&fixed, &[fake], false).is_err());
-        assert!(validate_public_admin_oauth_resolved_addrs(
-            &fixed,
-            &[fake, SocketAddr::from(([127, 0, 0, 1], 443))],
-            true,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn custom_or_non_default_oauth_origins_reject_benchmarking_addresses() {
-        let fake = SocketAddr::from(([198, 18, 75, 234], 443));
-        for raw_url in [
-            "https://oauth.example.test/token",
-            "https://connect.linux.do:8443/oauth2/token",
-            "https://connect.linuxdo.org/oauth2/token",
-            "https://connect.linux.do.evil.test/oauth2/token",
-            "https://connect.linux.do/oauth2/token?tenant=unexpected",
-        ] {
-            let url = reqwest::Url::parse(raw_url).expect("test URL should parse");
-            assert!(
-                !is_fixed_linuxdo_oauth_origin(&url),
-                "must not trust {raw_url}"
-            );
-            assert!(validate_public_admin_oauth_resolved_addrs(&url, &[fake], true).is_err());
-        }
-    }
-}
-
 pub(crate) async fn maybe_build_local_admin_oauth_response(
     state: &AdminAppState<'_>,
     request_context: &AdminRequestContext<'_>,
@@ -688,4 +637,55 @@ pub(crate) async fn maybe_build_local_admin_oauth_response(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_fixed_linuxdo_oauth_origin, resolve_public_admin_oauth_endpoint,
+        validate_public_admin_oauth_resolved_addrs,
+    };
+    use std::net::SocketAddr;
+
+    #[tokio::test]
+    async fn oauth_test_endpoint_rejects_loopback_https_targets_before_connecting() {
+        let url = reqwest::Url::parse("https://127.0.0.1/oauth/token").expect("URL");
+
+        assert!(resolve_public_admin_oauth_endpoint(&url).await.is_err());
+    }
+
+    #[test]
+    fn linuxdo_builtin_origin_allows_only_benchmarking_addresses() {
+        let fixed = reqwest::Url::parse("https://connect.linux.do/oauth2/token")
+            .expect("LinuxDo URL should parse");
+        let fake = SocketAddr::from(([198, 18, 75, 234], 443));
+        assert!(is_fixed_linuxdo_oauth_origin(&fixed));
+        assert!(validate_public_admin_oauth_resolved_addrs(&fixed, &[fake], true).is_ok());
+        assert!(validate_public_admin_oauth_resolved_addrs(&fixed, &[fake], false).is_err());
+        assert!(validate_public_admin_oauth_resolved_addrs(
+            &fixed,
+            &[fake, SocketAddr::from(([127, 0, 0, 1], 443))],
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn custom_or_non_default_oauth_origins_reject_benchmarking_addresses() {
+        let fake = SocketAddr::from(([198, 18, 75, 234], 443));
+        for raw_url in [
+            "https://oauth.example.test/token",
+            "https://connect.linux.do:8443/oauth2/token",
+            "https://connect.linuxdo.org/oauth2/token",
+            "https://connect.linux.do.evil.test/oauth2/token",
+            "https://connect.linux.do/oauth2/token?tenant=unexpected",
+        ] {
+            let url = reqwest::Url::parse(raw_url).expect("test URL should parse");
+            assert!(
+                !is_fixed_linuxdo_oauth_origin(&url),
+                "must not trust {raw_url}"
+            );
+            assert!(validate_public_admin_oauth_resolved_addrs(&url, &[fake], true).is_err());
+        }
+    }
 }

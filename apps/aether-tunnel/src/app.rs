@@ -126,9 +126,14 @@ pub async fn run(mut config: Config, servers: Vec<ServerEntry>) -> anyhow::Resul
         if let Ok(proxy) = crate::egress_proxy::UpstreamProxyConfig::parse(proxy_url) {
             info!(
                 upstream_proxy_url = %proxy.redacted_url(),
+                upstream_proxy_remote_dns = config.upstream_proxy_remote_dns,
                 "provider upstream egress proxy configured"
             );
         }
+    }
+
+    if config.upstream_proxy_remote_dns {
+        warn!("provider hostname DNS resolution and destination IP access controls are delegated to the trusted upstream proxy");
     }
 
     // Resolve public IP (best-effort for region info)
@@ -1420,6 +1425,7 @@ mod tests {
             upstream_tcp_keepalive_secs: 60,
             upstream_tcp_nodelay: true,
             upstream_proxy_url: None,
+            upstream_proxy_remote_dns: false,
             legacy_redirect_replay_budget_bytes_ignored: None,
             emit_proxy_timing_header: true,
             log_level: "info".to_string(),

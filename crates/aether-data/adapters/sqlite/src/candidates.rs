@@ -1837,7 +1837,12 @@ INSERT INTO usage_settlement_snapshots (
                 "headers": {"retry-after": "30"},
                 "body": {"error": {"message": "original upstream failure"}}
             },
-            "failure_diagnostic": {"path": "$.input", "message": "original diagnostic"}
+            "failure_diagnostic": {
+                "path": "$.input", "message": "original diagnostic",
+                "stage": "request", "source_format": "openai:chat",
+                "target_format": "claude:messages", "safe_to_show": false,
+                "details": {"code": "invalid_enum_value", "actual": "private-value"}
+            }
         });
         let mut failed = sample_upsert(
             &candidate_id,

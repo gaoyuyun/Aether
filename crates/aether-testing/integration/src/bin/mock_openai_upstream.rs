@@ -1310,16 +1310,18 @@ mod tests {
 
     #[test]
     fn profile_values_depend_only_on_seed_sequence_and_domain() {
-        let mut config = Config::default();
-        config.seed = 0xfeed_beef;
-        config.first_byte_delay = Duration::from_millis(100);
-        config.first_byte_jitter = Duration::from_millis(50);
-        config.chunk_delay = Duration::from_millis(30);
-        config.chunk_delay_jitter = Duration::from_millis(10);
-        config.payload_bytes = 128;
-        config.payload_bytes_jitter = 64;
-        config.fault_truncate_stream_bps = BASIS_POINTS;
-        config.chunks = 9;
+        let config = Config {
+            seed: 0xfeed_beef,
+            first_byte_delay: Duration::from_millis(100),
+            first_byte_jitter: Duration::from_millis(50),
+            chunk_delay: Duration::from_millis(30),
+            chunk_delay_jitter: Duration::from_millis(10),
+            payload_bytes: 128,
+            payload_bytes_jitter: 64,
+            fault_truncate_stream_bps: BASIS_POINTS,
+            chunks: 9,
+            ..Default::default()
+        };
 
         let first = request_profile(&config, 1234);
         let unrelated = request_profile(&config, 9999);
@@ -1345,11 +1347,13 @@ mod tests {
 
     #[test]
     fn fault_buckets_are_disjoint_and_ordered() {
-        let mut config = Config::default();
-        config.fault_429_bps = 100;
-        config.fault_500_bps = 200;
-        config.fault_timeout_bps = 300;
-        config.fault_truncate_stream_bps = 400;
+        let config = Config {
+            fault_429_bps: 100,
+            fault_500_bps: 200,
+            fault_timeout_bps: 300,
+            fault_truncate_stream_bps: 400,
+            ..Default::default()
+        };
 
         assert_eq!(select_fault(&config, 0), Fault::Status429);
         assert_eq!(select_fault(&config, 99), Fault::Status429);
@@ -1435,12 +1439,14 @@ mod tests {
         let bind = listener
             .local_addr()
             .expect("test listener should have a local address");
-        let mut config = Config::default();
-        config.binds = vec![bind];
-        config.chunks = 0;
-        config.chunk_delay = Duration::ZERO;
-        config.fault_truncate_stream_bps = BASIS_POINTS;
-        config.seed = 0x1234_5678;
+        let config = Config {
+            binds: vec![bind],
+            chunks: 0,
+            chunk_delay: Duration::ZERO,
+            fault_truncate_stream_bps: BASIS_POINTS,
+            seed: 0x1234_5678,
+            ..Default::default()
+        };
         let metrics = Arc::new(Metrics::for_binds(&config.binds));
         let router = build_router(config, Arc::clone(&metrics), bind);
         let server = tokio::spawn(async move {

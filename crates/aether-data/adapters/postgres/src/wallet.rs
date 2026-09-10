@@ -4677,36 +4677,11 @@ VALUES (
                     .await
                     .map_postgres_err()?;
 
-                    let order_row = sqlx::query(
-                        r#"
-SELECT
-  id,
-  order_no,
-  wallet_id,
-  user_id,
-  CAST(amount_usd AS DOUBLE PRECISION) AS amount_usd,
-  CAST(pay_amount AS DOUBLE PRECISION) AS pay_amount,
-  pay_currency,
-  CAST(exchange_rate AS DOUBLE PRECISION) AS exchange_rate,
-  CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
-  CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
-  payment_method,
-  gateway_order_id,
-  gateway_response,
-  status,
-  CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT) AS created_at_unix_ms,
-  CAST(EXTRACT(EPOCH FROM paid_at) AS BIGINT) AS paid_at_unix_secs,
-  CAST(EXTRACT(EPOCH FROM credited_at) AS BIGINT) AS credited_at_unix_secs,
-  CAST(EXTRACT(EPOCH FROM expires_at) AS BIGINT) AS expires_at_unix_secs
-FROM payment_orders
-WHERE id = $1
-LIMIT 1
-                        "#,
-                    )
-                    .bind(&order_id)
-                    .fetch_one(&mut **tx)
-                    .await
-                    .map_postgres_err()?;
+                    let order_row = sqlx::query(FIND_ADMIN_PAYMENT_ORDER_SQL)
+                        .bind(&order_id)
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_postgres_err()?;
                     Ok(Some((wallet, map_admin_payment_order_row(&order_row)?)))
                 })
             })
@@ -5894,6 +5869,8 @@ RETURNING
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  order_kind,
   gateway_order_id,
   gateway_response,
   status,
@@ -5939,6 +5916,8 @@ SELECT
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  order_kind,
   gateway_order_id,
   gateway_response,
   status,
@@ -5993,6 +5972,8 @@ RETURNING
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  order_kind,
   gateway_order_id,
   gateway_response,
   status,
@@ -6259,6 +6240,8 @@ RETURNING
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  order_kind,
   gateway_order_id,
   gateway_response,
   status,
@@ -6458,6 +6441,8 @@ RETURNING
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  order_kind,
   gateway_order_id,
   gateway_response,
   status,
@@ -7298,6 +7283,8 @@ RETURNING
   CAST(refunded_amount_usd AS DOUBLE PRECISION) AS refunded_amount_usd,
   CAST(refundable_amount_usd AS DOUBLE PRECISION) AS refundable_amount_usd,
   payment_method,
+  payment_provider,
+  order_kind,
   gateway_order_id,
   gateway_response,
   status,
@@ -8490,8 +8477,542 @@ VALUES ($1, $2, 'gift', 'gift_initial', $3, 0, $3, 0, 0, 0, $3, 'system_task', $
 
 #[cfg(test)]
 mod tests {
+    use aether_data_contracts::repository::wallet::{
+        CreateManualWalletRechargeInput, CreditAdminPaymentOrderInput, RedeemWalletCodeInput,
+        RedeemWalletCodeOutcome, WalletLookupKey, WalletMutationOutcome, WalletReadRepository,
+        WalletWriteRepository,
+    };
+    use sqlx::Row;
+
     use super::SqlxWalletRepository;
     use crate::{PostgresPoolConfig, PostgresPoolFactory};
+
+    #[test]
+    fn payment_order_sql_projections_cover_mapper_columns() {
+        let source = include_str!("wallet.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("wallet implementation should exist");
+        let mapper = source
+            .split("fn map_admin_payment_order_row(")
+            .nth(1)
+            .expect("payment order mapper should exist")
+            .split("\nfn ")
+            .next()
+            .expect("payment order mapper body should exist");
+        let required_columns = mapper
+            .split("row_get(row, \"")
+            .skip(1)
+            .map(|read| read.split('"').next().expect("column name should exist"))
+            .collect::<Vec<_>>();
+        assert!(required_columns.contains(&"payment_provider"));
+        assert!(required_columns.contains(&"order_kind"));
+
+        let mut projections_checked = 0;
+        for fragment in source.split("r#\"").skip(1) {
+            let Some((sql, _)) = fragment.split_once("\"#") else {
+                continue;
+            };
+            if !sql.contains("payment_orders")
+                || !sql.contains("AS created_at_unix_ms")
+                || !sql.contains("pay_currency")
+            {
+                continue;
+            }
+            let projection = match sql.rsplit_once("RETURNING") {
+                Some((_, projection)) => projection.to_string(),
+                None => sql
+                    .lines()
+                    .take_while(|line| !line.trim_start().starts_with("FROM payment_orders"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            let tokens = projection
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .collect::<Vec<_>>();
+            for column in &required_columns {
+                assert!(
+                    tokens.contains(column),
+                    "payment order projection omits {column}: {sql}"
+                );
+            }
+            projections_checked += 1;
+        }
+        assert!(
+            projections_checked > 0,
+            "payment order projections should exist"
+        );
+    }
+
+    async fn isolated_wallet_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("AETHER_TEST_DATABASE_URL")
+            .expect("AETHER_TEST_DATABASE_URL must point at the test database");
+        let options = database_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("test database URL should parse")
+            .options([("search_path", "pg_temp")]);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options)
+            .await
+            .expect("test database should connect");
+        for table in [
+            "wallets",
+            "payment_orders",
+            "wallet_transactions",
+            "user_plan_entitlements",
+            "redeem_code_batches",
+            "redeem_codes",
+        ] {
+            sqlx::query(&format!(
+                "CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING ALL)"
+            ))
+            .execute(&pool)
+            .await
+            .expect("isolated wallet table should be created");
+        }
+        pool
+    }
+
+    async fn seed_wallet(pool: &sqlx::PgPool) -> (String, String) {
+        let wallet_id = uuid::Uuid::new_v4().to_string();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO wallets (id, user_id, balance, gift_balance, total_recharged, created_at, updated_at) VALUES ($1, $2, 10, 3, 20, NOW(), NOW())",
+        )
+        .bind(&wallet_id)
+        .bind(&user_id)
+        .execute(pool)
+        .await
+        .expect("test wallet should be created");
+        (wallet_id, user_id)
+    }
+
+    async fn seed_pending_order(
+        pool: &sqlx::PgPool,
+        wallet_id: &str,
+        user_id: &str,
+        order_kind: &str,
+    ) -> String {
+        let order_id = uuid::Uuid::new_v4().to_string();
+        let plan_snapshot = (order_kind == "plan_purchase").then(|| {
+            serde_json::json!({
+                "id": "test-plan",
+                "duration_days": 30,
+                "purchase_limit_scope": "unlimited",
+                "entitlements": [{
+                    "type": "wallet_credit",
+                    "amount_usd": 4.0,
+                    "balance_bucket": "gift",
+                }],
+            })
+        });
+        sqlx::query(
+            "INSERT INTO payment_orders (id, order_no, wallet_id, user_id, amount_usd, pay_amount, pay_currency, payment_method, payment_provider, order_kind, product_id, product_snapshot, status, created_at, expires_at) VALUES ($1, $2, $3, $4, 5, 5, 'USD', 'stripe', 'stripe', $5, $6, $7, 'pending', NOW(), NOW() + INTERVAL '1 hour')",
+        )
+        .bind(&order_id)
+        .bind(format!("order-{order_id}"))
+        .bind(wallet_id)
+        .bind(user_id)
+        .bind(order_kind)
+        .bind(plan_snapshot.as_ref().map(|_| "test-plan"))
+        .bind(plan_snapshot)
+        .execute(pool)
+        .await
+        .expect("pending payment order should be created");
+        order_id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL bootstrap schema"]
+    async fn live_manual_recharge_commits_wallet_order_and_transaction() {
+        let pool = isolated_wallet_test_pool().await;
+        let (wallet_id, user_id) = seed_wallet(&pool).await;
+        let repository = SqlxWalletRepository::new(pool.clone());
+        let input = CreateManualWalletRechargeInput {
+            wallet_id: wallet_id.clone(),
+            amount_usd: 5.0,
+            payment_method: "admin_manual".to_string(),
+            operator_id: Some(uuid::Uuid::new_v4().to_string()),
+            description: Some("manual recharge regression".to_string()),
+            order_no: format!("manual-{}", uuid::Uuid::new_v4()),
+        };
+        let (wallet, order) = repository
+            .create_manual_wallet_recharge(input.clone())
+            .await
+            .expect("manual recharge should commit")
+            .expect("test wallet should exist");
+
+        assert_eq!(wallet.id, wallet_id);
+        assert_eq!(wallet.user_id.as_deref(), Some(user_id.as_str()));
+        assert_eq!(wallet.balance, 15.0);
+        assert_eq!(wallet.gift_balance, 3.0);
+        assert_eq!(wallet.total_recharged, 25.0);
+        assert_eq!(order.order_no, input.order_no);
+        assert_eq!(order.wallet_id, wallet_id);
+        assert_eq!(order.user_id.as_deref(), Some(user_id.as_str()));
+        assert_eq!(order.amount_usd, 5.0);
+        assert_eq!(order.refunded_amount_usd, 0.0);
+        assert_eq!(order.refundable_amount_usd, 5.0);
+        assert_eq!(order.payment_method, "admin_manual");
+        assert_eq!(order.payment_provider, None);
+        assert_eq!(order.order_kind, "wallet_recharge");
+        assert_eq!(order.status, "credited");
+        assert!(order.paid_at_unix_secs.is_some());
+        assert!(order.credited_at_unix_secs.is_some());
+        assert_eq!(
+            order.gateway_response,
+            Some(serde_json::json!({
+                "source": "manual",
+                "operator_id": input.operator_id,
+                "description": input.description,
+            }))
+        );
+
+        assert!(repository
+            .create_manual_wallet_recharge(input.clone())
+            .await
+            .is_err());
+        for amount_usd in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(repository
+                .create_manual_wallet_recharge(CreateManualWalletRechargeInput {
+                    amount_usd,
+                    ..input.clone()
+                })
+                .await
+                .is_err());
+        }
+        assert!(repository
+            .create_manual_wallet_recharge(CreateManualWalletRechargeInput {
+                wallet_id: uuid::Uuid::new_v4().to_string(),
+                ..input.clone()
+            })
+            .await
+            .expect("missing wallet should not fail")
+            .is_none());
+
+        let persisted_wallet = repository
+            .find(WalletLookupKey::WalletId(&wallet_id))
+            .await
+            .expect("wallet should be readable after commit")
+            .expect("wallet should persist");
+        assert_eq!(persisted_wallet, wallet);
+        let persisted_order = repository
+            .find_admin_payment_order(&order.id)
+            .await
+            .expect("payment order should be readable after commit")
+            .expect("payment order should persist");
+        assert_eq!(persisted_order, order);
+
+        let transaction = sqlx::query(
+            "SELECT category, reason_code, CAST(amount AS DOUBLE PRECISION) AS amount, CAST(balance_before AS DOUBLE PRECISION) AS balance_before, CAST(balance_after AS DOUBLE PRECISION) AS balance_after, CAST(recharge_balance_before AS DOUBLE PRECISION) AS recharge_balance_before, CAST(recharge_balance_after AS DOUBLE PRECISION) AS recharge_balance_after, CAST(gift_balance_before AS DOUBLE PRECISION) AS gift_balance_before, CAST(gift_balance_after AS DOUBLE PRECISION) AS gift_balance_after, link_type, link_id, operator_id, description FROM wallet_transactions WHERE wallet_id = $1",
+        )
+        .bind(&wallet_id)
+        .fetch_one(&pool)
+        .await
+        .expect("recharge transaction should persist");
+        assert_eq!(transaction.get::<String, _>("category"), "recharge");
+        assert_eq!(
+            transaction.get::<String, _>("reason_code"),
+            "topup_admin_manual"
+        );
+        assert_eq!(transaction.get::<f64, _>("amount"), 5.0);
+        assert_eq!(transaction.get::<f64, _>("balance_before"), 13.0);
+        assert_eq!(transaction.get::<f64, _>("balance_after"), 18.0);
+        assert_eq!(transaction.get::<f64, _>("recharge_balance_before"), 10.0);
+        assert_eq!(transaction.get::<f64, _>("recharge_balance_after"), 15.0);
+        assert_eq!(transaction.get::<f64, _>("gift_balance_before"), 3.0);
+        assert_eq!(transaction.get::<f64, _>("gift_balance_after"), 3.0);
+        assert_eq!(transaction.get::<String, _>("link_type"), "payment_order");
+        assert_eq!(transaction.get::<String, _>("link_id"), order.id);
+        assert_eq!(
+            transaction.get::<Option<String>, _>("operator_id"),
+            input.operator_id
+        );
+        assert_eq!(
+            transaction.get::<Option<String>, _>("description"),
+            input.description
+        );
+        for table in ["wallets", "payment_orders", "wallet_transactions"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .expect("wallet record count should be readable");
+            assert_eq!(count, 1, "rejected recharges must not add {table} rows");
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL bootstrap schema"]
+    async fn live_admin_order_state_changes_preserve_metadata() {
+        let pool = isolated_wallet_test_pool().await;
+        let (wallet_id, user_id) = seed_wallet(&pool).await;
+        let repository = SqlxWalletRepository::new(pool.clone());
+        for target_status in ["expired", "failed"] {
+            let order_id = seed_pending_order(&pool, &wallet_id, &user_id, "wallet_recharge").await;
+            let order = if target_status == "expired" {
+                let outcome = repository
+                    .expire_admin_payment_order(&order_id)
+                    .await
+                    .expect("order expiry should commit");
+                let WalletMutationOutcome::Applied((order, changed)) = outcome else {
+                    panic!("pending order should expire");
+                };
+                assert!(changed);
+                assert!(matches!(
+                    repository.expire_admin_payment_order(&order_id).await,
+                    Ok(WalletMutationOutcome::Applied((_, false)))
+                ));
+                order
+            } else {
+                let outcome = repository
+                    .fail_admin_payment_order(&order_id)
+                    .await
+                    .expect("order failure should commit");
+                let WalletMutationOutcome::Applied(order) = outcome else {
+                    panic!("pending order should be marked failed");
+                };
+                order
+            };
+            assert_eq!(order.status, target_status);
+            assert_eq!(order.payment_provider.as_deref(), Some("stripe"));
+            assert_eq!(order.order_kind, "wallet_recharge");
+            assert_eq!(
+                repository
+                    .find_admin_payment_order(&order_id)
+                    .await
+                    .unwrap(),
+                Some(order)
+            );
+        }
+        let wallet = repository
+            .find(WalletLookupKey::WalletId(&wallet_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (wallet.balance, wallet.gift_balance, wallet.total_recharged),
+            (10.0, 3.0, 20.0)
+        );
+        let transaction_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallet_transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(transaction_count, 0);
+        pool.close().await;
+    }
+
+    async fn assert_admin_payment_order_credit(order_kind: &str) {
+        let pool = isolated_wallet_test_pool().await;
+        let (wallet_id, user_id) = seed_wallet(&pool).await;
+        let order_id = seed_pending_order(&pool, &wallet_id, &user_id, order_kind).await;
+        let repository = SqlxWalletRepository::new(pool.clone());
+        let input = CreditAdminPaymentOrderInput {
+            order_id: order_id.clone(),
+            gateway_order_id: None,
+            pay_amount: None,
+            pay_currency: None,
+            exchange_rate: None,
+            gateway_response_patch: None,
+            operator_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        let outcome = repository
+            .credit_admin_payment_order(input.clone())
+            .await
+            .expect("admin credit should commit");
+        let WalletMutationOutcome::Applied((order, changed)) = outcome else {
+            panic!("pending payment order should be credited");
+        };
+        assert!(changed);
+        assert_eq!(order.status, "credited");
+        assert_eq!(order.payment_provider.as_deref(), Some("stripe"));
+        assert_eq!(order.order_kind, order_kind);
+        assert!(order.paid_at_unix_secs.is_some());
+        assert!(order.credited_at_unix_secs.is_some());
+        assert_eq!(
+            repository
+                .find_admin_payment_order(&order_id)
+                .await
+                .unwrap(),
+            Some(order.clone())
+        );
+        assert!(matches!(
+            repository.credit_admin_payment_order(input).await,
+            Ok(WalletMutationOutcome::Applied((_, false)))
+        ));
+        assert!(matches!(
+            repository.expire_admin_payment_order(&order_id).await,
+            Ok(WalletMutationOutcome::Invalid(_))
+        ));
+        assert!(matches!(
+            repository.fail_admin_payment_order(&order_id).await,
+            Ok(WalletMutationOutcome::Invalid(_))
+        ));
+
+        let wallet = repository
+            .find(WalletLookupKey::WalletId(&wallet_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_balances = if order_kind == "plan_purchase" {
+            assert_eq!(order.refundable_amount_usd, 0.0);
+            let fulfillment: String =
+                sqlx::query_scalar("SELECT fulfillment_status FROM payment_orders WHERE id = $1")
+                    .bind(&order_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(fulfillment, "fulfilled");
+            (10.0, 7.0, 20.0)
+        } else {
+            assert_eq!(order.refundable_amount_usd, 5.0);
+            (15.0, 3.0, 25.0)
+        };
+        assert_eq!(
+            (wallet.balance, wallet.gift_balance, wallet.total_recharged),
+            expected_balances
+        );
+        let transaction_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM wallet_transactions WHERE wallet_id = $1")
+                .bind(&wallet_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(transaction_count, 1);
+        let entitlement_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_plan_entitlements WHERE payment_order_id = $1",
+        )
+        .bind(&order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(entitlement_count, i64::from(order_kind == "plan_purchase"));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL bootstrap schema"]
+    async fn live_admin_wallet_order_credit_commits_once() {
+        assert_admin_payment_order_credit("wallet_recharge").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL bootstrap schema"]
+    async fn live_admin_plan_order_credit_commits_once() {
+        assert_admin_payment_order_credit("plan_purchase").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL bootstrap schema"]
+    async fn live_redeem_code_commits_order_and_wallet_once_for_each_bucket() {
+        let pool = isolated_wallet_test_pool().await;
+        let repository = SqlxWalletRepository::new(pool.clone());
+        for balance_bucket in ["recharge", "gift"] {
+            let (wallet_id, user_id) = seed_wallet(&pool).await;
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            let code_id = uuid::Uuid::new_v4().to_string();
+            let code = super::generate_redeem_code_normalized();
+            sqlx::query(
+                "INSERT INTO redeem_code_batches (id, name, amount_usd, balance_bucket, total_count, created_at, updated_at) VALUES ($1, 'regression batch', 5, $2, 1, NOW(), NOW())",
+            )
+            .bind(&batch_id)
+            .bind(balance_bucket)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO redeem_codes (id, batch_id, code_hash, code_prefix, code_suffix, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, NOW(), NOW())",
+            )
+            .bind(&code_id)
+            .bind(&batch_id)
+            .bind(super::hash_redeem_code(&code))
+            .bind(super::redeem_code_prefix(&code))
+            .bind(super::redeem_code_suffix(&code))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let input = RedeemWalletCodeInput {
+                code: super::format_redeem_code(&code),
+                user_id,
+                order_no: format!("redeem-{}", uuid::Uuid::new_v4()),
+            };
+            let outcome = repository
+                .redeem_wallet_code(input.clone())
+                .await
+                .expect("redeem code recharge should commit");
+            let RedeemWalletCodeOutcome::Redeemed {
+                wallet,
+                order,
+                amount_usd,
+                ..
+            } = outcome
+            else {
+                panic!("active code should be redeemed");
+            };
+            assert_eq!(amount_usd, 5.0);
+            assert_eq!(order.status, "credited");
+            assert_eq!(order.order_kind, "wallet_recharge");
+            assert_eq!(order.payment_provider, None);
+            let expected_balances = if balance_bucket == "recharge" {
+                assert_eq!(order.payment_method, "card_code");
+                assert_eq!(order.refundable_amount_usd, 5.0);
+                (15.0, 3.0, 25.0)
+            } else {
+                assert_eq!(order.payment_method, "gift_code");
+                assert_eq!(order.refundable_amount_usd, 0.0);
+                (10.0, 8.0, 25.0)
+            };
+            assert_eq!(
+                (wallet.balance, wallet.gift_balance, wallet.total_recharged),
+                expected_balances
+            );
+            assert!(matches!(
+                repository.redeem_wallet_code(input).await,
+                Ok(RedeemWalletCodeOutcome::CodeRedeemed)
+            ));
+            assert_eq!(
+                repository
+                    .find(WalletLookupKey::WalletId(&wallet_id))
+                    .await
+                    .unwrap(),
+                Some(wallet)
+            );
+            assert_eq!(
+                repository
+                    .find_admin_payment_order(&order.id)
+                    .await
+                    .unwrap(),
+                Some(order.clone())
+            );
+            let redeemed = sqlx::query(
+                "SELECT status, redeemed_wallet_id, redeemed_payment_order_id FROM redeem_codes WHERE id = $1",
+            )
+            .bind(&code_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(redeemed.get::<String, _>("status"), "redeemed");
+            assert_eq!(redeemed.get::<String, _>("redeemed_wallet_id"), wallet_id);
+            assert_eq!(
+                redeemed.get::<String, _>("redeemed_payment_order_id"),
+                order.id
+            );
+            for table in ["payment_orders", "wallet_transactions"] {
+                let count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE wallet_id = $1"
+                ))
+                .bind(&wallet_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(count, 1, "redeeming twice must not duplicate {table}");
+            }
+        }
+        pool.close().await;
+    }
 
     #[tokio::test]
     async fn repository_constructs_from_lazy_pool() {

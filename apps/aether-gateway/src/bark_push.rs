@@ -23,7 +23,6 @@ const MAX_BARK_TEMPLATE_BYTES: usize = 256 * 1024;
 const MAX_BARK_TITLE_BYTES: usize = 512;
 const MAX_BARK_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BARK_RENDERED_BODY_BYTES: usize = 2 * 1024 * 1024;
-const MAX_BARK_RESOLVED_ADDRESSES: usize = 32;
 
 #[derive(Clone)]
 pub(crate) struct BarkPushConfig {
@@ -208,19 +207,20 @@ async fn build_bark_push_client_and_url(
     let port = push_url
         .port_or_known_default()
         .ok_or_else(|| GatewayError::Internal("Bark 服务器地址缺少端口".to_string()))?;
-    let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![SocketAddr::new(ip, port)]
-    } else {
-        tokio::time::timeout(
-            std::time::Duration::from_millis(BARK_CONNECT_TIMEOUT_MS),
-            tokio::net::lookup_host((host.as_str(), port)),
-        )
-        .await
-        .map_err(|_| GatewayError::Internal("Bark 服务器 DNS 解析超时".to_string()))?
-        .map_err(|_| GatewayError::Internal("Bark 服务器 DNS 解析失败".to_string()))?
-        .take(MAX_BARK_RESOLVED_ADDRESSES)
-        .collect::<Vec<_>>()
-    };
+    let addresses = aether_http::lookup_host_with_limits(
+        host.as_str(),
+        port,
+        std::time::Duration::from_millis(BARK_CONNECT_TIMEOUT_MS),
+    )
+    .await
+    .map_err(|error| {
+        let message = match error.kind() {
+            std::io::ErrorKind::TimedOut => "Bark 服务器 DNS 解析超时",
+            std::io::ErrorKind::InvalidData => "Bark 服务器 DNS 解析返回过多地址",
+            _ => "Bark 服务器 DNS 解析失败",
+        };
+        GatewayError::Internal(message.to_string())
+    })?;
     let allow_benchmarking_ip = push_url.scheme() == "https"
         && push_url.port_or_known_default() == Some(443)
         && host.eq_ignore_ascii_case("api.day.app");

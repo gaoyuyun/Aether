@@ -1826,12 +1826,12 @@ async fn fetch_grok_attachment_url(
         // a fragment from the previous URL, while an absolute Location can
         // introduce either explicitly.
         validate_grok_attachment_url(&url)?;
-        let public_addr = public_socket_addr_for_url(&url).await?;
+        let public_addrs = public_socket_addrs_for_url(&url).await?;
         let response = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(url.host_str().unwrap_or_default(), &[public_addr])
+            .resolve_to_addrs(url.host_str().unwrap_or_default(), &public_addrs)
             .build()
             .map_err(ExecutionRuntimeTransportError::ClientBuild)?
             .get(url.clone())
@@ -1897,10 +1897,10 @@ fn validate_grok_attachment_url(url: &reqwest::Url) -> Result<(), ExecutionRunti
     Ok(())
 }
 
-async fn public_socket_addr_for_url(
+async fn public_socket_addrs_for_url(
     url: &reqwest::Url,
-) -> Result<std::net::SocketAddr, ExecutionRuntimeTransportError> {
-    let host = url.host().ok_or_else(|| {
+) -> Result<Vec<std::net::SocketAddr>, ExecutionRuntimeTransportError> {
+    let host = url.host_str().ok_or_else(|| {
         ExecutionRuntimeTransportError::UpstreamRequest(
             "Grok attachment URL is missing a host".to_string(),
         )
@@ -1910,64 +1910,34 @@ async fn public_socket_addr_for_url(
             "Grok attachment URL is missing a port".to_string(),
         )
     })?;
-    let host = match host {
-        url::Host::Ipv4(ip) => {
-            let ip = IpAddr::V4(ip);
-            if !grok_attachment_ip_is_public(ip) {
-                return Err(ExecutionRuntimeTransportError::UpstreamRequest(
-                    "Grok attachment URL resolves to a non-public address".to_string(),
-                ));
-            }
-            return Ok(std::net::SocketAddr::new(ip, port));
-        }
-        url::Host::Ipv6(ip) => {
-            let ip = IpAddr::V6(ip);
-            if !grok_attachment_ip_is_public(ip) {
-                return Err(ExecutionRuntimeTransportError::UpstreamRequest(
-                    "Grok attachment URL resolves to a non-public address".to_string(),
-                ));
-            }
-            return Ok(std::net::SocketAddr::new(ip, port));
-        }
-        url::Host::Domain(host) => host,
-    };
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if !grok_attachment_ip_is_public(ip) {
-            return Err(ExecutionRuntimeTransportError::UpstreamRequest(
-                "Grok attachment URL resolves to a non-public address".to_string(),
-            ));
-        }
-        return Ok(std::net::SocketAddr::new(ip, port));
-    }
-    let mut public_addr = None;
-    let mut resolved_any = false;
-    for addr in
+    let addresses =
         aether_http::lookup_host_with_limits(host, port, aether_http::DEFAULT_DNS_LOOKUP_TIMEOUT)
             .await
             .map_err(|err| {
                 ExecutionRuntimeTransportError::UpstreamRequest(format!(
                     "Grok attachment URL DNS resolution failed: {err}"
                 ))
-            })?
-    {
-        resolved_any = true;
-        if !grok_attachment_ip_is_public(addr.ip()) {
-            return Err(ExecutionRuntimeTransportError::UpstreamRequest(
-                "Grok attachment URL resolves to a non-public address".to_string(),
-            ));
-        }
-        public_addr.get_or_insert(addr);
-    }
-    if !resolved_any {
+            })?;
+    validate_grok_attachment_addresses(addresses)
+}
+
+fn validate_grok_attachment_addresses(
+    addresses: Vec<std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>, ExecutionRuntimeTransportError> {
+    if addresses.is_empty() {
         return Err(ExecutionRuntimeTransportError::UpstreamRequest(
             "Grok attachment URL DNS resolution returned no addresses".to_string(),
         ));
     }
-    public_addr.ok_or_else(|| {
-        ExecutionRuntimeTransportError::UpstreamRequest(
-            "Grok attachment URL has no public address".to_string(),
-        )
-    })
+    if addresses
+        .iter()
+        .any(|address| !grok_attachment_ip_is_public(address.ip()))
+    {
+        return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+            "Grok attachment URL resolves to a non-public address".to_string(),
+        ));
+    }
+    Ok(addresses)
 }
 
 fn grok_attachment_ip_is_public(ip: IpAddr) -> bool {
@@ -3898,7 +3868,7 @@ mod tests {
         grok_should_use_imagine_websocket, grok_success_frame_stream, grok_upload_url,
         grok_upstream_model_name, grok_usage_estimate, grok_user_id_from_cookie_header,
         materialize_grok_image_assets, maximum_base64_len_for_decoded_limit, openai_chat_body,
-        openai_image_body, openai_image_sse, openai_responses_body, public_socket_addr_for_url,
+        openai_image_body, openai_image_sse, openai_responses_body, public_socket_addrs_for_url,
         set_grok_image_edit_config, validate_grok_attachment_url, GrokAttachmentInput,
         GrokCollected, GrokImagineImage, GrokStreamAdapter,
     };
@@ -4520,7 +4490,7 @@ mod tests {
         ] {
             let url = reqwest::Url::parse(raw_url).expect("URL should parse");
             assert!(
-                public_socket_addr_for_url(&url).await.is_err(),
+                public_socket_addrs_for_url(&url).await.is_err(),
                 "private IPv6 literal should be rejected: {raw_url}"
             );
         }
@@ -4528,11 +4498,29 @@ mod tests {
         let url = reqwest::Url::parse("https://[2606:4700:4700::1111]/attachment")
             .expect("URL should parse");
         assert_eq!(
-            public_socket_addr_for_url(&url)
+            public_socket_addrs_for_url(&url)
                 .await
                 .expect("public IPv6 literal should pass"),
-            "[2606:4700:4700::1111]:443".parse().unwrap()
+            vec!["[2606:4700:4700::1111]:443".parse().unwrap()]
         );
+    }
+
+    #[test]
+    fn grok_attachment_dns_keeps_all_safe_addresses_for_connection_fallback() {
+        let addresses = vec![
+            "[2606:4700:4700::1111]:443".parse().unwrap(),
+            "8.8.8.8:443".parse().unwrap(),
+        ];
+        assert_eq!(
+            super::validate_grok_attachment_addresses(addresses.clone()).unwrap(),
+            addresses
+        );
+        assert!(super::validate_grok_attachment_addresses(Vec::new()).is_err());
+        for blocked in ["198.18.0.1:443", "127.0.0.1:443", "[fd00::1]:443"] {
+            let mut mixed = addresses.clone();
+            mixed.push(blocked.parse().unwrap());
+            assert!(super::validate_grok_attachment_addresses(mixed).is_err());
+        }
     }
 
     #[test]

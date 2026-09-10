@@ -480,6 +480,14 @@ pub struct Config {
     #[arg(long, env = "AETHER_TUNNEL_UPSTREAM_PROXY_URL")]
     pub upstream_proxy_url: Option<String>,
 
+    #[arg(
+        long,
+        env = "AETHER_TUNNEL_UPSTREAM_PROXY_REMOTE_DNS",
+        default_value_t = false,
+        help = "Trust an HTTP or SOCKS5h upstream proxy to resolve hostnames and enforce destination IP access controls"
+    )]
+    pub upstream_proxy_remote_dns: bool,
+
     /// Accepted only so older launch commands and environments keep working.
     /// Redirect request bodies are always replayed without a cumulative size limit.
     #[arg(
@@ -820,6 +828,16 @@ impl Config {
             crate::egress_proxy::UpstreamProxyConfig::parse(proxy_url)
                 .map_err(|err| anyhow::anyhow!("upstream_proxy_url invalid: {err}"))?;
         }
+        if self.upstream_proxy_remote_dns {
+            let proxy_url = normalized_proxy_url(&self.upstream_proxy_url).ok_or_else(|| {
+                anyhow::anyhow!("upstream_proxy_remote_dns requires upstream_proxy_url")
+            })?;
+            let proxy = crate::egress_proxy::UpstreamProxyConfig::parse(proxy_url)
+                .map_err(anyhow::Error::msg)?;
+            if !proxy.supports_remote_target_dns() {
+                anyhow::bail!("upstream_proxy_remote_dns requires an http:// or socks5h:// proxy");
+            }
+        }
         if matches!(self.max_in_flight_streams, Some(0)) {
             anyhow::bail!("max_in_flight_streams must be > 0");
         }
@@ -1087,6 +1105,8 @@ pub struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_proxy_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy_remote_dns: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub emit_proxy_timing_header: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_level: Option<String>,
@@ -1306,6 +1326,10 @@ impl ConfigFile {
             self.upstream_tcp_nodelay
         );
         set!("AETHER_TUNNEL_UPSTREAM_PROXY_URL", self.upstream_proxy_url);
+        set!(
+            "AETHER_TUNNEL_UPSTREAM_PROXY_REMOTE_DNS",
+            self.upstream_proxy_remote_dns
+        );
         set!(
             "AETHER_TUNNEL_EMIT_PROXY_TIMING_HEADER",
             self.emit_proxy_timing_header
@@ -1669,6 +1693,57 @@ mod tests {
 
     use super::*;
     use crate::hardware::HardwareInfo;
+
+    #[test]
+    fn proxy_remote_dns_requires_explicit_trust_and_a_remote_dns_proxy() {
+        let mut config = Config::parse_from([
+            "aether-tunnel",
+            "--aether-url",
+            "https://example.com",
+            "--management-token",
+            "ae_test",
+            "--node-name",
+            "tunnel-test",
+        ]);
+        assert!(!config.upstream_proxy_remote_dns);
+        let argument = Config::command()
+            .get_arguments()
+            .find(|argument| argument.get_id() == "upstream_proxy_remote_dns")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            argument.get_env().unwrap(),
+            "AETHER_TUNNEL_UPSTREAM_PROXY_REMOTE_DNS"
+        );
+
+        config.upstream_proxy_remote_dns = true;
+        for proxy in [None, Some(" "), Some("socks5://127.0.0.1:1080")] {
+            config.upstream_proxy_url = proxy.map(str::to_string);
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("upstream_proxy_remote_dns"));
+        }
+        for proxy in ["http://127.0.0.1:8080", "socks5h://127.0.0.1:1080"] {
+            config.upstream_proxy_url = Some(proxy.to_string());
+            config
+                .validate()
+                .expect("explicit remote DNS configuration should validate");
+        }
+    }
+
+    #[test]
+    fn config_file_round_trips_proxy_remote_dns() {
+        let config = parse_config_file_content(
+            "upstream_proxy_url = \"socks5h://127.0.0.1:1080\"\nupstream_proxy_remote_dns = true",
+        )
+        .unwrap();
+        assert_eq!(config.upstream_proxy_remote_dns, Some(true));
+        let round_trip: ConfigFile = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(round_trip.upstream_proxy_remote_dns, Some(true));
+        assert_eq!(ConfigFile::default().upstream_proxy_remote_dns, None);
+    }
 
     fn config_save_test_dir(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(

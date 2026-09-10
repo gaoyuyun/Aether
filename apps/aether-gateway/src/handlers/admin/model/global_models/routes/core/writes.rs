@@ -278,46 +278,6 @@ async fn build_batch_delete_global_models_response(
     ))
 }
 
-#[cfg(test)]
-mod batch_boundary_tests {
-    use super::{normalize_admin_global_model_batch_ids, MAX_ADMIN_GLOBAL_MODEL_BATCH_ITEMS};
-
-    #[test]
-    fn global_model_batch_ids_are_bounded_and_deduplicated() {
-        assert_eq!(
-            normalize_admin_global_model_batch_ids(
-                vec![
-                    "model-2".to_string(),
-                    "model-1".to_string(),
-                    " model-2 ".to_string(),
-                    "   ".to_string(),
-                ],
-                "ids",
-            )
-            .expect("valid ids"),
-            vec![
-                "model-2".to_string(),
-                "model-1".to_string(),
-                "   ".to_string(),
-            ]
-        );
-        assert!(normalize_admin_global_model_batch_ids(
-            (0..=MAX_ADMIN_GLOBAL_MODEL_BATCH_ITEMS)
-                .map(|index| format!("model-{index}"))
-                .collect(),
-            "ids",
-        )
-        .is_err());
-        assert!(normalize_admin_global_model_batch_ids(
-            (0..MAX_ADMIN_GLOBAL_MODEL_BATCH_ITEMS)
-                .map(|index| format!("provider-{index}"))
-                .collect(),
-            "provider_ids",
-        )
-        .is_ok());
-    }
-}
-
 async fn build_assign_to_providers_response(
     state: &AdminAppState<'_>,
     request_context: &AdminRequestContext<'_>,
@@ -356,4 +316,44 @@ async fn build_assign_to_providers_response(
         "global_model",
         &global_model_id,
     ))
+}
+
+#[cfg(test)]
+mod batch_boundary_tests {
+    use super::{normalize_admin_global_model_batch_ids, MAX_ADMIN_GLOBAL_MODEL_BATCH_ITEMS};
+
+    #[test]
+    fn global_model_batch_ids_are_bounded_and_deduplicated() {
+        assert_eq!(
+            normalize_admin_global_model_batch_ids(
+                vec![
+                    "model-2".to_string(),
+                    "model-1".to_string(),
+                    " model-2 ".to_string(),
+                    "   ".to_string(),
+                ],
+                "ids",
+            )
+            .expect("valid ids"),
+            vec![
+                "model-2".to_string(),
+                "model-1".to_string(),
+                "   ".to_string(),
+            ]
+        );
+        assert!(normalize_admin_global_model_batch_ids(
+            (0..=MAX_ADMIN_GLOBAL_MODEL_BATCH_ITEMS)
+                .map(|index| format!("model-{index}"))
+                .collect(),
+            "ids",
+        )
+        .is_err());
+        assert!(normalize_admin_global_model_batch_ids(
+            (0..MAX_ADMIN_GLOBAL_MODEL_BATCH_ITEMS)
+                .map(|index| format!("provider-{index}"))
+                .collect(),
+            "provider_ids",
+        )
+        .is_ok());
+    }
 }

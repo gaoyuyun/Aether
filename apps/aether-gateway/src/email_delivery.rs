@@ -136,14 +136,16 @@ pub(crate) async fn send_smtp_email(
     email: ComposedEmail,
 ) -> Result<(), GatewayError> {
     validate_smtp_delivery_inputs(&config, &email)?;
-    tokio::task::spawn_blocking(move || send_smtp_email_blocking(config, email))
+    let stream = connect_tcp_stream(&config).await?;
+    tokio::task::spawn_blocking(move || send_smtp_email_blocking(config, email, stream))
         .await
         .map_err(|err| GatewayError::Internal(err.to_string()))?
 }
 
 pub(crate) async fn probe_smtp_connection(config: SmtpDeliveryConfig) -> Result<(), GatewayError> {
     validate_smtp_config(&config)?;
-    tokio::task::spawn_blocking(move || probe_smtp_connection_blocking(config))
+    let stream = connect_tcp_stream(&config).await?;
+    tokio::task::spawn_blocking(move || probe_smtp_connection_blocking(config, stream))
         .await
         .map_err(|err| GatewayError::Internal(err.to_string()))?
 }
@@ -328,43 +330,58 @@ fn resolve_server_name(host: &str) -> Result<rustls::pki_types::ServerName<'stat
         .map_err(|err| GatewayError::Internal(err.to_string()))
 }
 
-fn connect_tcp_stream(config: &SmtpDeliveryConfig) -> Result<std::net::TcpStream, GatewayError> {
-    use std::net::ToSocketAddrs;
-    let addresses = (config.host.as_str(), config.port)
-        .to_socket_addrs()
-        .map_err(|err| GatewayError::Internal(err.to_string()))?
-        .take(16)
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(GatewayError::Internal(
-            "smtp host did not resolve to an address".to_string(),
-        ));
-    }
-    let deadline = std::time::Instant::now()
-        .checked_add(std::time::Duration::from_secs(SMTP_TIMEOUT_SECS))
-        .unwrap_or_else(std::time::Instant::now);
-    let mut last_error = None;
-    let mut stream = None;
-    for address in addresses {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
+async fn connect_tcp_stream(
+    config: &SmtpDeliveryConfig,
+) -> Result<std::net::TcpStream, GatewayError> {
+    connect_tcp_stream_with_dns(
+        aether_http::lookup_host_with_limits(
+            &config.host,
+            config.port,
+            aether_http::DEFAULT_DNS_LOOKUP_TIMEOUT,
+        ),
+        std::time::Duration::from_secs(SMTP_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn connect_tcp_stream_with_dns(
+    lookup: impl std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>,
+    timeout: std::time::Duration,
+) -> Result<std::net::TcpStream, GatewayError> {
+    let stream = tokio::time::timeout(timeout, async {
+        let addresses = lookup.await.map_err(|error| {
+            let message = match error.kind() {
+                std::io::ErrorKind::TimedOut => "smtp DNS resolution timed out",
+                std::io::ErrorKind::InvalidData => {
+                    "smtp DNS resolution returned too many addresses"
+                }
+                _ => "smtp DNS resolution failed",
+            };
+            GatewayError::Internal(message.to_string())
+        })?;
+        if addresses.is_empty() {
+            return Err(GatewayError::Internal(
+                "smtp host did not resolve to an address".to_string(),
+            ));
         }
-        match std::net::TcpStream::connect_timeout(&address, remaining) {
-            Ok(candidate) => {
-                stream = Some(candidate);
-                break;
-            }
-            Err(err) => last_error = Some(err),
-        }
-    }
-    let stream = stream.ok_or_else(|| {
-        GatewayError::Internal(
-            last_error
-                .map(|err| err.to_string())
-                .unwrap_or_else(|| "smtp connection timed out".to_string()),
-        )
-    })?;
+        let attempts = addresses
+            .into_iter()
+            .map(|address| Box::pin(tokio::net::TcpStream::connect(address)));
+        futures_util::future::select_ok(attempts)
+            .await
+            .map(|(stream, _)| stream)
+            .map_err(|error| {
+                GatewayError::Internal(format!("smtp connection failed ({})", error.kind()))
+            })
+    })
+    .await
+    .map_err(|_| GatewayError::Internal("smtp DNS or TCP connection timed out".to_string()))??;
+    let stream = stream
+        .into_std()
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(SMTP_TIMEOUT_SECS)))
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
@@ -680,16 +697,15 @@ fn smtp_probe_connection<S: std::io::Read + std::io::Write>(
 fn send_smtp_email_blocking(
     config: SmtpDeliveryConfig,
     email: ComposedEmail,
+    stream: std::net::TcpStream,
 ) -> Result<(), GatewayError> {
     if config.use_ssl {
-        let stream = connect_tcp_stream(&config)?;
         let tls_stream = wrap_tls_stream(stream, &config.host)?;
         let mut reader = std::io::BufReader::new(tls_stream);
         let _ = smtp_expect(&mut reader, &[220])?;
         return smtp_send_message(&mut reader, &config, &email);
     }
 
-    let stream = connect_tcp_stream(&config)?;
     let mut reader = std::io::BufReader::new(stream);
     let _ = smtp_expect(&mut reader, &[220])?;
     let _ = smtp_send_command(&mut reader, "EHLO aether.local", &[250])?;
@@ -705,16 +721,17 @@ fn send_smtp_email_blocking(
     smtp_deliver_message(&mut reader, &config, &email)
 }
 
-fn probe_smtp_connection_blocking(config: SmtpDeliveryConfig) -> Result<(), GatewayError> {
+fn probe_smtp_connection_blocking(
+    config: SmtpDeliveryConfig,
+    stream: std::net::TcpStream,
+) -> Result<(), GatewayError> {
     if config.use_ssl {
-        let stream = connect_tcp_stream(&config)?;
         let tls_stream = wrap_tls_stream(stream, &config.host)?;
         let mut reader = std::io::BufReader::new(tls_stream);
         let _ = smtp_expect(&mut reader, &[220])?;
         return smtp_probe_connection(&mut reader, &config);
     }
 
-    let stream = connect_tcp_stream(&config)?;
     let mut reader = std::io::BufReader::new(stream);
     let _ = smtp_expect(&mut reader, &[220])?;
     let _ = smtp_send_command(&mut reader, "EHLO aether.local", &[250])?;
@@ -776,6 +793,140 @@ mod tests {
     #[test]
     fn allows_normal_smtp_values() {
         assert!(validate_smtp_delivery_inputs(&config(), &email()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn smtp_connection_deadline_includes_a_stalled_dns_lookup() {
+        let error = connect_tcp_stream_with_dns(
+            std::future::pending(),
+            std::time::Duration::from_millis(5),
+        )
+        .await
+        .expect_err("DNS must not outlive the connection deadline");
+        assert!(format!("{error:?}").contains("smtp DNS or TCP connection timed out"));
+    }
+
+    #[tokio::test]
+    async fn smtp_dns_errors_and_empty_answers_fail_without_connecting() {
+        for (addresses, expected) in [
+            (Ok(Vec::new()), "smtp host did not resolve to an address"),
+            (
+                Err(std::io::Error::other("sensitive-dns-detail")),
+                "smtp DNS resolution failed",
+            ),
+            (
+                Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+                "smtp DNS resolution returned too many addresses",
+            ),
+            (
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+                "smtp DNS resolution timed out",
+            ),
+        ] {
+            let error = connect_tcp_stream_with_dns(
+                std::future::ready(addresses),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .expect_err("invalid DNS answers must fail before TCP connect");
+            assert!(format!("{error:?}").contains(expected));
+            assert!(!format!("{error:?}").contains("sensitive-dns-detail"));
+        }
+    }
+
+    #[tokio::test]
+    async fn smtp_connection_tries_answers_beyond_the_old_sixteen_address_limit() {
+        let unavailable = tokio::net::TcpSocket::new_v4().unwrap();
+        unavailable.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+        let available = listener.local_addr().unwrap();
+        let mut addresses = vec![unavailable.local_addr().unwrap(); 16];
+        addresses.push(available);
+        let stream = connect_tcp_stream_with_dns(
+            std::future::ready(Ok(addresses)),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("later DNS answers should remain available for fallback");
+        assert_eq!(stream.peer_addr().unwrap(), available);
+        assert_eq!(
+            stream.read_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(SMTP_TIMEOUT_SECS))
+        );
+    }
+
+    #[tokio::test]
+    async fn smtp_probe_and_delivery_use_the_preconnected_stream() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        for deliver in [false, true] {
+            let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(stream);
+                reader
+                    .get_mut()
+                    .write_all(b"220 mock SMTP ready\r\n")
+                    .await
+                    .unwrap();
+                let mut delivered = false;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                    let response = if line.starts_with("EHLO ")
+                        || line.starts_with("MAIL FROM:")
+                        || line.starts_with("RCPT TO:")
+                    {
+                        &b"250 OK\r\n"[..]
+                    } else if line == "DATA\r\n" {
+                        reader
+                            .get_mut()
+                            .write_all(b"354 End with dot\r\n")
+                            .await
+                            .unwrap();
+                        loop {
+                            line.clear();
+                            assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                            if line == ".\r\n" {
+                                break;
+                            }
+                        }
+                        delivered = true;
+                        &b"250 Accepted\r\n"[..]
+                    } else {
+                        assert_eq!(line, "QUIT\r\n");
+                        reader
+                            .get_mut()
+                            .write_all(b"221 Goodbye\r\n")
+                            .await
+                            .unwrap();
+                        break;
+                    };
+                    reader.get_mut().write_all(response).await.unwrap();
+                }
+                assert_eq!(delivered, deliver);
+            });
+            let config = SmtpDeliveryConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                user: None,
+                password: None,
+                use_tls: false,
+                use_ssl: false,
+                ..config()
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                if deliver {
+                    send_smtp_email(config, email()).await.unwrap();
+                } else {
+                    probe_smtp_connection(config).await.unwrap();
+                }
+                server.await.unwrap();
+            })
+            .await
+            .expect("local SMTP probe and delivery should complete");
+        }
     }
 
     #[test]

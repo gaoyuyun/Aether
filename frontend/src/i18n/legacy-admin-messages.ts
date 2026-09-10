@@ -114,6 +114,8 @@ export const legacyAdminEnglishMessages: Record<string, string> = {
   '错误重试次数': 'Error retry count',
   'CF保持心跳': 'CF keepalive',
   'Cyber继续转移': 'Fail over on Cyber errors',
+  '取消请求立即打断': 'Abort immediately on client cancellation',
+  '默认关闭：客户端取消或断开后，服务端继续等待请求完成并正常计费。开启后立即打断且不计费，按次计费的请求仍收取单次请求费用。仅作用于当前调度策略。': 'Off by default: after client cancellation or disconnection, the server completes the request and bills normally. When enabled, requests are aborted immediately without usage charges, except for per-request fees. Applies only to this routing policy.',
   '调度配置': 'Routing configuration',
   '先选择调度维度，再配置优先级模式、调度策略和提供商排序。': 'Choose the routing scope, then configure the priority mode, routing strategy, and provider order.',
   '调度维度': 'Routing scope',

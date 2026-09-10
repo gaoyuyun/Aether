@@ -182,7 +182,7 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalStandardSyncAttemptSour
         self.input
             .routing_policy
             .as_ref()
-            .map(|policy| policy.execution_policy)
+            .map(|policy| policy.execution_policy.clone())
     }
 
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
@@ -232,7 +232,7 @@ impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalStandardStreamAttempt
         self.input
             .routing_policy
             .as_ref()
-            .map(|policy| policy.execution_policy)
+            .map(|policy| policy.execution_policy.clone())
     }
 
     async fn next_execution_attempt(&mut self) -> Result<Option<AiStreamAttempt>, GatewayError> {

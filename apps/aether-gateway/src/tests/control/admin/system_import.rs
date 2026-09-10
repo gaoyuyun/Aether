@@ -3834,12 +3834,12 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
         Some(&Value::Null)
     );
     assert_eq!(
-        decrypt_test_provider_catalog_credential(&key, ProviderCatalogCredentialField::ApiKey,),
+        decrypt_test_provider_catalog_credential(key, ProviderCatalogCredentialField::ApiKey,),
         "oauth-access-token-new"
     );
 
     let auth_config =
-        decrypt_test_provider_catalog_credential(&key, ProviderCatalogCredentialField::AuthConfig);
+        decrypt_test_provider_catalog_credential(key, ProviderCatalogCredentialField::AuthConfig);
     let auth_config: Value =
         serde_json::from_str(&auth_config).expect("oauth auth config json should parse");
     assert_eq!(auth_config["provider_type"], "codex");

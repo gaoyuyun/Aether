@@ -3764,18 +3764,19 @@ mod tests {
         .await;
 
         assert_eq!(normal_batch.len(), 1);
-        let retry_states = metrics
-            .retry_states
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(
-            retry_states
-                .get(&(0, RequestCandidateQueueLane::Normal))
-                .map(|state| state.attempt),
-            Some(1)
-        );
-        assert!(!retry_states.contains_key(&(0, RequestCandidateQueueLane::Active)));
-        drop(retry_states);
+        {
+            let retry_states = metrics
+                .retry_states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                retry_states
+                    .get(&(0, RequestCandidateQueueLane::Normal))
+                    .map(|state| state.attempt),
+                Some(1)
+            );
+            assert!(!retry_states.contains_key(&(0, RequestCandidateQueueLane::Active)));
+        }
         assert!(request_candidate_retry_is_ready(
             &metrics,
             0,

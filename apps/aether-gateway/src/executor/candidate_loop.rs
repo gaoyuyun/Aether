@@ -666,6 +666,73 @@ struct ProviderTransferState {
 struct ProviderTransferStateTracker {
     by_provider: BTreeMap<String, ProviderTransferState>,
     exhausted_provider_ids: BTreeSet<String>,
+    global: GlobalTransferState,
+}
+
+#[derive(Debug, Default)]
+struct GlobalTransferState {
+    first_attempt_started_at: Option<Instant>,
+    last_candidate: Option<(String, String, String)>,
+    transfer_count: u64,
+    limits: Option<ProviderTransferLimits>,
+    exhausted: bool,
+}
+
+impl GlobalTransferState {
+    fn load_policy(&mut self, report_context: Option<&serde_json::Value>) {
+        if self.limits.is_none() {
+            if let Some(policy) =
+                crate::orchestration::routing_execution_policy_from_report_context(report_context)
+            {
+                self.limits = Some(ProviderTransferLimits {
+                    max_transfer_count: policy.max_transfer_count,
+                    max_transfer_timeout_seconds: policy.max_transfer_timeout_seconds,
+                });
+            }
+        }
+    }
+
+    fn changes_candidate(&self, plan: &aether_contracts::ExecutionPlan) -> bool {
+        self.last_candidate
+            .as_ref()
+            .is_some_and(|(provider, endpoint, key)| {
+                provider != &plan.provider_id
+                    || endpoint != &plan.endpoint_id
+                    || key != &plan.key_id
+            })
+    }
+
+    fn record_attempt_started(&mut self, plan: &aether_contracts::ExecutionPlan, now: Instant) {
+        self.first_attempt_started_at.get_or_insert(now);
+        if self.changes_candidate(plan) {
+            self.transfer_count = self.transfer_count.saturating_add(1);
+        }
+        self.last_candidate = Some((
+            plan.provider_id.clone(),
+            plan.endpoint_id.clone(),
+            plan.key_id.clone(),
+        ));
+    }
+
+    fn check_before_attempt(
+        &mut self,
+        plan: &aether_contracts::ExecutionPlan,
+        now: Instant,
+    ) -> Option<(bool, bool)> {
+        let limits = self.limits?;
+        let started_at = self.first_attempt_started_at?;
+        let count_reached = self.changes_candidate(plan)
+            && limits.max_transfer_count > 0
+            && self.transfer_count >= limits.max_transfer_count;
+        let timeout_reached = limits.max_transfer_timeout_seconds > 0
+            && now.saturating_duration_since(started_at)
+                >= Duration::from_secs(limits.max_transfer_timeout_seconds);
+        if !count_reached && !timeout_reached {
+            return None;
+        }
+        self.exhausted = true;
+        Some((count_reached, timeout_reached))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -728,6 +795,7 @@ struct ProviderTransferLimitReached {
 
 impl ProviderTransferStateTracker {
     fn record_attempt_started(&mut self, plan: &aether_contracts::ExecutionPlan, now: Instant) {
+        self.global.record_attempt_started(plan, now);
         match self.by_provider.entry(plan.provider_id.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(ProviderTransferState {
@@ -914,11 +982,42 @@ async fn should_skip_provider_transfer_attempt<Attempt>(
 where
     Attempt: AiExecutionAttempt + Send + Sync + 'static,
 {
-    let reached = tracker
-        .state
-        .lock()
-        .await
-        .check_before_attempt(attempt.execution_plan(), Instant::now());
+    let owned_report_context = attempt
+        .report_context_ref()
+        .is_none()
+        .then(|| attempt.report_context())
+        .flatten();
+    let report_context = attempt
+        .report_context_ref()
+        .or(owned_report_context.as_ref());
+    let mut tracker = tracker.state.lock().await;
+    tracker.global.load_policy(report_context);
+    if tracker.global.exhausted {
+        return true;
+    }
+    let now = Instant::now();
+    if let Some((count_reached, timeout_reached)) = tracker
+        .global
+        .check_before_attempt(attempt.execution_plan(), now)
+    {
+        warn!(
+            event_name = "routing_transfer_limit_reached",
+            log_type = "event",
+            trace_id,
+            plan_kind,
+            transfer_count = tracker.global.transfer_count,
+            elapsed_ms = tracker
+                .global
+                .first_attempt_started_at
+                .map(|started| now.saturating_duration_since(started).as_millis() as u64)
+                .unwrap_or(0),
+            count_reached,
+            timeout_reached,
+            "gateway exhausted the routing strategy transfer budget"
+        );
+        return true;
+    }
+    let reached = tracker.check_before_attempt(attempt.execution_plan(), now);
     let Some(reached) = reached else {
         return false;
     };
@@ -2521,6 +2620,130 @@ mod tests {
             ]
         );
         assert_eq!(port.unused.lock().unwrap().as_slice(), ["a-key3-retry0"]);
+    }
+
+    #[tokio::test]
+    async fn routing_transfer_budget_counts_switches_across_providers_not_same_key_retries() {
+        for (limit, succeeds) in [(1, false), (2, true)] {
+            let state = AppState::new().unwrap();
+            let port = TransferTestPort::new(&state);
+            let mut attempts = transfer_test_attempts();
+            for attempt in &mut attempts {
+                attempt.report_context["routing_execution_policy"] =
+                    json!({ "max_transfer_count": limit });
+            }
+            let outcome = run_ai_attempt_loop(&port, attempts).await.unwrap();
+            assert_eq!(
+                matches!(outcome, AiAttemptLoopOutcome::Responded(_)),
+                succeeds
+            );
+            {
+                let executed = port.executed.lock().unwrap();
+                assert_eq!(
+                    &executed[..3],
+                    ["a-key1-retry0", "a-key2-retry0", "a-key2-retry1"]
+                );
+                assert_eq!(executed.len(), if succeeds { 4 } else { 3 });
+            }
+            assert_eq!(port.tracker.state.lock().await.global.transfer_count, limit);
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_loop_honors_global_transfer_budget_across_providers() {
+        let state = AppState::new().unwrap();
+        let port = TransferTestPort::new(&state);
+        let mut attempts = transfer_test_attempts();
+        for attempt in &mut attempts {
+            attempt.report_context["routing_execution_policy"] = json!({ "max_transfer_count": 1 });
+        }
+        let mut source = TransferTestAttemptSource {
+            attempts: attempts.into(),
+            skipped_providers: Vec::new(),
+        };
+        let outcome = run_dynamic_attempt_loop(
+            &port,
+            &mut source,
+            "global-budget",
+            "test",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            LocalExecutionRequestOutcome::Exhausted(_)
+        ));
+        assert_eq!(
+            port.executed.lock().unwrap().as_slice(),
+            ["a-key1-retry0", "a-key2-retry0", "a-key2-retry1"]
+        );
+        assert_eq!(source.skipped_providers, ["provider-a", "provider-b"]);
+    }
+
+    #[test]
+    fn routing_time_budget_is_cumulative_and_zero_is_unlimited() {
+        let mut global = super::GlobalTransferState::default();
+        global.load_policy(Some(
+            &json!({ "routing_execution_policy": { "max_transfer_timeout_seconds": 60 } }),
+        ));
+        let now = tokio::time::Instant::now();
+        let plan = test_plan(None);
+        global.record_attempt_started(&plan, now);
+        global.record_attempt_started(&plan, now + Duration::from_secs(40));
+        assert_eq!(global.transfer_count, 0);
+        assert_eq!(
+            global.check_before_attempt(&plan, now + Duration::from_secs(59)),
+            None
+        );
+        assert_eq!(
+            global.check_before_attempt(&plan, now + Duration::from_secs(60)),
+            Some((false, true))
+        );
+        let mut unlimited = super::GlobalTransferState::default();
+        unlimited.load_policy(Some(&json!({ "routing_execution_policy": {} })));
+        unlimited.record_attempt_started(&plan, now);
+        assert_eq!(
+            unlimited.check_before_attempt(&plan, now + Duration::from_secs(86_400)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cloned_tracker_preserves_global_budget_across_candidate_loops() {
+        let state = AppState::new().unwrap();
+        let tracker = ProviderTransferTracker::default();
+        let mut attempts = transfer_test_attempts();
+        for attempt in &mut attempts {
+            attempt.report_context["routing_execution_policy"] = json!({ "max_transfer_count": 1 });
+        }
+        let remaining = attempts.split_off(3);
+        let first_port = TransferTestPort::with_tracker(&state, tracker.clone());
+        let first_outcome = run_ai_attempt_loop(&first_port, attempts).await.unwrap();
+        assert!(matches!(first_outcome, AiAttemptLoopOutcome::Exhausted(_)));
+        assert_eq!(tracker.state.lock().await.global.transfer_count, 1);
+
+        let second_port = TransferTestPort::with_tracker(&state, tracker.clone());
+        let mut source = TransferTestAttemptSource {
+            attempts: remaining.into(),
+            skipped_providers: Vec::new(),
+        };
+        let second_outcome = run_dynamic_attempt_loop(
+            &second_port,
+            &mut source,
+            "global-budget-across-loops",
+            "test",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            second_outcome,
+            LocalExecutionRequestOutcome::NoPath
+        ));
+        assert!(second_port.executed.lock().unwrap().is_empty());
+        assert_eq!(source.skipped_providers, ["provider-a", "provider-b"]);
+        assert!(tracker.state.lock().await.global.exhausted);
     }
 
     #[tokio::test]

@@ -44,7 +44,7 @@ pub(crate) fn local_auth_jwt_secret() -> Result<String, String> {
         Err(std::env::VarError::NotPresent) => {
             #[cfg(test)]
             {
-                return Ok(TEST_JWT_SECRET.to_string());
+                Ok(TEST_JWT_SECRET.to_string())
             }
 
             #[cfg(not(test))]

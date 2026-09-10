@@ -168,52 +168,6 @@ fn wallet_public_refund_payload(mut payload: serde_json::Value) -> serde_json::V
     payload
 }
 
-#[cfg(test)]
-mod tests {
-    use super::wallet_refund_payload_from_record;
-    use aether_data::repository::wallet::StoredAdminWalletRefund;
-    use serde_json::json;
-
-    #[test]
-    fn public_refund_projection_excludes_payout_proof_and_upstream_payload() {
-        let record = StoredAdminWalletRefund {
-            id: "refund-1".to_string(),
-            refund_no: "rf_1".to_string(),
-            wallet_id: "wallet-1".to_string(),
-            user_id: Some("user-1".to_string()),
-            payment_order_id: Some("order-1".to_string()),
-            source_type: "payment_order".to_string(),
-            source_id: Some("order-1".to_string()),
-            refund_mode: "original_channel".to_string(),
-            amount_usd: 10.0,
-            status: "processing".to_string(),
-            reason: Some("requested".to_string()),
-            failure_reason: None,
-            gateway_refund_id: Some("gateway-refund-1".to_string()),
-            payout_method: None,
-            payout_reference: None,
-            payout_proof: Some(json!({
-                "gateway_refund": {
-                    "id": "gateway-refund-1",
-                    "payload": {"payer": "sensitive", "credential": "secret"}
-                }
-            })),
-            requested_by: Some("user-1".to_string()),
-            approved_by: Some("admin-1".to_string()),
-            processed_by: Some("admin-1".to_string()),
-            created_at_unix_ms: 1,
-            updated_at_unix_secs: 1,
-            processed_at_unix_secs: Some(1),
-            completed_at_unix_secs: None,
-        };
-
-        let payload = wallet_refund_payload_from_record(&record);
-        assert!(payload.get("payout_proof").is_none());
-        assert_eq!(payload["status"], "processing");
-        assert_eq!(payload["gateway_refund_id"], "gateway-refund-1");
-    }
-}
-
 pub(super) async fn handle_wallet_refunds_list(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
@@ -657,5 +611,51 @@ pub(super) async fn handle_wallet_create_refund(
                 false,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wallet_refund_payload_from_record;
+    use aether_data::repository::wallet::StoredAdminWalletRefund;
+    use serde_json::json;
+
+    #[test]
+    fn public_refund_projection_excludes_payout_proof_and_upstream_payload() {
+        let record = StoredAdminWalletRefund {
+            id: "refund-1".to_string(),
+            refund_no: "rf_1".to_string(),
+            wallet_id: "wallet-1".to_string(),
+            user_id: Some("user-1".to_string()),
+            payment_order_id: Some("order-1".to_string()),
+            source_type: "payment_order".to_string(),
+            source_id: Some("order-1".to_string()),
+            refund_mode: "original_channel".to_string(),
+            amount_usd: 10.0,
+            status: "processing".to_string(),
+            reason: Some("requested".to_string()),
+            failure_reason: None,
+            gateway_refund_id: Some("gateway-refund-1".to_string()),
+            payout_method: None,
+            payout_reference: None,
+            payout_proof: Some(json!({
+                "gateway_refund": {
+                    "id": "gateway-refund-1",
+                    "payload": {"payer": "sensitive", "credential": "secret"}
+                }
+            })),
+            requested_by: Some("user-1".to_string()),
+            approved_by: Some("admin-1".to_string()),
+            processed_by: Some("admin-1".to_string()),
+            created_at_unix_ms: 1,
+            updated_at_unix_secs: 1,
+            processed_at_unix_secs: Some(1),
+            completed_at_unix_secs: None,
+        };
+
+        let payload = wallet_refund_payload_from_record(&record);
+        assert!(payload.get("payout_proof").is_none());
+        assert_eq!(payload["status"], "processing");
+        assert_eq!(payload["gateway_refund_id"], "gateway-refund-1");
     }
 }
