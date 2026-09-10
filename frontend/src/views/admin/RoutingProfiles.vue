@@ -886,6 +886,7 @@ import {
   savePerModelRoutingConfig,
   setRoutingSortingScope,
   upsertModelSchedulingRule,
+  type RoutingDefaultPolicy,
   type RoutingGroupConfig,
   type RoutingPriorityMode,
   type RoutingSchedulingMode,
@@ -1329,49 +1330,34 @@ function updateFirstStepSchedulingMode(mode: RoutingSchedulingMode): void {
   })
 }
 
-function updateStickyKeyAttempts(value: string | number): void {
+function updateDefaultPolicy(patch: Partial<RoutingDefaultPolicy>): void {
   if (!draft.value) return
-  updateDraftConfig({
-    ...draft.value.config_json,
-    default_policy: {
-      ...draft.value.config_json.default_policy,
-      sticky_key_attempts: normalizeStickyKeyAttempts(value),
-    },
-  })
+  Object.assign(draft.value.config_json.default_policy, patch)
+  // 同步全局选项，避免误判模型有未保存改动，或保存模型时覆盖全局修改。
+  if (editingConfig.value) {
+    editingConfig.value.default_policy = normalizeRoutingGroupConfig({
+      default_policy: draft.value.config_json.default_policy,
+    }).default_policy
+  }
+}
+
+function updateStickyKeyAttempts(value: string | number): void {
+  updateDefaultPolicy({ sticky_key_attempts: normalizeStickyKeyAttempts(value) })
 }
 
 function updateKeepPriorityOnConversion(value: boolean): void {
-  if (!draft.value) return
-  updateDraftConfig({
-    ...draft.value.config_json,
-    default_policy: {
-      ...draft.value.config_json.default_policy,
-      keep_priority_on_conversion: value,
-    },
-  })
+  updateDefaultPolicy({ keep_priority_on_conversion: value })
 }
 
 function updateExecutionPolicy(
   field: 'enable_cf_heartbeat' | 'cyber_continue_failover' | 'cancel_on_client_disconnect',
   value: boolean,
 ): void {
-  if (!draft.value) return
-  updateDraftConfig({
-    ...draft.value.config_json,
-    default_policy: {
-      ...draft.value.config_json.default_policy,
-      [field]: value,
-    },
-  })
+  updateDefaultPolicy({ [field]: value })
 }
 
 function updateRoutingFailoverPolicy(value: RoutingFailoverPolicy): void {
-  if (!draft.value) return
-  const patch = normalizeRoutingFailoverPolicy(value)
-  Object.assign(draft.value.config_json.default_policy, patch)
-  if (editingConfig.value) {
-    Object.assign(editingConfig.value.default_policy, normalizeRoutingFailoverPolicy(patch))
-  }
+  updateDefaultPolicy(normalizeRoutingFailoverPolicy(value))
 }
 
 function removePerModelPolicy(model: string): void {

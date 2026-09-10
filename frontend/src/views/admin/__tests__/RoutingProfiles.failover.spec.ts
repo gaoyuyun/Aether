@@ -25,14 +25,15 @@ vi.mock('@/features/routing/components', async () => ({
 
 const mounted: Array<{ app: App, root: HTMLElement }> = []
 
-function group(id: string): RoutingGroupRecord {
+function group(id: string, scope: 'unified' | 'per_model' = 'unified'): RoutingGroupRecord {
+  const config = createEmptyRoutingGroupConfig()
   return {
     id,
     name: id,
     enabled: true,
     is_system_default: false,
     sort_order: 0,
-    config_json: createEmptyRoutingGroupConfig(),
+    config_json: scope === 'per_model' ? savePerModelRoutingConfig(config, 'model-a') : config,
     version: 1,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
@@ -98,8 +99,8 @@ afterEach(() => {
 })
 
 describe('RoutingProfiles failover persistence', () => {
-  it('enables Save for JSON-only edits and persists both sections together', async () => {
-    const root = await mountPage()
+  it.each(['unified', 'per_model'] as const)('enables Save for JSON-only edits and persists both sections together (%s)', async (scope) => {
+    const root = await mountPage([group('strategy-a', scope)])
     expect(button(root, '保存').disabled).toBe(true)
     await editJson(root, '成功转移规则', '[{"pattern":"(?i)capacity"}]')
     await editJson(root, '错误终止规则', '[{"status_codes":[400,413]}]')
@@ -144,7 +145,7 @@ describe('RoutingProfiles failover persistence', () => {
     expect(routingApi.updateRoutingGroup.mock.calls[0][1].config_json.default_policy.failover_rules.success_failover_patterns).toEqual([])
   })
 
-  it('preserves global failover edits while saving an independently edited model', async () => {
+  it('preserves global system and failover edits while saving an independently edited model', async () => {
     const strategy = group('strategy-a')
     strategy.config_json = savePerModelRoutingConfig(strategy.config_json, 'model-a')
     const root = await mountPage([strategy])
@@ -156,10 +157,16 @@ describe('RoutingProfiles failover persistence', () => {
     if (!model) throw new Error('Missing configured model')
     model.click()
     await nextTick()
+    await input(root, '全局最大转移时间', '60')
+    expect(button(root, '保存').disabled).toBe(false)
+    expect(element<HTMLButtonElement>(root, 'button[title="保存到草稿"]').disabled).toBe(true)
     const loadBalance = [...root.querySelectorAll<HTMLButtonElement>('button')].find(control => control.textContent?.trim() === '负载均衡')
     if (!loadBalance) throw new Error('Missing model scheduling control')
     loadBalance.click()
     await nextTick()
+    button(root, 'CF保持心跳').click()
+    await nextTick()
+    await input(root, '错误重试次数', '4')
     await input(root, '全局最大转移次数', '5')
     button(root, '添加错误终止规则').click()
     await nextTick()
@@ -172,9 +179,90 @@ describe('RoutingProfiles failover persistence', () => {
     await flush()
     expect(routingApi.updateRoutingGroup).toHaveBeenCalledTimes(1)
     const saved = routingApi.updateRoutingGroup.mock.calls[0][1].config_json
+    expect(saved.default_policy.enable_cf_heartbeat).toBe(true)
+    expect(saved.default_policy.sticky_key_attempts).toBe(4)
     expect(saved.default_policy.max_transfer_count).toBe(5)
+    expect(saved.default_policy.max_transfer_timeout_seconds).toBe(60)
     expect(saved.default_policy.failover_rules.error_stop_patterns).toEqual([{ pattern: '', status_codes: [429] }])
     expect(getModelScheduling(saved, 'model-a').scheduling_mode).toBe('load_balance')
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+})
+
+describe.each(['unified', 'per_model'] as const)('RoutingProfiles global settings (%s)', (scope) => {
+  it.each([
+    { label: '格式转换保持优先级', field: 'keep_priority_on_conversion', value: true },
+    { label: 'Cyber继续转移', field: 'cyber_continue_failover', value: true },
+    { label: 'CF保持心跳', field: 'enable_cf_heartbeat', value: true },
+    { label: '取消请求立即打断', field: 'cancel_on_client_disconnect', value: true },
+    { label: '错误重试次数', field: 'sticky_key_attempts', value: 4 },
+    { label: '全局最大转移次数', field: 'max_transfer_count', value: 5 },
+    { label: '全局最大转移时间', field: 'max_transfer_timeout_seconds', value: 60 },
+  ] as const)('saves $label without requiring a model save', async ({ label, field, value }) => {
+    const strategy = group('strategy-a', scope)
+    const root = await mountPage([strategy])
+    const initialValue = strategy.config_json.default_policy[field]
+    const setValue = async (nextValue: boolean | number) => {
+      if (typeof nextValue === 'boolean') {
+        button(root, label).click()
+        await nextTick()
+      } else {
+        await input(root, label, String(nextValue))
+      }
+    }
+
+    expect(button(root, '保存').disabled).toBe(true)
+    await setValue(value)
+    expect(button(root, '保存').disabled).toBe(false)
+    expect(root.querySelector('button[title="保存到草稿"]')).toBeNull()
+
+    await setValue(initialValue)
+    expect(button(root, '保存').disabled).toBe(true)
+    await setValue(value)
+    button(root, '保存').click()
+    await flush()
+
+    expect(routingApi.updateRoutingGroup).toHaveBeenCalledTimes(1)
+    expect(routingApi.updateRoutingGroup.mock.calls[0][1].config_json.default_policy[field]).toBe(value)
+    expect(button(root, '保存').disabled).toBe(true)
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+
+  it('saves system options together with added, edited and removed failover form rules', async () => {
+    const root = await mountPage([group('strategy-a', scope)])
+    button(root, '取消请求立即打断').click()
+    await nextTick()
+    button(root, '添加成功转移规则').click()
+    await nextTick()
+    await input(root, '成功转移规则 1 正则', '(?i)capacity')
+    button(root, '添加错误终止规则').click()
+    await nextTick()
+    await input(root, '终止规则 1 状态码', '400, 413')
+    expect(button(root, '保存').disabled).toBe(false)
+    button(root, '保存').click()
+    await flush()
+
+    expect(routingApi.updateRoutingGroup).toHaveBeenCalledTimes(1)
+    expect(routingApi.updateRoutingGroup.mock.calls[0][1].config_json.default_policy.cancel_on_client_disconnect).toBe(true)
+    expect(routingApi.updateRoutingGroup.mock.calls[0][1].config_json.default_policy.failover_rules).toEqual({
+      success_failover_patterns: [{ pattern: '(?i)capacity', status_codes: [] }],
+      error_stop_patterns: [{ pattern: '', status_codes: [400, 413] }],
+    })
+    expect(button(root, '保存').disabled).toBe(true)
+
+    await input(root, '成功转移规则 1 正则', '(?i)overloaded')
+    button(root, '删除错误终止规则 1').click()
+    await nextTick()
+    expect(button(root, '保存').disabled).toBe(false)
+    button(root, '保存').click()
+    await flush()
+
+    expect(routingApi.updateRoutingGroup).toHaveBeenCalledTimes(2)
+    expect(routingApi.updateRoutingGroup.mock.calls[1][1].config_json.default_policy.failover_rules).toEqual({
+      success_failover_patterns: [{ pattern: '(?i)overloaded', status_codes: [] }],
+      error_stop_patterns: [],
+    })
+    expect(button(root, '保存').disabled).toBe(true)
     expect(toast.error).not.toHaveBeenCalled()
   })
 })
