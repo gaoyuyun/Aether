@@ -1435,15 +1435,82 @@ fn sqlite_usage_leaderboard_group_expr(
         }
         UsageLeaderboardGroupBy::User => (
             "user_id",
-            "(SELECT users.username FROM users WHERE users.id = user_id)",
+            "(SELECT users.username FROM users WHERE users.id = usage_totals.group_key)",
             "user_id IS NOT NULL AND TRIM(user_id) <> ''",
         ),
         UsageLeaderboardGroupBy::ApiKey => (
             "api_key_id",
-            "(SELECT api_keys.name FROM api_keys WHERE api_keys.id = api_key_id)",
+            "(SELECT api_keys.name FROM api_keys WHERE api_keys.id = usage_totals.group_key)",
             "api_key_id IS NOT NULL AND TRIM(api_key_id) <> ''",
         ),
     }
+}
+
+fn sqlite_usage_leaderboard_query(query: &UsageLeaderboardQuery) -> QueryBuilder<'static, Sqlite> {
+    let (group_key_expr, legacy_name_expr, extra_filter) =
+        sqlite_usage_leaderboard_group_expr(query.group_by);
+    // Resolve names after grouping, once per key/user rather than per request.
+    // SQLite can prefer the grouping index or settlement primary-key index,
+    // loading large rows for each request. Keep unscoped analytics on covering
+    // indexes; a user filter may still benefit from its selective user index.
+    let usage_index = if query.user_id.is_none() {
+        " INDEXED BY idx_usage_analytics_covering"
+    } else {
+        ""
+    };
+    let mut builder = QueryBuilder::<Sqlite>::new(format!(
+        r#"
+WITH usage_totals AS (
+SELECT
+  {group_key_expr} AS group_key,
+  COUNT(*) AS request_count,
+  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
+  COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd
+FROM "usage"{usage_index}
+LEFT JOIN usage_settlement_snapshots AS settlement
+  INDEXED BY idx_usage_settlement_analytics_covering
+  ON settlement.request_id = "usage".request_id
+"#,
+        total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR
+    ));
+    let mut has_where = false;
+    push_sqlite_usage_range(
+        &mut builder,
+        &mut has_where,
+        query.created_from_unix_secs,
+        query.created_until_unix_secs,
+    );
+    push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
+    push_sqlite_usage_where(&mut builder, &mut has_where);
+    builder.push(extra_filter);
+    push_sqlite_usage_optional_text_filter(
+        &mut builder,
+        &mut has_where,
+        "user_id",
+        query.user_id.as_deref(),
+    );
+    push_sqlite_usage_optional_text_filter(
+        &mut builder,
+        &mut has_where,
+        "provider_name",
+        query.provider_name.as_deref(),
+    );
+    push_sqlite_usage_optional_text_filter(
+        &mut builder,
+        &mut has_where,
+        "model",
+        query.model.as_deref(),
+    );
+    builder.push(format!(
+        r#"
+GROUP BY group_key
+)
+SELECT usage_totals.*, {legacy_name_expr} AS legacy_name
+FROM usage_totals
+ORDER BY group_key ASC
+"#
+    ));
+    builder
 }
 
 fn sqlite_usage_body_sql_columns(field: UsageBodyField) -> (&'static str, &'static str) {
@@ -3023,6 +3090,7 @@ SELECT
   ), 0) AS estimated_full_cost_usd
 FROM "usage"
 LEFT JOIN usage_settlement_snapshots AS settlement
+  INDEXED BY idx_usage_settlement_analytics_covering
   ON settlement.request_id = "usage".request_id
 "#,
             input_price_expr = sqlite_usage_metadata_input_price_expr()
@@ -3748,6 +3816,7 @@ SELECT
     AS overall_response_time_samples
 FROM "usage"
 LEFT JOIN usage_settlement_snapshots AS settlement
+  INDEXED BY idx_usage_settlement_analytics_covering
   ON settlement.request_id = "usage".request_id
 "#,
             effective_input_expr = SQLITE_USAGE_EFFECTIVE_INPUT_TOKENS_EXPR,
@@ -4635,52 +4704,7 @@ FROM "usage"
             return Ok(Vec::new());
         }
 
-        let (group_key_expr, legacy_name_expr, extra_filter) =
-            sqlite_usage_leaderboard_group_expr(query.group_by);
-        let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            r#"
-SELECT
-  {group_key_expr} AS group_key,
-  MAX({legacy_name_expr}) AS legacy_name,
-  COUNT(*) AS request_count,
-  COALESCE(SUM({total_tokens_expr}), 0) AS total_tokens,
-  COALESCE(SUM(COALESCE(CAST(total_cost_usd AS REAL), 0)), 0) AS total_cost_usd
-FROM "usage"
-LEFT JOIN usage_settlement_snapshots AS settlement
-  ON settlement.request_id = "usage".request_id
-"#,
-            total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR
-        ));
-        let mut has_where = false;
-        push_sqlite_usage_range(
-            &mut builder,
-            &mut has_where,
-            query.created_from_unix_secs,
-            query.created_until_unix_secs,
-        );
-        push_sqlite_usage_finalized_filter(&mut builder, &mut has_where);
-        push_sqlite_usage_where(&mut builder, &mut has_where);
-        builder.push(extra_filter);
-        push_sqlite_usage_optional_text_filter(
-            &mut builder,
-            &mut has_where,
-            "user_id",
-            query.user_id.as_deref(),
-        );
-        push_sqlite_usage_optional_text_filter(
-            &mut builder,
-            &mut has_where,
-            "provider_name",
-            query.provider_name.as_deref(),
-        );
-        push_sqlite_usage_optional_text_filter(
-            &mut builder,
-            &mut has_where,
-            "model",
-            query.model.as_deref(),
-        );
-        builder.push(" GROUP BY group_key ORDER BY group_key ASC");
-
+        let mut builder = sqlite_usage_leaderboard_query(query);
         let rows = builder.build().fetch_all(&self.pool).await.map_sql_err()?;
         rows.iter()
             .map(|row| {
@@ -5024,6 +5048,8 @@ WHERE "usage".provider_id = ?
         let created_until_unix_secs = usage_current_unix_secs().saturating_add(1);
         let user_id = query.user_id.as_deref();
         let mut summaries = BTreeMap::<String, StoredUsageDailySummary>::new();
+        let mut raw_ranges = Vec::new();
+        let mut cursor = query.created_from_unix_secs;
 
         for item in self
             .summarize_usage_daily_heatmap_from_daily_aggregates(
@@ -5033,17 +5059,34 @@ WHERE "usage".provider_id = ?
             )
             .await?
         {
+            let day_start = chrono::NaiveDate::parse_from_str(&item.date, "%Y-%m-%d")
+                .map_err(|err| {
+                    DataLayerError::UnexpectedValue(format!("invalid heatmap date: {err}"))
+                })?
+                .and_time(chrono::NaiveTime::MIN)
+                .and_utc()
+                .timestamp()
+                .max(0) as u64;
+            if cursor < day_start {
+                raw_ranges.push((cursor, day_start));
+            }
+            cursor = cursor.max(day_start.saturating_add(86_400));
             summaries.insert(item.date.clone(), item);
         }
-        for item in self
-            .summarize_usage_daily_heatmap_raw_from_range(
-                query.created_from_unix_secs,
-                created_until_unix_secs,
-                user_id,
-            )
-            .await?
-        {
-            summaries.entry(item.date.clone()).or_insert(item);
+        if cursor < created_until_unix_secs {
+            raw_ranges.push((cursor, created_until_unix_secs));
+        }
+        // Daily aggregates remain authoritative, including imported history.
+        // Only read gaps and the live tail: scanning all raw history and then
+        // discarding dates already present above defeats the rollup entirely.
+        // Do not use MAX(date) as a cutoff, since older buckets can be missing.
+        for (from, until) in raw_ranges {
+            for item in self
+                .summarize_usage_daily_heatmap_raw_from_range(from, until, user_id)
+                .await?
+            {
+                summaries.entry(item.date.clone()).or_insert(item);
+            }
         }
 
         Ok(summaries.into_values().collect())
@@ -6197,3 +6240,6 @@ fn row_u64(row: &SqliteRow, field: &str) -> Result<u64, DataLayerError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod analytics_tests;
