@@ -155,6 +155,14 @@ debug = "line-tables-only"
 # lighter debug format here as well to reduce rustc peak memory.
 debug = "line-tables-only"
 
+# Without incremental compilation, Cargo defaults to 16 codegen units.
+# Partition this large crate more finely for dev/test compilation.
+[profile.dev.package.aether-gateway]
+codegen-units = 256
+
+[profile.test.package.aether-gateway]
+codegen-units = 256
+
 [profile.release]
 lto = "thin"
 strip = true

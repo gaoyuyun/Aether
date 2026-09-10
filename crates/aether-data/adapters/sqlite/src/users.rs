@@ -3367,14 +3367,7 @@ INSERT INTO users (
 
     #[tokio::test]
     async fn sqlite_hard_delete_preserves_history_ids_and_anonymizes_snapshots() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::raw_sql(
             r#"
 INSERT INTO users (
@@ -3813,14 +3806,7 @@ INSERT INTO audit_logs (
 
     #[tokio::test]
     async fn sqlite_atomic_user_delete_requires_wallet_absence() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             "INSERT INTO users (id, username, email, role, auth_source, is_active, is_deleted, created_at, updated_at) VALUES ('atomic-user', 'atomic-user', 'atomic@example.com', 'user', 'local', 1, 0, 1, 1)",
         )
@@ -3862,14 +3848,7 @@ INSERT INTO audit_logs (
 
     #[tokio::test]
     async fn sqlite_atomic_user_delete_detects_api_key_wallet() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             "INSERT INTO users (id, username, email, role, auth_source, is_active, is_deleted, created_at, updated_at) VALUES ('api-wallet-user', 'api-wallet-user', 'api-wallet@example.com', 'user', 'local', 1, 0, 1, 1)",
         )
@@ -3940,14 +3919,7 @@ INSERT INTO audit_logs (
 
     #[tokio::test]
     async fn sqlite_atomically_preserves_last_active_admin_and_revokes_on_security_change() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_sqlite_admin(&pool, "admin-1", "admin_one").await;
         sqlx::query(
             "INSERT INTO management_tokens (id, user_id, name, token_hash, created_at, updated_at) VALUES ('token-admin-1', 'admin-1', 'admin token', 'token-hash-admin-1', 1, 1)",
@@ -4121,14 +4093,7 @@ INSERT INTO users (
 
     #[tokio::test]
     async fn sqlite_repository_reads_user_contract_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO users (
@@ -4552,14 +4517,7 @@ INSERT INTO users (
 
     #[tokio::test]
     async fn failed_non_password_session_insert_rolls_back_device_revocation() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_active_session_test_user(&pool, "session-rollback-user").await;
         let repository = SqliteUserReadRepository::new(pool);
         let now = chrono::Utc::now();
@@ -4596,14 +4554,7 @@ INSERT INTO users (
 
     #[tokio::test]
     async fn security_state_changes_revoke_sessions_without_reactivation() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_active_session_test_user(&pool, "sqlite-security-state-user").await;
         let repository = SqliteUserReadRepository::new(pool);
         let now = chrono::Utc::now();
@@ -4738,14 +4689,7 @@ INSERT INTO users (
 
     #[tokio::test]
     async fn unchanged_security_state_preserves_sqlite_sessions() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_active_session_test_user(&pool, "sqlite-unchanged-security-user").await;
         let repository = SqliteUserReadRepository::new(pool);
         let now = chrono::Utc::now();
@@ -4791,14 +4735,7 @@ INSERT INTO users (
 
     #[tokio::test]
     async fn sqlite_repository_manages_oauth_users_and_links() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO oauth_providers (
@@ -5167,14 +5104,7 @@ INSERT INTO oauth_providers (
 
     #[tokio::test]
     async fn sqlite_oauth_bind_rejects_disabled_provider() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO oauth_providers (
@@ -5212,14 +5142,7 @@ INSERT INTO oauth_providers (
 
     #[tokio::test]
     async fn sqlite_oauth_unbind_only_counts_enabled_provider_links() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO oauth_providers (
@@ -5281,14 +5204,7 @@ INSERT INTO oauth_providers (
 
     #[tokio::test]
     async fn sqlite_oauth_unbind_respects_ldap_exclusive_local_login_policy() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO oauth_providers (

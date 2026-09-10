@@ -862,14 +862,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_writes_and_reads_video_tasks() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteVideoTaskRepository::new(pool);
         repository
@@ -979,14 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_rejects_identity_conflicts_without_modifying_task_state() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteVideoTaskRepository::new(pool);
         let original = sample_task("task-owned", VideoTaskStatus::Submitted, 100);
@@ -1122,12 +1108,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_video_claim_and_completion_preserve_business_fields() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        run_migrations(&pool).await.unwrap();
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteVideoTaskRepository::new(pool.clone());
         for api_format in ["openai:video", "gemini:video"] {
             let id = uuid::Uuid::new_v4().to_string();

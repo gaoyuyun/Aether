@@ -21,6 +21,8 @@ mod proxy_nodes;
 mod quota;
 mod routing_profiles;
 mod settlement;
+#[cfg(test)]
+mod test_support;
 mod usage;
 mod users;
 mod video_tasks;

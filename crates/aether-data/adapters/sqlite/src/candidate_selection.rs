@@ -1419,7 +1419,6 @@ mod tests {
         ExactPageAccumulator, SqliteMinimalCandidateSelectionReadRepository,
         REQUESTED_MODEL_RAW_SCAN_LIMIT,
     };
-    use crate::run_migrations;
     use aether_data_contracts::repository::candidate_selection::{
         MinimalCandidateSelectionReadRepository, StoredPoolKeyCandidateOrder,
         StoredPoolKeyCandidateRowsQuery, StoredRequestedModelCandidateRowsQuery,
@@ -1568,14 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_reads_candidate_selection_rows() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_candidate_selection(&pool).await;
 
         let repository = SqliteMinimalCandidateSelectionReadRepository::new(pool);
@@ -1688,14 +1680,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_requested_model_page_crosses_coarse_false_positive_windows() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_requested_model_pagination(&pool).await;
 
         let repository = SqliteMinimalCandidateSelectionReadRepository::new(pool);
@@ -1717,14 +1702,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_load_balance_pool_key_pages_use_stable_seeded_order() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_candidate_selection(&pool).await;
 
         let repository = SqliteMinimalCandidateSelectionReadRepository::new(pool);

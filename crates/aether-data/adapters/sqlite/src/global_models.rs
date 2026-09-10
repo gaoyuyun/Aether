@@ -1165,7 +1165,6 @@ fn optional_admin_global_model_usage_count_i64(
 #[cfg(test)]
 mod tests {
     use super::SqliteGlobalModelReadRepository;
-    use crate::run_migrations;
     use aether_data_contracts::repository::global_models::{
         AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
         GlobalModelReadRepository, PublicCatalogModelListQuery, PublicCatalogModelSearchQuery,
@@ -1175,14 +1174,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_reads_global_model_contract_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_rows(&pool).await;
 
         let repository = SqliteGlobalModelReadRepository::new(pool);
@@ -1273,14 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_writes_global_models_and_provider_models() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_provider(&pool).await;
 
         let repository = SqliteGlobalModelReadRepository::new(pool);
@@ -1402,14 +1387,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_public_catalog_defaults_missing_input_and_output_prices_to_zero() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_provider(&pool).await;
         sqlx::query(
             r#"

@@ -711,7 +711,6 @@ mod tests {
         non_negative_u64, optional_unix_secs, SqliteManagementTokenRepository,
         UPDATE_MANAGEMENT_TOKEN_SQL,
     };
-    use crate::run_migrations;
     use aether_data_contracts::repository::management_tokens::{
         ActivateManagementTokenIfMatches, CreateManagementTokenRecord, ManagementTokenListQuery,
         ManagementTokenReadRepository, ManagementTokenWriteRepository,
@@ -744,14 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_round_trips_management_tokens() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO users (id, email, username, role, is_active, created_at, updated_at)
@@ -976,14 +968,7 @@ VALUES ('user-1', 'user-1@example.com', 'user-1', 'admin', 1, 1, 1)
 
     #[tokio::test]
     async fn sqlite_install_activation_rejects_changed_admin_identity_snapshot() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO users (

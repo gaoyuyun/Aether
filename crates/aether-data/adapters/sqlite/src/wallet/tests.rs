@@ -40,14 +40,7 @@ async fn ensure_test_users(pool: &sqlx::SqlitePool, user_ids: &[&str]) {
 
 #[tokio::test]
 async fn sqlite_stripe_secret_cas_requires_the_exact_locked_row() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     ensure_test_user(&pool, "stripe-cas-user").await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let wallet = repository
@@ -138,14 +131,7 @@ async fn sqlite_stripe_secret_cas_requires_the_exact_locked_row() {
 
 #[tokio::test]
 async fn sqlite_admin_balance_adjustment_rejects_invalid_numbers_without_writes() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "invalid-adjustment-user").await;
     let wallet = repository
@@ -204,14 +190,7 @@ async fn sqlite_admin_balance_adjustment_rejects_invalid_numbers_without_writes(
 
 #[tokio::test]
 async fn sqlite_manual_wallet_recharge_rejects_invalid_numbers_without_writes() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     ensure_test_user(&pool, "invalid-manual-recharge-user").await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let wallet = repository
@@ -320,14 +299,7 @@ async fn sqlite_manual_wallet_recharge_rejects_invalid_numbers_without_writes() 
 
 #[tokio::test]
 async fn sqlite_wallet_initialization_rejects_missing_owners_without_writes() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     assert!(repository
@@ -378,14 +350,7 @@ async fn sqlite_wallet_initialization_rejects_missing_owners_without_writes() {
 
 #[tokio::test]
 async fn sqlite_wallet_read_repository_reads_wallet_contract_views() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_rows(&pool).await;
 
     let repository = SqliteWalletReadRepository::new(pool);
@@ -468,14 +433,7 @@ async fn sqlite_wallet_read_repository_reads_wallet_contract_views() {
 
 #[tokio::test]
 async fn sqlite_provisional_wallet_cleanup_is_activity_guarded() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     ensure_test_user(&pool, "provisional-user").await;
@@ -529,14 +487,7 @@ async fn sqlite_provisional_wallet_cleanup_is_activity_guarded() {
 
 #[tokio::test]
 async fn sqlite_wallet_compensation_delete_is_owner_and_reference_guarded() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     ensure_test_user(&pool, "funded-compensation-user").await;
@@ -626,14 +577,7 @@ INSERT INTO wallet_daily_usage_ledgers (
 
 #[tokio::test]
 async fn sqlite_wallet_snapshot_compensation_deletes_funded_match_only() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     ensure_test_user(&pool, "snapshot-compensation-user").await;
@@ -735,14 +679,7 @@ INSERT INTO wallet_daily_usage_ledgers (
 
 #[tokio::test]
 async fn sqlite_wallet_refund_rejects_invalid_amounts_and_foreign_wallets() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     ensure_test_user(&pool, "refund-security-user").await;
@@ -818,14 +755,7 @@ async fn sqlite_wallet_refund_rejects_invalid_amounts_and_foreign_wallets() {
 
 #[tokio::test]
 async fn sqlite_wallet_refund_rejects_invalid_reserved_amounts() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     ensure_test_user(&pool, "refund-reservation-user").await;
@@ -1074,14 +1004,7 @@ WHERE id = ?
 
 #[tokio::test]
 async fn sqlite_process_refund_rejects_corrupt_persisted_amount_without_side_effects() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     for (index, amount_usd) in [0.0, -1.0, f64::INFINITY].into_iter().enumerate() {
@@ -1106,14 +1029,7 @@ async fn sqlite_process_refund_rejects_corrupt_persisted_amount_without_side_eff
 
 #[tokio::test]
 async fn sqlite_complete_refund_rejects_corrupt_persisted_amount_without_side_effects() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     for (index, amount_usd) in [0.0, -1.0, f64::INFINITY].into_iter().enumerate() {
@@ -1141,14 +1057,7 @@ async fn sqlite_complete_refund_rejects_corrupt_persisted_amount_without_side_ef
 
 #[tokio::test]
 async fn sqlite_fail_refund_rejects_corrupt_persisted_amount_without_side_effects() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     for (index, amount_usd) in [0.0, -1.0, f64::INFINITY].into_iter().enumerate() {
@@ -1174,14 +1083,7 @@ async fn sqlite_fail_refund_rejects_corrupt_persisted_amount_without_side_effect
 
 #[tokio::test]
 async fn sqlite_fail_refund_rejects_negative_recharge_balance_without_side_effects() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let fixture = create_refund_mutation_fixture(&repository, "fail-negative-balance").await;
     process_refund_mutation_fixture(&repository, &fixture).await;
@@ -1210,14 +1112,7 @@ async fn sqlite_fail_refund_rejects_negative_recharge_balance_without_side_effec
 
 #[tokio::test]
 async fn sqlite_pending_gateway_refund_evidence_is_durable_and_cannot_be_reverted() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let fixture = create_refund_mutation_fixture(&repository, "pending-gateway").await;
     process_refund_mutation_fixture(&repository, &fixture).await;
@@ -1343,14 +1238,7 @@ async fn sqlite_pending_gateway_refund_evidence_is_durable_and_cannot_be_reverte
 
 #[tokio::test]
 async fn sqlite_success_gateway_refund_proof_upgrades_processing_evidence() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let fixture = create_refund_mutation_fixture(&repository, "success-proof-upgrade").await;
     process_refund_mutation_fixture(&repository, &fixture).await;
@@ -1429,14 +1317,7 @@ async fn sqlite_success_gateway_refund_proof_upgrades_processing_evidence() {
 
 #[tokio::test]
 async fn sqlite_offline_processing_refund_failure_releases_reservation() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let fixture = create_refund_mutation_fixture(&repository, "offline-failure").await;
     process_refund_mutation_fixture(&repository, &fixture).await;
@@ -1478,14 +1359,7 @@ async fn sqlite_offline_processing_refund_failure_releases_reservation() {
 
 #[tokio::test]
 async fn sqlite_processing_refund_requires_offline_mode_without_gateway_evidence() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     let original_channel = create_refund_mutation_fixture(&repository, "original-channel").await;
@@ -1523,14 +1397,7 @@ async fn sqlite_processing_refund_requires_offline_mode_without_gateway_evidence
 
 #[tokio::test]
 async fn sqlite_refund_rejects_foreign_or_uncredited_payment_order_without_side_effects() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let fixture = create_refund_mutation_fixture(&repository, "order-integrity").await;
 
@@ -1606,14 +1473,7 @@ async fn sqlite_refund_rejects_foreign_or_uncredited_payment_order_without_side_
 
 #[tokio::test]
 async fn sqlite_wallet_write_repository_handles_public_recharge_callback_and_refund() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_users(
@@ -2170,14 +2030,7 @@ async fn sqlite_wallet_write_repository_handles_public_recharge_callback_and_ref
 
 #[tokio::test]
 async fn sqlite_payment_callback_rejects_gateway_identifier_mismatch_without_crediting() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-callback-identifier-mismatch").await;
 
@@ -2269,14 +2122,7 @@ async fn sqlite_payment_callback_rejects_gateway_identifier_mismatch_without_cre
 
 #[tokio::test]
 async fn sqlite_payment_callback_rejects_wallet_owner_mismatch_without_crediting() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_users(&pool, &["callback-order-owner", "callback-wallet-owner"]).await;
 
@@ -2367,14 +2213,7 @@ async fn sqlite_payment_callback_rejects_wallet_owner_mismatch_without_crediting
 
 #[tokio::test]
 async fn sqlite_payment_callback_credits_overdrawn_recharge_balance() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-callback-overdrawn").await;
 
@@ -2452,14 +2291,7 @@ async fn sqlite_payment_callback_credits_overdrawn_recharge_balance() {
 
 #[tokio::test]
 async fn sqlite_manual_credit_rejects_invalid_order_and_wallet_values() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-manual-credit-invalid").await;
     let order = match repository
@@ -2560,14 +2392,7 @@ async fn sqlite_manual_credit_rejects_invalid_order_and_wallet_values() {
 
 #[tokio::test]
 async fn sqlite_payment_callback_rejects_unknown_order_status_without_crediting() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-callback-invalid-state").await;
 
@@ -2642,14 +2467,7 @@ async fn sqlite_payment_callback_rejects_unknown_order_status_without_crediting(
 
 #[tokio::test]
 async fn sqlite_payment_callback_recovers_failed_checkout_placeholder_without_losing_credit() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-callback-failed-checkout").await;
 
@@ -2772,14 +2590,7 @@ async fn sqlite_payment_callback_recovers_failed_checkout_placeholder_without_lo
 
 #[tokio::test]
 async fn sqlite_payment_callback_rejects_corrupt_stored_credit_amount() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-callback-corrupt-amount").await;
 
@@ -2847,14 +2658,7 @@ async fn sqlite_payment_callback_rejects_corrupt_stored_credit_amount() {
 
 #[tokio::test]
 async fn sqlite_payment_callback_reconstructs_legacy_provider_amount_from_order_terms() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_users(
         &pool,
@@ -3015,14 +2819,7 @@ async fn sqlite_payment_callback_reconstructs_legacy_provider_amount_from_order_
 
 #[tokio::test]
 async fn sqlite_payment_callback_requires_provider_namespace_to_match_exactly() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-provider-boundary").await;
 
@@ -3084,14 +2881,7 @@ async fn sqlite_payment_callback_requires_provider_namespace_to_match_exactly() 
 
 #[tokio::test]
 async fn sqlite_legacy_epay_channel_order_without_provider_is_compatible() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-legacy-epay").await;
 
@@ -3180,14 +2970,7 @@ async fn sqlite_legacy_epay_channel_order_without_provider_is_compatible() {
 
 #[tokio::test]
 async fn sqlite_payment_callback_validates_placeholder_gateway_binding_and_conflicts() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_users(
         &pool,
@@ -3358,14 +3141,7 @@ async fn sqlite_payment_callback_validates_placeholder_gateway_binding_and_confl
 
 #[tokio::test]
 async fn sqlite_payment_gateway_order_identifier_is_unique_within_payment_method() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_users(
         &pool,
@@ -3474,14 +3250,7 @@ async fn sqlite_payment_gateway_order_identifier_is_unique_within_payment_method
 
 #[tokio::test]
 async fn sqlite_payment_callback_failure_does_not_rebind_existing_identifiers() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_user(&pool, "user-callback-failure-preserve").await;
     let order = match repository
@@ -3708,14 +3477,7 @@ async fn sqlite_payment_callback_registration_is_atomic_under_concurrency() {
 
 #[tokio::test]
 async fn sqlite_payment_callback_binds_settlement_amount_before_usd_conversion() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     let repository = SqliteWalletReadRepository::new(pool);
     ensure_test_user(repository.pool(), "user-fee-callback").await;
@@ -3897,14 +3659,7 @@ async fn sqlite_payment_callback_binds_settlement_amount_before_usd_conversion()
 
 #[tokio::test]
 async fn sqlite_plan_purchase_rejects_missing_user_without_creating_wallet_or_order() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     let input = CreatePlanPurchaseOrderInput {
         preferred_wallet_id: Some("missing-user-wallet".to_string()),
@@ -3956,14 +3711,7 @@ async fn sqlite_plan_purchase_rejects_missing_user_without_creating_wallet_or_or
 
 #[tokio::test]
 async fn sqlite_plan_purchase_rejects_preferred_wallet_id_owned_by_another_user() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
     ensure_test_users(&pool, &["plan-wallet-owner", "plan-wallet-conflict"]).await;
     let existing_wallet = repository
@@ -4137,14 +3885,7 @@ async fn sqlite_plan_purchase_initializes_one_wallet_under_concurrency() {
 
 #[tokio::test]
 async fn sqlite_wallet_recharge_rejects_missing_user_without_creating_wallet_or_order() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool.clone());
 
     let error = repository
@@ -4192,14 +3933,7 @@ async fn sqlite_wallet_recharge_rejects_missing_user_without_creating_wallet_or_
 #[tokio::test]
 async fn sqlite_plan_purchase_blocks_duplicate_pending_active_period_order_and_manual_credit_fulfills(
 ) {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     let repository = SqliteWalletReadRepository::new(pool);
     sqlx::query(
@@ -4464,14 +4198,7 @@ INSERT INTO billing_plans (
 
 #[tokio::test]
 async fn sqlite_finds_reusable_pending_plan_purchase_order() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     let repository = SqliteWalletReadRepository::new(pool);
     sqlx::query(
@@ -4636,14 +4363,7 @@ INSERT INTO payment_orders (
 
 #[tokio::test]
 async fn sqlite_plan_purchase_replaces_same_class_entitlements_on_manual_credit() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     let repository = SqliteWalletReadRepository::new(pool);
     sqlx::query(
@@ -4835,14 +4555,7 @@ INSERT INTO billing_plans (
 
 #[tokio::test]
 async fn sqlite_plan_replacement_stacks_usage_policies_unless_groups_match() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     let repository = SqliteWalletReadRepository::new(pool);
     sqlx::query("PRAGMA foreign_keys = OFF")
@@ -4979,14 +4692,7 @@ INSERT INTO user_plan_entitlements (
 
 #[tokio::test]
 async fn sqlite_plan_purchase_respects_lifetime_purchase_limit() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     let repository = SqliteWalletReadRepository::new(pool);
     sqlx::query(
@@ -5274,14 +4980,7 @@ impl SqliteWalletReadRepository {
 
 #[tokio::test]
 async fn sqlite_recharge_checkout_update_rejects_expired_order() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     let repository = SqliteWalletReadRepository::new(pool);
 
     sqlx::query(

@@ -429,18 +429,9 @@ mod tests {
         LdapBindPasswordUpdate, StoredLdapModuleConfig,
     };
 
-    use crate::run_migrations;
-
     #[tokio::test]
     async fn sqlite_repository_reads_and_writes_auth_module_configs() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO oauth_providers (

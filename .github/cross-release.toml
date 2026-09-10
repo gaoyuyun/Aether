@@ -1,0 +1,10 @@
+# cross does not forward application metadata or RUSTC_WRAPPER by default.
+# The workflow mounts the static sccache client and starts its host daemon.
+[build.env]
+passthrough = [
+    "AETHER_BUILD_VERSION",
+    "AETHER_BUILD_TYPE",
+    "RUSTC_WRAPPER=/usr/local/bin/sccache",
+    "SCCACHE_CLIENT_SIDE",
+    "SCCACHE_SERVER_PORT",
+]

@@ -500,18 +500,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::run_migrations as run_sqlite_migrations;
 
     #[tokio::test]
     async fn sqlite_routing_group_repository_round_trips() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_sqlite_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteRoutingGroupRepository::new(pool);
         repository
@@ -604,14 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_keeps_system_and_subject_defaults_unique() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_sqlite_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteRoutingGroupRepository::new(pool);
 
         for (id, is_system_default) in [("group-1", true), ("group-2", true), ("group-3", false)] {
@@ -699,14 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repair_migration_resolves_existing_duplicate_defaults() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_sqlite_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteRoutingGroupRepository::new(pool.clone());
         sqlx::raw_sql(
             r#"

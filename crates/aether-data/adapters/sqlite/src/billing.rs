@@ -1586,7 +1586,6 @@ mod tests {
     use serde_json::json;
 
     use super::SqliteBillingReadRepository;
-    use crate::run_migrations;
     use aether_data_contracts::repository::billing::{
         AdminBillingCollectorWriteInput, AdminBillingMutationOutcome, AdminBillingRuleWriteInput,
         BillingPlanWriteInput, BillingReadRepository, PaymentGatewayConfigCasWriteInput,
@@ -1595,14 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_reads_billing_model_context() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_billing_context(&pool).await;
 
         let repository = SqliteBillingReadRepository::new(pool);
@@ -1625,14 +1617,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_manages_admin_billing_rules_and_collectors() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteBillingReadRepository::new(pool);
 
         let rule = match repository
@@ -1745,14 +1730,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_revokes_active_user_plan_entitlement() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let now = super::current_unix_secs_i64();
         sqlx::query(
             r#"
@@ -1845,14 +1823,7 @@ INSERT INTO user_plan_entitlements (
 
     #[tokio::test]
     async fn sqlite_repository_deletes_unused_billing_plans_only() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteBillingReadRepository::new(pool.clone());
 
         let input = BillingPlanWriteInput {
@@ -1935,14 +1906,7 @@ VALUES ('order-1', 'order-no-1', 'wallet-1', 0, 'epay', 'plan_purchase',
 
     #[tokio::test]
     async fn sqlite_gateway_upsert_preserves_secret_atomically_without_dropping_insert_secret() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteBillingReadRepository::new(pool);
 
         let mut input = PaymentGatewayConfigWriteInput {
@@ -2006,14 +1970,7 @@ VALUES ('order-1', 'order-no-1', 'wallet-1', 0, 'epay', 'plan_purchase',
 
     #[tokio::test]
     async fn sqlite_gateway_cas_is_create_only_and_secret_exact() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteBillingReadRepository::new(pool);
         let input = PaymentGatewayConfigWriteInput {
             provider: "stripe".to_string(),

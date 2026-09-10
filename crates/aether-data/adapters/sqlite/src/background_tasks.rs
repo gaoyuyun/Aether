@@ -431,18 +431,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::run_migrations;
 
     #[tokio::test]
     async fn sqlite_background_task_repository_round_trips_runs_and_events() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteBackgroundTaskRepository::new(pool);
         let run = repository

@@ -1090,12 +1090,7 @@ mod tests {
         use aether_data_contracts::repository::quota::{
             ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
         };
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        run_migrations(&pool).await.unwrap();
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query("INSERT INTO providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, is_active, created_at, updated_at) VALUES ('provider-1', 'monthly', 'custom', 'monthly_quota', 20, 5, 7, 960, 1, 1, 1)").execute(&pool).await.unwrap();
         let candidates = SqliteRequestCandidateRepository::new(pool.clone());
         let quotas = SqliteProviderQuotaRepository::new(pool.clone());
@@ -1202,12 +1197,7 @@ mod tests {
         use aether_data_contracts::repository::quota::{
             ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
         };
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        run_migrations(&pool).await.unwrap();
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query("INSERT INTO providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, is_active, created_at, updated_at) VALUES ('provider-1', 'monthly', 'custom', 'monthly_quota', 20, 5, 7, 960, 1, 1, 1)").execute(&pool).await.unwrap();
         let candidates = SqliteRequestCandidateRepository::new(pool.clone());
         let quotas = SqliteProviderQuotaRepository::new(pool.clone());
@@ -1280,14 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_writes_and_reads_request_candidates() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteRequestCandidateRepository::new(pool.clone());
         let created = repository
@@ -1473,14 +1456,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_candidate_dispatch_persists_attempt_quota_delta_atomically() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteRequestCandidateRepository::new(pool.clone());
         let snapshot = ProviderQuotaDispatchSnapshot {
             schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
@@ -1522,14 +1498,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_candidate_dispatch_reconciles_earlier_settlement_without_regression() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::raw_sql(
             r#"
 INSERT INTO "usage" (
@@ -1718,14 +1687,7 @@ INSERT INTO usage_settlement_snapshots (
 
     #[tokio::test]
     async fn sqlite_batch_upsert_preserves_order_and_rolls_back_on_error() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteRequestCandidateRepository::new(pool);
         let request_id = "request-batch";
 
@@ -1822,12 +1784,7 @@ INSERT INTO usage_settlement_snapshots (
 
     #[tokio::test]
     async fn sqlite_failed_candidate_diagnostics_survive_late_success_and_streaming() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        run_migrations(&pool).await.unwrap();
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteRequestCandidateRepository::new(pool.clone());
         let request_id = format!("diagnostic-replay-{}", uuid::Uuid::new_v4());
         let candidate_id = uuid::Uuid::new_v4().to_string();

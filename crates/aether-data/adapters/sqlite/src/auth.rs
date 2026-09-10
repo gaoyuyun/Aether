@@ -1530,7 +1530,6 @@ fn map_auth_api_key_export_row(
 #[cfg(test)]
 mod tests {
     use super::SqliteAuthApiKeyReadRepository;
-    use crate::run_migrations;
     use aether_data_contracts::repository::auth::{
         AuthApiKeyLookupKey, AuthApiKeyReadRepository, AuthApiKeyWriteRepository,
         CreateStandaloneApiKeyRecord, CreateUserApiKeyRecord, StandaloneApiKeyExportListQuery,
@@ -1541,14 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_reads_auth_api_key_contract_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_auth_api_key_rows(&pool).await;
 
         let repository = SqliteAuthApiKeyReadRepository::new(pool);
@@ -1613,14 +1605,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_writes_auth_api_key_contract_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_auth_user(&pool).await;
 
         let repository = SqliteAuthApiKeyReadRepository::new(pool);
@@ -2132,14 +2117,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_api_key_delete_is_owner_scoped_and_preserves_anonymized_facts() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::raw_sql(
             r#"
 INSERT INTO users (

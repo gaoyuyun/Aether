@@ -2247,14 +2247,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_reads_proxy_nodes_and_events() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO proxy_nodes (
@@ -2311,14 +2304,7 @@ VALUES ('node-1', 'registered', 'ok', 3)
 
     #[tokio::test]
     async fn sqlite_repository_writes_proxy_node_contract_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteProxyNodeReadRepository::new(pool);
         let manual = repository
@@ -2584,14 +2570,7 @@ VALUES ('node-1', 'registered', 'ok', 3)
 
     #[tokio::test]
     async fn sqlite_repository_aggregates_proxy_node_metrics_and_filters_events() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteProxyNodeReadRepository::new(pool);
         let registered = repository
@@ -2778,14 +2757,7 @@ VALUES ('node-1', 'registered', 'ok', 3)
 
     #[tokio::test]
     async fn sqlite_registration_preserves_omitted_security_and_allows_rotation() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProxyNodeReadRepository::new(pool);
 
         let first = repository

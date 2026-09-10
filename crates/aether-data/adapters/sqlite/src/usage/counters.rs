@@ -2148,14 +2148,7 @@ mod tests {
     async fn provider_quota_backfill_resumes_by_cursor_and_reports_anomalies() {
         use aether_data_contracts::repository::quota::ProviderQuotaReadRepository;
 
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        crate::run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let epoch = 1_700_000_000i64 / 60 * 60;
         let clock_minute = epoch + 600;
         sqlx::query(
@@ -2364,14 +2357,7 @@ INSERT INTO provider_quota_maintenance_state (
 
     #[tokio::test]
     async fn provider_quota_window_maintenance_rebuilds_future_counters() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        crate::run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let now = current_unix_secs().max(86_400) as u64;
         let clock_minute = now / 60 * 60;
         let epoch = clock_minute.saturating_sub(3_600);
@@ -2429,14 +2415,7 @@ INSERT INTO provider_quota_usage_buckets (
 
     #[tokio::test]
     async fn provider_quota_counters_use_dispatch_epoch_across_mode_switches() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        crate::run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let now = current_unix_secs().max(240);
         let clock_minute = (now as u64 / 60) * 60;
         let anchor = clock_minute.saturating_sub(120);
@@ -2534,14 +2513,7 @@ INSERT INTO providers (
 
     #[tokio::test]
     async fn unresolved_provider_quota_delta_waits_for_reconciliation_before_flush() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        crate::run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let now = current_unix_secs().max(120);
         let epoch = now / 60 * 60;
         sqlx::query(
@@ -2613,14 +2585,7 @@ INSERT INTO usage_counter_deltas (
 
     #[tokio::test]
     async fn auxiliary_counters_flush_report_health_and_cleanup() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        crate::run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO users (id, auth_source, created_at, updated_at)
@@ -2730,14 +2695,7 @@ VALUES ('counter-node', 'test-generation-counter-node', 'counter node', '127.0.0
 
     #[tokio::test]
     async fn proxy_counter_enqueue_requires_the_expected_generation() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        crate::run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO proxy_nodes (id, tunnel_generation, name, ip, port, created_at, updated_at)
@@ -2799,14 +2757,7 @@ VALUES ('generation-node', 'generation-a', 'generation node', '127.0.0.1', 8080,
 
     #[tokio::test]
     async fn proxy_counter_flush_does_not_cross_generation_reuse() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        crate::run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO proxy_nodes (id, tunnel_generation, name, ip, port, created_at, updated_at)

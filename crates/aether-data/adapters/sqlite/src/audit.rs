@@ -278,18 +278,10 @@ fn event_count_from_sqlite_row(row: &SqliteRow) -> Result<(String, u64), DataLay
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run_migrations;
 
     #[tokio::test]
     async fn sqlite_audit_log_repository_reads_monitoring_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_sqlite_audit_logs(&pool).await;
 
         let repository = SqliteAuditLogReadRepository::new(pool);

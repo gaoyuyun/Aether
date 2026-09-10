@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to compile while warming release caches (does not publish)
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -22,6 +28,9 @@ jobs:
       contents: read
     steps:
       - name: Require successful CI for this commit
+        # Manual builds can warm the default branch's caches alongside CI.
+        # Only tag pushes publish images, and they must pass this gate.
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -54,12 +63,14 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            aether-vscodex/web/package-lock.json
 
       - name: Install dependencies and build
         working-directory: frontend
         env:
-          AETHER_BUILD_VERSION: ${{ github.ref_name }}
+          AETHER_BUILD_VERSION: ${{ inputs.version || github.ref_name }}
         run: |
           npm ci
           npm run build
@@ -85,6 +96,16 @@ jobs:
             target: x86_64-unknown-linux-musl
           - arch: arm64
             target: aarch64-unknown-linux-musl
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+      CROSS_CONFIG: .github/cross-release.toml
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'false'
+      SCCACHE_CACHE_SIZE: 2G
+      SCCACHE_CLIENT_SIDE: '1'
+      SCCACHE_IDLE_TIMEOUT: 0
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -94,21 +115,75 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Set compiler cache directory
+        run: echo "SCCACHE_DIR=${RUNNER_TEMP}/sccache" >> "${GITHUB_ENV}"
+
+      - name: Set up Rust compiler cache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: v0.17.0
+
+      # Bulk archives avoid sccache's per-object GHA API writes being dropped
+      # under rate limiting during two simultaneous cold release builds.
+      - name: Restore compiler cache archive
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: release-sccache-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            release-sccache-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Connect cross to the compiler cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The client compiles inside cross and talks to the host daemon.
+          # Disk cache hits return paths, so mount the cache at the same path.
+          mkdir -p "${SCCACHE_DIR}"
+          printf 'CROSS_CONTAINER_OPTS=--network=host --volume=%s:/usr/local/bin/sccache:ro --volume=%s:%s\n' \
+            "${SCCACHE_PATH}" "${SCCACHE_DIR}" "${SCCACHE_DIR}" >> "${GITHUB_ENV}"
+          sccache --start-server
+
+      - name: Keep only the active Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain | cut -d ' ' -f 1)"
+          while read -r toolchain _; do
+            if [[ "${toolchain}" != "${active_toolchain}" ]]; then
+              rustup toolchain uninstall "${toolchain}"
+            fi
+          done < <(rustup toolchain list)
+
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: release-${{ matrix.target }}
+          key: ${{ hashFiles('.github/cross-release.toml') }}
           workspaces: . -> target
+          cache-on-failure: false
+          cache-workspace-crates: true
 
       - name: Install cross
         uses: taiki-e/install-action@896fc2f9f9fdb3d9747dbce378ccab57f25346f4 # cross
+        with:
+          tool: cross@0.2.5
 
       - name: Build gateway
         env:
-          AETHER_BUILD_VERSION: ${{ github.ref_name }}
+          AETHER_BUILD_VERSION: ${{ inputs.version || github.ref_name }}
           AETHER_BUILD_TYPE: release
-          CARGO_TERM_COLOR: always
-        run: cross build --release --locked -p aether-gateway --target ${{ matrix.target }}
+        run: python3 .github/scripts/measure.py cross build --release --locked -p aether-gateway --bin aether-gateway --target ${{ matrix.target }} --timings
+
+      - name: Upload release build timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-build-timings-${{ matrix.arch }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload gateway artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
@@ -120,6 +195,7 @@ jobs:
 
   publish:
     name: Build and publish Docker image
+    if: github.event_name == 'push'
     needs:
       - build_frontend
       - build_gateway
@@ -194,5 +270,13 @@ jobs:
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
+          # Keep signed provenance in GitHub without a sha256-* referrers tag
+          # in GHCR. BuildKit provenance remains part of the image index.
+          push-to-registry: false
           create-storage-record: false
+
+      - name: Remove legacy GHCR attestation tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: python3 .github/scripts/cleanup_registry_attestations.py

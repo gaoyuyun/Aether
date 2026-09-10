@@ -501,7 +501,6 @@ fn map_row(row: &SqliteRow) -> Result<StoredGeminiFileMapping, DataLayerError> {
 #[cfg(test)]
 mod tests {
     use super::SqliteGeminiFileMappingRepository;
-    use crate::run_migrations;
     use aether_data_contracts::repository::gemini_file_mappings::{
         GeminiFileMappingListQuery, GeminiFileMappingReadRepository,
         GeminiFileMappingWriteRepository, UpsertGeminiFileMappingRecord,
@@ -509,14 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_round_trips_gemini_file_mappings() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteGeminiFileMappingRepository::new(pool);
         let created = repository

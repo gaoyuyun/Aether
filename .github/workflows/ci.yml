@@ -10,6 +10,11 @@ on:
       - fork/dev
   workflow_dispatch:
   workflow_call:
+    inputs:
+      full:
+        description: Run every CI job when called by another workflow
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -19,14 +24,55 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust workspace
+  changes:
+    name: Select CI jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Test workflow helpers
+        run: |
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+          bash tests/release_supply_chain_test.sh
+
+      - name: Select jobs from changed files
+        id: changes
+        env:
+          CI_FORCE_FULL: ${{ inputs.full }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/ci_changes.py
+
+  rust_tests:
+    name: Rust tests (${{ matrix.suite }})
+    needs: changes
+    # A failed selector must not turn required checks into successful skips.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: gateway
+            packages: -p aether-gateway --features testkit
+          - suite: workspace
+            packages: --workspace --exclude aether-gateway
     env:
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 4
       CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -36,26 +82,94 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Set up Rust compiler cache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
         with:
-          shared-key: ci-workspace
-          workspaces: . -> target
-          cache-on-failure: true
+          version: v0.17.0
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check all workspace targets
-        run: cargo check --workspace --all-targets --locked
+      # rust-cache hashes every installed toolchain. Keep the runner's changing
+      # preinstalled stable release out of the cache key for our pinned compiler.
+      - name: Keep only the active Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          active_toolchain="$(rustup show active-toolchain | cut -d ' ' -f 1)"
+          while read -r toolchain _; do
+            if [[ "${toolchain}" != "${active_toolchain}" ]]; then
+              rustup toolchain uninstall "${toolchain}"
+            fi
+          done < <(rustup toolchain list)
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: ci-${{ matrix.suite }}
+          workspaces: . -> target
+          # Do not persist a partial build under an immutable dependency key.
+          cache-on-failure: false
+
+      # Compiling the tests also checks the workspace. Keep all-targets coverage
+      # without first doing a separate metadata-only cargo check build.
+      - name: Compile workspace tests
+        env:
+          RUST_MIN_STACK: 8388608
+        run: python3 .github/scripts/measure.py cargo test ${{ matrix.packages }} --all-targets --no-run --locked --timings
 
       - name: Test workspace
         env:
           RUST_MIN_STACK: 8388608
-        run: cargo test --workspace --locked
+        run: python3 .github/scripts/measure.py cargo test ${{ matrix.packages }} --all-targets --locked -- --quiet
+
+      # --all-targets does not include doctests.
+      - name: Test documentation
+        env:
+          RUST_MIN_STACK: 8388608
+        run: cargo test ${{ matrix.packages }} --doc --locked
+
+      - name: Upload Rust build timings
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: rust-build-timings-${{ matrix.suite }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Preserve the required check name while the two suites run independently.
+  rust:
+    name: Rust workspace
+    needs: [changes, rust_tests]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify Rust suites
+        env:
+          SELECTION_RESULT: ${{ needs.changes.result }}
+          RUST_REQUIRED: ${{ needs.changes.outputs.rust }}
+          TEST_RESULT: ${{ needs.rust_tests.result }}
+        run: |
+          if [[ "${SELECTION_RESULT}" != "success" ]]; then
+            echo 'CI job selection failed.' >&2
+            exit 1
+          fi
+          if [[ "${TEST_RESULT}" == "success" ]]; then
+            exit 0
+          fi
+          if [[ "${RUST_REQUIRED}" == "false" && "${TEST_RESULT}" == "skipped" ]]; then
+            exit 0
+          fi
+          echo "Rust suites did not succeed: ${TEST_RESULT}" >&2
+          exit 1
 
   frontend:
     name: Frontend
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.frontend == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -67,7 +181,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            aether-vscodex/web/package-lock.json
 
       - name: Install dependencies
         working-directory: frontend

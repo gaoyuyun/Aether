@@ -709,7 +709,6 @@ fn i64_from_usize(value: usize, field: &str) -> Result<i64, DataLayerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run_migrations;
 
     fn score(timestamp_base: Option<u64>) -> UpsertPoolMemberScore {
         UpsertPoolMemberScore {
@@ -750,14 +749,7 @@ mod tests {
     }
 
     async fn repository() -> SqlitePoolMemberScoreRepository {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         SqlitePoolMemberScoreRepository::new(pool)
     }
 

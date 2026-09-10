@@ -371,18 +371,9 @@ mod tests {
         ProviderQuotaReadRepository, ProviderQuotaWriteRepository,
     };
 
-    use crate::run_migrations;
-
     #[tokio::test]
     async fn sqlite_repository_reads_and_resets_provider_quotas() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_provider_quotas(&pool).await;
 
         let repository = SqliteProviderQuotaRepository::new(pool);
@@ -440,14 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_fail_closes_on_unresolved_monthly_attempt() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_provider_quotas(&pool).await;
         sqlx::query(
             r#"
@@ -490,14 +474,7 @@ INSERT INTO usage_counter_deltas (
 
     #[tokio::test]
     async fn sqlite_repository_scopes_fail_closed_state_to_current_quota_epoch() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_provider_quotas(&pool).await;
         sqlx::query(
             r#"
@@ -570,12 +547,7 @@ INSERT INTO provider_quota_maintenance_state (
         use aether_data_contracts::repository::quota::{
             ProviderQuotaAdjustment, ProviderQuotaResetMode,
         };
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        run_migrations(&pool).await.unwrap();
+        let pool = crate::test_support::migrated_pool().await;
         seed_provider_quotas(&pool).await;
         sqlx::query("UPDATE providers SET quota_last_reset_at=960, quota_cycle_start_at=960, quota_subscription_started_at=960, quota_expires_at=9999999 WHERE id='provider-1'").execute(&pool).await.unwrap();
         let repository = SqliteProviderQuotaRepository::new(pool.clone());

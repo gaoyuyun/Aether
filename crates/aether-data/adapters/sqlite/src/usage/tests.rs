@@ -40,14 +40,7 @@ fn sqlite_usage_list_projection_skips_http_capture_storage() {
 
 #[tokio::test]
 async fn sqlite_cache_affinity_intervals_support_a_limited_source_cte() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     sqlx::query(
         r#"
 INSERT INTO "usage" (
@@ -82,14 +75,7 @@ INSERT INTO "usage" (
 
 #[tokio::test]
 async fn sqlite_reads_only_exact_provider_quota_window_counters() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     sqlx::query(
         r#"
 INSERT INTO providers (id, name, provider_type, created_at, updated_at) VALUES
@@ -191,14 +177,7 @@ fn sqlite_first_byte_upsert_rejects_older_revision_in_sql() {
 
 #[tokio::test]
 async fn sqlite_provider_performance_can_skip_timeline() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     SqliteUsageWriteRepository::new(pool.clone())
@@ -247,14 +226,7 @@ async fn sqlite_provider_performance_can_skip_timeline() {
 
 #[tokio::test]
 async fn sqlite_cost_savings_prefers_canonical_settlement_values() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     SqliteUsageWriteRepository::new(pool.clone())
@@ -304,14 +276,7 @@ WHERE request_id = 'cost-savings-settlement';
 
 #[tokio::test]
 async fn sqlite_cost_savings_combines_daily_rollups_with_live_usage() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     sqlx::query(
         r#"
@@ -353,14 +318,7 @@ INSERT INTO "usage" (
 
 #[tokio::test]
 async fn sqlite_cost_savings_uses_scoped_daily_rollups() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     sqlx::query(
         r#"
@@ -407,14 +365,7 @@ INSERT INTO "usage" (
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_upserts_and_flushes_counter_deltas() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
@@ -512,14 +463,7 @@ async fn sqlite_usage_write_repository_upserts_and_flushes_counter_deltas() {
 
 #[tokio::test]
 async fn sqlite_usage_stats_rebuild_uses_canonical_terminal_totals() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let repository = SqliteUsageWriteRepository::new(pool.clone());
 
@@ -681,12 +625,7 @@ WHERE request_id = 'rebuild-completed';
 async fn sqlite_shallow_capture_preserves_legacy_refs_without_decoding_bodies() {
     use aether_data_contracts::repository::usage::{StoredUsageBodyPayload, UsageBodyField};
 
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    run_migrations(&pool).await.unwrap();
+    let pool = crate::test_support::migrated_pool().await;
 
     let request_id = format!("shallow-capture-{}", uuid::Uuid::new_v4().simple());
     let inline_body = serde_json::json!({"legacy": "inline"});
@@ -795,14 +734,7 @@ async fn sqlite_shallow_capture_preserves_legacy_refs_without_decoding_bodies() 
 
 #[tokio::test]
 async fn sqlite_usage_http_capture_round_trips_and_preserves_sparse_updates() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let writer = SqliteUsageWriteRepository::new(pool.clone());
 
@@ -950,14 +882,7 @@ async fn sqlite_usage_http_capture_round_trips_and_preserves_sparse_updates() {
 
 #[tokio::test]
 async fn sqlite_usage_http_read_falls_back_to_legacy_inline_and_compressed_columns() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let writer = SqliteUsageWriteRepository::new(pool.clone());
     let mut captured = sample_usage("legacy-capture", "pending", "pending", 2_000);
@@ -1035,14 +960,7 @@ WHERE request_id = 'legacy-capture';
 
 #[tokio::test]
 async fn sqlite_usage_body_refs_enforce_request_and_field_ownership() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let writer = SqliteUsageWriteRepository::new(pool.clone());
@@ -1107,14 +1025,7 @@ async fn sqlite_usage_body_refs_enforce_request_and_field_ownership() {
 
 #[tokio::test]
 async fn sqlite_usage_canonical_snapshots_round_trip_preserve_sparse_and_clear_terminal() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let writer = SqliteUsageWriteRepository::new(pool.clone());
     let reader = SqliteUsageReadRepository::new(pool.clone());
@@ -1389,14 +1300,7 @@ WHERE request_id = 'canonical-snapshots'
 
 #[tokio::test]
 async fn sqlite_usage_cleanup_matches_policy_windows_and_targets() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let repository = SqliteUsageWriteRepository::new(pool.clone());
 
@@ -1587,14 +1491,7 @@ VALUES (
 
 #[tokio::test]
 async fn sqlite_usage_cleanup_before_now_only_clears_selected_body_fields() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let repository = SqliteUsageWriteRepository::new(pool.clone());
     repository
@@ -1695,14 +1592,7 @@ VALUES (
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_does_not_regress_void_usage() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
@@ -1722,14 +1612,7 @@ async fn sqlite_usage_write_repository_does_not_regress_void_usage() {
 
 #[tokio::test]
 async fn sqlite_stale_terminal_event_is_a_full_transaction_noop() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
@@ -1805,14 +1688,7 @@ async fn sqlite_stale_terminal_event_is_a_full_transaction_noop() {
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_does_not_reopen_void_failure_from_late_streaming() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool);
@@ -1844,14 +1720,7 @@ async fn sqlite_usage_write_repository_does_not_reopen_void_failure_from_late_st
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_does_not_regress_terminal_usage_from_late_streaming() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
@@ -1956,14 +1825,7 @@ async fn sqlite_usage_write_repository_does_not_regress_terminal_usage_from_late
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_allows_authoritative_completed_recovery() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool);
@@ -2002,14 +1864,7 @@ async fn sqlite_usage_write_repository_allows_authoritative_completed_recovery()
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_preserves_streaming_response_start_from_late_active() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool);
@@ -2041,14 +1896,7 @@ async fn sqlite_usage_write_repository_preserves_streaming_response_start_from_l
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_keeps_streaming_capture_from_late_pending() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool);
@@ -2086,14 +1934,7 @@ async fn sqlite_usage_write_repository_keeps_streaming_capture_from_late_pending
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_cleans_stale_pending_requests() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
@@ -2188,14 +2029,7 @@ ORDER BY request_id
 
 #[tokio::test]
 async fn sqlite_usage_write_repository_cleanup_uses_failed_candidate_status_when_present() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
@@ -2296,14 +2130,7 @@ ORDER BY request_id
 
 #[tokio::test]
 async fn sqlite_stale_cleanup_derives_category_from_candidate_status_code() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let repository = SqliteUsageWriteRepository::new(pool.clone());
@@ -2347,14 +2174,7 @@ INSERT INTO request_candidates (
 
 #[tokio::test]
 async fn sqlite_usage_read_repository_reads_usage_contract_views() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let writer = SqliteUsageWriteRepository::new(pool.clone());
@@ -2414,14 +2234,7 @@ WHERE request_id = 'request-1'
 
 #[tokio::test]
 async fn sqlite_usage_websocket_filter_applies_to_list_count_and_keyword_search() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
 
     let writer = SqliteUsageWriteRepository::new(pool.clone());
@@ -2513,14 +2326,7 @@ async fn sqlite_usage_websocket_filter_applies_to_list_count_and_keyword_search(
 
 #[tokio::test]
 async fn sqlite_usage_daily_heatmap_reads_imported_daily_aggregates() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     sqlx::query(
         r#"
@@ -2576,14 +2382,7 @@ INSERT INTO stats_user_daily (
 
 #[tokio::test]
 async fn sqlite_usage_totals_by_user_ids_reads_imported_user_daily_aggregates() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     sqlx::query(
         r#"
@@ -2622,14 +2421,7 @@ INSERT INTO "usage" (
 
 #[tokio::test]
 async fn sqlite_dashboard_daily_stats_reads_imported_daily_aggregates() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     sqlx::query(
         r#"
@@ -2676,14 +2468,7 @@ INSERT INTO stats_daily (
 
 #[tokio::test]
 async fn sqlite_dashboard_daily_stats_combines_dimension_rollups_with_live_usage() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     sqlx::query(
         r#"
@@ -2759,14 +2544,7 @@ INSERT INTO "usage" (
 
 #[tokio::test]
 async fn sqlite_dashboard_daily_stats_uses_raw_rows_for_local_day_boundaries() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
 
     sqlx::query(
         r#"
@@ -2816,14 +2594,7 @@ INSERT INTO "usage" (
 
 #[tokio::test]
 async fn sqlite_first_byte_fast_path_preserves_lifecycle_state_and_counters() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let repository = SqliteUsageWriteRepository::new(pool.clone());
 
@@ -2964,14 +2735,7 @@ WHERE request_id = 'first-byte-missing'
 
 #[tokio::test]
 async fn sqlite_first_byte_fast_path_rejects_stale_revision() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let repository = SqliteUsageWriteRepository::new(pool.clone());
 
@@ -3010,14 +2774,7 @@ async fn sqlite_first_byte_fast_path_rejects_stale_revision() {
 
 #[tokio::test]
 async fn sqlite_pending_batch_is_atomic_and_persists_auxiliary_state() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;
     let repository = SqliteUsageWriteRepository::new(pool.clone());
     assert!(repository.supports_pending_usage_batch());
@@ -3312,14 +3069,7 @@ fn cleanup_window(
 // ---------------------------------------------------------------------------
 
 async fn hourly_fast_path_pool() -> sqlx::SqlitePool {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("sqlite pool should connect");
-    run_migrations(&pool)
-        .await
-        .expect("sqlite migrations should run");
+    let pool = crate::test_support::migrated_pool().await;
     pool
 }
 

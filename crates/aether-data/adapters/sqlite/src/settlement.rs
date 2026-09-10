@@ -1599,14 +1599,7 @@ WHERE id = ?
 mod tests {
     #[tokio::test]
     async fn sqlite_repository_skips_user_billing_but_tracks_provider_cost() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_settlement_rows(&pool).await;
 
         let repository = SqliteSettlementRepository::new(pool.clone());
@@ -1672,14 +1665,7 @@ WHERE request_id = 'request-1'
 
     #[tokio::test]
     async fn sqlite_reconciles_processed_attempt_with_idempotent_adjustment() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let candidate_id = "candidate-settlement-adjustment";
         let base_id = uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_OID,
@@ -1734,14 +1720,7 @@ INSERT INTO usage_counter_deltas (
 
     #[tokio::test]
     async fn sqlite_zero_cost_attempts_finish_as_ready_or_failed() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         for (candidate_id, cost_is_resolved, expected_status, sequence) in [
             ("candidate-zero-priced", true, "ready", 1_i64),
@@ -1796,14 +1775,7 @@ INSERT INTO usage_counter_deltas (
 
     #[tokio::test]
     async fn sqlite_openai_search_zero_cost_attempt_is_resolved() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let search_delta_id = uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_OID,
             b"provider-quota-attempt:search-candidate",
@@ -1880,14 +1852,7 @@ INSERT INTO usage_counter_deltas (
 
     #[tokio::test]
     async fn sqlite_repository_settles_usage_once() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_settlement_rows(&pool).await;
 
         let repository = SqliteSettlementRepository::new(pool.clone());
@@ -2004,14 +1969,7 @@ WHERE request_id = 'request-1'
 
     #[tokio::test]
     async fn sqlite_settlement_rejects_corrupt_wallet_before_financial_mutation() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_settlement_rows(&pool).await;
         sqlx::query("UPDATE wallets SET balance = ? WHERE id = 'wallet-1'")
             .bind(f64::INFINITY)
@@ -2061,14 +2019,7 @@ WHERE request_id = 'request-1'
 
     #[tokio::test]
     async fn request_admission_insert_defensively_preserves_the_existing_token() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO users (id, username, auth_source, created_at, updated_at)
@@ -2124,14 +2075,7 @@ VALUES
 
     #[tokio::test]
     async fn deleting_user_cascades_usage_policy_ledgers_and_terminal_calls_are_noops() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         sqlx::query(
             r#"
 INSERT INTO users (id, username, auth_source, created_at, updated_at)
@@ -2219,14 +2163,7 @@ SELECT
 
     #[tokio::test]
     async fn sqlite_repository_voids_failed_usage_without_wallet_mutation() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_settlement_rows(&pool).await;
 
         let repository = SqliteSettlementRepository::new(pool.clone());
@@ -2261,14 +2198,7 @@ SELECT
 
     #[tokio::test]
     async fn sqlite_repository_overdraws_finite_wallet_and_settles_usage() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_settlement_rows(&pool).await;
 
         let repository = SqliteSettlementRepository::new(pool.clone());
@@ -2319,14 +2249,7 @@ SELECT
 
     #[tokio::test]
     async fn sqlite_repository_records_wallet_for_quota_covered_user_usage() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_quota_covered_settlement_rows(&pool).await;
 
         let repository = SqliteSettlementRepository::new(pool.clone());
@@ -2373,14 +2296,7 @@ SELECT
 
     #[tokio::test]
     async fn sqlite_repository_exhausts_strict_quota_after_actual_cost_overrun() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_quota_covered_settlement_rows(&pool).await;
 
         let repository = SqliteSettlementRepository::new(pool.clone());
@@ -2415,14 +2331,7 @@ SELECT
 
     #[tokio::test]
     async fn sqlite_repository_uses_current_plan_wallet_overage_policy() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_quota_covered_settlement_rows(&pool).await;
         sqlx::query(
             r#"
@@ -2603,14 +2512,7 @@ WHERE id = 'plan-quota';
 
     #[tokio::test]
     async fn sqlite_repository_skips_plan_quota_but_still_debits_wallet() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_quota_covered_settlement_rows(&pool).await;
 
         let repository = SqliteSettlementRepository::new(pool.clone());

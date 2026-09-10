@@ -365,7 +365,6 @@ fn map_announcement_row(row: &SqliteRow) -> Result<StoredAnnouncement, DataLayer
 #[cfg(test)]
 mod tests {
     use super::SqliteAnnouncementRepository;
-    use crate::run_migrations;
     use aether_data_contracts::repository::announcements::{
         AnnouncementListQuery, AnnouncementReadRepository, AnnouncementWriteRepository,
         CreateAnnouncementRecord, UpdateAnnouncementRecord,
@@ -373,14 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_reads_and_writes_announcements() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_announcement_user(&pool).await;
 
         let repository = SqliteAnnouncementRepository::new(pool);

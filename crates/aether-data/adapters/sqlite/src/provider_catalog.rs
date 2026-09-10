@@ -3605,7 +3605,6 @@ fn map_key_row(row: &SqliteRow) -> Result<StoredProviderCatalogKey, DataLayerErr
 #[cfg(test)]
 mod tests {
     use super::SqliteProviderCatalogReadRepository;
-    use crate::run_migrations;
     use aether_data_contracts::repository::provider_catalog::{
         ProviderCatalogKeyAdaptiveState, ProviderCatalogKeyAdaptiveStateUpdate,
         ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyHealthStateUpdate,
@@ -3629,14 +3628,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_proxy_cas_accepts_python_spaced_json_and_distinguishes_null_from_missing_rows()
     {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProviderCatalogReadRepository::new(pool.clone());
 
         let expected_proxy = json!({
@@ -3830,14 +3822,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_admin_credential_cas_rotates_codex_namespace_atomically() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProviderCatalogReadRepository::new(pool);
         repository
             .create_provider(
@@ -3954,14 +3939,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_admin_credential_rotation_rejects_non_object_runtime_roots() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProviderCatalogReadRepository::new(pool);
         repository
             .create_provider(
@@ -4023,14 +4001,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_ordinary_admin_update_cannot_replace_credentials() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProviderCatalogReadRepository::new(pool);
         repository
             .create_provider(
@@ -4079,14 +4050,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_reads_provider_catalog_contract_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         seed_rows(&pool).await;
 
         let repository = SqliteProviderCatalogReadRepository::new(pool);
@@ -4154,14 +4118,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_runtime_key_mutations_are_field_scoped_and_compare_and_swap() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProviderCatalogReadRepository::new(pool);
         repository
             .create_provider(
@@ -4337,14 +4294,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_runtime_metadata_cas_rejects_non_object_metadata_roots() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProviderCatalogReadRepository::new(pool);
         repository
             .create_provider(
@@ -4459,14 +4409,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_oauth_runtime_cas_fences_auth_config_and_preserves_admin_fields() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteProviderCatalogReadRepository::new(pool);
         repository
             .create_provider(
@@ -4867,14 +4810,7 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_repository_writes_provider_catalog_contract_views() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("sqlite pool should connect");
-        run_migrations(&pool)
-            .await
-            .expect("sqlite migrations should run");
+        let pool = crate::test_support::migrated_pool().await;
 
         let repository = SqliteProviderCatalogReadRepository::new(pool);
         let provider = StoredProviderCatalogProvider::new(
