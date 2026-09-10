@@ -661,12 +661,10 @@ impl AppState {
         &self,
         provider_ids: &[String],
     ) -> Result<Vec<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
-        let keys = self
-            .data
+        self.data
             .list_provider_catalog_key_summaries_by_provider_ids(provider_ids)
             .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        self.open_provider_catalog_keys(keys).await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
     pub(crate) async fn list_provider_catalog_key_maintenance_summaries_by_provider_ids(

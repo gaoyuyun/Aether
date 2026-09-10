@@ -85,7 +85,7 @@ function createProviderKey(overrides: Partial<EndpointAPIKey> = {}): EndpointAPI
   }
 }
 
-function mount(props: Record<string, unknown>) {
+function mount(props: InstanceType<typeof ProviderKeyActionCluster>['$props']) {
   const root = document.createElement('div')
   document.body.appendChild(root)
   const app = createApp(defineComponent({

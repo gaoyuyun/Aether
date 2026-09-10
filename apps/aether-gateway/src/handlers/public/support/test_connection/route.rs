@@ -53,9 +53,6 @@ async fn resolve_test_connection_target(
     {
         return Err("provider endpoint must be an HTTP(S) URL without credentials or fragment");
     }
-    if url.scheme() == "http" && !(allow_private_targets && literal_loopback) {
-        return Err("provider endpoint must use HTTPS");
-    }
     let host = url
         .host_str()
         .ok_or("provider endpoint is missing a host")?
@@ -574,10 +571,11 @@ mod tests {
     async fn test_connection_target_rejects_private_addresses_in_production_mode() {
         for raw_url in [
             "http://127.0.0.1:8080/v1/chat/completions",
+            "http://10.0.0.1/v1/chat/completions",
+            "http://169.254.169.254/v1/chat/completions",
             "https://10.0.0.1/v1/chat/completions",
             "https://[::1]/v1/chat/completions",
             "https://localhost/v1/chat/completions",
-            "http://8.8.8.8/v1/chat/completions",
         ] {
             assert!(
                 resolve_test_connection_target(raw_url, false)
@@ -589,6 +587,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_connection_target_accepts_public_http_and_https_addresses() {
+        for allow_private_targets in [false, true] {
+            for (raw_url, expected_port) in [
+                ("http://8.8.8.8/v1/chat", 80),
+                ("http://8.8.8.8:8080/v1/chat", 8080),
+                ("https://8.8.8.8/v1/chat", 443),
+            ] {
+                let target = resolve_test_connection_target(raw_url, allow_private_targets)
+                    .await
+                    .expect("public HTTP(S) provider target should resolve");
+                assert_eq!(target.url.as_str(), raw_url);
+                assert_eq!(target.host, "8.8.8.8");
+                assert_eq!(target.addresses.len(), 1);
+                assert_eq!(target.addresses[0].ip().to_string(), "8.8.8.8");
+                assert_eq!(target.addresses[0].port(), expected_port);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_connection_target_allows_loopback_only_for_test_fixtures() {
         let target = resolve_test_connection_target("http://127.0.0.1:8080/v1/chat", true)
             .await
@@ -596,10 +614,10 @@ mod tests {
         assert_eq!(target.host, "127.0.0.1");
         assert_eq!(target.addresses.len(), 1);
         assert!(
-            resolve_test_connection_target("http://8.8.8.8/v1/chat", true)
+            resolve_test_connection_target("http://10.0.0.1/v1/chat", true)
                 .await
                 .is_err(),
-            "test mode must not make cleartext public endpoints acceptable"
+            "test mode must not make private non-loopback HTTP endpoints acceptable"
         );
         assert!(
             resolve_test_connection_target("https://10.0.0.1/v1/chat", true)
@@ -620,6 +638,9 @@ mod tests {
         for raw_url in [
             "https://user:pass@example.com/v1/chat",
             "https://example.com/v1/chat#fragment",
+            "http://user:pass@example.com/v1/chat",
+            "http://example.com/v1/chat#fragment",
+            "ftp://example.com/v1/chat",
         ] {
             assert!(
                 resolve_test_connection_target(raw_url, false)

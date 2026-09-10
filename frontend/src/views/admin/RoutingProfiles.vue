@@ -808,6 +808,7 @@
 </template>
 
 <script setup lang="ts">
+import { getI18nLocale } from '@/i18n'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -1749,8 +1750,8 @@ async function confirmDeleteDraft(): Promise<void> {
 
 function formatTimestamp(value?: string | null): string {
   if (!value) return '-'
-  const timestamp = new Date(value)
-  return Number.isNaN(timestamp.getTime()) ? '-' : timestamp.toLocaleString('zh-CN')
+  const timestamp = new Date(typeof value === 'number' ? value * 1000 : value)
+  return Number.isNaN(timestamp.getTime()) ? '-' : timestamp.toLocaleString(getI18nLocale())
 }
 
 onMounted(() => {

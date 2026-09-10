@@ -64,8 +64,8 @@ services:
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-aether}
       MYSQL_USER: ${MYSQL_USER:-aether}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-${DB_PASSWORD:?DB_PASSWORD must be configured}}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-${DB_PASSWORD:?DB_PASSWORD must be configured}}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-${DB_PASSWORD:?set DB_PASSWORD in .env}}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-${DB_PASSWORD:?set DB_PASSWORD in .env}}
       TZ: Asia/Shanghai
     volumes:
       - mysql_data:/var/lib/mysql
@@ -83,10 +83,13 @@ services:
   app:
     image: ${APP_IMAGE:-ghcr.io/fawney19/aether:latest}
     container_name: aether-app
-    user: "${AETHER_CONTAINER_UID:-65532}:${AETHER_CONTAINER_GID:-65532}"
+    user: "0:0"
     read_only: true
     cap_drop:
       - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - FOWNER
     security_opt:
       - no-new-privileges:true
     tmpfs:

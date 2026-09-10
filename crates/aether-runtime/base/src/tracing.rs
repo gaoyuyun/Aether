@@ -666,7 +666,8 @@ impl RollingFileSink {
         config: FileLoggingConfig,
         cleanup: fn(&str, &FileLoggingConfig) -> io::Result<usize>,
     ) -> io::Result<(Self, Option<StartupCleanupWarning>)> {
-        fs::create_dir_all(&config.dir)?;
+        fs::create_dir_all(&config.dir)
+            .map_err(|error| log_destination_error("create log directory", &config.dir, error))?;
         let startup_cleanup_warning =
             cleanup(service_name, &config)
                 .err()
@@ -727,13 +728,39 @@ fn open_bucketed_log_file(dir: &Path, service_name: &str, bucket: &str) -> io::R
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
 
-    let file = options.open(&path)?;
-    validate_open_log_file(&file, &path)?;
+    let file = options
+        .open(&path)
+        .map_err(|error| log_destination_error("open log file", &path, error))?;
+    validate_open_log_file(&file, &path)
+        .map_err(|error| log_destination_error("validate log file", &path, error))?;
     Ok(file)
+}
+
+fn log_destination_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    let mut message = format!("failed to {operation} {}: {error}", path.display());
+    #[cfg(unix)]
+    {
+        let process_uid = unsafe { libc::geteuid() };
+        let process_gid = unsafe { libc::getegid() };
+        message.push_str(&format!(" (process uid={process_uid}, gid={process_gid})"));
+    }
+    message.push_str(
+        "; check ownership and write permissions for the log directory and existing log files",
+    );
+    io::Error::new(error.kind(), message)
 }
 
 #[cfg(unix)]
 fn validate_open_log_file(file: &File, path: &Path) -> io::Result<()> {
+    validate_open_log_file_for_user(file, path, unsafe { libc::geteuid() })
+}
+
+#[cfg(unix)]
+fn validate_open_log_file_for_user(
+    file: &File,
+    path: &Path,
+    process_uid: libc::uid_t,
+) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let metadata = file.metadata()?;
@@ -743,12 +770,14 @@ fn validate_open_log_file(file: &File, path: &Path) -> io::Result<()> {
             format!("log destination is not a regular file: {}", path.display()),
         ));
     }
-    if metadata.uid() != unsafe { libc::geteuid() } {
+    if process_uid != 0 && metadata.uid() != process_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "log destination is owned by another user: {}",
-                path.display()
+                "log destination is owned by another user: {} (owner uid={}, expected uid={process_uid}); \
+                 chmod does not change file ownership",
+                path.display(),
+                metadata.uid()
             ),
         ));
     }
@@ -1079,6 +1108,121 @@ mod tests {
         assert_eq!(warning.error, "cleanup denied".to_string());
 
         fs::remove_dir_all(&warning.log_dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn rolling_file_sink_reports_directory_creation_failure_with_context() {
+        let dir = std::env::temp_dir().join(format!("aether-runtime-logs-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let blocker = dir.join("not-a-directory");
+        fs::write(&blocker, b"unchanged").expect("blocking file should exist");
+        let log_dir = blocker.join("logs");
+        let config = FileLoggingConfig::new(&log_dir, LogRotation::Daily, 7, 30);
+
+        let error = RollingFileSink::new("runtime-test", config)
+            .expect_err("a regular file must not be treated as a directory");
+        let message = error.to_string();
+        assert!(message.contains("failed to create log directory"));
+        assert!(message.contains(&log_dir.display().to_string()));
+        assert!(message.contains("ownership and write permissions"));
+        assert_eq!(fs::read(&blocker).expect("blocking file"), b"unchanged");
+
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn rolling_log_file_reports_open_failure_with_context() {
+        let dir = std::env::temp_dir().join(format!("aether-runtime-logs-{}", Uuid::new_v4()));
+        let path = bucketed_log_path(&dir, "runtime-test", "missing");
+
+        let error = open_bucketed_log_file(&dir, "runtime-test", "missing")
+            .expect_err("a missing parent directory must prevent file creation");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let message = error.to_string();
+        assert!(message.contains("failed to open log file"));
+        assert!(message.contains(&path.display().to_string()));
+        assert!(message.contains("ownership and write permissions"));
+        #[cfg(unix)]
+        {
+            assert!(message.contains(&format!("process uid={}", unsafe { libc::geteuid() })));
+            assert!(message.contains(&format!("gid={}", unsafe { libc::getegid() })));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolling_log_file_rejects_another_owner_even_with_world_writable_permissions() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = std::env::temp_dir().join(format!("aether-runtime-logs-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let path = bucketed_log_path(&dir, "runtime-test", "another-owner");
+        fs::write(&path, b"unchanged").expect("log file should exist");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777))
+            .expect("log permissions should be writable by all users");
+        let file = fs::File::open(&path).expect("log should open");
+        let owner_uid = file.metadata().expect("log metadata").uid();
+        let process_uid = owner_uid.wrapping_add(1);
+
+        let error = super::validate_open_log_file_for_user(&file, &path, process_uid)
+            .expect_err("chmod must not bypass the ownership check");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let message = error.to_string();
+        assert!(message.contains("log destination is owned by another user"));
+        assert!(message.contains(&format!("owner uid={owner_uid}")));
+        assert!(message.contains(&format!("expected uid={process_uid}")));
+        assert!(message.contains("chmod does not change file ownership"));
+        assert_eq!(fs::read(&path).expect("log contents"), b"unchanged");
+        assert_eq!(
+            file.metadata().expect("log metadata").permissions().mode() & 0o777,
+            0o777
+        );
+        drop(file);
+
+        let reopened = open_bucketed_log_file(&dir, "runtime-test", "another-owner")
+            .expect("the actual owner should be able to reopen the log");
+        assert_eq!(
+            reopened
+                .metadata()
+                .expect("log metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&path).expect("log contents"), b"unchanged");
+        drop(reopened);
+
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_log_validation_accepts_existing_owners_but_rejects_hardlinks() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = std::env::temp_dir().join(format!("aether-runtime-logs-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir should exist");
+        let path = bucketed_log_path(&dir, "runtime-test", "existing-owner");
+        fs::write(&path, b"unchanged").expect("log file should exist");
+        let file = fs::File::open(&path).expect("log should open");
+        let owner_uid = file.metadata().expect("log metadata").uid();
+
+        super::validate_open_log_file_for_user(&file, &path, 0)
+            .expect("root may use a regular log file without changing its owner");
+        let metadata = file.metadata().expect("log metadata");
+        assert_eq!(metadata.uid(), owner_uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&path).expect("log contents"), b"unchanged");
+
+        fs::hard_link(&path, dir.join("other-link.log")).expect("hardlink should exist");
+        let error = super::validate_open_log_file_for_user(&file, &path, 0)
+            .expect_err("root must still reject a log file with multiple hard links");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("multiple hard links"));
+        drop(file);
+
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
     }
 
     #[test]

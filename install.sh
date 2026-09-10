@@ -1883,13 +1883,10 @@ generate_compose_env() {
     redis_password="$(urlsafe_rand 32)"
     mysql_password="$(urlsafe_rand 32)"
     mysql_root_password="$(urlsafe_rand 32)"
-    resolve_new_compose_container_identity
 
     cp "${COMPOSE_DIR}/.env.example" "${output}"
     replace_or_append_env "${output}" "APP_IMAGE" "$(compose_image)"
     replace_or_append_env "${output}" "APP_PORT" "$(compose_app_port)"
-    replace_or_append_env "${output}" "AETHER_CONTAINER_UID" "${COMPOSE_CONTAINER_UID}"
-    replace_or_append_env "${output}" "AETHER_CONTAINER_GID" "${COMPOSE_CONTAINER_GID}"
     replace_or_append_env "${output}" "DB_PASSWORD" "${db_password}"
     replace_or_append_env "${output}" "REDIS_PASSWORD" "${redis_password}"
     replace_or_append_env "${output}" "MYSQL_PASSWORD" "${mysql_password}"

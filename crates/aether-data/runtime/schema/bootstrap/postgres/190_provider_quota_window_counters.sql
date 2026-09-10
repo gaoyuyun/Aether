@@ -1,3 +1,6 @@
+CREATE UNIQUE INDEX IF NOT EXISTS ix_usage_counter_deltas_quota_sequence
+    ON public.usage_counter_deltas (quota_delta_sequence);
+
 CREATE TABLE IF NOT EXISTS public.provider_quota_window_counters (
     provider_id character varying(36) NOT NULL
         REFERENCES public.providers(id) ON DELETE CASCADE,

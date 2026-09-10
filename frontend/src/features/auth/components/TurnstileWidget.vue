@@ -163,7 +163,7 @@ async function execute(action: string): Promise<string> {
   if (!turnstile || !container || !turnstile.execute) {
     throw new Error('Turnstile unavailable')
   }
-  const executeWidget = turnstile.execute
+  const execute = turnstile.execute.bind(turnstile)
 
   clearWidget()
 
@@ -192,7 +192,7 @@ async function execute(action: string): Promise<string> {
       },
     })
     widgetId.value = id
-    executeWidget(id)
+    execute(id)
   })
 }
 

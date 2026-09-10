@@ -521,7 +521,7 @@ describe('HorizontalRequestTimeline', () => {
     })
     await nextTick()
 
-    const lastCall = onTraceState.mock.calls.at(-1)?.[0]
+    const lastCall = onTraceState.mock.calls[onTraceState.mock.calls.length - 1]?.[0]
     expect(lastCall).toMatchObject({
       finalStatus: 'streaming',
     })
@@ -657,6 +657,98 @@ describe('HorizontalRequestTimeline', () => {
     expect(root.textContent).not.toContain('none')
     expect(root.textContent).not.toContain('不再重试')
     expect(root.textContent).not.toContain('该错误被标记为敏感上游错误')
+  })
+
+  it.each(['inline', 'reference', 'disabled', 'unavailable', 'none', undefined])(
+    'shows a fallback for redacted errors with body state %s',
+    async (bodyState) => {
+      const trace = buildTrace([
+        buildCandidate({
+          status_code: 400,
+          extra_data: {
+            upstream_response: {
+              status_code: 400,
+              body_state: bodyState,
+            },
+            error_flow: {
+              source: 'upstream_response',
+              status_code: 400,
+              decision: 'retry_next_candidate',
+            },
+          },
+        }),
+      ])
+      trace.final_status = 'failed'
+
+      const root = mountTimeline(trace, {
+        overrideStatusCode: 503,
+        requestStatus: 'failed',
+      })
+      await nextTick()
+
+      expect(root.querySelector('.status-tag')?.textContent?.trim()).toBe('400')
+      expect(root.querySelector('.error-status-badge')?.textContent?.trim()).toBe('HTTP 400')
+      expect(root.querySelector('.error-msg')?.textContent).toContain('链路追踪未包含详细错误内容')
+      expect(root.querySelector('.error-final-status')?.textContent).toContain('请求最终状态：HTTP 503')
+      expect(root.querySelector('.error-upstream-response-json')).toBeNull()
+    },
+  )
+
+  it('keeps the attempt status separate from the upstream transport status', async () => {
+    const root = mountTimeline(buildTrace([
+      buildCandidate({
+        status_code: 502,
+        error_type: 'stream_error',
+        extra_data: {
+          upstream_response: { status_code: 200, body_state: 'disabled' },
+        },
+      }),
+    ]))
+    await nextTick()
+
+    expect(root.querySelector('.status-tag')?.textContent?.trim()).toBe('502')
+    expect(root.querySelector('.error-status-badge')?.textContent?.trim()).toBe('HTTP 502')
+    expect(root.querySelector('.error-upstream-status')?.textContent).toContain('上游响应状态：HTTP 200')
+    expect(root.querySelector('.error-final-status')).toBeNull()
+  })
+
+  it('does not label an active request status as final', async () => {
+    const root = mountTimeline(buildTrace([
+      buildCandidate({ status_code: 400 }),
+    ]), {
+      overrideStatusCode: 200,
+      requestStatus: 'streaming',
+    })
+    await nextTick()
+
+    expect(root.querySelector('.error-final-status')).toBeNull()
+  })
+
+  it('shows failure details even when no status or error message was retained', async () => {
+    const root = mountTimeline(buildTrace([buildCandidate()]))
+    await nextTick()
+
+    expect(root.querySelector('.error-msg')?.textContent).toContain('链路追踪未包含详细错误内容')
+  })
+
+  it('keeps a generic error visible when only upstream headers are available', async () => {
+    const root = mountTimeline(buildTrace([
+      buildCandidate({
+        status_code: 400,
+        error_message: 'execution runtime stream returned non-success status 400',
+        extra_data: {
+          upstream_response: {
+            status_code: 400,
+            headers: { 'content-type': 'application/json' },
+            body_state: 'reference',
+          },
+        },
+      }),
+    ]))
+    await nextTick()
+
+    expect(root.querySelector('.error-msg')?.textContent).toContain('上游返回非成功状态 400')
+    expect(root.querySelector('.error-upstream-response-json')?.textContent).toContain('application/json')
   })
 
   it('keeps local sync diagnostics visible when upstream response body capture is disabled', async () => {

@@ -23,7 +23,7 @@
       </div>
       <Select
         :model-value="modelValue"
-        @update:model-value="handleModelValueUpdate"
+        @update:model-value="($event === 'user' || $event === 'admin' || $event === 'audit_admin') && $emit('update:modelValue', $event)"
       >
         <SelectTrigger class="h-10 w-full">
           <SelectValue />
@@ -66,10 +66,6 @@ defineProps<{
 function handleModelValueUpdate(value: string): void {
   if (value === 'user' || value === 'admin' || value === 'audit_admin') emit('update:modelValue', value)
 }
-
-defineEmits<{
-  'update:modelValue': [value: UserRole]
-}>()
 
 const { legacyT } = useI18n()
 </script>

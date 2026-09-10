@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AxiosAdapter, AxiosInstance, InternalAxiosRequestConfig } from 'axios'
+import type { AxiosAdapter, InternalAxiosRequestConfig } from 'axios'
 
 import apiClient, {
   AUTH_SESSION_SIGNAL_KEY,
@@ -7,10 +7,6 @@ import apiClient, {
   parseAuthSessionSignal,
 } from '@/api/client'
 import { cache, cachedRequest } from '@/utils/cache'
-
-type TestableApiClient = Omit<typeof apiClient, 'client'> & {
-  client: AxiosInstance
-}
 
 describe('apiClient auth state change event', () => {
   beforeEach(() => {
@@ -55,10 +51,10 @@ describe('apiClient auth state change event', () => {
   })
 
   it('restores a session through the refresh cookie and stores the result in memory only', async () => {
-    const rawClient = apiClient as TestableApiClient
-    const previousAdapter = rawClient.client.defaults.adapter
+    const rawClient = apiClient['client']
+    const previousAdapter = rawClient.defaults.adapter
 
-    rawClient.client.defaults.adapter = (async (config: InternalAxiosRequestConfig) => ({
+    rawClient.defaults.adapter = (async (config: InternalAxiosRequestConfig) => ({
       data: { access_token: 'restored-access-token' },
       status: 200,
       statusText: 'OK',
@@ -72,16 +68,16 @@ describe('apiClient auth state change event', () => {
       expect(localStorage.getItem('access_token')).toBeNull()
       expect(sessionStorage.getItem('access_token')).toBeNull()
     } finally {
-      rawClient.client.defaults.adapter = previousAdapter
+      rawClient.defaults.adapter = previousAdapter
     }
   })
 
   it('does not resurrect a session when logout wins an in-flight restore', async () => {
-    const rawClient = apiClient as TestableApiClient
-    const previousAdapter = rawClient.client.defaults.adapter
+    const rawClient = apiClient['client']
+    const previousAdapter = rawClient.defaults.adapter
     let resolveRefresh!: (response: Awaited<ReturnType<AxiosAdapter>>) => void
 
-    rawClient.client.defaults.adapter = (() => new Promise((resolve) => {
+    rawClient.defaults.adapter = (() => new Promise((resolve) => {
       resolveRefresh = resolve
     })) as AxiosAdapter
 
@@ -100,7 +96,7 @@ describe('apiClient auth state change event', () => {
       await expect(restore).rejects.toThrow('Auth state changed')
       expect(apiClient.getToken()).toBeNull()
     } finally {
-      rawClient.client.defaults.adapter = previousAdapter
+      rawClient.defaults.adapter = previousAdapter
     }
   })
 
@@ -141,11 +137,11 @@ describe('apiClient auth state change event', () => {
   })
 
   it('sends auth refresh without a request body', async () => {
-    const rawClient = apiClient as unknown as TestableApiClient
-    const previousAdapter = rawClient.client.defaults.adapter
+    const rawClient = apiClient['client']
+    const previousAdapter = rawClient.defaults.adapter
     const requests: InternalAxiosRequestConfig[] = []
 
-    rawClient.client.defaults.adapter = (async (config: InternalAxiosRequestConfig) => {
+    rawClient.defaults.adapter = (async (config: InternalAxiosRequestConfig) => {
       requests.push(config)
       return {
         data: { access_token: 'new-access-token' },
@@ -165,16 +161,16 @@ describe('apiClient auth state change event', () => {
       expect(requests[0].method).toBe('post')
       expect(requests[0].data).toBeUndefined()
     } finally {
-      rawClient.client.defaults.adapter = previousAdapter
+      rawClient.defaults.adapter = previousAdapter
     }
   })
 
   it('authenticates protected gateway operational requests', async () => {
-    const rawClient = apiClient as TestableApiClient
-    const previousAdapter = rawClient.client.defaults.adapter
+    const rawClient = apiClient['client']
+    const previousAdapter = rawClient.defaults.adapter
     const requests: InternalAxiosRequestConfig[] = []
 
-    rawClient.client.defaults.adapter = (async (config: InternalAxiosRequestConfig) => {
+    rawClient.defaults.adapter = (async (config: InternalAxiosRequestConfig) => {
       requests.push(config)
       return {
         data: '',
@@ -193,7 +189,7 @@ describe('apiClient auth state change event', () => {
       expect(requests[0].headers.Authorization).toBe('Bearer operational-access-token')
       expect(requests[0].headers['X-Client-Device-Id']).toBeTruthy()
     } finally {
-      rawClient.client.defaults.adapter = previousAdapter
+      rawClient.defaults.adapter = previousAdapter
     }
   })
 })

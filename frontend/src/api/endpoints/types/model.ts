@@ -1,5 +1,12 @@
 import type { ProviderModelMapping } from './provider'
 
+export interface ModelProviderReference {
+  id: string
+  model_id?: string | null
+  name: string
+  is_active: boolean
+}
+
 // ========== 阶梯计费类型 ==========
 
 /** 缓存时长定价配置 */
@@ -77,7 +84,10 @@ export interface ModelBillingConfig {
   [key: string]: unknown
 }
 
-export interface ModelConfig {
+export interface ModelConfig extends Record<string, unknown> {
+  description?: string
+  model_mappings?: string[]
+  api_formats?: string[]
   billing?: ModelBillingConfig
   [key: string]: unknown
 }
@@ -137,7 +147,7 @@ export interface ModelCreate {
   supports_extended_thinking?: boolean
   supports_image_generation?: boolean
   is_active?: boolean
-  config?: Record<string, unknown>
+  config?: ModelConfig
 }
 
 export interface ModelUpdate {
@@ -153,7 +163,7 @@ export interface ModelUpdate {
   supports_image_generation?: boolean
   is_active?: boolean
   is_available?: boolean
-  config?: Record<string, unknown> | null
+  config?: ModelConfig | null
 }
 
 export interface ModelCapabilities {
@@ -260,7 +270,7 @@ export interface GlobalModelCreate {
   // Key 能力配置 - 模型支持的能力列表
   supported_capabilities?: string[]
   // 模型配置（JSON格式）- 包含能力、规格、元信息等
-  config?: Record<string, unknown>
+  config?: ModelConfig
   is_active?: boolean
 }
 
@@ -274,7 +284,7 @@ export interface GlobalModelUpdate {
   // Key 能力配置 - 模型支持的能力列表
   supported_capabilities?: string[] | null
   // 模型配置（JSON格式）- 包含能力、规格、元信息等
-  config?: Record<string, unknown> | null
+  config?: ModelConfig | null
 }
 
 export interface GlobalModelResponse {

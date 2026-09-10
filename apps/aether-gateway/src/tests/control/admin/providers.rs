@@ -71,6 +71,66 @@ async fn provider_health_summary(
 }
 
 #[tokio::test]
+async fn admin_provider_summary_health_preserves_redacted_key_summaries() {
+    let endpoint = sample_endpoint(
+        "endpoint-chat",
+        "provider-openai",
+        "openai:chat",
+        "https://api.openai.example",
+    );
+    let keys = [
+        ("key-api", "api_key", None, 0.25),
+        ("key-oauth", "oauth", Some("{}"), 0.75),
+    ]
+    .into_iter()
+    .map(|(key_id, auth_type, auth_config, score)| {
+        let mut key = sample_key(key_id, "provider-openai", "openai:chat", "test")
+            .with_health_fields(Some(json!({"openai:chat": {"health_score": score}})), None);
+        key.auth_type = auth_type.to_string();
+        key.encrypted_api_key = Some("summary".to_string());
+        key.encrypted_auth_config = auth_config.map(ToOwned::to_owned);
+        key
+    })
+    .collect();
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider("provider-openai", "openai", 10)],
+        vec![endpoint],
+        keys,
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            repository,
+        ));
+
+    for uri in [
+        "/api/admin/providers/summary",
+        "/api/admin/providers/provider-openai/summary",
+    ] {
+        let response = local_admin_providers_response(&state, http::Method::GET, uri, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("summary body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("summary should parse");
+        let summary = if uri == "/api/admin/providers/summary" {
+            &payload["items"][0]
+        } else {
+            &payload
+        };
+
+        assert_eq!(summary["total_keys"], 2);
+        assert_eq!(summary["active_keys"], 2);
+        assert_eq!(summary["endpoint_health_details"][0]["total_keys"], 2);
+        assert_eq!(summary["endpoint_health_details"][0]["active_keys"], 2);
+        assert_eq!(summary["endpoint_health_details"][0]["health_score"], 0.5);
+        assert_eq!(summary["avg_health_score"], 0.5);
+        assert_eq!(summary["unhealthy_endpoints"], 0);
+    }
+}
+
+#[tokio::test]
 async fn admin_provider_summary_health_ignores_disabled_keys() {
     let endpoint = sample_endpoint(
         "endpoint-chat",
@@ -1112,16 +1172,24 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         }))
         .send()
         .await
-        .expect("next-minute quota start update should succeed");
-    assert_eq!(next_minute_response.status(), StatusCode::OK);
+        .expect("next-minute quota start update should return a response");
+    assert_eq!(next_minute_response.status(), StatusCode::BAD_REQUEST);
+    let rejected_update: serde_json::Value = next_minute_response
+        .json()
+        .await
+        .expect("quota adjustment error should parse");
+    assert!(rejected_update["detail"]
+        .as_str()
+        .expect("quota adjustment error should explain the required operation")
+        .contains("调整周期"));
     let next_minute_provider = provider_catalog_repository
         .list_providers_by_ids(&["provider-openai".to_string()])
         .await
         .expect("provider should reload after next-minute update");
-    assert_eq!(next_minute_provider[0].monthly_used_usd, Some(0.0));
+    assert_eq!(next_minute_provider[0].monthly_used_usd, Some(12.5));
     assert_eq!(
         next_minute_provider[0].quota_last_reset_at_unix_secs,
-        Some(1_711_000_080)
+        Some(1_711_000_027)
     );
 
     let invalid_timeout_response = reqwest::Client::new()
@@ -1219,7 +1287,10 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         .iter()
         .find(|provider| provider.id == "provider-openai")
         .expect("provider should exist");
-    assert_eq!(updated_provider.billing_type.as_deref(), Some("free_tier"));
+    assert_eq!(
+        updated_provider.billing_type.as_deref(),
+        Some("monthly_quota")
+    );
     assert_eq!(
         updated_provider.request_timeout_secs,
         Some(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS as f64)

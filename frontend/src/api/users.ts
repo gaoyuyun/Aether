@@ -60,7 +60,7 @@ export interface User {
 export interface CreateUserRequest {
   username: string
   password: string
-  email: string
+  email?: string
   role?: UserRole
   initial_gift_usd?: number | null
   unlimited?: boolean

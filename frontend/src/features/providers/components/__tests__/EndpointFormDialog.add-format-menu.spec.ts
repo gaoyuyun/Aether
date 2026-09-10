@@ -12,6 +12,6 @@ describe('EndpointFormDialog add endpoint format menu', () => {
     const addEndpointSection = source.split('<!-- 添加新端点 -->')[1]
 
     expect(addEndpointSection).toBeDefined()
-    expect(addEndpointSection).toContain('<SelectContent :disable-portal="false">')
+    expect(addEndpointSection).toMatch(/<SelectContent\b[^>]*:disable-portal="false"/)
   })
 })

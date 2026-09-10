@@ -1140,19 +1140,40 @@ fn usage_cleanup_window_with_override_is_always_non_aggressive() {
     let override_duration = chrono::Duration::days(180);
     let clamped = usage_cleanup_window_with_override(now_utc, settings, Some(override_duration));
 
-    assert_eq!(clamped.detail_cutoff, policy.detail_cutoff);
-    assert_eq!(clamped.compressed_cutoff, policy.compressed_cutoff);
-    assert_eq!(clamped.header_cutoff, policy.header_cutoff);
-    assert_eq!(clamped.log_cutoff, now_utc - override_duration);
-    assert!(clamped.log_cutoff > policy.log_cutoff);
+    assert_eq!(clamped.detail_cutoff, now_utc - override_duration);
+    assert_eq!(clamped.compressed_cutoff, now_utc - override_duration);
+    assert_eq!(clamped.header_cutoff, now_utc - override_duration);
+    assert_eq!(clamped.log_cutoff, policy.log_cutoff);
+    assert!(clamped.log_cutoff <= policy.log_cutoff);
 
     let far_override = chrono::Duration::days(5);
     let far = usage_cleanup_window_with_override(now_utc, settings, Some(far_override));
-    assert_eq!(far.detail_cutoff, now_utc - far_override);
-    assert_eq!(far.compressed_cutoff, now_utc - far_override);
-    assert_eq!(far.header_cutoff, now_utc - far_override);
-    assert_eq!(far.log_cutoff, now_utc - far_override);
-    assert!(far.log_cutoff > policy.log_cutoff);
+    assert_eq!(far, policy);
+
+    for days in [0, 5, 30, 180, 400] {
+        let cutoff = now_utc - chrono::Duration::days(days);
+        let window = usage_cleanup_window_with_override(
+            now_utc,
+            settings,
+            Some(chrono::Duration::days(days)),
+        );
+        for (actual, configured) in [
+            (window.detail_cutoff, policy.detail_cutoff),
+            (window.compressed_cutoff, policy.compressed_cutoff),
+            (window.header_cutoff, policy.header_cutoff),
+            (window.log_cutoff, policy.log_cutoff),
+        ] {
+            assert!(actual <= configured);
+            assert!(actual <= cutoff);
+            for age in [1, 7, 15, 30, 90, 180, 365, 401] {
+                let created_at = now_utc - chrono::Duration::days(age);
+                if created_at < actual {
+                    assert!(created_at < configured);
+                    assert!(created_at < cutoff);
+                }
+            }
+        }
+    }
 
     let passthrough = usage_cleanup_window_with_override(now_utc, settings, None);
     assert_eq!(passthrough, policy);

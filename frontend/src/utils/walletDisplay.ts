@@ -268,7 +268,7 @@ export function callbackStatusLabel(status: string | null | undefined): string {
   return labels[status] || status
 }
 
-export function callbackStatusBadge(status: string | null | undefined): string {
+export function callbackStatusBadge(status: string | null | undefined) {
   if (status === 'processed') return 'success'
   if (status === 'duplicate' || status === 'ignored') return 'secondary'
   if (status === 'invalid_signature' || status === 'error') return 'destructive'

@@ -205,7 +205,7 @@
                 v-if="!isEndpointConfigReadOnly"
                 v-model:open="endpointRulesExpanded[endpoint.id]"
               >
-                <div class="flex items-center gap-2">
+                <div class="flex flex-wrap items-center gap-2">
                   <!-- 有规则时显示可折叠的触发器 -->
                   <CollapsibleTrigger
                     v-if="getTotalRulesCount(endpoint) > 0"
@@ -236,7 +236,18 @@
                     请求/响应规则
                   </span>
                   <div class="flex-1" />
-                  <div class="flex items-center gap-1 shrink-0">
+                  <div class="flex w-full flex-wrap items-center justify-end gap-1 sm:w-auto">
+                    <Button
+                      v-if="getTotalRulesCount(endpoint) > 0"
+                      variant="ghost"
+                      size="sm"
+                      class="h-7 text-xs px-2"
+                      :title="legacyT('查看已保存规则的原值')"
+                      @click="revealRulesEndpointId = endpoint.id"
+                    >
+                      <Eye class="w-3 h-3 mr-1" />
+                      {{ legacyT('查看原值') }}
+                    </Button>
                     <Button
                       v-if="hasRulePanelChanges(endpoint)"
                       variant="ghost"
@@ -1016,6 +1027,12 @@
     </template>
   </Dialog>
 
+  <EndpointRulesRevealDialog
+    :model-value="modelValue && revealRulesEndpointId !== null"
+    :endpoint-id="revealRulesEndpointId"
+    @update:model-value="revealRulesEndpointId = null"
+  />
+
   <!-- 删除端点确认弹窗 -->
   <AlertDialog
     :model-value="deleteConfirmOpen"
@@ -1052,13 +1069,14 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from '@/components/ui'
-import { Settings, Trash2, Check, X, Power, ChevronRight, Plus, Shuffle, RotateCcw, Radio, CheckCircle, Save, Filter, HelpCircle, GripVertical, Globe, Code2, AlignLeft } from 'lucide-vue-next'
+import { Settings, Trash2, Check, X, Power, ChevronRight, Plus, Shuffle, RotateCcw, Radio, CheckCircle, Save, Filter, HelpCircle, GripVertical, Globe, Code2, AlignLeft, Eye } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { log } from '@/utils/logger'
 import { useI18n } from '@/i18n'
 import AlertDialog from '@/components/common/AlertDialog.vue'
 import EndpointConditionEditor from './EndpointConditionEditor.vue'
+import EndpointRulesRevealDialog from './EndpointRulesRevealDialog.vue'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
 import { getDefaultEndpointBaseUrl, getDefaultEndpointPath } from './endpoint-default-paths'
 import {
@@ -1444,6 +1462,7 @@ function handleBodyRuleDragEnd(endpointId: string) {
 // 状态
 const addingEndpoint = ref(false)
 const savingEndpointId = ref<string | null>(null)
+const revealRulesEndpointId = ref<string | null>(null)
 const resettingDefaultRulesEndpointId = ref<string | null>(null)
 const deletingEndpointId = ref<string | null>(null)
 const togglingEndpointId = ref<string | null>(null)
@@ -1544,7 +1563,7 @@ function validateJsonCondition(rule: Record<string, unknown>, label: string, ind
   if (!isJsonObject(raw)) return formatJsonRuleError(label, index, 'condition 必须是对象')
   const shapeError = validateJsonConditionShape(raw, formatJsonRuleFieldLabel(label, index, 'condition'))
   if (shapeError) return shapeError
-  const editable = conditionToEditable(raw as unknown as BodyRule['condition'])
+  const editable = conditionToEditable(raw as NonNullable<BodyRule['condition']> & Record<string, unknown>)
   const err = validateEditableCondition(editable)
   return err ? formatJsonRuleError(label, index, err) : null
 }
@@ -3307,7 +3326,8 @@ onMounted(() => {
 })
 
 // 监听 props 变化
-watch(() => props.modelValue, (open) => {
+watch(() => [props.modelValue, props.provider?.id] as const, ([open]) => {
+  revealRulesEndpointId.value = null
   bodyRuleHelpOpenEndpointId.value = null
   ruleSelectOpen.value = {}
   responseRuleSelectOpen.value = {}
@@ -3338,6 +3358,8 @@ watch(() => props.modelValue, (open) => {
   } else {
     // 关闭对话框时完全清空新端点表单
     newEndpoint.value = { api_format: '', base_url: '', custom_path: '' }
+    endpointEditStates.value = {}
+    localEndpoints.value = []
   }
 }, { immediate: true })
 
@@ -3416,7 +3438,16 @@ async function saveEndpoint(endpoint: ProviderEndpoint) {
 
     if (Object.keys(payload).length === 0) return
 
-    await updateEndpoint(endpoint.id, payload)
+    const submittedState = JSON.stringify(state)
+    const submittedJsonDraft = endpointRulesJsonDraft.value[endpoint.id]
+    const updatedEndpoint = await updateEndpoint(endpoint.id, payload)
+    if (endpointEditStates.value[endpoint.id] === state) {
+      localEndpoints.value = localEndpoints.value.map(current => current.id === endpoint.id ? updatedEndpoint : current)
+      if (JSON.stringify(state) === submittedState
+        && endpointRulesJsonDraft.value[endpoint.id] === submittedJsonDraft) {
+        resetEndpointChanges(updatedEndpoint)
+      }
+    }
     success(legacyT('端点已更新'))
     emit('endpointUpdated')
   } catch (error: unknown) {

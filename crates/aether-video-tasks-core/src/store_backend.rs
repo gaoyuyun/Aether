@@ -451,6 +451,49 @@ mod tests {
     }
 
     #[test]
+    fn completed_gemini_download_survives_encrypted_file_reload() {
+        let path = temp_store_path("completed-download");
+        let video_url = "https://cdn.example.test/video.mp4?signature=a%2Fb%2Bc%3D";
+        let mut snapshot = sensitive_gemini_snapshot();
+        snapshot.apply_provider_body(
+            json!({
+                "done": true,
+                "debug": "private-debug",
+                "response": {
+                    "generateVideoResponse": {
+                        "generatedSamples": [{"video": {"uri": video_url}}]
+                    }
+                }
+            })
+            .as_object()
+            .expect("provider body"),
+        );
+        let store = FileVideoTaskStore::new(&path, DEVELOPMENT_ENCRYPTION_KEY).expect("store");
+        store.insert(snapshot);
+        drop(store);
+        let bytes = std::fs::read_to_string(&path).expect("encrypted store file");
+        assert!(bytes.starts_with(ENCRYPTED_VIDEO_TASK_STORE_PREFIX));
+        assert!(!bytes.contains(video_url));
+        assert!(!bytes.contains("transport-key-required-for-resume"));
+        let restored =
+            FileVideoTaskStore::new(&path, DEVELOPMENT_ENCRYPTION_KEY).expect("restored store");
+        let task = restored
+            .clone_gemini("task-sensitive")
+            .expect("completed Gemini task");
+        let record = task.to_upsert_record();
+        assert_eq!(
+            record.status,
+            aether_data_contracts::repository::video_tasks::VideoTaskStatus::Completed
+        );
+        assert_eq!(record.video_url.as_deref(), Some(video_url));
+        assert_eq!(record.prompt.as_deref(), Some("create a video"));
+        assert!(!task.metadata.to_string().contains("private-debug"));
+        assert!(record.request_metadata.is_none());
+        drop(restored);
+        cleanup_store_path(&path);
+    }
+
+    #[test]
     fn loading_encrypted_store_rewrites_legacy_provider_diagnostics() {
         let path = temp_store_path("diagnostic-migration");
         let legacy_plaintext = serde_json::to_string(&json!({

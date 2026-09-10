@@ -4,7 +4,8 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 INSTALLER="${REPO_ROOT}/apps/aether-tunnel/install.sh"
 POWERSHELL_INSTALLER="${REPO_ROOT}/apps/aether-tunnel/install.ps1"
-TEST_ROOT="${REPO_ROOT}/.tmp-tunnel-installer-test.$$"
+# Config paths intentionally reject writable ancestors, including /tmp.
+TEST_ROOT="$(mktemp -d "${HOME}/.aether-tunnel-installer-test.XXXXXX")"
 
 cleanup_test_root() {
     chmod -R u+rwX "${TEST_ROOT}" 2>/dev/null || true
@@ -27,7 +28,6 @@ file_mode() {
     stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
-mkdir -m 700 "${TEST_ROOT}"
 LIB="${TEST_ROOT}/installer-lib.sh"
 sed '/^main()/,$d' "${INSTALLER}" >"${LIB}"
 # shellcheck source=/dev/null

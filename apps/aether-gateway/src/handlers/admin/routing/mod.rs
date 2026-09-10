@@ -786,6 +786,7 @@ mod tests {
     #[test]
     fn routing_payloads_format_timestamps_as_rfc3339() {
         let group = StoredRoutingGroup {
+            sort_order: 0,
             id: "group-1".to_string(),
             name: "Default".to_string(),
             description: None,

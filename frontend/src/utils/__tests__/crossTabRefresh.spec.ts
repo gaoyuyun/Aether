@@ -103,7 +103,7 @@ describe('CrossTabRefreshCoordinator', () => {
   })
 
   it('serializes refresh requests without transferring access tokens between tabs', async () => {
-    let resolveRefresh: ((token: string) => void) | null = null
+    let resolveRefresh!: (token: string) => void
     const firstExecutor = vi.fn(
       () =>
         new Promise<string>((resolve) => {
@@ -151,10 +151,12 @@ describe('CrossTabRefreshCoordinator', () => {
     const first = new CrossTabRefreshCoordinator({
       storage: localStorage,
       channelFactory: createChannel,
+      waitTimeoutMs: 50,
     })
     const second = new CrossTabRefreshCoordinator({
       storage: localStorage,
       channelFactory: createChannel,
+      waitTimeoutMs: 50,
     })
 
     const firstRun = first.run(firstExecutor)

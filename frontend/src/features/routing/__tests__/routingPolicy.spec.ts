@@ -77,7 +77,7 @@ describe('routingPolicy', () => {
     expect(createEmptyRoutingGroupConfig().default_policy.sticky_key_attempts).toBe(2)
     expect(normalizeRoutingGroupConfig({}).default_policy.sticky_key_attempts).toBe(2)
     expect(normalizeRoutingGroupConfig({
-      default_policy: { priority_mode: 'provider', scheduling_mode: 'cache_affinity', keep_priority_on_conversion: false, sticky_key_attempts: 3 },
+      default_policy: { priority_mode: 'provider', scheduling_mode: 'cache_affinity', keep_priority_on_conversion: false, sticky_key_attempts: 3, enable_cf_heartbeat: false, cyber_continue_failover: false },
     }).default_policy.sticky_key_attempts).toBe(3)
     expect(normalizeStickyKeyAttempts('5')).toBe(5)
     expect(normalizeStickyKeyAttempts(-1)).toBe(2)

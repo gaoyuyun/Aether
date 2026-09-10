@@ -92,28 +92,6 @@ vi.mock('@/components/ui', async () => {
     },
   })
 
-  const Textarea = defineComponent({
-    inheritAttrs: false,
-    props: {
-      modelValue: { type: String, default: '' },
-      class: String,
-      disabled: Boolean,
-    },
-    emits: ['update:modelValue'],
-    setup(props, { attrs, emit }) {
-      return () => h('textarea', {
-        ...attrs,
-        class: props.class,
-        disabled: props.disabled,
-        value: props.modelValue,
-        onInput: (event: Event) => emit(
-          'update:modelValue',
-          (event.target as HTMLTextAreaElement).value,
-        ),
-      })
-    },
-  })
-
   const Button = defineComponent({
     inheritAttrs: false,
     props: {
@@ -136,6 +114,7 @@ vi.mock('@/components/ui', async () => {
     Button,
     Card: wrapper('section'),
     Input,
+    Switch: wrapper('button'),
     Table: wrapper('table'),
     TableBody: wrapper('tbody'),
     TableCard: wrapper(),
@@ -143,7 +122,6 @@ vi.mock('@/components/ui', async () => {
     TableHead: wrapper('th'),
     TableHeader: wrapper('thead'),
     TableRow: wrapper('tr'),
-    Textarea,
   }
 })
 
@@ -180,21 +158,24 @@ let app: App | undefined
 let root: HTMLElement | undefined
 
 function routingGroup(
-  allowedModels: string[] = [],
+  description = '',
   overrides: Partial<RoutingGroupRecord> = {},
 ): RoutingGroupRecord {
   return {
     id: 'group-1',
     name: 'Default routing',
-    description: null,
+    description,
     enabled: true,
     is_system_default: true,
+    sort_order: 0,
     config_json: {
-      allowed_models: allowedModels,
       default_policy: {
         priority_mode: 'provider',
         scheduling_mode: 'cache_affinity',
         keep_priority_on_conversion: false,
+        enable_cf_heartbeat: false,
+        cyber_continue_failover: false,
+        sticky_key_attempts: 2,
       },
       model_policies: [],
       rules: [],
@@ -242,9 +223,9 @@ async function mountPage(
   await flushPromises()
 }
 
-function setTextareaValue(textarea: HTMLTextAreaElement, value: string): void {
-  textarea.value = value
-  textarea.dispatchEvent(new Event('input', { bubbles: true }))
+function setDescriptionValue(descriptionInput: HTMLInputElement, value: string): void {
+  descriptionInput.value = value
+  descriptionInput.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
 beforeEach(() => {
@@ -261,16 +242,16 @@ afterEach(() => {
   root = undefined
 })
 
-describe('RoutingProfiles model allowlist', () => {
-  it('saves one selector per line without an extra apply step', async () => {
+describe('RoutingProfiles draft saving', () => {
+  it('saves the edited description', async () => {
     await mountPage()
 
-    const textarea = root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement
-    expect(textarea).toBeInstanceOf(HTMLTextAreaElement)
+    const descriptionInput = root?.querySelector(
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement
+    expect(descriptionInput).toBeInstanceOf(HTMLInputElement)
 
-    setTextareaValue(textarea, 'gpt-5\nclaude-*\nvendor,model')
+    setDescriptionValue(descriptionInput, 'Updated description')
     await nextTick()
 
     const saveButton = root?.querySelector(
@@ -283,15 +264,13 @@ describe('RoutingProfiles model allowlist', () => {
     expect(apiMocks.updateRoutingGroup).toHaveBeenCalledWith(
       'group-1',
       expect.objectContaining({
-        config_json: expect.objectContaining({
-          allowed_models: ['gpt-5', 'claude-*', 'vendor,model'],
-        }),
+        description: 'Updated description',
       }),
     )
   })
 
   it('locks the editor while a save is in flight', async () => {
-    const group = routingGroup(['model-a'])
+    const group = routingGroup('Initial description')
     let resolveUpdate: ((value: RoutingGroupRecord) => void) | undefined
     let submittedPayload: RoutingGroupUpdateRequest | undefined
 
@@ -305,10 +284,10 @@ describe('RoutingProfiles model allowlist', () => {
       },
     )
 
-    const textarea = root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement
-    setTextareaValue(textarea, 'model-a\nmodel-b')
+    const descriptionInput = root?.querySelector(
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement
+    setDescriptionValue(descriptionInput, 'Updated description')
     await nextTick()
 
     const saveButton = root?.querySelector(
@@ -318,17 +297,10 @@ describe('RoutingProfiles model allowlist', () => {
     await nextTick()
 
     const editor = root?.querySelector('[aria-busy="true"]') as HTMLElement
-    const clearButton = root?.querySelector(
-      '[data-testid="clear-allowed-models"]',
-    ) as HTMLButtonElement
     expect(editor.hasAttribute('inert')).toBe(true)
-    expect(textarea.disabled).toBe(true)
-    expect(clearButton.disabled).toBe(true)
     expect(saveButton.disabled).toBe(true)
 
-    setTextareaValue(textarea, 'model-c')
-    await nextTick()
-    expect(submittedPayload?.config_json?.allowed_models).toEqual(['model-a', 'model-b'])
+    expect(submittedPayload?.description).toBe('Updated description')
 
     if (!resolveUpdate || !submittedPayload) throw new Error('save request did not start')
     resolveUpdate({
@@ -342,17 +314,17 @@ describe('RoutingProfiles model allowlist', () => {
 
     expect(root?.querySelector('[aria-busy="true"]')).toBeNull()
     expect((root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement).value).toBe('model-a\nmodel-b')
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement).value).toBe('Updated description')
     expect(apiMocks.updateRoutingGroup).toHaveBeenCalledTimes(1)
   })
 
   it('keeps another group selected when an earlier save response arrives', async () => {
-    const firstGroup = routingGroup(['model-a'], {
+    const firstGroup = routingGroup('Initial description', {
       id: 'group-1',
       name: 'First routing',
     })
-    const secondGroup = routingGroup(['model-b'], {
+    const secondGroup = routingGroup('Second description', {
       id: 'group-2',
       name: 'Second routing',
       is_system_default: false,
@@ -370,10 +342,10 @@ describe('RoutingProfiles model allowlist', () => {
       },
     )
 
-    const textarea = root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement
-    setTextareaValue(textarea, 'model-a\nmodel-a-new')
+    const descriptionInput = root?.querySelector(
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement
+    setDescriptionValue(descriptionInput, 'Updated description')
     await nextTick()
     ;(root?.querySelector('button[aria-label="保存"]') as HTMLButtonElement).click()
     await nextTick()
@@ -382,8 +354,8 @@ describe('RoutingProfiles model allowlist', () => {
     routeMocks.route.params = { groupId: 'group-2' }
     await nextTick()
     expect((root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement).value).toBe('model-b')
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement).value).toBe('Second description')
 
     if (!resolveUpdate || !submittedPayload) throw new Error('save request did not start')
     resolveUpdate({
@@ -397,13 +369,13 @@ describe('RoutingProfiles model allowlist', () => {
 
     expect(root?.querySelector('h2')?.textContent).toContain('Second routing')
     expect((root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement).value).toBe('model-b')
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement).value).toBe('Second description')
     expect(routeMocks.replace).not.toHaveBeenCalled()
   })
 
   it('refreshes a clean draft when returning to the saved group before the response arrives', async () => {
-    const group = routingGroup(['model-a'])
+    const group = routingGroup('Initial description')
     let resolveUpdate: ((value: RoutingGroupRecord) => void) | undefined
     let submittedPayload: RoutingGroupUpdateRequest | undefined
 
@@ -417,10 +389,10 @@ describe('RoutingProfiles model allowlist', () => {
       },
     )
 
-    const textarea = root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement
-    setTextareaValue(textarea, 'model-a\nmodel-b')
+    const descriptionInput = root?.querySelector(
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement
+    setDescriptionValue(descriptionInput, 'Updated description')
     await nextTick()
     ;(root?.querySelector('button[aria-label="保存"]') as HTMLButtonElement).click()
     await nextTick()
@@ -433,8 +405,8 @@ describe('RoutingProfiles model allowlist', () => {
     routeMocks.route.params = { groupId: 'group-1' }
     await nextTick()
     expect((root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement).value).toBe('model-a')
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement).value).toBe('Initial description')
 
     if (!resolveUpdate || !submittedPayload) throw new Error('save request did not start')
     resolveUpdate({
@@ -447,8 +419,8 @@ describe('RoutingProfiles model allowlist', () => {
     await flushPromises()
 
     expect((root?.querySelector(
-      '[data-testid="allowed-models-input"]',
-    ) as HTMLTextAreaElement).value).toBe('model-a\nmodel-b')
+      'input[placeholder="例如：默认策略 / 高推理策略 / 号池优先策略"]',
+    ) as HTMLInputElement).value).toBe('Updated description')
     expect((root?.querySelector(
       'button[aria-label="保存"]',
     ) as HTMLButtonElement).disabled).toBe(true)
@@ -483,7 +455,7 @@ describe('RoutingProfiles model allowlist', () => {
     if (!resolveCreate || !submittedPayload) throw new Error('create request did not start')
     const config = submittedPayload.config_json
     resolveCreate({
-      ...routingGroup(config?.allowed_models ?? [], {
+      ...routingGroup(submittedPayload.description ?? '', {
         id: 'created-group',
         name: submittedPayload.name,
         description: submittedPayload.description,

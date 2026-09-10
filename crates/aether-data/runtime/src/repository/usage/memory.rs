@@ -2806,6 +2806,40 @@ fn hydrate_client_family(item: &mut StoredRequestUsageAudit) {
     }
 }
 
+fn merge_usage_body_capture(
+    incoming_body: Option<Value>,
+    incoming_ref: Option<String>,
+    incoming_state: Option<UsageBodyCaptureState>,
+    existing: Option<&StoredRequestUsageAudit>,
+    field: UsageBodyField,
+) -> (Option<Value>, Option<String>, Option<UsageBodyCaptureState>) {
+    if matches!(
+        incoming_state,
+        Some(
+            UsageBodyCaptureState::None
+                | UsageBodyCaptureState::Disabled
+                | UsageBodyCaptureState::Unavailable
+        )
+    ) {
+        return (None, None, incoming_state);
+    }
+    if incoming_body.is_some() {
+        return (
+            incoming_body,
+            None,
+            incoming_state.or(Some(UsageBodyCaptureState::Inline)),
+        );
+    }
+    if incoming_ref.is_some() {
+        return (None, incoming_ref, Some(UsageBodyCaptureState::Reference));
+    }
+    (
+        existing.and_then(|item| item.body_value(field).cloned()),
+        existing.and_then(|item| item.body_ref(field).map(ToOwned::to_owned)),
+        incoming_state.or_else(|| existing.and_then(|item| item.body_state(field))),
+    )
+}
+
 fn request_body_capture_replaces_derived_facts(
     request_body: Option<&Value>,
     request_body_state: Option<UsageBodyCaptureState>,
@@ -2937,36 +2971,47 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
                 return Ok(existing.clone());
             }
         }
-        let capture_usage = sanitize_usage_capture_controls_for_persistence(capture_usage);
+        let mut capture_usage = sanitize_usage_capture_controls_for_persistence(capture_usage);
         if let Some(existing) = by_request_id.get_mut(&usage.request_id) {
-            existing.request_headers = None;
-            existing.request_body = None;
-            existing.request_body_ref = None;
-            existing.request_body_state = None;
-            existing.provider_request_headers = None;
-            existing.provider_request_body = None;
-            existing.provider_request_body_ref = None;
-            existing.provider_request_body_state = None;
-            existing.response_headers = None;
-            existing.response_body = None;
-            existing.response_body_ref = None;
-            existing.response_body_state = None;
-            existing.client_response_headers = None;
-            existing.client_response_body = None;
-            existing.client_response_body_ref = None;
-            existing.client_response_body_state = None;
             existing.request_metadata =
                 sanitize_usage_request_metadata(existing.request_metadata.take());
         }
         {
             let mut detached_bodies = self.detached_bodies.write().expect("usage repository lock");
-            for field in [
-                UsageBodyField::RequestBody,
-                UsageBodyField::ProviderRequestBody,
-                UsageBodyField::ResponseBody,
-                UsageBodyField::ClientResponseBody,
+            for (field, state, body) in [
+                (
+                    UsageBodyField::RequestBody,
+                    capture_usage.request_body_state,
+                    &capture_usage.request_body,
+                ),
+                (
+                    UsageBodyField::ProviderRequestBody,
+                    capture_usage.provider_request_body_state,
+                    &capture_usage.provider_request_body,
+                ),
+                (
+                    UsageBodyField::ResponseBody,
+                    capture_usage.response_body_state,
+                    &capture_usage.response_body,
+                ),
+                (
+                    UsageBodyField::ClientResponseBody,
+                    capture_usage.client_response_body_state,
+                    &capture_usage.client_response_body,
+                ),
             ] {
-                detached_bodies.remove(&usage_body_ref(&usage.request_id, field));
+                if body.is_some()
+                    || matches!(
+                        state,
+                        Some(
+                            UsageBodyCaptureState::None
+                                | UsageBodyCaptureState::Disabled
+                                | UsageBodyCaptureState::Unavailable
+                        )
+                    )
+                {
+                    detached_bodies.remove(&usage_body_ref(&usage.request_id, field));
+                }
             }
         }
 
@@ -3031,10 +3076,36 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
             }
         });
         let request_metadata = sanitize_memory_request_metadata(request_metadata);
-        let request_body_ref = None;
-        let provider_request_body_ref = None;
-        let response_body_ref = None;
-        let client_response_body_ref = None;
+        let (request_body, request_body_ref, request_body_state) = merge_usage_body_capture(
+            capture_usage.request_body.take(),
+            capture_usage.request_body_ref.take(),
+            capture_usage.request_body_state,
+            existing.as_ref(),
+            UsageBodyField::RequestBody,
+        );
+        let (provider_request_body, provider_request_body_ref, provider_request_body_state) =
+            merge_usage_body_capture(
+                capture_usage.provider_request_body.take(),
+                capture_usage.provider_request_body_ref.take(),
+                capture_usage.provider_request_body_state,
+                existing.as_ref(),
+                UsageBodyField::ProviderRequestBody,
+            );
+        let (response_body, response_body_ref, response_body_state) = merge_usage_body_capture(
+            capture_usage.response_body.take(),
+            capture_usage.response_body_ref.take(),
+            capture_usage.response_body_state,
+            existing.as_ref(),
+            UsageBodyField::ResponseBody,
+        );
+        let (client_response_body, client_response_body_ref, client_response_body_state) =
+            merge_usage_body_capture(
+                capture_usage.client_response_body.take(),
+                capture_usage.client_response_body_ref.take(),
+                capture_usage.client_response_body_state,
+                existing.as_ref(),
+                UsageBodyField::ClientResponseBody,
+            );
         let stored = StoredRequestUsageAudit {
             id: existing
                 .as_ref()
@@ -3143,22 +3214,38 @@ impl UsageWriteRepository for InMemoryUsageReadRepository {
             ),
             status: usage.status,
             billing_status: usage.billing_status,
-            request_headers: None,
-            request_body: None,
+            request_headers: capture_usage.request_headers.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|item| item.request_headers.clone())
+            }),
+            request_body,
             request_body_ref,
-            request_body_state: capture_usage.request_body_state,
-            provider_request_headers: None,
-            provider_request_body: None,
+            request_body_state,
+            provider_request_headers: capture_usage.provider_request_headers.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|item| item.provider_request_headers.clone())
+            }),
+            provider_request_body,
             provider_request_body_ref,
-            provider_request_body_state: capture_usage.provider_request_body_state,
-            response_headers: None,
-            response_body: None,
+            provider_request_body_state,
+            response_headers: capture_usage.response_headers.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|item| item.response_headers.clone())
+            }),
+            response_body,
             response_body_ref,
-            response_body_state: capture_usage.response_body_state,
-            client_response_headers: None,
-            client_response_body: None,
+            response_body_state,
+            client_response_headers: capture_usage.client_response_headers.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|item| item.client_response_headers.clone())
+            }),
+            client_response_body,
             client_response_body_ref,
-            client_response_body_state: capture_usage.client_response_body_state,
+            client_response_body_state,
             candidate_id: if replace_routing_snapshot {
                 capture_usage.candidate_id
             } else {

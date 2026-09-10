@@ -1964,6 +1964,7 @@ async fn keeps_refresh_failed_oauth_candidate_selectable_before_local_auth_resol
         u64::MAX,
         false,
         None,
+        ordering_config(&state).await,
     )
     .await
     .expect("selection should succeed");

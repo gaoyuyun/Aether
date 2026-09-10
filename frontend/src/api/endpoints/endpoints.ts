@@ -2,6 +2,20 @@ import client from '../client'
 import type { ProviderEndpoint, ProxyConfig, HeaderRule, BodyRule, FormatAcceptanceConfig } from './types'
 import { markAccessControlCatalogChanged } from '@/utils/accessControlCatalog'
 
+export interface ProviderEndpointRules {
+  header_rules: HeaderRule[]
+  body_rules: BodyRule[]
+  response_header_rules: HeaderRule[]
+}
+
+export async function revealEndpointRules(endpointId: string, signal?: AbortSignal): Promise<ProviderEndpointRules> {
+  const response = await client.get<ProviderEndpointRules>(
+    `/api/admin/endpoints/${encodeURIComponent(endpointId)}/rules/reveal`,
+    { signal },
+  )
+  return response.data
+}
+
 /**
  * 获取指定 Provider 的所有 Endpoints
  */

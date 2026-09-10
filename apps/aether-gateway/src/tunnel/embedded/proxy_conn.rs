@@ -9,6 +9,7 @@ use aether_runtime::bounded_queue;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use super::hub::{ConnConfig, HubRouter, ProxyConn, ProxyManagementTokenCredential, SendStatus};
@@ -84,6 +85,35 @@ pub async fn handle_proxy_connection(
 
     let (tx, mut rx) = bounded_queue::<Message>(cfg.outbound_queue_capacity);
     let (close_tx, mut close_rx) = watch::channel(false);
+    let settings = if protocol_version >= 3 {
+        let Some(settings) = read_proxy_settings(
+            &mut ws_tx,
+            &mut ws_rx,
+            security.as_deref(),
+            protocol_version,
+        )
+        .await
+        else {
+            warn!(conn_id, "proxy SETTINGS negotiation failed");
+            return;
+        };
+        let local = super::hub::local_settings();
+        let negotiated =
+            settings.negotiate(local.initial_stream_window_bytes, local.drain_deadline_ms);
+        let message = Message::Binary(protocol::encode_settings(&negotiated).into());
+        let Ok(message) = encrypt_message(message, security.as_deref()) else {
+            return;
+        };
+        if !matches!(
+            tokio::time::timeout(PROXY_HELLO_TIMEOUT, ws_tx.send(message)).await,
+            Ok(Ok(()))
+        ) {
+            return;
+        }
+        negotiated
+    } else {
+        super::hub::local_settings()
+    };
     let conn = ProxyConn::new(
         conn_id,
         node_id.clone(),
@@ -93,7 +123,8 @@ pub async fn handle_proxy_connection(
         max_streams,
         protocol_version,
     )
-    .with_tunnel_generation(node_generation);
+    .with_tunnel_generation(node_generation)
+    .with_settings(settings);
     let conn = match (security_key.clone(), management_token_credential) {
         (Some(key), None) => Arc::new(conn.with_authenticated_key(key)),
         (None, Some(credential)) => Arc::new(conn.with_management_token_credential(credential)),
@@ -416,19 +447,22 @@ async fn run_proxy_reader(
     let idle_enabled = !idle_timeout.is_zero();
     let mut oversized_count = 0u32;
     let mut frames_received: u64 = 0;
+    let mut close_rx = conn.outbound.subscribe_close();
+    let mut heartbeats = JoinSet::new();
     loop {
-        let msg = if idle_enabled {
-            tokio::select! {
-                msg = ws_rx.next() => msg,
-                _ = tokio::time::sleep(idle_timeout) => {
-                    warn!(conn_id = conn.id, node_id = %conn.node_id, "proxy idle timeout");
-                    let _ = conn.send(Message::Binary(protocol::encode_goaway().into()));
-                    conn.request_close();
-                    break;
-                }
+        if conn.outbound.is_closing() {
+            break;
+        }
+        while heartbeats.try_join_next().is_some() {}
+        let msg = tokio::select! {
+            biased;
+            _ = close_rx.changed() => break,
+            msg = ws_rx.next() => msg,
+            _ = tokio::time::sleep(idle_timeout), if idle_enabled => {
+                warn!(conn_id = conn.id, node_id = %conn.node_id, "proxy idle timeout");
+                conn.request_close();
+                break;
             }
-        } else {
-            ws_rx.next().await
         };
 
         match msg {
@@ -463,7 +497,27 @@ async fn run_proxy_reader(
                     continue;
                 }
 
-                hub.handle_proxy_frame(conn.id, &mut data).await;
+                let is_heartbeat = protocol::FrameHeader::parse(&data)
+                    .is_some_and(|header| header.msg_type == protocol::HEARTBEAT_DATA);
+                if is_heartbeat {
+                    if heartbeats.is_empty() {
+                        let heartbeat_hub = Arc::clone(&hub);
+                        let conn_id = conn.id;
+                        heartbeats.spawn(async move {
+                            if tokio::time::timeout(
+                                Duration::from_secs(10),
+                                heartbeat_hub.handle_proxy_frame(conn_id, &mut data),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!(conn_id, "proxy heartbeat processing timed out");
+                            }
+                        });
+                    }
+                } else {
+                    hub.handle_proxy_frame(conn.id, &mut data).await;
+                }
             }
             Some(Ok(Message::Close(_))) | None => {
                 info!(
@@ -489,6 +543,56 @@ async fn run_proxy_reader(
             _ => {}
         }
     }
+    heartbeats.shutdown().await;
+}
+
+async fn read_proxy_settings(
+    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    ws_rx: &mut futures_util::stream::SplitStream<WebSocket>,
+    security: Option<&SecureFrameCodec>,
+    protocol_version: u8,
+) -> Option<protocol::SettingsPayload> {
+    tokio::time::timeout(PROXY_HELLO_TIMEOUT, async {
+        let mut hello_received = security.is_some();
+        for _ in 0..MAX_PREAUTH_PINGS {
+            match ws_rx.next().await? {
+                Ok(Message::Binary(data)) => {
+                    if data.len() > 256 * 1024 {
+                        return None;
+                    }
+                    let data = decrypt_message(data, security).ok()?;
+                    let frame = Frame::decode(data.into()).ok()?;
+                    if frame.stream_id != 0 || frame.flags != 0 {
+                        return None;
+                    }
+                    match frame.msg_type {
+                        MsgType::Hello if !hello_received => {
+                            let hello =
+                                serde_json::from_slice::<HelloPayload>(&frame.payload).ok()?;
+                            if hello.protocol_version != protocol_version {
+                                return None;
+                            }
+                            hello_received = true;
+                        }
+                        MsgType::Settings if hello_received => {
+                            let settings =
+                                serde_json::from_slice::<protocol::SettingsPayload>(&frame.payload)
+                                    .ok()?;
+                            return settings.is_valid().then_some(settings);
+                        }
+                        _ => return None,
+                    }
+                }
+                Ok(Message::Ping(payload)) => ws_tx.send(Message::Pong(payload)).await.ok()?,
+                Ok(Message::Pong(_)) => {}
+                _ => return None,
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn encrypt_message(
@@ -523,6 +627,158 @@ fn decrypt_message(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn slow_heartbeat_does_not_block_response_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as ClientMessage};
+
+        let called = Arc::new(AtomicUsize::new(0));
+        let callback_called = Arc::clone(&called);
+        let control_plane = super::super::control_plane::ControlPlaneClient::local(
+            move |_, _| {
+                callback_called.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            },
+            |_, _, _, _| Box::pin(async { Ok(()) }),
+        );
+        let data = crate::data::GatewayDataState::with_tunnel_management_auth_for_testkit(
+            "heartbeat-test",
+            "heartbeat-generation",
+            "ae-tunnel-harness-management-token",
+            aether_crypto::DEVELOPMENT_ENCRYPTION_KEY,
+        )
+        .unwrap();
+        let state = super::super::AppState::new(
+            control_plane,
+            ConnConfig {
+                ping_interval: Duration::from_secs(60),
+                idle_timeout: Duration::ZERO,
+                outbound_queue_capacity: 128,
+            },
+            16,
+        )
+        .with_data(Arc::new(data));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = super::super::build_router_with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut request = format!("ws://{address}/api/internal/proxy-tunnel")
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert("x-node-id", "heartbeat-test".parse().unwrap());
+        headers.insert(
+            aether_contracts::tunnel_security::TUNNEL_GENERATION_HEADER,
+            "heartbeat-generation".parse().unwrap(),
+        );
+        headers.insert(
+            aether_contracts::tunnel::TUNNEL_PROTOCOL_VERSION_HEADER,
+            "3".parse().unwrap(),
+        );
+        headers.insert(
+            "authorization",
+            "Bearer ae-tunnel-harness-management-token".parse().unwrap(),
+        );
+        let (mut websocket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let hello = HelloPayload {
+            protocol_version: 3,
+            capabilities: vec![],
+            session_id: None,
+            replica_id: None,
+        };
+        websocket
+            .send(ClientMessage::Binary(protocol::encode_hello(&hello).into()))
+            .await
+            .unwrap();
+        websocket
+            .send(ClientMessage::Binary(
+                protocol::encode_settings(&super::super::hub::local_settings()).into(),
+            ))
+            .await
+            .unwrap();
+        let ClientMessage::Binary(settings) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected SETTINGS")
+        };
+        assert_eq!(Frame::decode(settings).unwrap().msg_type, MsgType::Settings);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.hub.has_local_proxy("heartbeat-test") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let meta: protocol::RequestMeta = serde_json::from_value(serde_json::json!({
+            "method": "GET", "url": "https://example.com", "headers": {}, "stream": true, "timeout": 10
+        })).unwrap();
+        let stream = state
+            .hub
+            .open_local_stream("heartbeat-test", &meta)
+            .await
+            .unwrap();
+        let ClientMessage::Binary(request) = websocket.next().await.unwrap().unwrap() else {
+            panic!("expected request headers")
+        };
+        let stream_id = Frame::decode(request).unwrap().stream_id;
+        let heartbeat = Frame::control(
+            MsgType::HeartbeatData,
+            serde_json::to_vec(&serde_json::json!({"node_id": "heartbeat-test"})).unwrap(),
+        );
+        websocket
+            .send(ClientMessage::Binary(heartbeat.encode()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while called.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..8 {
+            websocket
+                .send(ClientMessage::Binary(heartbeat.encode()))
+                .await
+                .unwrap();
+        }
+        let response = Frame::new(
+            stream_id,
+            MsgType::ResponseHeaders,
+            0,
+            serde_json::to_vec(&serde_json::json!({"status": 200, "headers": []})).unwrap(),
+        );
+        websocket
+            .send(ClientMessage::Binary(response.encode()))
+            .await
+            .unwrap();
+        assert_eq!(
+            stream
+                .wait_headers(Duration::from_secs(1))
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        state.hub.request_close_all_proxies();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.hub.has_local_proxy("heartbeat-test") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
     use super::*;
 
     const KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";

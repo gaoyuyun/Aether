@@ -12,10 +12,11 @@ use axum::extract::ws::Message;
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::mpsc;
 use tokio::sync::{watch, Notify};
 use tracing::{debug, info, warn};
 
+pub use super::body::LocalBodyEvent;
+use super::body::{BodyReceiver, ResponseBuffer};
 use super::control_plane::ControlPlaneClient;
 use super::protocol;
 
@@ -28,6 +29,10 @@ const DEFAULT_STREAM_INITIAL_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
 const DEFAULT_DRAIN_DEADLINE_MS: u64 = 30_000;
 const DEFAULT_NODE_STATUS_QUEUE_CAPACITY: usize = 1_024;
 const CONNECTION_WARMUP: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+#[path = "flow_control_tests.rs"]
+mod flow_control_tests;
 
 static STREAM_INITIAL_WINDOW_BYTES: LazyLock<u32> = LazyLock::new(|| {
     std::env::var("AETHER_TUNNEL_STREAM_INITIAL_WINDOW_BYTES")
@@ -53,11 +58,16 @@ static NODE_STATUS_QUEUE_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
         .unwrap_or(DEFAULT_NODE_STATUS_QUEUE_CAPACITY)
 });
 
-static STREAM_MIN_WINDOW_UPDATE_BYTES: LazyLock<u32> = LazyLock::new(|| {
-    STREAM_INITIAL_WINDOW_BYTES
-        .saturating_div(4)
-        .clamp(1, 1024 * 1024)
-});
+pub(super) fn local_settings() -> protocol::SettingsPayload {
+    protocol::SettingsPayload {
+        initial_stream_window_bytes: (*STREAM_INITIAL_WINDOW_BYTES)
+            .min(aether_contracts::tunnel::MAX_TUNNEL_DECOMPRESSED_PAYLOAD_BYTES as u32),
+        min_window_update_bytes: STREAM_INITIAL_WINDOW_BYTES
+            .saturating_div(4)
+            .clamp(1, 1024 * 1024),
+        drain_deadline_ms: *DRAIN_DEADLINE_MS,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendStatus {
@@ -91,6 +101,7 @@ impl ConnHealthState {
 struct StreamFlowWindow {
     available: Mutex<u64>,
     notify: Notify,
+    closed: AtomicBool,
 }
 
 impl StreamFlowWindow {
@@ -98,6 +109,7 @@ impl StreamFlowWindow {
         Self {
             available: Mutex::new(u64::from(initial)),
             notify: Notify::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -109,6 +121,12 @@ impl StreamFlowWindow {
         let requested = bytes as u64;
         let started_at = Instant::now();
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(());
+            }
             {
                 let mut available = self.available.lock();
                 if *available >= requested {
@@ -120,10 +138,7 @@ impl StreamFlowWindow {
             let Some(remaining) = timeout.checked_sub(started_at.elapsed()) else {
                 return Err(());
             };
-            if tokio::time::timeout(remaining, self.notify.notified())
-                .await
-                .is_err()
-            {
+            if tokio::time::timeout(remaining, notified).await.is_err() {
                 return Err(());
             }
         }
@@ -136,6 +151,11 @@ impl StreamFlowWindow {
         let mut available = self.available.lock();
         *available = available.saturating_add(u64::from(delta));
         drop(available);
+        self.notify.notify_waiters();
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         self.notify.notify_waiters();
     }
 }
@@ -209,6 +229,10 @@ impl BoundedOutbound {
     pub fn snapshot(&self) -> QueueSnapshot {
         self.tx.snapshot()
     }
+
+    pub(super) fn subscribe_close(&self) -> watch::Receiver<bool> {
+        self.close_tx.subscribe()
+    }
 }
 
 pub struct ProxyConn {
@@ -231,6 +255,7 @@ pub struct ProxyConn {
     flow_window_blocked_ms: AtomicU64,
     write_latency_last_us: AtomicU64,
     write_latency_ewma_us: AtomicU64,
+    settings: Mutex<protocol::SettingsPayload>,
 }
 
 impl ProxyConn {
@@ -244,6 +269,7 @@ impl ProxyConn {
         protocol_version: u8,
     ) -> Self {
         Self {
+            settings: Mutex::new(local_settings()),
             id,
             node_id,
             node_name,
@@ -268,6 +294,11 @@ impl ProxyConn {
 
     pub fn with_authenticated_key(mut self, authenticated_key: String) -> Self {
         self.authenticated_key = Some(authenticated_key);
+        self
+    }
+
+    pub(super) fn with_settings(mut self, settings: protocol::SettingsPayload) -> Self {
+        *self.settings.get_mut() = settings;
         self
     }
 
@@ -565,13 +596,6 @@ pub struct LocalResponseHead {
     pub headers: Vec<(String, String)>,
 }
 
-#[derive(Debug)]
-pub enum LocalBodyEvent {
-    Chunk(Bytes),
-    End,
-    Error(String),
-}
-
 #[derive(Debug, Default)]
 struct LocalWaitState {
     response: Option<LocalResponseHead>,
@@ -585,10 +609,11 @@ pub struct LocalStream {
     proxy_stream_id: u32,
     request_window: StreamFlowWindow,
     response_consumed_since_update: Mutex<u64>,
+    min_window_update_bytes: u32,
+    response_connection: Mutex<Option<std::sync::Weak<ProxyConn>>>,
     wait_state: Mutex<LocalWaitState>,
     headers_notify: Notify,
-    body_tx: mpsc::Sender<LocalBodyEvent>,
-    body_rx: Mutex<Option<mpsc::Receiver<LocalBodyEvent>>>,
+    body: Arc<ResponseBuffer>,
     terminal: AtomicBool,
 }
 
@@ -600,7 +625,6 @@ impl LocalStream {
         proxy_stream_id: u32,
         initial_window_bytes: u32,
     ) -> Self {
-        let (body_tx, body_rx) = mpsc::channel(128);
         Self {
             id,
             tunnel_generation,
@@ -608,10 +632,11 @@ impl LocalStream {
             proxy_stream_id,
             request_window: StreamFlowWindow::new(initial_window_bytes),
             response_consumed_since_update: Mutex::new(0),
+            min_window_update_bytes: (initial_window_bytes / 4).clamp(1, 1024 * 1024),
+            response_connection: Mutex::new(None),
             wait_state: Mutex::new(LocalWaitState::default()),
             headers_notify: Notify::new(),
-            body_tx,
-            body_rx: Mutex::new(Some(body_rx)),
+            body: ResponseBuffer::new(initial_window_bytes as usize),
             terminal: AtomicBool::new(false),
         }
     }
@@ -632,26 +657,51 @@ impl LocalStream {
         self.request_window.add(delta);
     }
 
-    fn response_window_update_delta(&self, bytes: usize) -> Option<u32> {
-        if bytes == 0 {
-            return None;
+    async fn flush_response_credit(&self) -> Result<(), String> {
+        if self.terminal.load(Ordering::Acquire) {
+            return Ok(());
         }
-
-        let mut consumed = self.response_consumed_since_update.lock();
-        *consumed = consumed.saturating_add(bytes as u64);
-        let threshold = u64::from(*STREAM_MIN_WINDOW_UPDATE_BYTES);
-        if *consumed < threshold {
-            return None;
+        let connection = self
+            .response_connection
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let Some(connection) = connection else {
+            return Ok(());
+        };
+        if connection.protocol_version() < 3 {
+            return Ok(());
         }
-
-        let delta = (*consumed).min(u64::from(u32::MAX)) as u32;
-        *consumed = consumed.saturating_sub(u64::from(delta));
-        Some(delta)
+        let delta = {
+            let consumed = self.response_consumed_since_update.lock();
+            if *consumed < u64::from(self.min_window_update_bytes) {
+                return Ok(());
+            }
+            (*consumed).min(u64::from(u32::MAX)) as u32
+        };
+        let frame = protocol::encode_window_update(self.proxy_stream_id, delta);
+        if connection
+            .send_wait(Message::Binary(frame.into()), OUTBOUND_BACKPRESSURE_TIMEOUT)
+            .await
+            == SendStatus::Queued
+        {
+            let mut consumed = self.response_consumed_since_update.lock();
+            *consumed = consumed.saturating_sub(u64::from(delta));
+            return Ok(());
+        }
+        if self.terminal.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        connection.request_close();
+        Err("proxy flow-control update failed".to_string())
     }
 
     pub async fn wait_headers(&self, timeout: Duration) -> Result<LocalResponseHead, String> {
         tokio::time::timeout(timeout, async {
             loop {
+                let notified = self.headers_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 let outcome = {
                     let state = self.wait_state.lock();
                     if let Some(response) = &state.response {
@@ -662,15 +712,20 @@ impl LocalStream {
                 if let Some(error) = outcome {
                     return Err(error);
                 }
-                self.headers_notify.notified().await;
+                notified.await;
             }
         })
         .await
         .map_err(|_| "timed out waiting for response headers".to_string())?
     }
 
-    pub fn take_body_receiver(&self) -> Option<mpsc::Receiver<LocalBodyEvent>> {
-        self.body_rx.lock().take()
+    pub fn take_body_receiver(self: &Arc<Self>) -> Option<LocalBodyReceiver> {
+        self.body.take_receiver().map(|receiver| LocalBodyReceiver {
+            receiver,
+            stream: Arc::clone(self),
+            failed: false,
+            pending: None,
+        })
     }
 
     fn set_response_headers(&self, meta: protocol::ResponseMeta) {
@@ -690,21 +745,11 @@ impl LocalStream {
         }
     }
 
-    async fn push_body_chunk(&self, payload: Bytes) -> bool {
+    fn push_body_chunk(&self, payload: Bytes) -> bool {
         if self.terminal.load(Ordering::Acquire) {
             return false;
         }
-        // Use a timeout to prevent a slow consumer from blocking the shared
-        // proxy-connection reader (head-of-line blocking across streams).
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            self.body_tx.send(LocalBodyEvent::Chunk(payload)),
-        )
-        .await
-        {
-            Ok(Ok(())) => true,
-            _ => false,
-        }
+        self.body.push(payload)
     }
 
     fn finish(&self) {
@@ -722,7 +767,8 @@ impl LocalStream {
         if notify {
             self.headers_notify.notify_waiters();
         }
-        let _ = self.body_tx.try_send(LocalBodyEvent::End);
+        self.request_window.close();
+        self.body.finish(Ok(()));
     }
 
     fn fail(&self, error: impl Into<String>) {
@@ -742,7 +788,38 @@ impl LocalStream {
         if notify {
             self.headers_notify.notify_waiters();
         }
-        let _ = self.body_tx.try_send(LocalBodyEvent::Error(error));
+        self.request_window.close();
+        self.body.finish(Err(error));
+    }
+}
+
+pub struct LocalBodyReceiver {
+    receiver: BodyReceiver,
+    stream: Arc<LocalStream>,
+    failed: bool,
+    pending: Option<LocalBodyEvent>,
+}
+
+impl LocalBodyReceiver {
+    pub async fn recv(&mut self) -> Option<LocalBodyEvent> {
+        if self.failed {
+            return None;
+        }
+        if self.pending.is_none() {
+            let event = self.receiver.recv().await?;
+            if let LocalBodyEvent::Chunk(chunk) = &event {
+                let mut consumed = self.stream.response_consumed_since_update.lock();
+                *consumed = consumed.saturating_add(chunk.len() as u64);
+            }
+            self.pending = Some(event);
+        }
+        if matches!(self.pending, Some(LocalBodyEvent::Chunk(_))) {
+            if let Err(error) = self.stream.flush_response_credit().await {
+                self.failed = true;
+                return Some(LocalBodyEvent::Error(error));
+            }
+        }
+        self.pending.take()
     }
 }
 
@@ -763,6 +840,21 @@ pub struct HubRouter {
     stream_reset_reasons: Mutex<HashMap<String, u64>>,
     drain_total: AtomicU64,
     drain_reasons: Mutex<HashMap<String, u64>>,
+}
+
+struct PendingStreamGuard<'router> {
+    hub: &'router HubRouter,
+    connection: &'router ProxyConn,
+    stream_id: u64,
+    committed: bool,
+}
+
+impl Drop for PendingStreamGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed && self.hub.cleanup_local_stream(self.stream_id) {
+            self.connection.release_stream();
+        }
+    }
 }
 
 struct NodeStatusEvent {
@@ -1166,17 +1258,27 @@ impl HubRouter {
 
         // Frames encoded successfully -- now register the stream.
         let local_stream_id = self.next_local_stream_id.fetch_add(1, Ordering::Relaxed);
-        let local_stream = Arc::new(LocalStream::new(
+        let settings = proxy_conn.settings.lock().clone();
+        let mut local_stream = LocalStream::new(
             local_stream_id,
             proxy_conn.node_generation.clone(),
             proxy_conn.id,
             proxy_stream_id,
-            *STREAM_INITIAL_WINDOW_BYTES,
-        ));
+            settings.initial_stream_window_bytes,
+        );
+        local_stream.min_window_update_bytes = settings.min_window_update_bytes;
+        *local_stream.response_connection.get_mut() = Some(Arc::downgrade(&proxy_conn));
+        let local_stream = Arc::new(local_stream);
         self.local_streams
             .insert(local_stream_id, local_stream.clone());
         self.proxy_to_local
             .insert((proxy_conn.id, proxy_stream_id), local_stream_id);
+        let mut pending_stream = PendingStreamGuard {
+            hub: self,
+            connection: &proxy_conn,
+            stream_id: local_stream_id,
+            committed: false,
+        };
 
         let send_status = proxy_conn
             .send_wait(
@@ -1195,10 +1297,11 @@ impl HubRouter {
             "open_local_stream dispatched"
         );
         match send_status {
-            SendStatus::Queued => Ok(local_stream),
+            SendStatus::Queued => {
+                pending_stream.committed = true;
+                Ok(local_stream)
+            }
             SendStatus::Closed | SendStatus::Congested => {
-                self.cleanup_local_stream(local_stream_id);
-                proxy_conn.release_stream();
                 Err("proxy connection congested".to_string())
             }
         }
@@ -1243,7 +1346,9 @@ impl HubRouter {
             .map(|entry| entry.value().clone())
             .ok_or_else(|| "proxy connection unavailable".to_string())?;
 
-        let total_chunks = payload.len().div_ceil(MAX_REQUEST_BODY_FRAME_SIZE);
+        let chunk_size = MAX_REQUEST_BODY_FRAME_SIZE
+            .min(proxy_conn.settings.lock().initial_stream_window_bytes as usize);
+        let total_chunks = payload.len().div_ceil(chunk_size);
         let result = if total_chunks == 0 {
             if end_stream {
                 self.send_request_body_frame(&proxy_conn, &stream, &[], true)
@@ -1252,7 +1357,7 @@ impl HubRouter {
                 Ok(())
             }
         } else {
-            for (index, chunk) in payload.chunks(MAX_REQUEST_BODY_FRAME_SIZE).enumerate() {
+            for (index, chunk) in payload.chunks(chunk_size).enumerate() {
                 let is_last_chunk = index + 1 == total_chunks;
                 if let Err(error) = self
                     .send_request_body_frame(
@@ -1352,17 +1457,20 @@ impl HubRouter {
             } else {
                 protocol::encode_stream_error(stream.proxy_stream_id, reason)
             };
-            let _ = pc.send(Message::Binary(frame.into()));
+            if pc.send(Message::Binary(frame.into())) != SendStatus::Queued {
+                pc.request_close();
+            }
         }
         stream.fail(reason.to_string());
     }
 
-    fn cleanup_local_stream(&self, local_stream_id: u64) {
+    fn cleanup_local_stream(&self, local_stream_id: u64) -> bool {
         let Some((_, stream)) = self.local_streams.remove(&local_stream_id) else {
-            return;
+            return false;
         };
         self.proxy_to_local
             .remove(&(stream.proxy_conn_id, stream.proxy_stream_id));
+        true
     }
 
     pub async fn handle_proxy_frame(self: &Arc<Self>, proxy_conn_id: u64, data: &mut [u8]) {
@@ -1433,9 +1541,7 @@ impl HubRouter {
                     .get(&proxy_conn_id)
                     .map(|entry| entry.value().clone());
                 if let Some(pc) = pc {
-                    let _ = pc
-                        .send_wait(Message::Binary(pong.into()), Duration::from_millis(250))
-                        .await;
+                    let _ = pc.send(Message::Binary(pong.into()));
                 }
             }
             protocol::PONG => {}
@@ -1509,11 +1615,36 @@ impl HubRouter {
                 );
             }
             protocol::SETTINGS => {
-                debug!(
-                    msg_type = header.msg_type,
-                    proxy_conn_id = proxy_conn_id,
-                    "received tunnel protocol v3 SETTINGS from proxy"
-                );
+                let settings = protocol::decode_payload_with_limit(
+                    data,
+                    &header,
+                    MAX_TUNNEL_CONTROL_PAYLOAD_SIZE,
+                )
+                .ok()
+                .and_then(|payload| {
+                    serde_json::from_slice::<protocol::SettingsPayload>(&payload).ok()
+                })
+                .filter(|settings| settings.is_valid());
+                if let Some(connection) = self.proxy_conns_by_id.get(&proxy_conn_id) {
+                    if header.stream_id != 0 || header.flags != 0 {
+                        connection.request_close();
+                        return;
+                    }
+                    let Some(settings) = settings else {
+                        connection.request_close();
+                        return;
+                    };
+                    let local = local_settings();
+                    let settings = settings
+                        .negotiate(local.initial_stream_window_bytes, local.drain_deadline_ms);
+                    let mut current = connection.settings.lock();
+                    if connection.stream_count.load(Ordering::Acquire) > 0 && *current != settings {
+                        drop(current);
+                        connection.request_close();
+                        return;
+                    }
+                    *current = settings;
+                }
             }
             protocol::WINDOW_UPDATE => {
                 self.handle_window_update(proxy_conn_id, header.stream_id, data, &header);
@@ -1739,19 +1870,8 @@ impl HubRouter {
             None => return,
         };
 
-        let payload_len = payload.len();
-        if !stream.push_body_chunk(Bytes::from(payload)).await {
+        if !stream.push_body_chunk(Bytes::from(payload)) {
             self.cancel_local_stream(local_id, "local relay response congested");
-            return;
-        }
-
-        if let Some(pc) = self.proxy_conns_by_id.get(&proxy_conn_id) {
-            if pc.protocol_version() >= 3 {
-                if let Some(delta) = stream.response_window_update_delta(payload_len) {
-                    let frame = protocol::encode_window_update(header.stream_id, delta);
-                    let _ = pc.send(Message::Binary(frame.into()));
-                }
-            }
         }
     }
 

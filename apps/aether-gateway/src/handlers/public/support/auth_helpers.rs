@@ -248,7 +248,7 @@ pub(super) fn auth_verification_send_cooldown_seconds() -> i64 {
         .unwrap_or(60)
 }
 
-pub(super) fn auth_refresh_cookie_name() -> String {
+pub(crate) fn auth_refresh_cookie_name() -> String {
     std::env::var("AUTH_REFRESH_COOKIE_NAME")
         .ok()
         .map(|value| value.trim().to_string())

@@ -13,12 +13,20 @@ describe('safePaymentTargetUrl', () => {
   })
 
   it.each([
+    'https://checkout.stripe.com/c/pay/cs_test_checkout#fidkdWxOYHwnPyd1blpxYHZxWjA0',
+    'https://pay.example/submit?order=1&signature=a%2Fb%3D#session=a%2Bb%3D',
+  ])('preserves payment session fragments: %s', (value) => {
+    expect(safePaymentTargetUrl(value)).toBe(value)
+  })
+
+  it.each([
     'javascript:alert(1)',
     'data:text/html,attack',
     'http://pay.example/submit',
     '//pay.example/submit',
     'https://user:secret@pay.example/submit',
-    'https://pay.example/submit#fragment',
+    'https://user:secret@pay.example/submit#session',
+    'https://pay.example\\@attacker.example/submit#session',
     '/\\pay.example/submit',
     '/payment/continue?order=1',
     '../payment/continue?order=1',

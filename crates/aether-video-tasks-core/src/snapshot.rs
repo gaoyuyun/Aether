@@ -1,6 +1,7 @@
 use aether_data_contracts::repository::video_tasks::{StoredVideoTask, UpsertVideoTask};
 use serde_json::{json, Map, Value};
 
+use crate::transport::{gemini_metadata_video_url, gemini_video_metadata};
 use crate::types::sanitize_video_task_error_code;
 use crate::{
     local_status_from_stored, non_empty_owned, request_body_string, GeminiVideoTaskSeed,
@@ -104,7 +105,7 @@ impl LocalVideoTaskSnapshot {
                     progress_percent: task.progress_percent,
                     error_code: task.error_code.clone(),
                     error_message: task.error_message.clone(),
-                    metadata: Value::Object(Map::new()),
+                    metadata: gemini_video_metadata(task.video_url.as_deref()),
                     persistence,
                     transport,
                 }))
@@ -128,7 +129,8 @@ impl LocalVideoTaskSnapshot {
                 let previous_error_code = seed.error_code.clone();
                 let error_code =
                     sanitized_error_code_for_status(seed.status, seed.error_code.take());
-                let safe_metadata = Value::Object(Map::new());
+                let safe_metadata =
+                    gemini_video_metadata(gemini_metadata_video_url(&seed.metadata).as_deref());
                 let changed = previous_error_code != error_code
                     || seed.error_message.is_some()
                     || seed.metadata != safe_metadata;

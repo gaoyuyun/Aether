@@ -50,14 +50,12 @@
           <ProxyConfigSection
             id="section-proxy"
             :proxy-node-id="systemConfig.system_proxy_node_id"
-            :extra-trusted-dns-hosts-str="extraTrustedDnsHostsStr"
             :online-nodes="proxyNodesStore.onlineNodes"
             :all-nodes="proxyNodesStore.nodes"
             :loading="systemConfigLoading || proxyConfigLoading"
             :has-changes="hasProxyConfigChanges"
             @save="saveProxyConfig"
             @update:proxy-node-id="systemConfig.system_proxy_node_id = $event"
-            @update:extra-trusted-dns-hosts-str="extraTrustedDnsHostsStr = $event"
           />
 
           <!-- 基础配置 -->
@@ -355,7 +353,6 @@ const {
   hasCleanupConfigChanges,
   sensitiveHeadersStr,
   turnstileAllowedHostnamesStr,
-  extraTrustedDnsHostsStr,
   loadSystemConfig,
   loadSystemVersion,
   saveSiteInfo,

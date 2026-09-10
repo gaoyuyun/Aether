@@ -55,7 +55,7 @@
         <Select
           :model-value="aggregateMergeMode"
           :open="aggregateMergeModeSelectOpen"
-          @update:model-value="handleAggregateMergeModeUpdate"
+          @update:model-value="($event === 'skip' || $event === 'overwrite' || $event === 'error') && $emit('update:aggregateMergeMode', $event)"
           @update:open="$emit('update:aggregateMergeModeSelectOpen', $event)"
         >
           <SelectTrigger>

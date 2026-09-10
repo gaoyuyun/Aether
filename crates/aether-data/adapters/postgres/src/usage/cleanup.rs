@@ -1,8 +1,11 @@
+use std::io::Write;
+
 use aether_data_contracts::repository::usage::{
-    UsageCleanupExecutionMode, UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets,
-    UsageCleanupWindow,
+    parse_usage_body_ref, usage_body_ref, UsageBodyField, UsageCleanupExecutionMode,
+    UsageCleanupPreviewCounts, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
 };
 use chrono::{DateTime, Utc};
+use flate2::{write::GzEncoder, Compression};
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use sqlx::Row;
@@ -211,7 +214,8 @@ SET request_body_ref = NULL,
 WHERE request_id = ANY($1)
 "#;
 const SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL: &str = r#"
-SELECT id, request_id
+SELECT
+    id
 FROM usage
 WHERE created_at < $1
   AND ($2::timestamptz IS NULL OR created_at >= $2)
@@ -224,25 +228,26 @@ WHERE created_at < $1
     OR provider_request_body_compressed IS NOT NULL
     OR client_response_body IS NOT NULL
     OR client_response_body_compressed IS NOT NULL
-    OR EXISTS (
-      SELECT 1
-      FROM usage_body_blobs
-      WHERE usage_body_blobs.request_id = usage.request_id
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM usage_http_audits
-      WHERE usage_http_audits.request_id = usage.request_id
-        AND (
-          usage_http_audits.request_body_ref IS NOT NULL
-          OR usage_http_audits.provider_request_body_ref IS NOT NULL
-          OR usage_http_audits.response_body_ref IS NOT NULL
-          OR usage_http_audits.client_response_body_ref IS NOT NULL
-        )
-    )
   )
 ORDER BY created_at ASC, id ASC
 LIMIT $3
+"#;
+const SELECT_USAGE_BODY_COMPRESSION_ROW_SQL: &str = r#"
+SELECT
+  id,
+  request_id,
+  request_body,
+  request_body_compressed,
+  response_body,
+  response_body_compressed,
+  provider_request_body,
+  provider_request_body_compressed,
+  client_response_body,
+  client_response_body_compressed
+FROM usage
+WHERE id = $1
+LIMIT 1
+FOR UPDATE
 "#;
 const SELECT_EXPIRED_ACTIVE_API_KEYS_SQL: &str = r#"
 SELECT id, auto_delete_on_expiry
@@ -270,6 +275,30 @@ WHERE id = $1
   AND is_active IS TRUE
 "#;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageDetachedBodyBlobWrite {
+    pub body_ref: String,
+    pub body_field: &'static str,
+    pub payload_gzip: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageDetachedBodyRefs {
+    pub request_body_ref: Option<String>,
+    pub provider_request_body_ref: Option<String>,
+    pub response_body_ref: Option<String>,
+    pub client_response_body_ref: Option<String>,
+}
+
+impl UsageDetachedBodyRefs {
+    pub fn any_present(&self) -> bool {
+        self.request_body_ref.is_some()
+            || self.provider_request_body_ref.is_some()
+            || self.response_body_ref.is_some()
+            || self.client_response_body_ref.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageLegacyBodyRefMetadataRow {
     pub id: String,
@@ -277,9 +306,30 @@ pub struct UsageLegacyBodyRefMetadataRow {
     pub request_metadata: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct UsageLegacyBodyRefPurgePlan {
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageLegacyBodyRefMigrationPlan {
+    pub refs: UsageDetachedBodyRefs,
     pub request_metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageBodyCompressionRow {
+    pub id: String,
+    pub request_id: String,
+    pub request_body: Option<Value>,
+    pub request_body_compressed: Option<Vec<u8>>,
+    pub response_body: Option<Value>,
+    pub response_body_compressed: Option<Vec<u8>>,
+    pub provider_request_body: Option<Value>,
+    pub provider_request_body_compressed: Option<Vec<u8>>,
+    pub client_response_body: Option<Value>,
+    pub client_response_body_compressed: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageBodyExternalizationPlan {
+    pub blobs: Vec<UsageDetachedBodyBlobWrite>,
+    pub refs: UsageDetachedBodyRefs,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -294,23 +344,57 @@ struct ExpiredApiKeyRow<'a> {
     auto_delete_on_expiry: Option<bool>,
 }
 
-pub fn purge_legacy_body_ref_metadata_plan(
+pub fn compress_usage_json_value(value: &Value) -> Result<Vec<u8>, DataLayerError> {
+    let bytes = serde_json::to_vec(value).map_err(|err| {
+        DataLayerError::UnexpectedValue(format!("failed to serialize usage json for gzip: {err}"))
+    })?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
+    encoder.write_all(&bytes).map_err(|err| {
+        DataLayerError::UnexpectedValue(format!("failed to gzip usage json: {err}"))
+    })?;
+    encoder.finish().map_err(|err| {
+        DataLayerError::UnexpectedValue(format!("failed to finish gzipped usage json: {err}"))
+    })
+}
+
+pub fn migrate_legacy_body_ref_metadata_plan(
+    request_id: &str,
     request_metadata: Option<Value>,
-) -> Option<UsageLegacyBodyRefPurgePlan> {
+) -> Option<UsageLegacyBodyRefMigrationPlan> {
     let mut metadata = match request_metadata {
         Some(Value::Object(object)) => object,
         _ => return None,
     };
 
+    let mut refs = UsageDetachedBodyRefs::default();
     let mut removed_any = false;
-    for key in [
-        "request_body_ref",
-        "provider_request_body_ref",
-        "response_body_ref",
-        "client_response_body_ref",
+    for field in [
+        UsageBodyField::RequestBody,
+        UsageBodyField::ProviderRequestBody,
+        UsageBodyField::ResponseBody,
+        UsageBodyField::ClientResponseBody,
     ] {
-        if metadata.remove(key).is_some() {
-            removed_any = true;
+        let key = field.as_ref_key();
+        let Some(value) = metadata.remove(key) else {
+            continue;
+        };
+        removed_any = true;
+        let parsed = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(parse_usage_body_ref)
+            .filter(|(parsed_request_id, parsed_field)| {
+                parsed_request_id == request_id && *parsed_field == field
+            })
+            .map(|(parsed_request_id, parsed_field)| {
+                usage_body_ref(&parsed_request_id, parsed_field)
+            });
+        match field {
+            UsageBodyField::RequestBody => refs.request_body_ref = parsed,
+            UsageBodyField::ProviderRequestBody => refs.provider_request_body_ref = parsed,
+            UsageBodyField::ResponseBody => refs.response_body_ref = parsed,
+            UsageBodyField::ClientResponseBody => refs.client_response_body_ref = parsed,
         }
     }
 
@@ -318,9 +402,45 @@ pub fn purge_legacy_body_ref_metadata_plan(
         return None;
     }
 
-    Some(UsageLegacyBodyRefPurgePlan {
+    Some(UsageLegacyBodyRefMigrationPlan {
+        refs,
         request_metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
     })
+}
+
+pub fn build_usage_body_externalization(
+    row: &UsageBodyCompressionRow,
+) -> Result<UsageBodyExternalizationPlan, DataLayerError> {
+    let mut plan = UsageBodyExternalizationPlan::default();
+    maybe_externalize_usage_body_field(
+        &mut plan,
+        &row.request_id,
+        UsageBodyField::RequestBody,
+        row.request_body.as_ref(),
+        row.request_body_compressed.as_deref(),
+    )?;
+    maybe_externalize_usage_body_field(
+        &mut plan,
+        &row.request_id,
+        UsageBodyField::ProviderRequestBody,
+        row.provider_request_body.as_ref(),
+        row.provider_request_body_compressed.as_deref(),
+    )?;
+    maybe_externalize_usage_body_field(
+        &mut plan,
+        &row.request_id,
+        UsageBodyField::ResponseBody,
+        row.response_body.as_ref(),
+        row.response_body_compressed.as_deref(),
+    )?;
+    maybe_externalize_usage_body_field(
+        &mut plan,
+        &row.request_id,
+        UsageBodyField::ClientResponseBody,
+        row.client_response_body.as_ref(),
+        row.client_response_body_compressed.as_deref(),
+    )?;
+    Ok(plan)
 }
 
 impl SqlxUsageReadRepository {
@@ -392,7 +512,7 @@ impl SqlxUsageReadRepository {
         };
         let detail_body_newer_than = detail_body_newer_than(window, targets);
         let legacy_body_refs_migrated = if targets.detail_body {
-            purge_legacy_usage_body_ref_metadata(
+            migrate_legacy_usage_body_ref_metadata(
                 &self.pool,
                 window.detail_cutoff,
                 batch_size,
@@ -403,7 +523,7 @@ impl SqlxUsageReadRepository {
             0
         };
         let body_externalized = if targets.detail_body {
-            purge_usage_detail_body_fields(
+            compress_usage_body_fields(
                 &self.pool,
                 window.detail_cutoff,
                 batch_size,
@@ -879,7 +999,7 @@ async fn delete_old_usage_records(
     Ok(total_deleted)
 }
 
-async fn purge_legacy_usage_body_ref_metadata(
+async fn migrate_legacy_usage_body_ref_metadata(
     pool: &PostgresPool,
     cutoff_time: DateTime<Utc>,
     batch_size: usize,
@@ -889,7 +1009,7 @@ async fn purge_legacy_usage_body_ref_metadata(
         warn!(
             cutoff_time = %cutoff_time,
             newer_than = ?newer_than,
-            "usage cleanup legacy body-ref purge skipped due to invalid window"
+            "usage cleanup legacy body-ref migration skipped due to invalid window"
         );
         return Ok(0);
     }
@@ -920,12 +1040,33 @@ async fn purge_legacy_usage_body_ref_metadata(
             break;
         }
 
-        let mut batch_purged = 0usize;
+        let mut batch_migrated = 0usize;
         for row in rows {
-            let Some(plan) = purge_legacy_body_ref_metadata_plan(row.request_metadata) else {
+            let mut tx = pool.begin().await.map_err(postgres_error)?;
+            let current_metadata = sqlx::query_scalar::<_, Option<Value>>(
+                "SELECT request_metadata FROM usage WHERE id = $1 FOR UPDATE",
+            )
+            .bind(&row.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(postgres_error)?;
+            let Some(plan) =
+                migrate_legacy_body_ref_metadata_plan(&row.request_id, current_metadata.flatten())
+            else {
                 continue;
             };
-            let mut tx = pool.begin().await.map_err(postgres_error)?;
+            if plan.refs.any_present() {
+                sqlx::query(UPSERT_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
+                    .bind(&row.request_id)
+                    .bind(plan.refs.request_body_ref.as_deref())
+                    .bind(plan.refs.provider_request_body_ref.as_deref())
+                    .bind(plan.refs.response_body_ref.as_deref())
+                    .bind(plan.refs.client_response_body_ref.as_deref())
+                    .bind("ref_backed")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(postgres_error)?;
+            }
             let updated = sqlx::query(UPDATE_USAGE_REQUEST_METADATA_SQL)
                 .bind(&row.id)
                 .bind(plan.request_metadata)
@@ -933,30 +1074,14 @@ async fn purge_legacy_usage_body_ref_metadata(
                 .await
                 .map_err(postgres_error)?
                 .rows_affected();
-            let request_ids = vec![row.request_id];
-            sqlx::query(DELETE_USAGE_BODY_BLOBS_SQL)
-                .bind(&request_ids)
-                .execute(&mut *tx)
-                .await
-                .map_err(postgres_error)?;
-            sqlx::query(CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
-                .bind(&request_ids)
-                .execute(&mut *tx)
-                .await
-                .map_err(postgres_error)?;
-            sqlx::query(DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL)
-                .bind(request_ids)
-                .execute(&mut *tx)
-                .await
-                .map_err(postgres_error)?;
             tx.commit().await.map_err(postgres_error)?;
             if updated > 0 {
-                batch_purged += 1;
+                batch_migrated += 1;
             }
         }
 
-        total_migrated += batch_purged;
-        if batch_purged == 0 || batch_purged < batch_size {
+        total_migrated += batch_migrated;
+        if batch_migrated == 0 || batch_migrated < batch_size {
             break;
         }
     }
@@ -1099,7 +1224,7 @@ async fn cleanup_usage_stale_body_fields(
     Ok(total_cleaned)
 }
 
-async fn purge_usage_detail_body_fields(
+async fn compress_usage_body_fields(
     pool: &PostgresPool,
     cutoff_time: DateTime<Utc>,
     batch_size: usize,
@@ -1109,65 +1234,130 @@ async fn purge_usage_detail_body_fields(
         warn!(
             cutoff_time = %cutoff_time,
             newer_than = ?newer_than,
-            "usage cleanup detail body purge skipped due to invalid window"
+            "usage cleanup body compression skipped due to invalid window"
         );
         return Ok(0);
     }
 
-    let mut total_purged = 0usize;
+    let mut total_compressed = 0usize;
+    let mut no_progress_count = 0usize;
+    let batch_size = batch_size.clamp(1, 25);
     loop {
         let mut stream = sqlx::query(SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL)
             .bind(cutoff_time)
             .bind(newer_than)
             .bind(i64::try_from(batch_size).unwrap_or(i64::MAX))
             .fetch(pool);
-        let mut rows = Vec::new();
+        let mut ids = Vec::new();
         while let Some(row) = stream.try_next().await.map_err(postgres_error)? {
-            rows.push(UsageBodyCleanupRow {
+            ids.push(row.try_get::<String, _>("id").map_err(postgres_error)?);
+        }
+        if ids.is_empty() {
+            break;
+        }
+
+        let mut batch_success = 0usize;
+        for id in ids {
+            let mut tx = pool.begin().await.map_err(postgres_error)?;
+            let row = sqlx::query(SELECT_USAGE_BODY_COMPRESSION_ROW_SQL)
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(postgres_error)?;
+            let Some(row) = row else {
+                continue;
+            };
+            let row = UsageBodyCompressionRow {
                 id: row.try_get::<String, _>("id").map_err(postgres_error)?,
                 request_id: row
                     .try_get::<String, _>("request_id")
                     .map_err(postgres_error)?,
-            });
+                request_body: row
+                    .try_get::<Option<Value>, _>("request_body")
+                    .map_err(postgres_error)?,
+                request_body_compressed: row
+                    .try_get::<Option<Vec<u8>>, _>("request_body_compressed")
+                    .map_err(postgres_error)?,
+                response_body: row
+                    .try_get::<Option<Value>, _>("response_body")
+                    .map_err(postgres_error)?,
+                response_body_compressed: row
+                    .try_get::<Option<Vec<u8>>, _>("response_body_compressed")
+                    .map_err(postgres_error)?,
+                provider_request_body: row
+                    .try_get::<Option<Value>, _>("provider_request_body")
+                    .map_err(postgres_error)?,
+                provider_request_body_compressed: row
+                    .try_get::<Option<Vec<u8>>, _>("provider_request_body_compressed")
+                    .map_err(postgres_error)?,
+                client_response_body: row
+                    .try_get::<Option<Value>, _>("client_response_body")
+                    .map_err(postgres_error)?,
+                client_response_body_compressed: row
+                    .try_get::<Option<Vec<u8>>, _>("client_response_body_compressed")
+                    .map_err(postgres_error)?,
+            };
+            let detached = build_usage_body_externalization(&row)?;
+            if detached.refs.any_present() {
+                for blob in &detached.blobs {
+                    sqlx::query(super::UPSERT_USAGE_BODY_BLOB_SQL)
+                        .bind(&blob.body_ref)
+                        .bind(&row.request_id)
+                        .bind(blob.body_field)
+                        .bind(&blob.payload_gzip)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(postgres_error)?;
+                }
+                sqlx::query(UPSERT_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
+                    .bind(&row.request_id)
+                    .bind(detached.refs.request_body_ref.as_deref())
+                    .bind(detached.refs.provider_request_body_ref.as_deref())
+                    .bind(detached.refs.response_body_ref.as_deref())
+                    .bind(detached.refs.client_response_body_ref.as_deref())
+                    .bind("ref_backed")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(postgres_error)?;
+                let updated = sqlx::query(UPDATE_USAGE_BODY_COMPRESSION_SQL)
+                    .bind(&row.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(postgres_error)?
+                    .rows_affected();
+                tx.commit().await.map_err(postgres_error)?;
+                if updated > 0 {
+                    batch_success += 1;
+                }
+                continue;
+            }
+
+            let updated = sqlx::query(UPDATE_USAGE_BODY_COMPRESSION_SQL)
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(postgres_error)?
+                .rows_affected();
+            tx.commit().await.map_err(postgres_error)?;
+            if updated > 0 {
+                batch_success += 1;
+            }
         }
-        if rows.is_empty() {
-            break;
+
+        if batch_success == 0 {
+            no_progress_count += 1;
+            if no_progress_count >= 3 {
+                warn!(
+                    "usage cleanup body compression stopped after repeated zero-progress batches"
+                );
+                break;
+            }
+        } else {
+            no_progress_count = 0;
         }
-        let row_count = rows.len();
-        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-        let request_ids = rows
-            .iter()
-            .map(|row| row.request_id.clone())
-            .collect::<Vec<_>>();
-        let mut tx = pool.begin().await.map_err(postgres_error)?;
-        let updated = sqlx::query(CLEAR_USAGE_BODY_FIELDS_SQL)
-            .bind(ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(postgres_error)?
-            .rows_affected();
-        sqlx::query(DELETE_USAGE_BODY_BLOBS_SQL)
-            .bind(&request_ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(postgres_error)?;
-        sqlx::query(CLEAR_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
-            .bind(&request_ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(postgres_error)?;
-        sqlx::query(DELETE_EMPTY_USAGE_HTTP_AUDITS_SQL)
-            .bind(request_ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(postgres_error)?;
-        tx.commit().await.map_err(postgres_error)?;
-        total_purged = total_purged.saturating_add(usize::try_from(updated).unwrap_or(usize::MAX));
-        if row_count < batch_size {
-            break;
-        }
+        total_compressed += batch_success;
     }
-    Ok(total_purged)
+    Ok(total_compressed)
 }
 
 async fn cleanup_expired_api_keys(
@@ -1218,21 +1408,386 @@ async fn cleanup_expired_api_keys(
     Ok(cleaned)
 }
 
+fn maybe_externalize_usage_body_field(
+    plan: &mut UsageBodyExternalizationPlan,
+    request_id: &str,
+    field: UsageBodyField,
+    inline_body: Option<&Value>,
+    compressed_body: Option<&[u8]>,
+) -> Result<(), DataLayerError> {
+    let Some(payload_gzip) = (match inline_body {
+        Some(value) => Some(compress_usage_json_value(value)?),
+        None => compressed_body.map(|value| value.to_vec()),
+    }) else {
+        return Ok(());
+    };
+    let body_ref = usage_body_ref(request_id, field);
+    plan.blobs.push(UsageDetachedBodyBlobWrite {
+        body_ref: body_ref.clone(),
+        body_field: field.as_storage_field(),
+        payload_gzip,
+    });
+    match field {
+        UsageBodyField::RequestBody => plan.refs.request_body_ref = Some(body_ref),
+        UsageBodyField::ProviderRequestBody => plan.refs.provider_request_body_ref = Some(body_ref),
+        UsageBodyField::ResponseBody => plan.refs.response_body_ref = Some(body_ref),
+        UsageBodyField::ClientResponseBody => plan.refs.client_response_body_ref = Some(body_ref),
+    }
+    Ok(())
+}
+
+const UPSERT_USAGE_HTTP_AUDIT_BODY_REFS_SQL: &str = r#"
+INSERT INTO usage_http_audits (
+  request_id,
+  request_body_ref,
+  provider_request_body_ref,
+  response_body_ref,
+  client_response_body_ref,
+  body_capture_mode
+)
+VALUES (
+  $1,
+  $2,
+  $3,
+  $4,
+  $5,
+  $6
+)
+ON CONFLICT (request_id)
+DO UPDATE SET
+  request_body_ref = COALESCE(EXCLUDED.request_body_ref, usage_http_audits.request_body_ref),
+  provider_request_body_ref = COALESCE(
+    EXCLUDED.provider_request_body_ref,
+    usage_http_audits.provider_request_body_ref
+  ),
+  response_body_ref = COALESCE(EXCLUDED.response_body_ref, usage_http_audits.response_body_ref),
+  client_response_body_ref = COALESCE(
+    EXCLUDED.client_response_body_ref,
+    usage_http_audits.client_response_body_ref
+  ),
+  body_capture_mode = CASE
+    WHEN EXCLUDED.request_body_ref IS NOT NULL
+      OR EXCLUDED.provider_request_body_ref IS NOT NULL
+      OR EXCLUDED.response_body_ref IS NOT NULL
+      OR EXCLUDED.client_response_body_ref IS NOT NULL
+    THEN EXCLUDED.body_capture_mode
+    ELSE usage_http_audits.body_capture_mode
+  END,
+  updated_at = NOW()
+"#;
+
 const UPDATE_USAGE_REQUEST_METADATA_SQL: &str = r#"
 UPDATE usage
-SET request_metadata = $2::json,
-    updated_at = NOW()
+SET request_metadata = $2::json
+WHERE id = $1
+"#;
+
+const UPDATE_USAGE_BODY_COMPRESSION_SQL: &str = r#"
+UPDATE usage
+SET request_body = NULL,
+    response_body = NULL,
+    provider_request_body = NULL,
+    client_response_body = NULL,
+    request_body_compressed = NULL,
+    response_body_compressed = NULL,
+    provider_request_body_compressed = NULL,
+    client_response_body_compressed = NULL
 WHERE id = $1
 "#;
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
+    use flate2::read::GzDecoder;
     use serde_json::json;
 
     use super::{
-        purge_legacy_body_ref_metadata_plan, SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL,
+        build_usage_body_externalization, compress_usage_json_value,
+        migrate_legacy_body_ref_metadata_plan, UsageBodyCompressionRow,
         SELECT_USAGE_LEGACY_BODY_REF_METADATA_BATCH_SQL,
     };
+
+    #[test]
+    fn detail_retention_only_externalizes_legacy_bodies_and_locks_the_source_row() {
+        let selection = super::SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL;
+        assert!(selection.contains("request_body IS NOT NULL"));
+        assert!(selection.contains("response_body_compressed IS NOT NULL"));
+        assert!(!selection.contains("usage_body_blobs"));
+        assert!(!selection.contains("usage_http_audits"));
+        assert!(super::SELECT_USAGE_BODY_COMPRESSION_ROW_SQL.contains("FOR UPDATE"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AETHER_TEST_DATABASE_URL and PostgreSQL migrations"]
+    async fn live_body_retention_externalizes_without_prematurely_deleting_full_capture() {
+        use aether_data_contracts::repository::usage::{usage_body_ref, UsageBodyField};
+        use chrono::{Duration, Utc};
+        use sqlx::Row;
+
+        let database_url = std::env::var("AETHER_TEST_DATABASE_URL")
+            .expect("AETHER_TEST_DATABASE_URL must point at the test database");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("test database should connect");
+        crate::run_migrations(&pool)
+            .await
+            .expect("test database should migrate");
+        for table in ["usage", "usage_body_blobs", "usage_http_audits"] {
+            sqlx::query(&format!(
+                "CREATE TEMP TABLE {table} (LIKE public.{table} INCLUDING ALL)"
+            ))
+            .execute(&pool)
+            .await
+            .expect("isolated table should be created");
+        }
+        let now = Utc::now();
+        let fields = [
+            UsageBodyField::RequestBody,
+            UsageBodyField::ProviderRequestBody,
+            UsageBodyField::ResponseBody,
+            UsageBodyField::ClientResponseBody,
+        ];
+        for (request_id, age_days) in [
+            ("legacy-inline", 12),
+            ("legacy-gzip", 10),
+            ("detached-full", 10),
+            ("legacy-ref", 10),
+            ("foreign-ref", 10),
+            ("expired-inline", 40),
+            ("expired-detached", 40),
+            ("recent-inline", 1),
+        ] {
+            sqlx::query(
+                "INSERT INTO usage (id, request_id, provider_name, model, created_at) VALUES ($1, $2, 'test', 'test', $3)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(request_id)
+            .bind(now - Duration::days(age_days))
+            .execute(&pool)
+            .await
+            .expect("usage should be seeded");
+            for field in fields {
+                let payload = json!({"request": request_id, "field": field.as_storage_field()});
+                if request_id.ends_with("inline") || request_id == "legacy-gzip" {
+                    let column = field.as_storage_field();
+                    if request_id == "legacy-gzip" {
+                        sqlx::query(&format!(
+                            "UPDATE usage SET {column}_compressed = $1 WHERE request_id = $2"
+                        ))
+                        .bind(compress_usage_json_value(&payload).unwrap())
+                        .bind(request_id)
+                        .execute(&pool)
+                        .await
+                        .expect("legacy compressed body should be seeded");
+                    } else {
+                        sqlx::query(&format!(
+                            "UPDATE usage SET {column} = $1 WHERE request_id = $2"
+                        ))
+                        .bind(payload)
+                        .bind(request_id)
+                        .execute(&pool)
+                        .await
+                        .expect("legacy inline body should be seeded");
+                    }
+                } else if request_id != "foreign-ref" {
+                    sqlx::query(super::super::UPSERT_USAGE_BODY_BLOB_SQL)
+                        .bind(usage_body_ref(request_id, field))
+                        .bind(request_id)
+                        .bind(field.as_storage_field())
+                        .bind(compress_usage_json_value(&payload).unwrap())
+                        .execute(&pool)
+                        .await
+                        .expect("detached body should be seeded");
+                }
+            }
+            if matches!(request_id, "detached-full" | "expired-detached") {
+                sqlx::query(super::UPSERT_USAGE_HTTP_AUDIT_BODY_REFS_SQL)
+                    .bind(request_id)
+                    .bind(usage_body_ref(request_id, fields[0]))
+                    .bind(usage_body_ref(request_id, fields[1]))
+                    .bind(usage_body_ref(request_id, fields[2]))
+                    .bind(usage_body_ref(request_id, fields[3]))
+                    .bind("ref_backed")
+                    .execute(&pool)
+                    .await
+                    .expect("detached refs should be seeded");
+            }
+            if matches!(request_id, "legacy-ref" | "foreign-ref") {
+                let ref_owner = if request_id == "foreign-ref" {
+                    "detached-full"
+                } else {
+                    request_id
+                };
+                let mut metadata = json!({"keep": "business fact"});
+                for field in fields {
+                    metadata[format!("{}_ref", field.as_storage_field())] =
+                        json!(usage_body_ref(ref_owner, field));
+                }
+                sqlx::query("UPDATE usage SET request_metadata = $1 WHERE request_id = $2")
+                    .bind(metadata)
+                    .bind(request_id)
+                    .execute(&pool)
+                    .await
+                    .expect("legacy refs should be seeded");
+            }
+        }
+
+        let repository = super::SqlxUsageReadRepository::new(pool.clone());
+        let window = super::UsageCleanupWindow {
+            detail_cutoff: now - Duration::days(7),
+            compressed_cutoff: now - Duration::days(30),
+            header_cutoff: now - Duration::days(90),
+            log_cutoff: now - Duration::days(365),
+        };
+        let targets = super::UsageCleanupTargets::body_targets();
+        sqlx::query(
+            "ALTER TABLE usage_body_blobs ADD CONSTRAINT reject_externalization CHECK (request_id <> 'legacy-inline' OR body_field <> 'response_body')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(super::compress_usage_body_fields(
+            &pool,
+            now - Duration::days(11),
+            1,
+            Some(window.compressed_cutoff),
+        )
+        .await
+        .is_err());
+        let inline_preserved: bool = sqlx::query_scalar(
+            "SELECT request_body IS NOT NULL AND provider_request_body IS NOT NULL AND response_body IS NOT NULL AND client_response_body IS NOT NULL FROM usage WHERE request_id = 'legacy-inline'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(inline_preserved);
+        let partial_blobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = 'legacy-inline'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(partial_blobs, 0);
+        sqlx::query("ALTER TABLE usage_body_blobs DROP CONSTRAINT reject_externalization")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let preview = super::preview_usage_cleanup_impl(
+            &pool,
+            &window,
+            targets,
+            super::UsageCleanupExecutionMode::Policy,
+        )
+        .await
+        .expect("cleanup preview should succeed");
+        assert_eq!(preview.detail, 4);
+        assert_eq!(preview.compressed, 2);
+        let summary = repository
+            .cleanup_usage(
+                &window,
+                1,
+                false,
+                targets,
+                super::UsageCleanupExecutionMode::Policy,
+            )
+            .await
+            .expect("retention cleanup should succeed");
+        assert_eq!(summary.body_externalized, 2);
+        assert_eq!(summary.legacy_body_refs_migrated, 2);
+        assert_eq!(summary.body_cleaned, 2);
+        assert_eq!(summary.records_deleted, 0);
+
+        for request_id in [
+            "legacy-inline",
+            "legacy-gzip",
+            "detached-full",
+            "legacy-ref",
+        ] {
+            let audit = sqlx::query("SELECT * FROM usage_http_audits WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("body refs should remain available");
+            for field in fields {
+                let body_ref = usage_body_ref(request_id, field);
+                assert_eq!(
+                    audit.get::<String, _>(format!("{}_ref", field.as_storage_field()).as_str()),
+                    body_ref
+                );
+                assert_eq!(
+                    repository.resolve_body_ref(&body_ref).await.unwrap(),
+                    Some(json!({"request": request_id, "field": field.as_storage_field()}))
+                );
+            }
+        }
+        for request_id in ["expired-inline", "expired-detached", "foreign-ref"] {
+            for field in fields {
+                assert!(repository
+                    .resolve_body_ref(&usage_body_ref(request_id, field))
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        }
+        for request_id in ["legacy-ref", "foreign-ref"] {
+            let metadata: serde_json::Value =
+                sqlx::query_scalar("SELECT request_metadata FROM usage WHERE request_id = $1")
+                    .bind(request_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(metadata, json!({"keep": "business fact"}));
+        }
+        let rerun = repository
+            .cleanup_usage(
+                &window,
+                1,
+                false,
+                targets,
+                super::UsageCleanupExecutionMode::Policy,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rerun, super::UsageCleanupSummary::default());
+
+        let delete_now = super::UsageCleanupWindow {
+            detail_cutoff: now,
+            compressed_cutoff: now,
+            ..window
+        };
+        repository
+            .cleanup_usage(
+                &delete_now,
+                1,
+                false,
+                targets,
+                super::UsageCleanupExecutionMode::BeforeNowBodyFields,
+            )
+            .await
+            .expect("explicit immediate body deletion should still succeed");
+        let blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_body_blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(blob_count, 0);
+        let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_count, 8);
+    }
+
+    fn inflate_json(bytes: &[u8]) -> serde_json::Value {
+        let mut decoder = GzDecoder::new(bytes);
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .expect("gzip should decode");
+        serde_json::from_slice(&decoded).expect("json should decode")
+    }
 
     #[test]
     fn legacy_body_ref_cleanup_index_is_embedded_and_matches_batch_predicate() {
@@ -1282,21 +1837,88 @@ mod tests {
     }
 
     #[test]
-    fn detail_body_cleanup_selects_detached_capture_for_deletion() {
-        assert!(SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL.contains("usage_body_blobs"));
-        assert!(SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL.contains("usage_http_audits"));
-        assert!(!SELECT_USAGE_BODY_COMPRESSION_BATCH_SQL.contains("payload_gzip"));
+    fn usage_body_externalization_moves_inline_json_into_ref_backed_blobs() {
+        let row = UsageBodyCompressionRow {
+            id: "usage-1".to_string(),
+            request_id: "req-1".to_string(),
+            request_body: Some(json!({"hello": "world"})),
+            request_body_compressed: None,
+            response_body: None,
+            response_body_compressed: None,
+            provider_request_body: Some(json!({"provider": true})),
+            provider_request_body_compressed: None,
+            client_response_body: None,
+            client_response_body_compressed: None,
+        };
+
+        let plan = build_usage_body_externalization(&row).expect("plan should build");
+
+        assert_eq!(plan.blobs.len(), 2);
+        assert_eq!(
+            plan.refs.request_body_ref.as_deref(),
+            Some("usage://request/req-1/request_body")
+        );
+        assert_eq!(
+            plan.refs.provider_request_body_ref.as_deref(),
+            Some("usage://request/req-1/provider_request_body")
+        );
+        assert_eq!(
+            inflate_json(&plan.blobs[0].payload_gzip),
+            json!({"hello": "world"})
+        );
+        assert_eq!(
+            inflate_json(&plan.blobs[1].payload_gzip),
+            json!({"provider": true})
+        );
     }
 
     #[test]
-    fn legacy_body_ref_metadata_purge_strips_all_ref_keys() {
-        let plan = purge_legacy_body_ref_metadata_plan(Some(json!({
-            "trace_id": "trace-1",
-            "request_body_ref": "usage://request/req-1/request_body",
-            "response_body_ref": "usage://request/req-1/response_body"
-        })))
+    fn usage_body_externalization_reuses_existing_compressed_payloads() {
+        let compressed = compress_usage_json_value(&json!({"legacy": true}))
+            .expect("compressed payload should build");
+        let row = UsageBodyCompressionRow {
+            id: "usage-1".to_string(),
+            request_id: "req-legacy".to_string(),
+            request_body: None,
+            request_body_compressed: Some(compressed.clone()),
+            response_body: None,
+            response_body_compressed: None,
+            provider_request_body: None,
+            provider_request_body_compressed: None,
+            client_response_body: None,
+            client_response_body_compressed: None,
+        };
+
+        let plan = build_usage_body_externalization(&row).expect("plan should build");
+
+        assert_eq!(plan.blobs.len(), 1);
+        assert_eq!(plan.blobs[0].payload_gzip, compressed);
+        assert_eq!(
+            plan.refs.request_body_ref.as_deref(),
+            Some("usage://request/req-legacy/request_body")
+        );
+    }
+
+    #[test]
+    fn legacy_body_ref_metadata_migration_moves_matching_refs_and_strips_keys() {
+        let plan = migrate_legacy_body_ref_metadata_plan(
+            "req-1",
+            Some(json!({
+                "trace_id": "trace-1",
+                "request_body_ref": "usage://request/req-1/request_body",
+                "response_body_ref": "usage://request/req-1/response_body"
+            })),
+        )
         .expect("migration plan should exist");
 
+        assert_eq!(
+            plan.refs.request_body_ref.as_deref(),
+            Some("usage://request/req-1/request_body")
+        );
+        assert_eq!(
+            plan.refs.response_body_ref.as_deref(),
+            Some("usage://request/req-1/response_body")
+        );
         assert_eq!(
             plan.request_metadata,
             Some(json!({
@@ -1306,14 +1928,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_body_ref_metadata_purge_does_not_preserve_untrusted_refs() {
-        let plan = purge_legacy_body_ref_metadata_plan(Some(json!({
-            "request_body_ref": "blob://legacy-request",
-            "provider_request_body_ref": "usage://request/req-other/provider_request_body",
-            "candidate_index": 2
-        })))
+    fn legacy_body_ref_metadata_migration_strips_invalid_and_cross_request_refs() {
+        let plan = migrate_legacy_body_ref_metadata_plan(
+            "req-1",
+            Some(json!({
+                "request_body_ref": "blob://legacy-request",
+                "provider_request_body_ref": "usage://request/req-other/provider_request_body",
+                "candidate_index": 2
+            })),
+        )
         .expect("migration plan should exist");
 
+        assert!(!plan.refs.any_present());
         assert_eq!(
             plan.request_metadata,
             Some(json!({

@@ -1,6 +1,6 @@
 [package]
 name = "aether-tunnel"
-version = "0.3.16"
+version = "0.3.17"
 edition = "2021"
 description = "Tunnel agent for Aether"
 
@@ -47,3 +47,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 aether-gateway = { workspace = true, features = ["testkit"] }
+tokio = { version = "1", features = ["test-util"] }

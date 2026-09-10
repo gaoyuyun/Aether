@@ -3,21 +3,103 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use super::{
-    build_import_plan, deactivate_imported_credentials, decode_jsonl, decode_jsonl_with_limits,
-    encode_jsonl, export_mysql_core_jsonl, export_mysql_jsonl, export_postgres_core_jsonl,
-    export_sqlite_core_jsonl, filter_import_payload, import_mysql_jsonl, import_postgres_jsonl,
-    import_sqlite_jsonl, mysql_core_export_domains, normalize_imported_binary,
-    normalize_imported_integer_timestamp, normalize_postgres_import_payload,
-    postgres_bytea_json_value, postgres_core_export_domains, sqlite_core_export_domains,
-    sqlite_schema_copy_insert_sql, DataExportManifest, DataExportRecord, DataImportPlan,
-    ExportDomain, ExportRow, PostgresImportColumn, SchemaCopyColumn, SchemaCopyTable,
-    SqliteCopyColumn, AUXILIARY_TABLES,
+    apply_import_credential_policy, build_import_plan, deactivate_imported_credentials,
+    decode_jsonl, decode_jsonl_with_limits, encode_jsonl, export_mysql_core_jsonl,
+    export_mysql_jsonl, export_postgres_core_jsonl, export_sqlite_core_jsonl,
+    filter_import_payload, import_mysql_jsonl, import_postgres_jsonl, import_sqlite_jsonl,
+    mysql_core_export_domains, normalize_imported_binary, normalize_imported_integer_timestamp,
+    normalize_postgres_import_payload, postgres_bytea_json_value, postgres_core_export_domains,
+    sqlite_core_export_domains, sqlite_schema_copy_insert_sql, DataExportManifest,
+    DataExportRecord, DataImportOptions, DataImportPlan, ExportDomain, ExportRow,
+    PostgresImportColumn, SchemaCopyColumn, SchemaCopyTable, SqliteCopyColumn, AUXILIARY_TABLES,
 };
 use crate::driver::postgres::{PostgresPoolConfig, PostgresPoolFactory};
 use crate::lifecycle::migrate::{
     run_migrations as run_postgres_migrations, run_mysql_migrations, run_sqlite_migrations,
 };
 use crate::DatabaseDriver;
+
+mod credentials;
+
+#[tokio::test]
+async fn portable_usage_import_normalizes_nullable_postgres_metrics() {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let encoded = encode_jsonl(&[
+        DataExportRecord::manifest(DataExportManifest::new(
+            1_700_000_000,
+            Some(DatabaseDriver::Postgres),
+            vec![ExportDomain::Usage],
+        )),
+        DataExportRecord::row(
+            ExportDomain::Usage,
+            &request_id,
+            json!({
+                "request_id": request_id, "id": request_id,
+                "provider_name": "import-provider", "model": "import-model",
+                "input_tokens": null, "output_tokens": 7,
+                "cache_read_cost_usd": null, "cache_creation_cost_usd": null,
+                "input_cost_usd": null, "total_cost_usd": 0.25,
+                "actual_total_cost_usd": null, "rate_multiplier": null,
+                "is_stream": null, "has_format_conversion": null,
+                "input_price_per_1m": null, "wallet_balance_after": null,
+                "request_metadata": null,
+            }),
+        ),
+    ])
+    .unwrap();
+    let sqlite = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_sqlite_migrations(&sqlite).await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(import_sqlite_jsonl(&sqlite, &encoded).await.unwrap(), 1);
+    }
+    let select = "SELECT input_tokens, output_tokens, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd, rate_multiplier, is_stream, input_price_per_1m, wallet_balance_after, request_metadata FROM `usage` WHERE request_id = ?";
+    type ImportedMetrics = (
+        i64,
+        i64,
+        f64,
+        f64,
+        f64,
+        f64,
+        bool,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+    );
+    let expected: ImportedMetrics = (0, 7, 0.0, 0.0, 0.25, 1.0, false, None, None, None);
+    let metrics = sqlx::query_as::<_, ImportedMetrics>(select)
+        .bind(&request_id)
+        .fetch_one(&sqlite)
+        .await
+        .unwrap();
+    assert_eq!(metrics, expected);
+
+    if let Ok(database_url) = std::env::var("AETHER_TEST_MYSQL_URL") {
+        let mysql = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        run_mysql_migrations(&mysql).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(import_mysql_jsonl(&mysql, &encoded).await.unwrap(), 1);
+        }
+        let metrics = sqlx::query_as::<_, ImportedMetrics>(select)
+            .bind(&request_id)
+            .fetch_one(&mysql)
+            .await
+            .unwrap();
+        assert_eq!(metrics, expected);
+        sqlx::query("DELETE FROM `usage` WHERE request_id = ?")
+            .bind(&request_id)
+            .execute(&mysql)
+            .await
+            .unwrap();
+    }
+}
 
 #[test]
 fn jsonl_round_trips_manifest_and_domain_rows() {
@@ -691,6 +773,159 @@ fn postgres_to_sqlite_copy_uses_primary_key_upsert_instead_of_replace() {
     assert!(!sql.contains("OR REPLACE"));
     assert!(sql.contains("ON CONFLICT (\"request_id\") DO UPDATE SET"));
     assert!(sql.contains("\"status\" = excluded.\"status\""));
+}
+
+#[test]
+fn trusted_import_preserves_stable_credentials_only_when_explicitly_requested() {
+    assert!(!DataImportOptions::default().preserve_credentials);
+    for (table, payload) in [
+        ("users", json!({"password_hash": "$2b$12$trusted-hash"})),
+        (
+            "public.\"api_keys\"",
+            json!({
+                "key_hash": "trusted-key-hash", "key_encrypted": "trusted-ciphertext",
+                "status": "active", "is_active": true, "is_locked": false,
+            }),
+        ),
+        (
+            "management_tokens",
+            json!({"token_hash": "trusted-token-hash", "is_active": true}),
+        ),
+    ] {
+        for preserve_credentials in [false, true] {
+            let mut object = payload.as_object().unwrap().clone();
+            apply_import_credential_policy(
+                table,
+                &mut object,
+                |_| true,
+                DataImportOptions {
+                    preserve_credentials,
+                },
+            );
+            if preserve_credentials {
+                assert_eq!(&object, payload.as_object().unwrap());
+            } else {
+                assert_ne!(&object, payload.as_object().unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn trusted_import_still_revokes_imported_sessions_and_live_tunnels() {
+    let options = DataImportOptions {
+        preserve_credentials: true,
+    };
+    let mut session = json!({
+        "refresh_token_hash": "old-session", "prev_refresh_token_hash": "older-session",
+        "revoked_at": null, "revoke_reason": null,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    apply_import_credential_policy("public.user_sessions", &mut session, |_| true, options);
+    assert_ne!(session["refresh_token_hash"], json!("old-session"));
+    assert_eq!(session["prev_refresh_token_hash"], Value::Null);
+    assert_eq!(
+        session["revoke_reason"],
+        json!("imported_credentials_revoked")
+    );
+
+    let mut node = json!({
+        "tunnel_generation": "old-generation", "tunnel_connected": true,
+        "status": "online", "active_connections": 10,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    apply_import_credential_policy("proxy_nodes", &mut node, |_| true, options);
+    assert_ne!(node["tunnel_generation"], json!("old-generation"));
+    assert_eq!(node["tunnel_connected"], json!(false));
+    assert_eq!(node["status"], json!("offline"));
+    assert_eq!(node["active_connections"], json!(0));
+}
+
+#[tokio::test]
+#[ignore = "requires AETHER_TEST_POSTGRES_URL and PostgreSQL migrations"]
+async fn live_import_credential_policy_round_trips_through_postgres() {
+    let pool = PostgresPoolFactory::new(PostgresPoolConfig {
+        database_url: std::env::var("AETHER_TEST_POSTGRES_URL").unwrap(),
+        ..Default::default()
+    })
+    .unwrap()
+    .connect_lazy()
+    .unwrap();
+    run_postgres_migrations(&pool).await.unwrap();
+    for preserve_credentials in [false, true] {
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let key_id = uuid::Uuid::new_v4().to_string();
+        let password_hash = "$2b$12$trusted-import-hash";
+        let key_hash = format!("trusted-{key_id}");
+        sqlx::query("INSERT INTO users (id, username, password_hash, auth_source, email_verified) VALUES ($1, $2, $3, 'local', FALSE)")
+            .bind(&user_id).bind(format!("import-{}", &user_id[..8])).bind(password_hash)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO api_keys (id, user_id, key_hash, key_encrypted, name) VALUES ($1, $2, $3, 'trusted-ciphertext', 'Import probe')")
+            .bind(&key_id).bind(&user_id).bind(&key_hash).execute(&pool).await.unwrap();
+        let user: Value = sqlx::query_scalar("SELECT to_jsonb(users) FROM users WHERE id = $1")
+            .bind(&user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let key: Value =
+            sqlx::query_scalar("SELECT to_jsonb(api_keys) FROM api_keys WHERE id = $1")
+                .bind(&key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let input = encode_jsonl(&[
+            DataExportRecord::manifest(DataExportManifest::new(
+                1_788_739_200,
+                Some(DatabaseDriver::Postgres),
+                vec![ExportDomain::Users, ExportDomain::ApiKeys],
+            )),
+            DataExportRecord::row(ExportDomain::Users, &user_id, user),
+            DataExportRecord::row(ExportDomain::ApiKeys, &key_id, key),
+        ])
+        .unwrap();
+        super::postgres::import_postgres_jsonl_with_options(
+            &pool,
+            &input,
+            DataImportOptions {
+                preserve_credentials,
+            },
+        )
+        .await
+        .unwrap();
+        let imported_password: String =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+                .bind(&user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let imported_key: (String, Option<String>, bool) =
+            sqlx::query_as("SELECT key_hash, key_encrypted, is_active FROM api_keys WHERE id = $1")
+                .bind(&key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(imported_password == password_hash, preserve_credentials);
+        assert_eq!(imported_key.0 == key_hash, preserve_credentials);
+        assert_eq!(
+            imported_key.1.as_deref(),
+            preserve_credentials.then_some("trusted-ciphertext")
+        );
+        assert_eq!(imported_key.2, preserve_credentials);
+        sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(&key_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }
 
 fn postgres_column(data_type: &str, udt_name: &str) -> PostgresImportColumn {
@@ -1591,7 +1826,7 @@ VALUES (
     let imported = import_sqlite_jsonl(&target_pool, &encoded)
         .await
         .expect("sqlite import should load exported rows");
-    assert_eq!(imported, 22);
+    assert_eq!(imported, import_plan_row_count(&import_plan));
 
     let imported_api_key = sqlx::query_as::<_, (String, Option<String>, bool, bool, String)>(
         "SELECT key_hash, key_encrypted, is_active, is_locked, status FROM api_keys WHERE id = 'api-key-1'",
@@ -1726,7 +1961,7 @@ WHERE event_token = 'admission-1'
         let imported = import_postgres_jsonl(&postgres_pool, &encoded)
             .await
             .expect("postgres import should load exported rows");
-        assert_eq!(imported, 22);
+        assert_eq!(imported, import_plan_row_count(&import_plan));
 
         let imported_api_key = sqlx::query_as::<_, (String, Option<String>, bool, bool, String)>(
             "SELECT key_hash, key_encrypted, is_active, is_locked, status FROM api_keys WHERE id = 'api-key-1'",

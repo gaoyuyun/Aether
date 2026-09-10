@@ -987,13 +987,8 @@ fn runtime_miss_client_error_body(api_format: Option<&str>, message: &str) -> Va
 }
 
 fn runtime_miss_original_headers_json(headers: &HeaderMap) -> Value {
-    let mut headers = crate::headers::collect_control_headers(headers);
-    for (name, value) in headers.iter_mut() {
-        if runtime_miss_sensitive_header(name) {
-            *value = runtime_miss_mask_header_value(value);
-        }
-    }
-    serde_json::to_value(headers).unwrap_or_else(|_| json!({}))
+    serde_json::to_value(crate::headers::collect_control_headers(headers))
+        .unwrap_or_else(|_| json!({}))
 }
 
 fn runtime_miss_original_request_body_json(
@@ -1013,40 +1008,6 @@ fn runtime_miss_original_request_body_json(
             "body_bytes_b64": base64::engine::general_purpose::STANDARD.encode(body.as_ref())
         })
     })
-}
-
-fn runtime_miss_sensitive_header(name: &str) -> bool {
-    const SENSITIVE_HEADERS: &[&str] = &[
-        "authorization",
-        "x-api-key",
-        "api-key",
-        "x-goog-api-key",
-        "cookie",
-        "proxy-authorization",
-    ];
-
-    SENSITIVE_HEADERS
-        .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
-}
-
-fn runtime_miss_mask_header_value(value: &str) -> String {
-    let value = value.trim();
-    let char_count = value.chars().count();
-    if char_count <= 8 {
-        return "****".to_string();
-    }
-
-    let prefix: String = value.chars().take(4).collect();
-    let suffix: String = value
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{prefix}****{suffix}")
 }
 
 async fn load_runtime_miss_candidate_contexts(
@@ -1464,8 +1425,9 @@ mod tests {
         apply_runtime_miss_usage_routing, beautify_local_execution_client_error_message,
         insert_runtime_miss_candidate_usage_metadata,
         request_candidate_represents_provider_execution, runtime_miss_client_error_body,
-        select_last_runtime_miss_executed_candidate, select_last_runtime_miss_routing_candidate,
-        LocalExecutionRuntimeMissContext, RuntimeMissCandidateContext,
+        runtime_miss_original_headers_json, select_last_runtime_miss_executed_candidate,
+        select_last_runtime_miss_routing_candidate, LocalExecutionRuntimeMissContext,
+        RuntimeMissCandidateContext,
     };
     use crate::constants::EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS;
     use crate::state::LocalExecutionRuntimeMissDiagnostic;
@@ -1495,6 +1457,30 @@ mod tests {
             ),
             "没有可用提供商支持模型 gpt-5.4 的流式请求"
         );
+    }
+
+    #[test]
+    fn runtime_miss_usage_preserves_original_request_headers() {
+        let expected = json!({
+            "authorization": "Bearer original-client-token",
+            "x-api-key": "short",
+            "api-key": "original-api-key",
+            "x-goog-api-key": "original-google-key",
+            "cookie": "session=original-client",
+            "proxy-authorization": "Basic original-proxy-token",
+            "originator": "codex-cli",
+            "session-id": "original-session",
+            "x-codex-turn-metadata": "{\"turn_id\":\"original-turn\"}"
+        });
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in expected.as_object().unwrap() {
+            headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(value.as_str().unwrap()).unwrap(),
+            );
+        }
+
+        assert_eq!(runtime_miss_original_headers_json(&headers), expected);
     }
 
     #[test]

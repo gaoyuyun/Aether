@@ -8,7 +8,7 @@ use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
 use aether_data_contracts::repository::global_models::{
-    AdminProviderModelListQuery, GlobalModelReadRepository,
+    AdminGlobalModelListQuery, AdminProviderModelListQuery, GlobalModelReadRepository,
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -20,8 +20,9 @@ use http::StatusCode;
 use serde_json::json;
 
 use super::super::super::{
-    build_router_with_state, build_state_with_execution_runtime_override, sample_bound_auth_config,
-    sample_bound_key, sample_endpoint, sample_key, sample_proxy_node, start_server, AppState,
+    build_router_with_state, build_state_with_execution_runtime_override,
+    sample_admin_global_model, sample_bound_auth_config, sample_bound_key, sample_endpoint,
+    sample_key, sample_proxy_node, start_server, AppState,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -2421,7 +2422,15 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         )],
         vec![key],
     ));
-    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::default());
+    let existing_global_model = sample_admin_global_model(
+        "global-claude-sonnet-4",
+        "claude-sonnet-4",
+        "Claude Sonnet 4",
+    );
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::default()
+            .with_admin_global_models(vec![existing_global_model.clone()]),
+    );
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
@@ -2533,7 +2542,16 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .and_then(|value| value.get("remaining_fraction")),
         Some(&json!(0.25))
     );
-    let imported_provider_models = global_model_repository
+    let global_models = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .expect("global models should read after quota refresh");
+    assert_eq!(global_models.total, 1);
+    assert_eq!(global_models.items, vec![existing_global_model]);
+    let provider_models = global_model_repository
         .list_admin_provider_models(&AdminProviderModelListQuery {
             provider_id: "provider-antigravity".to_string(),
             is_active: None,
@@ -2541,15 +2559,8 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             limit: 100,
         })
         .await
-        .expect("imported Antigravity provider models should read");
-    let imported_model_names = imported_provider_models
-        .iter()
-        .map(|model| model.provider_model_name.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(imported_model_names.contains("claude-sonnet-4"));
-    assert!(imported_model_names.contains("gemini-2.5-pro"));
-    assert!(imported_model_names.contains("gemini-3.7-flash-tiered"));
-    assert!(!imported_model_names.contains("chat_23310"));
+        .expect("Antigravity provider models should read after quota refresh");
+    assert!(provider_models.is_empty());
     assert_eq!(
         reloaded[0]
             .upstream_metadata

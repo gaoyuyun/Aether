@@ -405,17 +405,39 @@ pub fn build_kiro_device_key_name(email: Option<&str>, refresh_token: Option<&st
                 .collect::<String>()
         })
         .unwrap_or_else(|| "unknown".to_string());
-    format!("kiro_{fallback} (idc)")
+    format!("账号_{fallback} (idc)")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_jwt_claims, enrich_admin_provider_oauth_auth_config,
+        build_kiro_device_key_name, decode_jwt_claims, enrich_admin_provider_oauth_auth_config,
         parse_provider_oauth_callback_params, MAX_UNVERIFIED_JWT_CLAIMS_BYTES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use serde_json::json;
+
+    #[test]
+    fn kiro_device_key_name_preserves_email_and_auth_method() {
+        assert_eq!(
+            build_kiro_device_key_name(Some("  kiro_user@example.com  "), Some("refresh-token-1")),
+            "kiro_user@example.com (idc)"
+        );
+    }
+
+    #[test]
+    fn kiro_device_key_name_without_email_uses_generic_account_prefix() {
+        for email in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                build_kiro_device_key_name(email, Some("refresh-token-1")),
+                "账号_154f43 (idc)"
+            );
+            assert_eq!(
+                build_kiro_device_key_name(email, None),
+                "账号_unknown (idc)"
+            );
+        }
+    }
 
     fn sample_unsigned_jwt(payload: serde_json::Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);

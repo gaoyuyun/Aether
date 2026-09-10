@@ -17,7 +17,7 @@
     <div class="xl:hidden">
       <Select
         :model-value="filterRole"
-        @update:model-value="emitFilterRole"
+        @update:model-value="updateRole"
       >
         <SelectTrigger :class="mobile ? 'w-24 h-8 text-xs border-border/60' : 'w-32 h-8 text-xs border-border/60'">
           <SelectValue :placeholder="legacyT(mobile ? '角色' : '全部角色')" />
@@ -37,7 +37,7 @@
     <div class="xl:hidden">
       <Select
         :model-value="filterStatus"
-        @update:model-value="emitFilterStatus"
+        @update:model-value="updateStatus"
       >
         <SelectTrigger :class="mobile ? 'w-20 h-8 text-xs border-border/60' : 'w-28 h-8 text-xs border-border/60'">
           <SelectValue :placeholder="legacyT(mobile ? '状态' : '全部状态')" />
@@ -78,7 +78,7 @@
     <div class="xl:hidden">
       <Select
         :model-value="sortOption"
-        @update:model-value="emitSortOption"
+        @update:model-value="updateSort"
       >
         <SelectTrigger :class="mobile ? 'w-32 h-8 text-xs border-border/60' : 'w-40 h-8 text-xs border-border/60'">
           <SelectValue :placeholder="legacyT('排序')" />
@@ -141,22 +141,19 @@ const emit = defineEmits<{
   'update:sortOption': [value: SortOption]
 }>()
 
-function emitFilterRole(value: string): void {
-  if (value === 'all' || props.roleOptions.some(option => option.value === value)) {
-    emit('update:filterRole', value as FilterRole)
-  }
+function updateRole(value: string) {
+  const option = props.roleOptions.find((option) => option.value === value)
+  if (option) emit('update:filterRole', option.value)
 }
 
-function emitFilterStatus(value: string): void {
-  if (value === 'all' || value === 'active' || value === 'inactive') {
-    emit('update:filterStatus', value)
-  }
+function updateStatus(value: string) {
+  const option = props.statusOptions.find((option) => option.value === value)
+  if (option) emit('update:filterStatus', option.value)
 }
 
-function emitSortOption(value: string): void {
-  if (value === 'default' || value === 'created_at_desc' || value === 'created_at_asc') {
-    emit('update:sortOption', value)
-  }
+function updateSort(value: string) {
+  const option = props.sortOptions.find((option) => option.value === value)
+  if (option) emit('update:sortOption', option.value)
 }
 
 const { legacyT } = useI18n()

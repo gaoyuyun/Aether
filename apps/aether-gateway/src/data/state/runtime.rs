@@ -1711,6 +1711,19 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn read_request_usage_body_payload(
+        &self,
+        body_ref: &str,
+    ) -> Result<
+        Option<aether_data_contracts::repository::usage::StoredUsageBodyPayload>,
+        DataLayerError,
+    > {
+        match &self.usage_reader {
+            Some(repository) => repository.read_body_payload(body_ref).await,
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn list_usage_audits(
         &self,
         query: &UsageAuditListQuery,

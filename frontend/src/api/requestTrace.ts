@@ -60,7 +60,7 @@ export interface CandidateProxyInfo {
 
 export interface CandidatePoolSelection {
   reason?: string
-  cost_soft_threshold?: boolean
+  cost_soft_threshold?: number | boolean | null
   cost_window_usage?: number | null
   cost_limit?: number | null
   [key: string]: unknown

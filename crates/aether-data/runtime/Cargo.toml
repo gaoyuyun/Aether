@@ -10,7 +10,7 @@ build = "build.rs"
 [features]
 default = ["postgres"]
 postgres = ["dep:aether-data-postgres", "sqlx/postgres"]
-mysql = ["dep:aether-data-mysql", "sqlx/mysql"]
+mysql = ["dep:aether-data-mysql", "sqlx/mysql", "sqlx/json"]
 sqlite = ["dep:aether-data-sqlite", "sqlx/sqlite"]
 all-drivers = ["postgres", "mysql", "sqlite"]
 

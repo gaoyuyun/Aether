@@ -1762,8 +1762,7 @@ mod tests {
         apply_users_me_usage_state_override, build_users_me_usage_active_payload,
         build_users_me_usage_record_payload, parse_users_me_usage_ids,
         parse_users_me_usage_record_filter, users_me_usage_client_is_stream,
-        users_me_usage_is_failed, users_me_usage_provider_visibility_enabled,
-        users_me_usage_terminal_candidate_state_override, users_me_usage_upstream_is_stream,
+        users_me_usage_provider_visibility_enabled, users_me_usage_upstream_is_stream,
         MAX_USERS_ME_USAGE_IDS, MAX_USERS_ME_USAGE_ID_BYTES,
     };
     use crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override;
@@ -2070,12 +2069,16 @@ mod tests {
 
     #[test]
     fn user_usage_active_override_uses_terminal_candidate_latency() {
-        let candidate = sample_candidate(
+        let mut candidate = sample_candidate(
             RequestCandidateStatus::Success,
             Some(200),
             Some(9_210),
             None,
         );
+        candidate.error_message = Some("private upstream diagnostic".to_string());
+        candidate.extra_data = Some(json!({
+            "upstream_response": {"body": {"error": {"message": "private upstream diagnostic"}}}
+        }));
 
         let payload =
             resolve_request_terminal_candidate_state_override(&[candidate]).expect("override");
@@ -2083,6 +2086,7 @@ mod tests {
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["response_time_ms"], 9_210);
         assert_eq!(payload["status_code"], 200);
+        assert!(!payload.to_string().contains("private upstream diagnostic"));
         assert_eq!(
             payload["response_time_updated_at"],
             "1970-01-01T00:00:10.210+00:00"
@@ -2221,7 +2225,7 @@ mod tests {
         super::clear_users_me_usage_active_failure_signal(object);
 
         assert_eq!(object["status_code"], 503);
-        assert_eq!(object["error_message"], "candidate failed");
+        assert_eq!(object["error_message"], "http_503");
         assert!(super::users_me_usage_payload_is_failed(object));
     }
 
@@ -2252,14 +2256,19 @@ mod tests {
     }
 
     #[test]
-    fn user_usage_active_pending_with_failure_signal_is_not_active() {
+    fn user_usage_active_pending_with_failure_signal_stays_active_until_terminal() {
         let item = StoredRequestUsageAudit {
             status_code: Some(503),
             error_message: Some("upstream failed".to_string()),
             ..sample_usage("pending")
         };
 
-        assert!(users_me_usage_is_failed(&item));
+        let mut payload = build_users_me_usage_active_payload(&item, false);
+        let object = payload
+            .as_object_mut()
+            .expect("active payload should be an object");
+        super::clear_users_me_usage_active_failure_signal(object);
+        assert!(!super::users_me_usage_payload_is_failed(object));
     }
 
     #[test]
@@ -2274,8 +2283,9 @@ mod tests {
             ..sample_usage("failed")
         };
 
-        let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
-        let active = build_users_me_usage_active_payload(&item);
+        let record =
+            build_users_me_usage_record_payload(&item, false, false, &BTreeMap::new(), false);
+        let active = build_users_me_usage_active_payload(&item, false);
         assert_eq!(record["error_message"], "authentication_error");
         assert_eq!(active["error_message"], "authentication_error");
         assert!(!record.to_string().contains("live-secret"));

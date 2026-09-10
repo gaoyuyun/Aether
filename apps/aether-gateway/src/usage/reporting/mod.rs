@@ -1308,7 +1308,13 @@ mod tests {
             stored[0].error_type.as_deref(),
             Some("stream_missing_terminal_event")
         );
-        assert!(stored[0].error_message.is_none());
+        assert_eq!(
+            stored[0].error_message.as_deref(),
+            Some(super::STREAM_MISSING_TERMINAL_EVENT_MESSAGE)
+        );
+        let mut public_candidate = stored[0].clone();
+        public_candidate.sanitize_sensitive_diagnostics();
+        assert!(public_candidate.error_message.is_none());
     }
 
     #[tokio::test]

@@ -392,8 +392,7 @@ class ApiClient {
 
     this.isRefreshing = true
     const requestAuthStateVersion = this.authStateVersion
-    let restorePromise!: Promise<string>
-    restorePromise = (async () => {
+    const restorePromise = (async () => {
       const accessToken = await this.coordinatedRefresh()
       if (requestAuthStateVersion !== this.authStateVersion) {
         throw new Error('Auth state changed during session restore')

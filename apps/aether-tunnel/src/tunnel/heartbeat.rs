@@ -31,14 +31,22 @@ enum AckDecision {
 }
 
 /// Handle for the dispatcher to forward HeartbeatAck frames.
-#[derive(Clone)]
 pub struct HeartbeatHandle {
     ack_tx: tokio::sync::mpsc::Sender<Bytes>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HeartbeatHandle {
-    pub async fn on_ack(&self, payload: Bytes) {
-        let _ = self.ack_tx.send(payload).await;
+    pub fn on_ack(&self, payload: Bytes) {
+        let _ = self.ack_tx.try_send(payload);
+    }
+}
+
+impl Drop for HeartbeatHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -48,7 +56,7 @@ impl HeartbeatHandle {
 pub fn spawn_noop() -> HeartbeatHandle {
     let (ack_tx, _) = tokio::sync::mpsc::channel::<Bytes>(1);
     // receiver is immediately dropped; on_ack() calls will silently fail
-    HeartbeatHandle { ack_tx }
+    HeartbeatHandle { ack_tx, task: None }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -74,7 +82,7 @@ pub fn spawn(
 ) -> HeartbeatHandle {
     let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Read initial interval from dynamic config (may be updated by remote config).
         let initial_interval = Duration::from_secs(server.dynamic.load().heartbeat_interval);
         let mut current_interval = initial_interval;
@@ -151,7 +159,8 @@ pub fn spawn(
                         current_interval = new_interval;
                     }
                 }
-                Some(ack_payload) = ack_rx.recv() => {
+                ack_payload = ack_rx.recv() => {
+                    let Some(ack_payload) = ack_payload else { break; };
                     match handle_ack(&server, &ack_payload) {
                         AckDecision::Accept {
                             heartbeat_id: ack_id,
@@ -179,7 +188,10 @@ pub fn spawn(
         }
     });
 
-    HeartbeatHandle { ack_tx }
+    HeartbeatHandle {
+        ack_tx,
+        task: Some(task),
+    }
 }
 
 async fn build_heartbeat_payload(

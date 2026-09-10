@@ -399,7 +399,9 @@ fn gateway_rejects_anonymous_operational_metrics() {
 }
 
 async fn gateway_rejects_anonymous_operational_metrics_impl() {
-    let gateway = build_router_with_state(AppState::new().expect("gateway state should build"));
+    let gateway = super::build_router_with_operational_routes_for_tests(
+        AppState::new().expect("gateway state should build"),
+    );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()

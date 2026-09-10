@@ -3,8 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.yml"
-RELEASE_WORKFLOW="${REPO_ROOT}/.github/workflows/release.yml"
-TUNNEL_RELEASE_WORKFLOW="${REPO_ROOT}/.github/workflows/build-tunnel.yml"
+RELEASE_WORKFLOW="${REPO_ROOT}/.github/workflows/publish-docker.yml"
 APP_DOCKERFILE="${REPO_ROOT}/Dockerfile.app"
 
 fail_test() {
@@ -45,24 +44,23 @@ assert_line "${RELEASE_WORKFLOW}" \
     "        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2"
 assert_line "${RELEASE_WORKFLOW}" '          subject-digest: ${{ steps.push.outputs.digest }}'
 assert_line "${RELEASE_WORKFLOW}" "          push-to-registry: true"
-assert_line "${RELEASE_WORKFLOW}" "          subject-path: |"
-assert_line "${RELEASE_WORKFLOW}" "            release-assets/install.sh"
-assert_line "${RELEASE_WORKFLOW}" "            release-assets/SHA256SUMS"
-assert_line "${RELEASE_WORKFLOW}" "            release-assets/AETHER_RELEASE_PROVENANCE.sigstore.json"
+assert_line "${RELEASE_WORKFLOW}" '          subject-name: ${{ steps.image.outputs.name }}'
+assert_line "${RELEASE_WORKFLOW}" "        id: push"
 
-assert_line "${TUNNEL_RELEASE_WORKFLOW}" "      attestations: write"
-assert_line "${TUNNEL_RELEASE_WORKFLOW}" "      id-token: write"
-assert_line "${TUNNEL_RELEASE_WORKFLOW}" \
-    "        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2"
-assert_line "${TUNNEL_RELEASE_WORKFLOW}" "            artifacts/SHA256SUMS.txt"
-assert_line "${TUNNEL_RELEASE_WORKFLOW}" \
-    "            artifacts/AETHER_TUNNEL_RELEASE_PROVENANCE.sigstore.json"
-assert_line "${TUNNEL_RELEASE_WORKFLOW}" \
-    "          tar czf ../../../aether-tunnel-\${{ matrix.name }}.tar.gz aether-tunnel.exe"
+python3 - "${REPO_ROOT}" <<'PY'
+import pathlib
+import re
+import sys
 
-if grep -ERq '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+[^[:space:]#]+@[^0-9a-f[:space:]][^[:space:]]*([[:space:]#]|$)' \
-    "${REPO_ROOT}/.github/workflows"; then
-    fail_test "workflow contains a mutable third-party action reference"
-fi
+root = pathlib.Path(sys.argv[1])
+for workflow in (root / ".github/workflows").glob("*.yml"):
+    for reference in re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)", workflow.read_text(), re.M):
+        if reference.startswith("./"):
+            assert (root / reference).is_file(), f"{workflow}: missing local workflow {reference}"
+        else:
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", reference), (
+                f"{workflow}: action must use a full commit SHA: {reference}"
+            )
+PY
 
 echo "PASS: release supply-chain pins and provenance workflow"

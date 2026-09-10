@@ -132,11 +132,17 @@ describe('ModelMappingDialog', () => {
       error: null,
       warning: null,
     })
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-1',
       provider_model_name: 'provider-model-1',
       provider_model_mappings: [],
-    } as unknown as Model
+    }
     const root = document.createElement('div')
     document.body.appendChild(root)
     const app = createApp(defineComponent({
@@ -186,12 +192,18 @@ describe('ModelMappingDialog', () => {
       base_url: 'https://api.example.com/v1',
       is_active: true,
     } as ProviderEndpoint
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
       provider_model_mappings: [],
-    } as unknown as Model
+    }
     const open = ref(false)
     const root = document.createElement('div')
     document.body.appendChild(root)
@@ -239,7 +251,13 @@ describe('ModelMappingDialog', () => {
       base_url: 'https://api.example.com/v1',
       is_active: true,
     } as ProviderEndpoint
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
@@ -249,7 +267,7 @@ describe('ModelMappingDialog', () => {
         endpoint_ids: [responsesEndpoint.id],
         operations: ['compact'],
       }],
-    } as Model
+    }
     const editingGroup: AliasGroup = {
       model,
       apiFormatsKey: '',
@@ -304,7 +322,13 @@ describe('ModelMappingDialog', () => {
   })
 
   it('preserves an edited compact scope when endpoint capabilities are unavailable', async () => {
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
@@ -314,7 +338,7 @@ describe('ModelMappingDialog', () => {
         endpoint_ids: ['endpoint-responses'],
         operations: ['compact'],
       }],
-    } as Model
+    }
     const editingGroup: AliasGroup = {
       model,
       apiFormatsKey: '',
@@ -369,7 +393,13 @@ describe('ModelMappingDialog', () => {
       base_url: 'https://api.example.com/v1',
       is_active: true,
     } as ProviderEndpoint
-    const model = {
+    const model: Model = {
+      provider_id: 'provider-1',
+      global_model_id: 'global-model-1',
+      is_active: true,
+      is_available: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
       id: 'model-sol',
       provider_model_name: 'gpt-5.6-sol',
       global_model_display_name: 'GPT-5.6 Sol',
@@ -379,7 +409,7 @@ describe('ModelMappingDialog', () => {
         endpoint_ids: [endpoint.id],
         operations: ['Compact'],
       }],
-    } as Model
+    }
     const editingGroup: AliasGroup = {
       model,
       apiFormatsKey: '',

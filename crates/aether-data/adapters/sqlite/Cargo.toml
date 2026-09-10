@@ -18,8 +18,6 @@ flate2.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["sqlite", "runtime-tokio-rustls", "chrono", "migrate", "macros"] }
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true

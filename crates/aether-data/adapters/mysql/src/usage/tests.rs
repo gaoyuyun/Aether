@@ -507,7 +507,7 @@ async fn mysql_stale_terminal_event_is_a_full_transaction_noop_when_url_is_set()
     .await
     .expect("routing snapshot should load");
     let settlement_before: (String, Option<f64>) = sqlx::query_as(
-        "SELECT billing_status, billing_total_cost_usd FROM usage_settlement_snapshots WHERE request_id = ?",
+        "SELECT billing_status, CAST(billing_total_cost_usd AS DOUBLE) FROM usage_settlement_snapshots WHERE request_id = ?",
     )
     .bind(&request_id)
     .fetch_one(&pool)
@@ -556,7 +556,7 @@ async fn mysql_stale_terminal_event_is_a_full_transaction_noop_when_url_is_set()
     .await
     .expect("routing snapshot should load");
     let settlement_after: (String, Option<f64>) = sqlx::query_as(
-        "SELECT billing_status, billing_total_cost_usd FROM usage_settlement_snapshots WHERE request_id = ?",
+        "SELECT billing_status, CAST(billing_total_cost_usd AS DOUBLE) FROM usage_settlement_snapshots WHERE request_id = ?",
     )
     .bind(&request_id)
     .fetch_one(&pool)
@@ -785,7 +785,7 @@ async fn mysql_concurrent_same_request_upserts_enqueue_counters_once_when_url_is
         return;
     };
     let pool = sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(4)
+        .max_connections(8)
         .connect(&database_url)
         .await
         .expect("mysql test pool should connect");
@@ -809,9 +809,9 @@ async fn mysql_concurrent_same_request_upserts_enqueue_counters_once_when_url_is
         .expect("global model should seed");
 
     let repository = MysqlUsageWriteRepository::new(pool.clone());
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
     let mut tasks = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..8 {
         let repository = repository.clone();
         let barrier = barrier.clone();
         let mut usage = sample_usage(
@@ -825,15 +825,26 @@ async fn mysql_concurrent_same_request_upserts_enqueue_counters_once_when_url_is
             1_000,
         );
         usage.model.clone_from(&model_name);
+        usage.response_body = Some(serde_json::json!({"answer": "captured across retries"}));
+        usage.response_body_state = Some(UsageBodyCaptureState::Inline);
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             repository.upsert(usage).await
         }));
     }
     for task in tasks {
-        task.await
+        let stored = task
+            .await
             .expect("concurrent usage writer should join")
             .expect("concurrent usage should persist");
+        assert_eq!(
+            stored.response_body,
+            Some(serde_json::json!({"answer": "captured across retries"}))
+        );
+        assert_eq!(
+            stored.response_body_state,
+            Some(UsageBodyCaptureState::Reference)
+        );
     }
     repository
         .flush_usage_counter_deltas(1_000)
@@ -885,7 +896,127 @@ async fn mysql_concurrent_same_request_upserts_enqueue_counters_once_when_url_is
 }
 
 #[tokio::test]
-async fn mysql_usage_http_capture_is_not_persisted_when_url_is_set() {
+async fn mysql_shallow_capture_preserves_legacy_refs_without_decoding_bodies() {
+    use aether_data_contracts::repository::usage::{StoredUsageBodyPayload, UsageBodyField};
+
+    let Ok(database_url) = std::env::var("AETHER_TEST_MYSQL_URL") else {
+        eprintln!("skipping MySQL shallow capture test: AETHER_TEST_MYSQL_URL is unset");
+        return;
+    };
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    run_migrations(&pool).await.unwrap();
+
+    let request_id = format!("shallow-capture-{}", uuid::Uuid::new_v4().simple());
+    let inline_body = serde_json::json!({"legacy": "inline"});
+    let corrupt_gzip = b"invalid gzip payload".to_vec();
+    sqlx::query(
+        r#"INSERT INTO `usage`
+           (id, request_id, request_headers, request_body, provider_request_body_compressed)
+           VALUES (?, ?, ?, ?, ?)"#,
+    )
+    .bind(&request_id)
+    .bind(&request_id)
+    .bind(serde_json::json!({"x-request": "retained"}).to_string())
+    .bind(inline_body.to_string())
+    .bind(&corrupt_gzip)
+    .execute(&pool)
+    .await
+    .expect("legacy capture should seed");
+    let response_ref = format!("usage://request/{request_id}/response_body");
+    sqlx::query(
+        "INSERT INTO usage_http_audits (request_id, response_body_ref, response_body_state) VALUES (?, ?, 'reference')",
+    )
+    .bind(&request_id)
+    .bind(&response_ref)
+    .execute(&pool)
+    .await
+    .expect("detached capture reference should seed");
+    sqlx::query(
+        "INSERT INTO usage_body_blobs (body_ref, request_id, body_field, payload_gzip) VALUES (?, ?, 'response_body', ?)",
+    )
+    .bind(&response_ref)
+    .bind(&request_id)
+    .bind(&corrupt_gzip)
+    .execute(&pool)
+    .await
+    .expect("detached body should seed");
+
+    let reader = MysqlUsageStorage::new(pool.clone());
+    let shallow = reader
+        .find_by_request_id_shallow(&request_id)
+        .await
+        .expect("detail metadata must not decode bodies")
+        .expect("usage should exist");
+    assert_eq!(
+        shallow.request_headers,
+        Some(serde_json::json!({"x-request": "retained"}))
+    );
+    for field in [
+        UsageBodyField::RequestBody,
+        UsageBodyField::ProviderRequestBody,
+        UsageBodyField::ResponseBody,
+    ] {
+        assert!(shallow.body_value(field).is_none());
+        assert_eq!(
+            shallow.body_ref(field),
+            Some(format!("usage://request/{request_id}/{}", field.as_storage_field()).as_str())
+        );
+    }
+    assert!(shallow.client_response_body.is_none());
+    assert!(shallow.client_response_body_ref.is_none());
+    assert_eq!(
+        shallow.response_body_state,
+        Some(UsageBodyCaptureState::Reference)
+    );
+
+    let inline_ref = shallow.request_body_ref.as_deref().unwrap();
+    let Some(StoredUsageBodyPayload::Json(raw)) =
+        reader.read_body_payload(inline_ref).await.unwrap()
+    else {
+        panic!("legacy inline JSON must remain available for on-demand reads");
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+        inline_body
+    );
+    assert_eq!(
+        reader.resolve_body_ref(inline_ref).await.unwrap(),
+        Some(inline_body)
+    );
+    for body_ref in [
+        shallow.provider_request_body_ref.as_deref().unwrap(),
+        shallow.response_body_ref.as_deref().unwrap(),
+    ] {
+        assert_eq!(
+            reader.read_body_payload(body_ref).await.unwrap(),
+            Some(StoredUsageBodyPayload::Gzip(corrupt_gzip.clone()))
+        );
+        assert!(reader.resolve_body_ref(body_ref).await.is_err());
+    }
+
+    sqlx::query("DELETE FROM usage_body_blobs WHERE request_id = ?")
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM usage_http_audits WHERE request_id = ?")
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM `usage` WHERE request_id = ?")
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mysql_usage_http_capture_round_trips_when_url_is_set() {
     let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -931,17 +1062,29 @@ async fn mysql_usage_http_capture_is_not_persisted_when_url_is_set() {
         .upsert(rich)
         .await
         .expect("MySQL canonical capture should upsert");
-    assert!(stored.request_headers.is_none());
-    assert!(stored.request_body.is_none());
-    assert!(stored.request_body_state.is_none());
-    assert!(stored.request_body_ref.is_none());
+    assert_eq!(
+        stored.request_headers,
+        Some(serde_json::json!({"x-client": "one"}))
+    );
+    assert_eq!(
+        stored.request_body,
+        Some(serde_json::json!({"request": true}))
+    );
+    assert_eq!(
+        stored.request_body_state,
+        Some(UsageBodyCaptureState::Reference)
+    );
+    assert_eq!(
+        stored.request_body_ref.as_deref(),
+        Some(format!("usage://request/{request_id}/request_body").as_str())
+    );
     let blob_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = ?")
             .bind(&request_id)
             .fetch_one(&pool)
             .await
             .expect("MySQL canonical blobs should count");
-    assert_eq!(blob_count, 0);
+    assert_eq!(blob_count, 2);
     let legacy_body: Option<String> =
         sqlx::query_scalar("SELECT CAST(request_body AS CHAR) FROM `usage` WHERE request_id = ?")
             .bind(&request_id)
@@ -964,8 +1107,8 @@ async fn mysql_usage_http_capture_is_not_persisted_when_url_is_set() {
         .upsert(sparse)
         .await
         .expect("MySQL sparse capture should upsert");
-    assert!(sparse_stored.request_headers.is_none());
-    assert!(sparse_stored.request_body.is_none());
+    assert_eq!(sparse_stored.request_headers, stored.request_headers);
+    assert_eq!(sparse_stored.request_body, stored.request_body);
 
     let mut clear = sample_usage(
         &request_id,
@@ -985,8 +1128,11 @@ async fn mysql_usage_http_capture_is_not_persisted_when_url_is_set() {
         .expect("MySQL explicit none should clear");
     assert!(cleared.request_body.is_none());
     assert!(cleared.request_body_ref.is_none());
-    assert!(cleared.request_body_state.is_none());
-    assert!(cleared.provider_request_body.is_none());
+    assert_eq!(
+        cleared.request_body_state,
+        Some(UsageBodyCaptureState::None)
+    );
+    assert_eq!(cleared.provider_request_body, stored.provider_request_body);
 }
 
 #[tokio::test]
@@ -1365,7 +1511,7 @@ async fn mysql_usage_cleanup_executes_when_url_is_set() {
 
     let window = UsageCleanupWindow {
         detail_cutoff: DateTime::from_timestamp(20, 0).expect("valid detail cutoff"),
-        compressed_cutoff: DateTime::from_timestamp(20, 0).expect("valid compressed cutoff"),
+        compressed_cutoff: DateTime::from_timestamp(5, 0).expect("valid compressed cutoff"),
         header_cutoff: DateTime::from_timestamp(20, 0).expect("valid header cutoff"),
         log_cutoff: DateTime::from_timestamp(5, 0).expect("valid log cutoff"),
     };
@@ -1392,27 +1538,16 @@ async fn mysql_usage_cleanup_executes_when_url_is_set() {
         .await
         .expect("MySQL detail cleanup should succeed");
     assert!(summary.body_externalized >= 1);
-    let stored_body: Option<String> =
-        sqlx::query_scalar("SELECT CAST(request_body AS CHAR) FROM `usage` WHERE request_id = ?")
+    let body_ref: String =
+        sqlx::query_scalar("SELECT request_body_ref FROM usage_http_audits WHERE request_id = ?")
             .bind(&request_id)
             .fetch_one(&pool)
             .await
-            .expect("purged body should load");
-    assert!(stored_body.is_none());
-    let body_blobs: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = ?")
-            .bind(&request_id)
-            .fetch_one(&pool)
-            .await
-            .expect("purged body blobs should count");
-    assert_eq!(body_blobs, 0);
-    let body_audits: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM usage_http_audits WHERE request_id = ?")
-            .bind(&request_id)
-            .fetch_one(&pool)
-            .await
-            .expect("purged body refs should count");
-    assert_eq!(body_audits, 0);
+            .expect("externalized body ref should load");
+    assert_eq!(
+        body_ref,
+        format!("usage://request/{request_id}/request_body")
+    );
 
     let headers_only = UsageCleanupTargets {
         detail_body: false,
@@ -1464,7 +1599,10 @@ async fn mysql_usage_cleanup_executes_when_url_is_set() {
     .expect("before-now fields should seed");
     let summary = repository
         .cleanup_usage(
-            &window,
+            &UsageCleanupWindow {
+                compressed_cutoff: window.detail_cutoff,
+                ..window.clone()
+            },
             1,
             false,
             UsageCleanupTargets::body_targets(),

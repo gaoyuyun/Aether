@@ -221,13 +221,17 @@ async fn gateway_handles_admin_video_tasks_list_locally_with_trusted_admin_princ
     assert_eq!(payload["pages"], json!(1));
     assert_eq!(payload["items"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["items"][0]["id"], "task-completed");
-    // Video-task persistence intentionally drops user-facing PII.  The admin
-    // projection must therefore use the privacy-safe fallback when no separate
-    // user snapshot is joined.
-    assert_eq!(payload["items"][0]["username"], "Unknown");
+    assert_eq!(payload["items"][0]["username"], "alice");
     assert_eq!(payload["items"][0]["provider_name"], "OpenAI");
     assert_eq!(payload["items"][0]["status"], "completed");
-    assert!(payload["items"][0]["prompt"].is_null());
+    assert_eq!(
+        payload["items"][0]["prompt"],
+        format!("{}...", "x".repeat(100))
+    );
+    assert_eq!(
+        payload["items"][0]["video_url"],
+        "https://8.8.8.8/task-completed.mp4"
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -393,7 +397,9 @@ async fn gateway_handles_admin_video_task_detail_locally_with_trusted_admin_prin
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["id"], "task-detail");
-    assert_eq!(payload["username"], "Unknown");
+    assert_eq!(payload["prompt"], "detail prompt");
+    assert_eq!(payload["video_url"], "https://8.8.8.8/task-detail.mp4");
+    assert_eq!(payload["username"], "charlie");
     assert_eq!(payload["provider_name"], "OpenAI");
     assert_eq!(payload["endpoint"]["id"], "endpoint-1");
     assert_eq!(payload["endpoint"]["api_format"], "openai:video");
@@ -734,7 +740,7 @@ async fn local_admin_video_task_cancel_attaches_explicit_audit() {
 }
 
 #[tokio::test]
-async fn gateway_does_not_redirect_sanitized_openai_video_url_or_forward_upstream() {
+async fn gateway_redirects_persisted_openai_video_url_without_forwarding_admin_request() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -762,7 +768,10 @@ async fn gateway_does_not_redirect_sanitized_openai_video_url_or_forward_upstrea
         ))
         .await
         .expect("task should upsert");
-    assert_eq!(stored.video_url, None);
+    assert_eq!(
+        stored.video_url.as_deref(),
+        Some("https://8.8.8.8/task-redirect.mp4")
+    );
 
     let (_upstream_url, upstream_handle) = start_server(upstream).await;
     let gateway = build_router_with_state(
@@ -788,7 +797,14 @@ async fn gateway_does_not_redirect_sanitized_openai_video_url_or_forward_upstrea
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        stored.video_url.as_deref()
+    );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -796,22 +812,22 @@ async fn gateway_does_not_redirect_sanitized_openai_video_url_or_forward_upstrea
 }
 
 #[tokio::test]
-async fn local_admin_video_task_video_is_unavailable_after_openai_url_sanitization() {
+async fn local_admin_video_task_download_preserves_signed_url_and_attaches_audit() {
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
-    let stored = repository
-        .upsert(sample_admin_video_task(
-            "task-video-audit",
-            VideoTaskStatus::Completed,
-            1_710_000_550,
-            "user-5",
-            "frank",
-            "provider-openai",
-            "gpt-video",
-            "video audit prompt",
-        ))
-        .await
-        .expect("task should upsert");
-    assert_eq!(stored.video_url, None);
+    let mut task = sample_admin_video_task(
+        "task-video-audit",
+        VideoTaskStatus::Completed,
+        1_710_000_550,
+        "user-5",
+        "frank",
+        "provider-openai",
+        "gpt-video",
+        "video audit prompt",
+    );
+    task.video_url =
+        Some("https://8.8.8.8/video.mp4?signature=a%2Fb%2Bc%3D&part=2&part=1".to_string());
+    let stored = repository.upsert(task).await.expect("task should upsert");
+    assert_eq!(stored.prompt.as_deref(), Some("video audit prompt"));
 
     let state = AppState::new()
         .expect("gateway state should build")
@@ -825,8 +841,15 @@ async fn local_admin_video_task_video_is_unavailable_after_openai_url_sanitizati
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert!(response.extensions().get::<AdminAuditEvent>().is_none());
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        stored.video_url.as_deref()
+    );
+    assert!(response.extensions().get::<AdminAuditEvent>().is_some());
 }
 
 #[tokio::test]

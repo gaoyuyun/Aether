@@ -50,6 +50,8 @@ use chrono::{TimeZone, Utc};
 const TEST_EMAIL_VERIFICATION_TOKEN: &str =
     "test-email-verification-token-00000000000000000000000000000000";
 
+#[path = "public_support/auth_cookie.rs"]
+mod auth_cookie;
 #[path = "public_support/dashboard.rs"]
 mod dashboard;
 #[path = "public_support/vscodex.rs"]
@@ -2199,9 +2201,7 @@ async fn gateway_rejects_unauthenticated_test_connection_before_using_provider_c
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["detail"], "缺少用户凭证");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(*provider_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -2292,9 +2292,7 @@ async fn gateway_rejects_non_admin_test_connection_before_using_provider_credent
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["detail"], "仅管理员可以测试供应商连接");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(*provider_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

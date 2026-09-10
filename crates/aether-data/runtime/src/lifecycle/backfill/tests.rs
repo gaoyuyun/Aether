@@ -112,9 +112,22 @@ async fn mysql_backfills_apply_portable_repairs_when_url_is_set() {
         return;
     };
 
-    let pool = sqlx::mysql::MySqlPoolOptions::new()
+    // MySQL cannot reopen a TEMPORARY table in the quota backfill's self-join.
+    // An isolated schema exercises the production SQL without touching shared fixtures.
+    let admin_pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
+        .await
+        .unwrap();
+    let database_name = format!("aether_backfill_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE `{database_name}`"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    let options: sqlx::mysql::MySqlConnectOptions = database_url.parse().unwrap();
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.database(&database_name))
         .await
         .expect("mysql backfill test pool should connect");
     let mut conn = pool
@@ -123,7 +136,7 @@ async fn mysql_backfills_apply_portable_repairs_when_url_is_set() {
         .expect("mysql backfill test connection should acquire");
     sqlx::raw_sql(
         r#"
-CREATE TEMPORARY TABLE schema_backfills (
+CREATE TABLE schema_backfills (
     version BIGINT PRIMARY KEY,
     description TEXT NOT NULL,
     success BOOLEAN NOT NULL,
@@ -131,24 +144,24 @@ CREATE TEMPORARY TABLE schema_backfills (
     execution_time BIGINT NOT NULL,
     applied_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 );
-CREATE TEMPORARY TABLE api_keys (
+CREATE TABLE api_keys (
     id VARCHAR(64) PRIMARY KEY,
     total_requests BIGINT NOT NULL DEFAULT 0,
     total_tokens BIGINT NOT NULL DEFAULT 0,
     total_cost_usd DOUBLE NOT NULL DEFAULT 0,
     last_used_at BIGINT
 );
-CREATE TEMPORARY TABLE provider_api_keys (
+CREATE TABLE provider_api_keys (
     id VARCHAR(64) PRIMARY KEY,
     total_tokens BIGINT NOT NULL DEFAULT 0
 );
-CREATE TEMPORARY TABLE global_models (
+CREATE TABLE global_models (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     usage_count BIGINT NOT NULL DEFAULT 0,
     updated_at BIGINT NOT NULL
 );
-CREATE TEMPORARY TABLE providers (
+CREATE TABLE providers (
     id VARCHAR(64) PRIMARY KEY,
     billing_type VARCHAR(64),
     monthly_used_usd DOUBLE NOT NULL DEFAULT 0,
@@ -158,17 +171,17 @@ CREATE TEMPORARY TABLE providers (
     is_active BOOLEAN NOT NULL,
     updated_at BIGINT NOT NULL DEFAULT 0
 );
-CREATE TEMPORARY TABLE provider_endpoints (
+CREATE TABLE provider_endpoints (
     id VARCHAR(64) PRIMARY KEY,
     enabled BOOLEAN NOT NULL,
     is_active BOOLEAN NOT NULL
 );
-CREATE TEMPORARY TABLE models (
+CREATE TABLE models (
     id VARCHAR(64) PRIMARY KEY,
     enabled BOOLEAN NOT NULL,
     is_active BOOLEAN NOT NULL
 );
-CREATE TEMPORARY TABLE `usage` (
+CREATE TABLE `usage` (
     request_id VARCHAR(128) PRIMARY KEY,
     api_key_id VARCHAR(64),
     provider_id VARCHAR(64),
@@ -194,7 +207,7 @@ CREATE TEMPORARY TABLE `usage` (
     created_at_unix_ms BIGINT NOT NULL DEFAULT 0,
     updated_at_unix_secs BIGINT NOT NULL DEFAULT 0
 );
-CREATE TEMPORARY TABLE usage_settlement_snapshots (
+CREATE TABLE usage_settlement_snapshots (
     request_id VARCHAR(128) PRIMARY KEY,
     billing_status VARCHAR(64) NOT NULL DEFAULT 'pending',
     billing_actual_total_cost_usd DOUBLE,
@@ -208,11 +221,17 @@ CREATE TEMPORARY TABLE usage_settlement_snapshots (
     finalized_at BIGINT,
     settlement_snapshot JSON
 );
-CREATE TEMPORARY TABLE usage_routing_snapshots (
+CREATE TABLE usage_routing_snapshots (
     request_id VARCHAR(128) PRIMARY KEY,
     candidate_id VARCHAR(128)
 );
-CREATE TEMPORARY TABLE usage_counter_deltas (
+CREATE TABLE request_candidates (
+    id VARCHAR(64) PRIMARY KEY,
+    request_id VARCHAR(128) NOT NULL,
+    provider_id VARCHAR(64),
+    status VARCHAR(32) NOT NULL
+);
+CREATE TABLE usage_counter_deltas (
     id VARCHAR(64) PRIMARY KEY,
     request_id VARCHAR(128) NOT NULL,
     kind VARCHAR(64) NOT NULL,
@@ -224,7 +243,7 @@ CREATE TEMPORARY TABLE usage_counter_deltas (
     quota_accounting_status VARCHAR(32),
     processed_at BIGINT
 );
-CREATE TEMPORARY TABLE provider_quota_maintenance_state (
+CREATE TABLE provider_quota_maintenance_state (
     provider_id VARCHAR(64) NOT NULL,
     quota_epoch_start BIGINT NOT NULL,
     task_kind VARCHAR(32) NOT NULL,
@@ -236,7 +255,7 @@ CREATE TEMPORARY TABLE provider_quota_maintenance_state (
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (provider_id, quota_epoch_start, task_kind)
 );
-CREATE TEMPORARY TABLE provider_quota_usage_buckets (
+CREATE TABLE provider_quota_usage_buckets (
     provider_id VARCHAR(64) NOT NULL,
     quota_epoch_start BIGINT NOT NULL,
     bucket_start BIGINT NOT NULL,
@@ -244,7 +263,7 @@ CREATE TEMPORARY TABLE provider_quota_usage_buckets (
     updated_at BIGINT NOT NULL,
     PRIMARY KEY (provider_id, quota_epoch_start, bucket_start)
 );
-CREATE TEMPORARY TABLE provider_quota_window_counters (
+CREATE TABLE provider_quota_window_counters (
     provider_id VARCHAR(64) NOT NULL,
     duration_secs BIGINT NOT NULL,
     quota_epoch_start BIGINT NOT NULL,
@@ -408,6 +427,12 @@ INSERT INTO usage_settlement_snapshots (
         .unwrap_or_else(|error| panic!("mysql {table} legacy flag should load: {error}"));
         assert!(!enabled, "mysql {table}.enabled should follow is_active");
     }
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE `{database_name}`"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
 }
 
 #[tokio::test]

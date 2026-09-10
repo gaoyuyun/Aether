@@ -869,12 +869,12 @@ pub fn build_terminal_usage_context_seed(
         request_type,
         is_stream: plan.stream,
         routing: build_runtime_routing_seed(plan, context),
-        request_headers: mask_sensitive_headers_in_json_value(context_value(
+        request_headers: validate_usage_headers_in_json_value(context_value(
             context,
             "original_headers",
         )),
         request_body: request_capture.request_body,
-        provider_request_headers: mask_sensitive_headers_in_json_value(
+        provider_request_headers: validate_usage_headers_in_json_value(
             context_usage_value(context, "provider_request_headers")
                 .or_else(|| headers_to_json(&plan.headers)),
         ),
@@ -2509,7 +2509,7 @@ fn sanitize_usage_event_data(mut data: UsageEventData) -> UsageEventData {
 }
 
 fn sanitize_usage_header_capture(value: Option<Value>) -> Option<Value> {
-    mask_sensitive_headers_in_json_value(value).map(capture_usage_storage_value)
+    validate_usage_headers_in_json_value(value).map(capture_usage_storage_value)
 }
 
 fn trim_owned_non_empty_string(value: String) -> Option<String> {
@@ -2732,39 +2732,11 @@ fn headers_to_json(headers: &BTreeMap<String, String>) -> Option<Value> {
         return None;
     }
     Some(Value::Object(Map::from_iter(headers.iter().map(
-        |(key, value)| (key.clone(), Value::String(mask_header_value(key, value))),
+        |(key, value)| (key.clone(), Value::String(value.clone())),
     ))))
 }
 
 const REDACTED_USAGE_VALUE: &str = "[redacted]";
-
-/// Only headers whose values are protocol metadata are persisted verbatim.
-/// Unknown headers are treated as credentials because providers commonly use
-/// custom `X-*` names for authentication.
-const SAFE_USAGE_HEADER_VALUE_NAMES: &[&str] = &[
-    "accept",
-    "accept-encoding",
-    "content-encoding",
-    "content-length",
-    "content-type",
-    "transfer-encoding",
-    "x-request-id",
-    "x-trace-id",
-];
-
-fn is_sensitive_header(name: &str) -> bool {
-    let trimmed = name.trim();
-    !SAFE_USAGE_HEADER_VALUE_NAMES
-        .iter()
-        .any(|candidate| trimmed.eq_ignore_ascii_case(candidate))
-}
-
-fn mask_header_value(name: &str, value: &str) -> String {
-    if !is_sensitive_header(name) {
-        return value.to_string();
-    }
-    mask_sensitive_header_value(value)
-}
 
 fn mask_sensitive_header_value(_value: &str) -> String {
     REDACTED_USAGE_VALUE.to_string()
@@ -2772,26 +2744,8 @@ fn mask_sensitive_header_value(_value: &str) -> String {
 
 /// Non-object values cannot be established as a valid header map and are
 /// discarded instead of being persisted verbatim.
-fn mask_sensitive_headers_in_json_value(value: Option<Value>) -> Option<Value> {
-    let mut value = value?;
-    let Value::Object(map) = &mut value else {
-        return None;
-    };
-    for (key, val) in map.iter_mut() {
-        if !is_sensitive_header(key) {
-            continue;
-        }
-        match val {
-            Value::String(text) => {
-                *text = mask_sensitive_header_value(text);
-            }
-            Value::Null => {}
-            other => {
-                *other = Value::String(mask_sensitive_header_value(&other.to_string()));
-            }
-        }
-    }
-    Some(value)
+fn validate_usage_headers_in_json_value(value: Option<Value>) -> Option<Value> {
+    aether_data_contracts::repository::usage::sanitize_usage_headers_for_persistence(value)
 }
 
 fn mask_sensitive_body_fields(mut value: Value) -> Value {
@@ -3556,11 +3510,10 @@ mod tests {
         build_terminal_usage_event_from_seed, build_usage_event_data_seed,
         build_usage_event_data_seed_describing_request_bodies, decode_body_for_storage,
         extract_token_counts_from_json, extract_token_counts_from_value, headers_to_json,
-        mask_header_value, mask_sensitive_body_fields, mask_sensitive_headers_in_json_value,
-        parse_sse_body_for_storage, resolve_error_message, trim_owned_non_empty_string,
-        LifecycleUsageSeed, TerminalUsageSeed, UsageBodyRefsSeed, UsageBodyStatesSeed,
-        UsageRoutingSeed, UsageTerminalState, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
-        REDACTED_USAGE_VALUE,
+        mask_sensitive_body_fields, parse_sse_body_for_storage, resolve_error_message,
+        trim_owned_non_empty_string, validate_usage_headers_in_json_value, LifecycleUsageSeed,
+        TerminalUsageSeed, UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed,
+        UsageTerminalState, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
     };
     use crate::{
         build_upsert_usage_record_from_event, GatewayStreamReportRequest, GatewaySyncReportRequest,
@@ -5711,14 +5664,14 @@ mod tests {
         assert_eq!(
             event.data.response_headers,
             Some(json!({
-                "authorization": REDACTED_USAGE_VALUE,
+                "authorization": "Bearer very-secret-token",
                 "content-type": "application/json"
             }))
         );
         assert_eq!(
             event.data.client_response_headers,
             Some(json!({
-                "authorization": REDACTED_USAGE_VALUE,
+                "authorization": "Bearer very-secret-token",
                 "content-type": "application/json"
             }))
         );
@@ -6611,7 +6564,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_terminal_seed_event_builder_sanitizes_headers_and_metadata_but_preserves_bodies() {
+    fn manual_terminal_seed_event_builder_sanitizes_metadata_but_preserves_headers_and_bodies() {
         let event = build_terminal_usage_event_from_seed(TerminalUsageSeed {
             terminal_state: UsageTerminalState::Completed,
             client_contract: "openai:chat".to_string(),
@@ -6682,26 +6635,26 @@ mod tests {
         assert_eq!(
             event.data.request_headers,
             Some(json!({
-                "authorization": REDACTED_USAGE_VALUE,
+                "authorization": "Bearer very-secret-token",
                 "accept": "application/json"
             }))
         );
         assert_eq!(
             event.data.provider_request_headers,
             Some(json!({
-                "x-api-key": REDACTED_USAGE_VALUE
+                "x-api-key": "sk-proj-super-secret"
             }))
         );
         assert_eq!(
             event.data.response_headers,
             Some(json!({
-                "set-cookie": REDACTED_USAGE_VALUE
+                "set-cookie": "session=extremely-secret-cookie"
             }))
         );
         assert_eq!(
             event.data.client_response_headers,
             Some(json!({
-                "authorization": REDACTED_USAGE_VALUE
+                "authorization": "Bearer client-secret"
             }))
         );
         assert_eq!(
@@ -6778,7 +6731,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_event_data_seed_masks_headers_before_outcome_paths_use_it() {
+    fn usage_event_data_seed_preserves_headers_before_outcome_paths_use_it() {
         let plan = ExecutionPlan {
             request_id: "req-seed-sanitize-1".to_string(),
             candidate_id: Some("cand-seed-sanitize-1".to_string()),
@@ -6817,7 +6770,7 @@ mod tests {
         assert_eq!(
             data.request_headers,
             Some(json!({
-                "authorization": REDACTED_USAGE_VALUE,
+                "authorization": "Bearer outcome-secret",
                 "accept": "application/json"
             }))
         );
@@ -6996,38 +6949,7 @@ mod tests {
     }
 
     #[test]
-    fn masks_known_sensitive_header_values() {
-        let token = "Bearer eyJhbGciOiJSUzI1NiJ9.payload-here.signature-tail";
-        let masked = mask_header_value("authorization", token);
-        assert_eq!(masked, REDACTED_USAGE_VALUE);
-
-        // 大小写不敏感
-        assert_eq!(
-            mask_header_value("Authorization", "12345678"),
-            REDACTED_USAGE_VALUE,
-        );
-        assert_eq!(
-            mask_header_value("X-Api-Key", "abcdefghij"),
-            REDACTED_USAGE_VALUE,
-        );
-
-        // Unknown custom headers are redacted by default.
-        assert_eq!(
-            mask_header_value("user-agent", "codex-tui/0.1"),
-            REDACTED_USAGE_VALUE,
-        );
-        assert_eq!(
-            mask_header_value("x-custom-auth", "tenant-secret"),
-            REDACTED_USAGE_VALUE,
-        );
-        assert_eq!(
-            mask_header_value("content-type", "application/json"),
-            "application/json",
-        );
-    }
-
-    #[test]
-    fn headers_to_json_masks_sensitive_headers_at_source() {
+    fn headers_to_json_preserves_original_headers_at_source() {
         let mut headers = BTreeMap::new();
         headers.insert(
             "authorization".to_string(),
@@ -7046,17 +6968,17 @@ mod tests {
             .get("authorization")
             .and_then(|v| v.as_str())
             .expect("authorization should be string");
-        assert_eq!(auth, REDACTED_USAGE_VALUE);
+        assert_eq!(auth, "Bearer eyJhbGciOiJSUzI1NiJ9.body.signature");
 
         let api_key = object
             .get("x-api-key")
             .and_then(|v| v.as_str())
             .expect("x-api-key should be string");
-        assert_eq!(api_key, REDACTED_USAGE_VALUE);
+        assert_eq!(api_key, "sk-proj-1234567890abcdef");
 
         assert_eq!(
             object.get("user-agent").and_then(|v| v.as_str()),
-            Some(REDACTED_USAGE_VALUE),
+            Some("codex-tui/0.1"),
         );
     }
 
@@ -7066,27 +6988,27 @@ mod tests {
     }
 
     #[test]
-    fn mask_sensitive_headers_in_json_value_handles_object_form() {
+    fn validate_usage_headers_in_json_value_handles_object_form() {
         let value = json!({
             "Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9.body.signature",
             "Cookie": "session=verylongcookievalue1234",
             "Accept": "application/json",
         });
-        let masked =
-            mask_sensitive_headers_in_json_value(Some(value)).expect("masked value should exist");
-        let object = masked.as_object().expect("expected object");
+        let captured =
+            validate_usage_headers_in_json_value(Some(value)).expect("captured value should exist");
+        let object = captured.as_object().expect("expected object");
 
         let auth = object
             .get("Authorization")
             .and_then(|v| v.as_str())
             .expect("Authorization should be string");
-        assert_eq!(auth, REDACTED_USAGE_VALUE);
+        assert_eq!(auth, "Bearer eyJhbGciOiJSUzI1NiJ9.body.signature");
 
         let cookie = object
             .get("Cookie")
             .and_then(|v| v.as_str())
             .expect("Cookie should be string");
-        assert_eq!(cookie, REDACTED_USAGE_VALUE);
+        assert_eq!(cookie, "session=verylongcookievalue1234");
 
         assert_eq!(
             object.get("Accept").and_then(|v| v.as_str()),
@@ -7095,11 +7017,11 @@ mod tests {
     }
 
     #[test]
-    fn mask_sensitive_headers_discards_non_object() {
+    fn validate_usage_headers_discards_non_object() {
         // None 输入返回 None
-        assert!(mask_sensitive_headers_in_json_value(None).is_none());
+        assert!(validate_usage_headers_in_json_value(None).is_none());
         // 非 object 不是可验证的 header map，直接丢弃。
-        let masked = mask_sensitive_headers_in_json_value(Some(json!("not an object")));
+        let masked = validate_usage_headers_in_json_value(Some(json!("not an object")));
         assert_eq!(masked, None);
     }
 

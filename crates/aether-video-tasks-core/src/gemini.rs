@@ -4,6 +4,7 @@ use aether_data_contracts::repository::video_tasks::{
 };
 use serde_json::{json, Map, Value};
 
+use crate::transport::{gemini_response_video_url, gemini_video_metadata};
 use crate::types::sanitize_video_task_error_code;
 use crate::{
     build_video_follow_up_report_context, current_unix_timestamp_secs, gemini_metadata_video_url,
@@ -112,7 +113,16 @@ impl GeminiVideoTaskSeed {
                 self.error_code = None;
                 self.error_message = None;
             }
-            self.metadata = json!({});
+            self.metadata = if error.is_none() {
+                gemini_video_metadata(
+                    provider_body
+                        .get("response")
+                        .and_then(gemini_response_video_url)
+                        .as_deref(),
+                )
+            } else {
+                json!({})
+            };
             return;
         }
 
@@ -365,8 +375,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        GeminiVideoTaskSeed, LocalVideoTaskPersistence, LocalVideoTaskStatus,
-        LocalVideoTaskTransport,
+        GeminiVideoTaskSeed, LocalVideoTaskPersistence, LocalVideoTaskSnapshot,
+        LocalVideoTaskStatus, LocalVideoTaskTransport,
     };
 
     use super::map_gemini_stored_task_to_read_response;
@@ -484,7 +494,54 @@ mod tests {
         assert!(record.request_metadata.is_none());
         assert_eq!(
             record.video_url.as_deref(),
-            Some("https://files.example/video.mp4?alt=media")
+            Some("https://files.example/video.mp4?alt=media&token=sensitive")
         );
+        assert_eq!(record.prompt.as_deref(), Some("business prompt"));
+
+        let transport = seed.transport.clone();
+        let mut snapshot = LocalVideoTaskSnapshot::Gemini(seed);
+        snapshot.apply_provider_body(json!({
+            "done": true,
+            "debug": "private-provider-debug",
+            "response": {
+                "provider_token": "private-provider-token",
+                "generateVideoResponse": {
+                    "generatedSamples": [{
+                        "video": {
+                            "uri": "https://files.example/video.mp4?alt=media&token=signed%2Bvalue",
+                            "debug": "private-video-debug"
+                        }
+                    }]
+                }
+            }
+        }).as_object().expect("provider body"));
+        assert!(!serde_json::to_string(&snapshot)
+            .expect("serialize snapshot")
+            .contains("private-"));
+        snapshot.sanitize_persisted_diagnostics();
+        let stored = snapshot.to_upsert_record().into_stored();
+        assert_eq!(stored.status, VideoTaskStatus::Completed);
+        assert_eq!(stored.prompt.as_deref(), Some("business prompt"));
+        assert_eq!(
+            stored.video_url.as_deref(),
+            Some("https://files.example/video.mp4?alt=media&token=signed%2Bvalue")
+        );
+        assert!(stored.request_metadata.is_none());
+        assert!(stored.original_request_body.is_none());
+
+        let mut restored =
+            LocalVideoTaskSnapshot::from_stored_task_with_transport(&stored, transport)
+                .expect("stored Gemini task should reconstruct");
+        restored.sanitize_persisted_diagnostics();
+        let restored_record = restored.to_upsert_record();
+        assert_eq!(restored_record.video_url, stored.video_url);
+        assert_eq!(restored_record.prompt, stored.prompt);
+        let response = restored.read_response();
+        assert_eq!(response.body_json["done"], true);
+        assert!(response
+            .body_json
+            .to_string()
+            .contains("/v1beta/files/aev_"));
+        assert!(!response.body_json.to_string().contains("signed%2Bvalue"));
     }
 }

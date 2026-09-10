@@ -536,6 +536,24 @@ async fn gateway_exposes_request_audit_bundle_via_internal_audit_endpoint() {
 
 #[tokio::test]
 async fn gateway_exposes_request_candidate_trace_via_internal_audit_endpoint() {
+    let mut failed_candidate = sample_request_candidate(
+        "cand-2",
+        "req-trace-1",
+        1,
+        RequestCandidateStatus::Failed,
+        Some(101),
+        Some(37),
+        Some(502),
+    );
+    failed_candidate.error_message = Some("private upstream diagnostic".to_string());
+    failed_candidate.extra_data = Some(json!({
+        "upstream_response": {
+            "status_code": 502,
+            "headers": {"x-request-id": "private-upstream-id"},
+            "body": {"error": {"message": "private upstream diagnostic"}}
+        },
+        "error_flow": {"status_code": 502, "message": "private upstream diagnostic"}
+    }));
     let repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
         sample_request_candidate(
             "cand-1",
@@ -546,15 +564,7 @@ async fn gateway_exposes_request_candidate_trace_via_internal_audit_endpoint() {
             None,
             None,
         ),
-        sample_request_candidate(
-            "cand-2",
-            "req-trace-1",
-            1,
-            RequestCandidateStatus::Failed,
-            Some(101),
-            Some(37),
-            Some(502),
-        ),
+        failed_candidate,
     ]));
 
     let gateway_state = AppState::new()
@@ -584,6 +594,14 @@ async fn gateway_exposes_request_candidate_trace_via_internal_audit_endpoint() {
     );
     assert_eq!(payload["candidates"][0]["id"], "cand-2");
     assert_eq!(payload["candidates"][0]["status"], "failed");
+    assert!(payload["candidates"][0]["error_message"].is_null());
+    assert_eq!(
+        payload["candidates"][0]["extra_data"]["upstream_response"]["status_code"],
+        502
+    );
+    let serialized = payload.to_string();
+    assert!(!serialized.contains("private upstream diagnostic"));
+    assert!(!serialized.contains("private-upstream-id"));
 
     gateway_handle.abort();
 }

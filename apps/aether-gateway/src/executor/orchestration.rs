@@ -1808,7 +1808,8 @@ mod tests {
             tokio::time::sleep(HEARTBEAT_USAGE_POLL_INTERVAL.min(deadline - now)).await;
         };
         assert_eq!(usage.status_code, Some(429));
-        assert_eq!(usage.error_message.as_deref(), Some("slow down"));
+        assert!(usage.error_message.is_none());
+        assert_eq!(usage.error_category.as_deref(), Some("client_error"));
 
         let candidates = request_candidate_repository
             .list_by_request_id(request_id)

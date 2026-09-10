@@ -58,13 +58,29 @@ pub async fn import_sqlite_jsonl(
     pool: &crate::driver::sqlite::SqlitePool,
     input: &str,
 ) -> Result<usize, DataLayerError> {
+    import_sqlite_jsonl_with_options(pool, input, DataImportOptions::default()).await
+}
+
+pub(super) async fn import_sqlite_jsonl_with_options(
+    pool: &crate::driver::sqlite::SqlitePool,
+    input: &str,
+    options: DataImportOptions,
+) -> Result<usize, DataLayerError> {
     let plan = build_import_plan(input)?;
-    import_sqlite_plan(pool, &plan).await
+    import_sqlite_plan_with_options(pool, &plan, options).await
 }
 
 pub async fn import_sqlite_plan(
     pool: &crate::driver::sqlite::SqlitePool,
     plan: &DataImportPlan,
+) -> Result<usize, DataLayerError> {
+    import_sqlite_plan_with_options(pool, plan, DataImportOptions::default()).await
+}
+
+async fn import_sqlite_plan_with_options(
+    pool: &crate::driver::sqlite::SqlitePool,
+    plan: &DataImportPlan,
+    options: DataImportOptions,
 ) -> Result<usize, DataLayerError> {
     let identity_scope = IdentityImportScope::from_plan(plan)?;
     let mut tx = pool.begin().await.map_sql_err()?;
@@ -74,21 +90,21 @@ pub async fn import_sqlite_plan(
     for domain in &plan.manifest.domains {
         if *domain == ExportDomain::Auxiliary {
             for row in plan.rows(*domain) {
-                import_sqlite_auxiliary_row(&mut tx, row, &mut column_cache).await?;
+                import_sqlite_auxiliary_row(&mut tx, row, &mut column_cache, options).await?;
                 imported = imported.saturating_add(1);
             }
             continue;
         }
         if *domain == ExportDomain::Billing {
             for row in plan.rows(*domain) {
-                import_sqlite_billing_row(&mut tx, row, &mut column_cache).await?;
+                import_sqlite_billing_row(&mut tx, row, &mut column_cache, options).await?;
                 imported = imported.saturating_add(1);
             }
             continue;
         }
         if *domain == ExportDomain::Wallets {
             for row in plan.rows(*domain) {
-                import_sqlite_wallet_row(&mut tx, row, &mut column_cache).await?;
+                import_sqlite_wallet_row(&mut tx, row, &mut column_cache, options).await?;
                 imported = imported.saturating_add(1);
             }
             continue;
@@ -97,7 +113,7 @@ pub async fn import_sqlite_plan(
         let target_columns =
             sqlite_import_columns_cached(&mut tx, &mut column_cache, table_name).await?;
         for row in plan.rows(*domain) {
-            import_sqlite_row(&mut tx, table_name, *domain, row, &target_columns).await?;
+            import_sqlite_row(&mut tx, table_name, *domain, row, &target_columns, options).await?;
             imported = imported.saturating_add(1);
         }
     }
@@ -463,12 +479,16 @@ async fn import_sqlite_row(
     domain: ExportDomain,
     row: &ExportRow,
     target_columns: &SqliteImportColumns,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let mut object =
         filter_import_payload("sqlite", table_name, domain, row, &target_columns.names)?;
-    deactivate_imported_credentials(table_name, &mut object, |column_name| {
-        target_columns.names.contains(column_name)
-    });
+    apply_import_credential_policy(
+        table_name,
+        &mut object,
+        |column_name| target_columns.names.contains(column_name),
+        options,
+    );
 
     let columns = object.keys().map(String::as_str).collect::<Vec<_>>();
     let column_sql = columns
@@ -520,6 +540,7 @@ async fn import_sqlite_billing_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     row: &ExportRow,
     column_cache: &mut BTreeMap<String, SqliteImportColumns>,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let (table_name, payload) = billing_payload_table(row)?;
     let table_name = sqlite_billing_table_name(&table_name)?;
@@ -533,6 +554,7 @@ async fn import_sqlite_billing_row(
             payload,
         },
         &target_columns,
+        options,
     )
     .await
 }
@@ -541,6 +563,7 @@ async fn import_sqlite_auxiliary_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     row: &ExportRow,
     column_cache: &mut BTreeMap<String, SqliteImportColumns>,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let (table_name, payload) = domain_payload_table(row, "auxiliary", None)?;
     let table = auxiliary_table(&table_name)?;
@@ -554,6 +577,7 @@ async fn import_sqlite_auxiliary_row(
             payload,
         },
         &target_columns,
+        options,
     )
     .await
 }
@@ -573,6 +597,7 @@ async fn import_sqlite_wallet_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     row: &ExportRow,
     column_cache: &mut BTreeMap<String, SqliteImportColumns>,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let (table_name, payload) = domain_payload_table(row, "wallet", Some("wallets"))?;
     let table_name = sqlite_wallet_table_name(&table_name)?;
@@ -586,6 +611,7 @@ async fn import_sqlite_wallet_row(
             payload,
         },
         &target_columns,
+        options,
     )
     .await
 }

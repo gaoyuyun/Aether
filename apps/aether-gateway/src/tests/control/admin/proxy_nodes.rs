@@ -1288,7 +1288,10 @@ async fn gateway_creates_updates_and_tests_manual_proxy_nodes_locally() {
     assert_ne!(second_create_payload["node_id"], create_payload["node_id"]);
     assert_eq!(second_create_payload["node"]["proxy_url"], proxy_url);
     assert_eq!(second_create_payload["node"]["proxy_username"], "bob");
-    assert_eq!(second_create_payload["node"]["proxy_password"], "an****et");
+    assert_eq!(second_create_payload["node"]["has_proxy_password"], true);
+    assert!(second_create_payload["node"]
+        .get("proxy_password")
+        .is_none());
 
     let test_url_response = client
         .post(format!("{gateway_url}/api/admin/proxy-nodes/test-url"))

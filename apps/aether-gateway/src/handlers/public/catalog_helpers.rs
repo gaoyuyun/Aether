@@ -129,9 +129,6 @@ pub(crate) fn normalize_admin_base_url(base_url: &str) -> Result<String, String>
     if parsed.host_str().is_none() {
         return Err("base_url 必须包含有效主机".to_string());
     }
-    if !aether_http::is_https_or_loopback_http_url(&parsed) {
-        return Err("base_url 必须使用 HTTPS；HTTP 仅允许字面量 loopback 主机".to_string());
-    }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("base_url 不允许包含用户名或密码".to_string());
     }
@@ -154,13 +151,39 @@ mod normalize_admin_base_url_tests {
             "https://user:password@api.example.test/v1",
             "https://api.example.test/v1?key=secret",
             "https://api.example.test/v1#secret",
-            "http://api.example.test/v1",
-            "http://10.0.0.1/v1",
-            "http://[::ffff:127.0.0.1]/v1",
+            "http://user:password@api.example.test/v1",
+            "http://api.example.test/v1?key=secret",
+            "http://api.example.test/v1#secret",
+            "ftp://api.example.test/v1",
+            "file:///v1",
+            "api.example.test/v1",
+            "",
             "https://",
+            "http://",
             "https://api.example.test:invalid/v1",
         ] {
             assert!(normalize_admin_base_url(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn endpoint_base_url_accepts_remote_http_hosts() {
+        for (raw_url, expected) in [
+            (
+                " HTTP://API.EXAMPLE.TEST:8080/v1/ ",
+                "http://api.example.test:8080/v1",
+            ),
+            ("http://8.8.8.8:8080/v1/", "http://8.8.8.8:8080/v1"),
+            ("http://10.0.0.1:8080/v1/", "http://10.0.0.1:8080/v1"),
+            (
+                "http://[2606:4700:4700::1111]:8080/v1/",
+                "http://[2606:4700:4700::1111]:8080/v1",
+            ),
+        ] {
+            assert_eq!(
+                normalize_admin_base_url(raw_url).expect("HTTP base URL should be accepted"),
+                expected,
+            );
         }
     }
 

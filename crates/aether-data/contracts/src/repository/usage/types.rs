@@ -1771,6 +1771,12 @@ pub fn canonical_usage_body_ref_for(
         .map(|(request_id, field)| usage_body_ref(&request_id, field))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredUsageBodyPayload {
+    Gzip(Vec<u8>),
+    Json(Vec<u8>),
+}
+
 #[async_trait]
 pub trait UsageReadRepository: Send + Sync {
     async fn find_by_id(
@@ -1799,6 +1805,20 @@ pub trait UsageReadRepository: Send + Sync {
         &self,
         body_ref: &str,
     ) -> Result<Option<Value>, crate::DataLayerError>;
+
+    async fn read_body_payload(
+        &self,
+        body_ref: &str,
+    ) -> Result<Option<StoredUsageBodyPayload>, crate::DataLayerError> {
+        self.resolve_body_ref(body_ref)
+            .await?
+            .map(|value| {
+                serde_json::to_vec(&value)
+                    .map(StoredUsageBodyPayload::Json)
+                    .map_err(|error| crate::DataLayerError::UnexpectedValue(error.to_string()))
+            })
+            .transpose()
+    }
 
     async fn list_usage_audits(
         &self,

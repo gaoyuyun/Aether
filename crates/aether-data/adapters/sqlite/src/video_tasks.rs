@@ -1120,6 +1120,82 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn sqlite_video_claim_and_completion_preserve_business_fields() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let repository = SqliteVideoTaskRepository::new(pool.clone());
+        for api_format in ["openai:video", "gemini:video"] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut original = sample_task(&id, VideoTaskStatus::Submitted, 100);
+            original.username = Some("video user".to_string());
+            original.api_key_name = Some("video client".to_string());
+            original.client_api_format = Some(api_format.to_string());
+            original.provider_api_format = Some(api_format.to_string());
+            original.original_request_body = Some(serde_json::json!({"token": "private"}));
+            original.request_metadata = Some(serde_json::json!({"authorization": "private"}));
+            original.duration_seconds = Some(8);
+            original.resolution = Some("1080p".to_string());
+            original.aspect_ratio = Some("16:9".to_string());
+            original.size = Some("1920x1080".to_string());
+            let stored = repository.upsert(original.clone()).await.unwrap();
+            assert!(stored.original_request_body.is_none());
+            assert!(stored.request_metadata.is_none());
+
+            let mut claimed = repository.claim_due(100, 130, 10).await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            let mut completion: UpsertVideoTask = claimed.pop().unwrap().into();
+            stored
+                .ensure_immutable_identity_matches(&completion)
+                .unwrap();
+            assert_eq!(completion.prompt, original.prompt);
+            assert_eq!(completion.username, original.username);
+            assert_eq!(completion.api_key_name, original.api_key_name);
+            let mut mismatched = completion.clone();
+            mismatched.duration_seconds = Some(99);
+            assert!(repository
+                .update_if_active(mismatched)
+                .await
+                .unwrap()
+                .is_none());
+
+            completion.status = VideoTaskStatus::Completed;
+            completion.progress_percent = 100;
+            completion.next_poll_at_unix_secs = None;
+            completion.completed_at_unix_secs = Some(120);
+            completion.updated_at_unix_secs = 120;
+            completion.video_url = Some(
+                "https://cdn.example.test/video.mp4?signature=a%2Fb%2Bc%3D&part=2&part=1"
+                    .to_string(),
+            );
+            let completed = repository
+                .update_if_active(completion.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.video_url, completion.video_url);
+            let reloaded = repository
+                .find(aether_data_contracts::repository::video_tasks::VideoTaskLookupKey::Id(&id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.status, VideoTaskStatus::Completed);
+            assert_eq!(reloaded.prompt, original.prompt);
+            assert_eq!(reloaded.username, original.username);
+            assert_eq!(reloaded.api_key_name, original.api_key_name);
+            assert_eq!(reloaded.video_url, completion.video_url);
+            assert_eq!(reloaded.duration_seconds, original.duration_seconds);
+            assert_eq!(reloaded.size, original.size);
+            assert!(reloaded.original_request_body.is_none());
+            assert!(reloaded.request_metadata.is_none());
+        }
+        pool.close().await;
+    }
+
     fn sample_task(
         id: &str,
         status: VideoTaskStatus,

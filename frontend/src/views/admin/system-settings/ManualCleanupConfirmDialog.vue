@@ -465,7 +465,7 @@ async function handleConfirm() {
   taskError.value = null
   try {
     const response = await adminApi.runManualUsageCleanup(buildRequest())
-    if (!('task' in response)) {
+    if ('detail' in response) {
       taskError.value = response.message
       emit('running-change', false)
       return

@@ -19,13 +19,13 @@ fn sanitize_request_candidate_rows(
     mut candidates: Vec<StoredRequestCandidate>,
 ) -> Vec<StoredRequestCandidate> {
     for candidate in &mut candidates {
-        candidate.sanitize_sensitive_diagnostics();
+        candidate.sanitize_for_persistence();
     }
     candidates
 }
 
 fn sanitize_request_candidate_row(mut candidate: StoredRequestCandidate) -> StoredRequestCandidate {
-    candidate.sanitize_sensitive_diagnostics();
+    candidate.sanitize_for_persistence();
     candidate
 }
 
@@ -1086,7 +1086,10 @@ mod request_candidate_security_tests {
     fn assert_candidate_is_sanitized(candidate: &StoredRequestCandidate) {
         assert_eq!(candidate.skip_reason.as_deref(), Some("unclassified_skip"));
         assert_eq!(candidate.error_type.as_deref(), Some("unclassified_error"));
-        assert!(candidate.error_message.is_none());
+        assert_eq!(
+            candidate.error_message.as_deref(),
+            Some("Bearer candidate-secret")
+        );
         assert_eq!(
             candidate.extra_data,
             Some(json!({"gateway_execution_runtime": true}))
@@ -1095,13 +1098,15 @@ mod request_candidate_security_tests {
             candidate.required_capabilities,
             Some(json!({"vision": true}))
         );
-        assert!(!serde_json::to_string(candidate)
+        let mut public_candidate = candidate.clone();
+        public_candidate.sanitize_sensitive_diagnostics();
+        assert!(!serde_json::to_string(&public_candidate)
             .expect("candidate should serialize")
             .contains("candidate-secret"));
     }
 
     #[test]
-    fn gateway_candidate_boundary_sanitizes_repository_rows_and_write_results() {
+    fn gateway_candidate_boundary_preserves_admin_errors_and_removes_request_payloads() {
         let candidate = sanitize_request_candidate_row(untrusted_candidate());
         assert_candidate_is_sanitized(&candidate);
 

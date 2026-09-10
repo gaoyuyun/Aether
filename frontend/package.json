@@ -16,7 +16,7 @@
     "test:ui": "node --experimental-require-module --disable-warning=ExperimentalWarning ./node_modules/vitest/vitest.mjs --ui",
     "test:run": "node --experimental-require-module --disable-warning=ExperimentalWarning ./node_modules/vitest/vitest.mjs run",
     "lint": "eslint . --fix",
-    "type-check": "vue-tsc --noEmit",
+    "type-check": "vue-tsc -b --force --pretty false",
     "version": "git describe --tags --always"
   },
   "dependencies": {

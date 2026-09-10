@@ -197,6 +197,7 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
             ..UsageRuntimeConfig::default()
         })
         .unwrap();
+    state.ensure_system_default_routing_group().await.unwrap();
     let gateway = serve(build_router_with_state(state)).await;
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -224,7 +225,14 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
             assert!(body.contains("fallback-b"), "expected fallback: {body}");
         }
     }
-    assert_eq!(a_hits.load(Ordering::SeqCst), usize::from(failure != 4));
+    // The first key gets one same-key retry by default. A committed stream
+    // cannot retry, while refused connections never reach the HTTP handler.
+    let failed_attempts = if committed_stream_error { 1 } else { 2 };
+    assert_eq!(
+        a_hits.load(Ordering::SeqCst),
+        if failure == 4 { 0 } else { failed_attempts },
+        "stream={stream} failure={failure} fallback={fallback}"
+    );
     let expected_b_hits = usize::from(fallback && !committed_stream_error);
     assert_eq!(b_hits.load(Ordering::SeqCst), expected_b_hits);
 
@@ -249,12 +257,11 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
     assert_eq!(recovered.monthly_used_usd, 0.0);
     let failed = sqlx::query("SELECT c.status, d.quota_accounting_status FROM request_candidates c JOIN usage_counter_deltas d ON d.request_id=c.id WHERE c.provider_id=? AND d.kind='provider_monthly'")
         .bind(&a_id).fetch_all(&pool).await.unwrap();
-    assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0].get::<String, _>("status"), "failed");
-    assert_eq!(
-        failed[0].get::<String, _>("quota_accounting_status"),
-        "ready"
-    );
+    assert_eq!(failed.len(), failed_attempts);
+    for attempt in failed {
+        assert_eq!(attempt.get::<String, _>("status"), "failed");
+        assert_eq!(attempt.get::<String, _>("quota_accounting_status"), "ready");
+    }
 
     // Restrict a new request to A so sticky affinity to the successful fallback cannot hide A.
     mode.store(0, Ordering::SeqCst);
@@ -277,7 +284,7 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
     assert_eq!(b_hits.load(Ordering::SeqCst), expected_b_hits);
     for _ in 0..100 {
         let finalized: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM usage WHERE finalized_at IS NOT NULL")
+            sqlx::query_scalar("SELECT COUNT(*) FROM usage WHERE finalized_at IS NOT NULL AND billing_status IN ('settled', 'void')")
                 .fetch_one(&pool)
                 .await
                 .unwrap();

@@ -238,6 +238,7 @@ mod tests {
 
         let constraints = SchedulerAuthConstraints {
             allowed_providers: Some(vec!["codex".to_string()]),
+            allowed_providers_and: None,
             allowed_api_formats: Some(vec!["codex:live".to_string()]),
             allowed_models: Some(vec!["live-future-alias".to_string()]),
         };

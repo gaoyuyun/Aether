@@ -584,7 +584,7 @@ ON DUPLICATE KEY UPDATE
     ELSE COALESCE(VALUES(status_code), status_code)
   END,
   error_type = VALUES(error_type),
-  error_message = NULL,
+  error_message = VALUES(error_message),
   latency_ms = CASE
     WHEN status IN ('success', 'failed', 'cancelled', 'skipped')
       AND VALUES(status) IN ('available', 'unused', 'pending', 'streaming')
@@ -696,6 +696,7 @@ fn merge_candidate(
     let extra_data = merge_json_objects(
         existing.as_ref().and_then(|value| value.extra_data.clone()),
         candidate.extra_data,
+        preserve_existing_lifecycle,
     );
     StoredRequestCandidate::new(
         id,
@@ -757,7 +758,17 @@ fn merge_candidate(
                 .error_type
                 .or_else(|| existing.as_ref().and_then(|value| value.error_type.clone()))
         },
-        None,
+        if preserve_existing_lifecycle {
+            existing
+                .as_ref()
+                .and_then(|value| value.error_message.clone())
+        } else {
+            candidate.error_message.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|value| value.error_message.clone())
+            })
+        },
         if preserve_existing_lifecycle {
             match existing.as_ref().and_then(|value| value.latency_ms) {
                 Some(value) => Some(to_i32_u64(value)?),
@@ -935,12 +946,24 @@ fn json_to_string(value: &Option<serde_json::Value>) -> Result<Option<String>, D
 fn merge_json_objects(
     existing: Option<serde_json::Value>,
     overlay: Option<serde_json::Value>,
+    preserve_error_details: bool,
 ) -> Option<serde_json::Value> {
     match (existing, overlay) {
         (
             Some(serde_json::Value::Object(mut existing_object)),
-            Some(serde_json::Value::Object(overlay_object)),
+            Some(serde_json::Value::Object(mut overlay_object)),
         ) => {
+            if preserve_error_details {
+                for key in [
+                    "upstream_response",
+                    "error_flow",
+                    "failure_diagnostic",
+                    "request_conversion_error",
+                    "request_body_build_error",
+                ] {
+                    overlay_object.remove(key);
+                }
+            }
             existing_object.extend(overlay_object);
             Some(serde_json::Value::Object(existing_object))
         }
@@ -1143,10 +1166,11 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("raw candidate diagnostics should load");
-        assert!(
+        assert_eq!(
             sqlx::Row::try_get::<Option<String>, _>(&raw, "error_message")
                 .expect("error_message should decode")
-                .is_none()
+                .as_deref(),
+            Some("Bearer legacy-secret")
         );
         assert_eq!(
             sqlx::Row::try_get::<Option<String>, _>(&raw, "skip_reason")
@@ -1346,6 +1370,94 @@ mod tests {
                 "stream_completed": true
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn mysql_failed_candidate_diagnostics_survive_late_success_and_streaming() {
+        let Ok(database_url) = std::env::var("AETHER_TEST_MYSQL_URL") else {
+            eprintln!("skipping MySQL diagnostic replay test: AETHER_TEST_MYSQL_URL is unset");
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let repository = MysqlRequestCandidateRepository::new(pool.clone());
+        let request_id = format!("diagnostic-replay-{}", uuid::Uuid::new_v4());
+        let candidate_id = uuid::Uuid::new_v4().to_string();
+        let original_extra = json!({
+            "upstream_response": {
+                "status_code": 503,
+                "headers": {"retry-after": "30"},
+                "body": {"error": {"message": "original upstream failure"}}
+            },
+            "failure_diagnostic": {"path": "$.input", "message": "original diagnostic"}
+        });
+        let mut failed = sample_upsert(
+            &request_id,
+            &candidate_id,
+            RequestCandidateStatus::Failed,
+            Some(original_extra.clone()),
+            5_000_000,
+        );
+        failed.request_id = request_id.clone();
+        failed.status_code = Some(503);
+        failed.error_type = Some("upstream_error".to_string());
+        failed.error_message = Some("original upstream failure".to_string());
+        repository.upsert(failed).await.unwrap();
+
+        for status in [
+            RequestCandidateStatus::Success,
+            RequestCandidateStatus::Streaming,
+        ] {
+            let mut late = sample_upsert(
+                &request_id,
+                &uuid::Uuid::new_v4().to_string(),
+                status,
+                Some(json!({
+                    "gateway_execution_runtime": true,
+                    "upstream_response": {"status_code": 200, "body": "late unrelated body"},
+                    "failure_diagnostic": {"message": "late unrelated diagnostic"}
+                })),
+                5_000_500,
+            );
+            late.request_id = request_id.clone();
+            late.error_message = Some("late unrelated error".to_string());
+            late.latency_ms = Some(9_999);
+            repository.upsert_many(vec![late]).await.unwrap();
+
+            let stored = repository.list_by_request_id(&request_id).await.unwrap();
+            assert_eq!(stored.len(), 1);
+            let candidate = &stored[0];
+            assert_eq!(candidate.id, candidate_id);
+            assert_eq!(candidate.status, RequestCandidateStatus::Failed);
+            assert_eq!(candidate.status_code, Some(503));
+            assert_eq!(candidate.error_type.as_deref(), Some("upstream_error"));
+            assert_eq!(
+                candidate.error_message.as_deref(),
+                Some("original upstream failure")
+            );
+            assert_eq!(candidate.latency_ms, Some(123));
+            assert_eq!(candidate.finished_at_unix_ms, Some(5_000_002));
+            let extra = candidate.extra_data.as_ref().unwrap();
+            assert_eq!(
+                extra["upstream_response"],
+                original_extra["upstream_response"]
+            );
+            assert_eq!(
+                extra["failure_diagnostic"],
+                original_extra["failure_diagnostic"]
+            );
+            assert_eq!(extra["gateway_execution_runtime"], true);
+        }
+        sqlx::query("DELETE FROM request_candidates WHERE request_id = ?")
+            .bind(request_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
     }
 
     fn sample_upsert(

@@ -120,8 +120,16 @@ pub(crate) async fn decrypt_or_migrate_smtp_password(
     }
     let plaintext = decrypt_system_config_secret(state, "smtp_password", stored.trim())
         .or_else(|| {
-            (!stored.trim().is_empty() && !looks_like_python_fernet_ciphertext(stored.trim()))
-                .then(|| stored.trim().to_string())
+            if stored_secret_uses_known_envelope_family(stored.trim()) {
+                return None;
+            }
+            decrypt_catalog_secret_with_fallbacks(state.encryption_key(), stored.trim()).or_else(
+                || {
+                    (!stored.trim().is_empty()
+                        && !looks_like_python_fernet_ciphertext(stored.trim()))
+                    .then(|| stored.trim().to_string())
+                },
+            )
         })
         .ok_or_else(|| system_config_secret_error("stored SMTP password cannot be decrypted"))?;
     if plaintext.contains('\0') {
@@ -700,11 +708,13 @@ mod tests {
     use super::{
         bark_device_key_binding, decrypt_bark_device_key_v2, decrypt_ldap_bind_password_v2,
         decrypt_ldap_bind_password_v3, decrypt_or_migrate_bark_device_key,
-        decrypt_or_migrate_ldap_bind_password, decrypt_or_migrate_system_config_secret,
+        decrypt_or_migrate_ldap_bind_password, decrypt_or_migrate_smtp_password,
+        decrypt_or_migrate_system_config_secret,
         decrypt_or_migrate_system_config_secret_with_before_compare, decrypt_system_config_secret,
-        encrypt_bark_device_key, encrypt_ldap_bind_password, encrypt_system_config_secret,
-        ldap_module_config_is_valid, normalize_ldap_transport_server_url,
-        LDAP_BIND_PASSWORD_V2_PREFIX, LDAP_BIND_PASSWORD_V3_PREFIX, SYSTEM_CONFIG_SECRET_V2_PREFIX,
+        encrypt_bark_device_key, encrypt_ldap_bind_password, encrypt_smtp_password,
+        encrypt_system_config_secret, ldap_module_config_is_valid,
+        normalize_ldap_transport_server_url, smtp_password_binding, LDAP_BIND_PASSWORD_V2_PREFIX,
+        LDAP_BIND_PASSWORD_V3_PREFIX, SMTP_PASSWORD_V3_PREFIX, SYSTEM_CONFIG_SECRET_V2_PREFIX,
     };
     use crate::data::GatewayDataState;
     use crate::AppState;
@@ -738,6 +748,165 @@ mod tests {
         let mut state = AppState::new().expect("gateway state should build");
         state.replace_data_state(Arc::new(data));
         state
+    }
+
+    #[tokio::test]
+    async fn smtp_password_migrates_legacy_formats_to_bound_v3() {
+        let binding = smtp_password_binding(
+            "smtp.example.com",
+            587,
+            Some("ops@example.com"),
+            true,
+            false,
+        )
+        .expect("SMTP binding should build");
+        let fixture_state = state_with_stored_secret(TEST_SECRET);
+        let legacy_values = [
+            TEST_SECRET.to_string(),
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, TEST_SECRET)
+                .expect("legacy SMTP password should encrypt"),
+            encrypt_system_config_secret(&fixture_state, TEST_KEY, TEST_SECRET)
+                .expect("v2 SMTP password should encrypt"),
+        ];
+
+        for legacy in legacy_values {
+            let state = state_with_stored_secret(&legacy);
+            let plaintext = decrypt_or_migrate_smtp_password(&state, &binding, legacy.clone())
+                .await
+                .expect("legacy SMTP password should migrate");
+            assert_eq!(plaintext, TEST_SECRET);
+            let migrated = state
+                .read_system_config_json_value_strong(TEST_KEY)
+                .await
+                .expect("SMTP password should read")
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .expect("SMTP password should be a string");
+            assert!(migrated.starts_with(SMTP_PASSWORD_V3_PREFIX));
+            assert_ne!(migrated, legacy);
+            assert_eq!(
+                decrypt_or_migrate_smtp_password(&state, &binding, migrated.clone())
+                    .await
+                    .expect("migrated SMTP password should decrypt"),
+                TEST_SECRET
+            );
+            assert_eq!(
+                state
+                    .read_system_config_json_value_strong(TEST_KEY)
+                    .await
+                    .unwrap(),
+                Some(json!(migrated))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn smtp_password_rejects_invalid_ciphertext_without_rewriting() {
+        let binding = smtp_password_binding(
+            "smtp.example.com",
+            587,
+            Some("ops@example.com"),
+            true,
+            false,
+        )
+        .expect("SMTP binding should build");
+        let fixture_state = state_with_stored_secret(TEST_SECRET);
+        let mut tampered = encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, TEST_SECRET)
+            .expect("legacy SMTP password should encrypt");
+        tampered.replace_range(tampered.len() - 2.., "AA");
+        let invalid_values = [
+            tampered,
+            encrypt_python_fernet_plaintext("unavailable-historical-key", TEST_SECRET)
+                .expect("wrong-key SMTP password should encrypt"),
+            encrypt_system_config_secret(&fixture_state, "other_secret", TEST_SECRET)
+                .expect("wrong-purpose secret should encrypt"),
+            "aether-system-config-secret-v2:invalid".to_string(),
+            "aether-smtp-password-v3:invalid".to_string(),
+            "aether-runtime-secret-v1:invalid".to_string(),
+            "aether-unknown-secret-v4:invalid".to_string(),
+        ];
+
+        for stored in invalid_values {
+            let state = state_with_stored_secret(&stored);
+            let error = decrypt_or_migrate_smtp_password(&state, &binding, stored.clone())
+                .await
+                .expect_err("invalid ciphertext must not become an SMTP password");
+            assert_eq!(
+                error.into_message(),
+                "stored SMTP password cannot be decrypted"
+            );
+            assert_eq!(
+                state
+                    .read_system_config_json_value_strong(TEST_KEY)
+                    .await
+                    .unwrap(),
+                Some(json!(stored))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn smtp_password_v3_rejects_changed_transport_binding() {
+        let binding = smtp_password_binding(
+            "smtp.example.com",
+            587,
+            Some("ops@example.com"),
+            true,
+            false,
+        )
+        .expect("SMTP binding should build");
+        let stored = encrypt_smtp_password(
+            &state_with_stored_secret(TEST_SECRET),
+            &binding,
+            TEST_SECRET,
+        )
+        .expect("SMTP password should encrypt");
+        let state = state_with_stored_secret(&stored);
+        for changed_binding in [
+            smtp_password_binding(
+                "other.example.com",
+                587,
+                Some("ops@example.com"),
+                true,
+                false,
+            ),
+            smtp_password_binding(
+                "smtp.example.com",
+                465,
+                Some("ops@example.com"),
+                true,
+                false,
+            ),
+            smtp_password_binding(
+                "smtp.example.com",
+                587,
+                Some("other@example.com"),
+                true,
+                false,
+            ),
+            smtp_password_binding(
+                "smtp.example.com",
+                587,
+                Some("ops@example.com"),
+                false,
+                false,
+            ),
+            smtp_password_binding("smtp.example.com", 587, Some("ops@example.com"), true, true),
+        ] {
+            assert!(decrypt_or_migrate_smtp_password(
+                &state,
+                &changed_binding.expect("changed binding should build"),
+                stored.clone(),
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(
+            state
+                .read_system_config_json_value_strong(TEST_KEY)
+                .await
+                .unwrap(),
+            Some(json!(stored))
+        );
     }
 
     fn ldap_config(bind_password: &str) -> StoredLdapModuleConfig {

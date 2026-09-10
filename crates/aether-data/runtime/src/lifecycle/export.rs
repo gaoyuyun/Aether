@@ -297,6 +297,10 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
         primary_key: &["id"],
     },
     AuxiliaryTable {
+        name: "stats_hourly_model_provider",
+        primary_key: &["id"],
+    },
+    AuxiliaryTable {
         name: "stats_hourly_provider",
         primary_key: &["id"],
     },
@@ -578,8 +582,14 @@ fn imported_payload_ids(
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DataImportOptions {
+    pub preserve_credentials: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DataCopyOptions {
     pub omit_request_body_details: bool,
+    pub preserve_credentials: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,6 +655,25 @@ fn set_supported_import_value(
     if target_has_column(column) {
         object.insert(column.to_string(), value);
     }
+}
+
+fn apply_import_credential_policy(
+    table_name: &str,
+    object: &mut serde_json::Map<String, Value>,
+    target_has_column: impl Fn(&str) -> bool,
+    options: DataImportOptions,
+) {
+    let normalized_table = table_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(table_name)
+        .trim_matches(|character| matches!(character, '"' | '`'));
+    if options.preserve_credentials
+        && matches!(normalized_table, "users" | "api_keys" | "management_tokens")
+    {
+        return;
+    }
+    deactivate_imported_credentials(table_name, object, target_has_column);
 }
 
 fn deactivate_imported_credentials(
@@ -1200,23 +1229,31 @@ pub async fn import_database_jsonl(
     database: SqlDatabaseConfig,
     input: &str,
 ) -> Result<usize, DataLayerError> {
+    import_database_jsonl_with_options(database, input, DataImportOptions::default()).await
+}
+
+pub async fn import_database_jsonl_with_options(
+    database: SqlDatabaseConfig,
+    input: &str,
+    options: DataImportOptions,
+) -> Result<usize, DataLayerError> {
     match database.driver {
         #[cfg(feature = "sqlite")]
         DatabaseDriver::Sqlite => {
             let pool = crate::driver::sqlite::SqlitePoolFactory::new(database)?.connect_lazy()?;
-            import_sqlite_jsonl(&pool, input).await
+            sqlite::import_sqlite_jsonl_with_options(&pool, input, options).await
         }
         #[cfg(feature = "mysql")]
         DatabaseDriver::Mysql => {
             let pool = crate::driver::mysql::MysqlPoolFactory::new(database)?.connect_lazy()?;
-            import_mysql_jsonl(&pool, input).await
+            mysql::import_mysql_jsonl_with_options(&pool, input, options).await
         }
         #[cfg(feature = "postgres")]
         DatabaseDriver::Postgres => {
             let pool =
                 crate::driver::postgres::PostgresPoolFactory::new(database.to_postgres_config()?)?
                     .connect_lazy()?;
-            import_postgres_jsonl(&pool, input).await
+            postgres::import_postgres_jsonl_with_options(&pool, input, options).await
         }
         #[cfg(not(feature = "sqlite"))]
         DatabaseDriver::Sqlite => Err(DataLayerError::InvalidInput(
@@ -1253,7 +1290,14 @@ pub async fn copy_database_records(
     if options.omit_request_body_details {
         omit_request_body_details_from_records(&mut records);
     }
-    import_database_jsonl(target, &encode_jsonl(&records)?).await
+    import_database_jsonl_with_options(
+        target,
+        &encode_jsonl(&records)?,
+        DataImportOptions {
+            preserve_credentials: options.preserve_credentials,
+        },
+    )
+    .await
 }
 
 fn omit_request_body_details_from_records(records: &mut Vec<DataExportRecord>) {
@@ -2042,7 +2086,12 @@ fn filter_import_payload(
     let mut filtered = serde_json::Map::new();
     for (column_name, value) in object {
         if target_columns.contains(column_name) {
-            filtered.insert(column_name.clone(), value.clone());
+            let value = if domain == ExportDomain::Usage && value.is_null() {
+                portable_usage_null_default(column_name).unwrap_or(Value::Null)
+            } else {
+                value.clone()
+            };
+            filtered.insert(column_name.clone(), value);
             continue;
         }
         if value.is_null() {
@@ -2065,6 +2114,47 @@ fn filter_import_payload(
     }
 
     Ok(filtered)
+}
+
+#[cfg(any(feature = "mysql", feature = "sqlite"))]
+fn portable_usage_null_default(column_name: &str) -> Option<Value> {
+    // PostgreSQL permits NULL for legacy usage metrics; the readers treat them
+    // as zero (or the neutral multiplier). MySQL/SQLite store those defaults
+    // explicitly. Keep optional prices, balances, policies and credentials NULL.
+    match column_name {
+        "input_tokens"
+        | "output_tokens"
+        | "total_tokens"
+        | "input_output_total_tokens"
+        | "input_context_tokens"
+        | "cache_creation_input_tokens"
+        | "cache_creation_input_tokens_5m"
+        | "cache_creation_input_tokens_1h"
+        | "cache_creation_ephemeral_5m_input_tokens"
+        | "cache_creation_ephemeral_1h_input_tokens"
+        | "cache_read_input_tokens"
+        | "input_cost_usd"
+        | "output_cost_usd"
+        | "cache_cost_usd"
+        | "cache_creation_cost_usd"
+        | "cache_creation_cost_usd_5m"
+        | "cache_creation_cost_usd_1h"
+        | "cache_read_cost_usd"
+        | "request_cost_usd"
+        | "total_cost_usd"
+        | "actual_input_cost_usd"
+        | "actual_output_cost_usd"
+        | "actual_cache_cost_usd"
+        | "actual_cache_creation_cost_usd"
+        | "actual_cache_creation_cost_usd_5m"
+        | "actual_cache_creation_cost_usd_1h"
+        | "actual_cache_read_cost_usd"
+        | "actual_request_cost_usd"
+        | "actual_total_cost_usd" => Some(Value::from(0)),
+        "rate_multiplier" => Some(Value::from(1)),
+        "is_stream" | "has_format_conversion" => Some(Value::Bool(false)),
+        _ => None,
+    }
 }
 
 fn payload_with_table(payload: Value, table_name: &str) -> Result<Value, DataLayerError> {

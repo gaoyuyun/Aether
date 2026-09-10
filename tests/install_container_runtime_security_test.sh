@@ -43,15 +43,12 @@ COMPOSE_FILES=(
     "${REPO_ROOT}/docker-compose.single-node.yml"
 )
 
-assert_line "${APP_DOCKERFILE}" "USER 65532:65532"
+assert_line "${APP_DOCKERFILE}" "USER 0:0"
+assert_line "${REPO_ROOT}/Dockerfile.app.local" "USER 0:0"
+assert_line "${REPO_ROOT}/Dockerfile.app.release-local" "USER 0:0"
 assert_line "${APP_DOCKERFILE}" "    HOME=/tmp/aether-home \\"
-if grep -Eq '^USER[[:space:]]+(root|0)(:0)?[[:space:]]*$' "${APP_DOCKERFILE}"; then
-    fail_test "production image still selects a root runtime identity"
-fi
 
 for compose_file in "${COMPOSE_FILES[@]}"; do
-    assert_line "${compose_file}" \
-        '    user: "${AETHER_CONTAINER_UID:-65532}:${AETHER_CONTAINER_GID:-65532}"'
     assert_line "${compose_file}" "    read_only: true"
     assert_line "${compose_file}" "    cap_drop:"
     assert_line "${compose_file}" "      - ALL"
@@ -59,10 +56,16 @@ for compose_file in "${COMPOSE_FILES[@]}"; do
     assert_line "${compose_file}" "      - no-new-privileges:true"
     assert_line "${compose_file}" "    tmpfs:"
     assert_line "${compose_file}" "      - /tmp:rw,nosuid,nodev,noexec,mode=1777"
-    if grep -Eq '^[[:space:]]+user:[[:space:]]+"?(root|0)(:0)?"?[[:space:]]*$' "${compose_file}"; then
-        fail_test "production Compose file still selects a root runtime identity: ${compose_file}"
-    fi
 done
+assert_line "${REPO_ROOT}/docker-compose.yml" '    user: "0:0"'
+assert_line "${REPO_ROOT}/docker-compose.yml" "    cap_add:"
+assert_line "${REPO_ROOT}/docker-compose.yml" "      - DAC_OVERRIDE"
+assert_line "${REPO_ROOT}/docker-compose.yml" "      - FOWNER"
+assert_line "${REPO_ROOT}/docker-compose.single-node.yml" \
+    '    user: "${AETHER_CONTAINER_UID:-65532}:${AETHER_CONTAINER_GID:-65532}"'
+if grep -Fq '    cap_add:' "${REPO_ROOT}/docker-compose.single-node.yml"; then
+    fail_test "single-node SQLite container must not regain capabilities"
+fi
 
 standard_install_body="$(declare -f install_compose_mode)"
 single_node_install_body="$(declare -f install_compose_single_node_mode)"
@@ -85,10 +88,10 @@ grep -Fq '${DB_PASSWORD:?set DB_PASSWORD in .env}' "${REPO_ROOT}/docker-compose.
     || fail_test "Postgres password is not required by Compose"
 grep -Fq '${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}' "${REPO_ROOT}/docker-compose.yml" \
     || fail_test "Redis password is not required by Compose"
-grep -Fq '${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}' "${REPO_ROOT}/docker-compose.yml" \
-    || fail_test "MySQL application password is not required by Compose"
-grep -Fq '${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}' "${REPO_ROOT}/docker-compose.yml" \
-    || fail_test "MySQL root password is not required by Compose"
+grep -Fq '${MYSQL_PASSWORD:-${DB_PASSWORD:?set DB_PASSWORD in .env}}' "${REPO_ROOT}/docker-compose.yml" \
+    || fail_test "MySQL application password must require a configured password"
+grep -Fq '${MYSQL_ROOT_PASSWORD:-${DB_PASSWORD:?set DB_PASSWORD in .env}}' "${REPO_ROOT}/docker-compose.yml" \
+    || fail_test "MySQL root password must require a configured password"
 if grep -Eq '(DB_PASSWORD|REDIS_PASSWORD|MYSQL_PASSWORD|MYSQL_ROOT_PASSWORD):?-?=?aether(_root)?([}"[:space:]]|$)' \
     "${REPO_ROOT}/docker-compose.yml" "${REPO_ROOT}/.env.example"; then
     fail_test "production Compose configuration contains a weak infrastructure password default"
@@ -156,12 +159,16 @@ rm -f "${COMPOSE_DIR}/data/unsafe-hardlink"
 cp "${REPO_ROOT}/.env.example" "${COMPOSE_DIR}/.env.example"
 ADMIN_PASSWORD="test-admin-password"
 APP_IMAGE="example.invalid/aether:test"
-AETHER_CONTAINER_UID="${fixture_uid}"
-AETHER_CONTAINER_GID="${fixture_gid}"
 JWT_SECRET_KEY=""
 ENCRYPTION_KEY=""
 generated_env="${TEST_ROOT}/generated.env"
 generate_compose_env "${generated_env}"
+assert_line "${generated_env}" "AETHER_CONTAINER_UID=65532"
+assert_line "${generated_env}" "AETHER_CONTAINER_GID=65532"
+generated_single_node_env="${TEST_ROOT}/single-node.env"
+generate_compose_single_node_env "${generated_single_node_env}"
+assert_line "${generated_single_node_env}" "AETHER_CONTAINER_UID=${fixture_uid}"
+assert_line "${generated_single_node_env}" "AETHER_CONTAINER_GID=${fixture_gid}"
 
 generated_secrets=()
 for key in \

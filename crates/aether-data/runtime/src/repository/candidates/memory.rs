@@ -10,19 +10,31 @@ use crate::DataLayerError;
 use async_trait::async_trait;
 
 fn sanitize_stored_candidate(mut candidate: StoredRequestCandidate) -> StoredRequestCandidate {
-    candidate.sanitize_sensitive_diagnostics();
+    candidate.sanitize_for_persistence();
     candidate
 }
 
 fn merge_extra_data(
     existing: Option<serde_json::Value>,
     overlay: Option<serde_json::Value>,
+    preserve_error_details: bool,
 ) -> Option<serde_json::Value> {
     match (existing, overlay) {
         (
             Some(serde_json::Value::Object(mut existing_object)),
-            Some(serde_json::Value::Object(overlay_object)),
+            Some(serde_json::Value::Object(mut overlay_object)),
         ) => {
+            if preserve_error_details {
+                for key in [
+                    "upstream_response",
+                    "error_flow",
+                    "failure_diagnostic",
+                    "request_conversion_error",
+                    "request_body_build_error",
+                ] {
+                    overlay_object.remove(key);
+                }
+            }
             existing_object.extend(overlay_object);
             Some(serde_json::Value::Object(existing_object))
         }
@@ -397,7 +409,13 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
                     .error_type
                     .or_else(|| existing.as_ref().and_then(|row| row.error_type.clone()))
             },
-            error_message: None,
+            error_message: if preserve_existing_lifecycle {
+                existing.as_ref().and_then(|row| row.error_message.clone())
+            } else {
+                candidate
+                    .error_message
+                    .or_else(|| existing.as_ref().and_then(|row| row.error_message.clone()))
+            },
             latency_ms: if preserve_existing_lifecycle {
                 existing.as_ref().and_then(|row| row.latency_ms)
             } else {
@@ -411,6 +429,7 @@ impl RequestCandidateWriteRepository for InMemoryRequestCandidateRepository {
             extra_data: merge_extra_data(
                 existing.as_ref().and_then(|row| row.extra_data.clone()),
                 candidate.extra_data,
+                preserve_existing_lifecycle,
             ),
             required_capabilities: candidate.required_capabilities.or_else(|| {
                 existing
@@ -589,7 +608,10 @@ mod tests {
             let candidate = stored
                 .get("cand-raw")
                 .expect("seeded candidate should exist");
-            assert!(candidate.error_message.is_none());
+            assert_eq!(
+                candidate.error_message.as_deref(),
+                Some("Bearer secret-token")
+            );
             assert_eq!(candidate.skip_reason.as_deref(), Some("unclassified_skip"));
             assert_eq!(candidate.error_type.as_deref(), Some("unclassified_error"));
             assert_eq!(
@@ -619,7 +641,10 @@ mod tests {
             .iter()
             .find(|candidate| candidate.id == "cand-bypassed")
             .expect("bypassed candidate should be returned");
-        assert!(candidate.error_message.is_none());
+        assert_eq!(
+            candidate.error_message.as_deref(),
+            Some("Bearer secret-token")
+        );
         assert_eq!(
             candidate.extra_data,
             Some(json!({"gateway_execution_runtime": true}))
@@ -665,7 +690,7 @@ mod tests {
             .await
             .expect("candidate merge should succeed");
         assert_eq!(merged.id, "cand-bypassed");
-        assert!(merged.error_message.is_none());
+        assert_eq!(merged.error_message.as_deref(), Some("Bearer secret-token"));
         assert_eq!(
             merged.extra_data,
             Some(json!({
@@ -839,7 +864,13 @@ mod tests {
             Some("retryable upstream failure".to_string()),
             Some(45),
             Some(1),
-            Some(json!({"stream_completed": true})),
+            Some(json!({
+                "stream_completed": true,
+                "upstream_response": {
+                    "status_code": 503,
+                    "body": {"error": {"message": "original upstream failure"}}
+                }
+            })),
             None,
             100,
             Some(101),
@@ -869,7 +900,10 @@ mod tests {
                 error_message: None,
                 latency_ms: Some(9_999),
                 concurrent_requests: Some(2),
-                extra_data: Some(json!({"gateway_execution_runtime": true})),
+                extra_data: Some(json!({
+                    "gateway_execution_runtime": true,
+                    "upstream_response": {"status_code": 200, "body": "late unrelated response"}
+                })),
                 required_capabilities: None,
                 created_at_unix_ms: None,
                 started_at_unix_ms: Some(102),
@@ -882,7 +916,10 @@ mod tests {
         assert_eq!(updated.status, RequestCandidateStatus::Failed);
         assert_eq!(updated.status_code, Some(503));
         assert_eq!(updated.error_type.as_deref(), Some("upstream_error"));
-        assert!(updated.error_message.is_none());
+        assert_eq!(
+            updated.error_message.as_deref(),
+            Some("retryable upstream failure")
+        );
         assert_eq!(updated.latency_ms, Some(45));
         assert_eq!(updated.concurrent_requests, Some(2));
         assert_eq!(updated.finished_at_unix_ms, Some(145));
@@ -890,7 +927,11 @@ mod tests {
             updated.extra_data,
             Some(json!({
                 "gateway_execution_runtime": true,
-                "stream_completed": true
+                "stream_completed": true,
+                "upstream_response": {
+                    "status_code": 503,
+                    "body": {"error": {"message": "original upstream failure"}}
+                }
             }))
         );
     }

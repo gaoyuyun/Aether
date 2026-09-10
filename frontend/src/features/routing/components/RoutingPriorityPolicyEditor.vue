@@ -179,7 +179,7 @@
               <div class="flex items-center gap-2">
                 <span class="truncate text-sm font-medium">{{ row.name }}</span>
                 <span
-                  v-if="row.kind === 'pool'"
+                  v-if="poolProviderIds.has(row.id)"
                   class="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary"
                 >
                   Pool

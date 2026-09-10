@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-const SAFE_VIDEO_URL_QUERY_KEYS: &[(&str, &str)] = &[("alt", "media")];
-
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -221,16 +219,11 @@ impl StoredVideoTask {
     }
 
     fn sanitize_persisted_diagnostics(&mut self) {
-        self.prompt = None;
         self.original_request_body = None;
         self.progress_message = None;
         self.error_code = sanitize_video_task_error_code(self.error_code.take());
         self.error_message = None;
-        self.video_url = sanitize_video_task_url(
-            self.client_api_format.as_deref(),
-            self.provider_api_format.as_deref(),
-            self.video_url.take(),
-        );
+        self.video_url = sanitize_video_task_url(self.video_url.take());
         self.request_metadata = None;
     }
 
@@ -339,18 +332,11 @@ pub struct UpsertVideoTask {
 
 impl UpsertVideoTask {
     pub fn sanitize_for_persistence(&mut self) {
-        self.username = None;
-        self.api_key_name = None;
-        self.prompt = None;
         self.original_request_body = None;
         self.progress_message = None;
         self.error_code = sanitize_video_task_error_code(self.error_code.take());
         self.error_message = None;
-        self.video_url = sanitize_video_task_url(
-            self.client_api_format.as_deref(),
-            self.provider_api_format.as_deref(),
-            self.video_url.take(),
-        );
+        self.video_url = sanitize_video_task_url(self.video_url.take());
         self.request_metadata = None;
     }
 
@@ -421,16 +407,7 @@ fn sanitize_video_task_error_code(value: Option<String>) -> Option<String> {
     })
 }
 
-fn sanitize_video_task_url(
-    client_api_format: Option<&str>,
-    provider_api_format: Option<&str>,
-    value: Option<String>,
-) -> Option<String> {
-    if effective_video_task_api_format(client_api_format, provider_api_format)
-        != Some("gemini:video")
-    {
-        return None;
-    }
+fn sanitize_video_task_url(value: Option<String>) -> Option<String> {
     let mut url = url::Url::parse(value?.trim()).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
@@ -440,15 +417,6 @@ fn sanitize_video_task_url(
         return None;
     }
 
-    let query = url
-        .query_pairs()
-        .filter(|(key, value)| SAFE_VIDEO_URL_QUERY_KEYS.contains(&(key.as_ref(), value.as_ref())))
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    url.set_query(None);
-    if !query.is_empty() {
-        url.query_pairs_mut().extend_pairs(query);
-    }
     url.set_fragment(None);
     Some(url.into())
 }
@@ -940,20 +908,23 @@ mod tests {
 
         assert_eq!(task.user_id.as_deref(), Some("user-1"));
         assert_eq!(task.api_key_id.as_deref(), Some("api-key-1"));
-        assert_eq!(task.username, None);
-        assert_eq!(task.api_key_name, None);
+        assert_eq!(task.username.as_deref(), Some("private-user-name"));
+        assert_eq!(task.api_key_name.as_deref(), Some("private-key-name"));
         assert_eq!(task.original_request_body, None);
         assert_eq!(task.progress_message, None);
         assert_eq!(task.error_message, None);
         assert_eq!(task.error_code.as_deref(), Some("provider_error"));
-        assert_eq!(task.video_url, None);
+        assert_eq!(
+            task.video_url.as_deref(),
+            Some("https://cdn.example.test/video.mp4?token=secret")
+        );
         assert_eq!(task.request_metadata, None);
-        assert_eq!(task.prompt, None);
+        assert_eq!(task.prompt.as_deref(), Some("prompt"));
         assert_eq!(task.duration_seconds, Some(4));
     }
 
     #[test]
-    fn upsert_sanitization_keeps_only_noncredential_video_urls() {
+    fn stored_task_preserves_prompt_and_signed_download_url() {
         let mut args = base_new_args();
         args.12 = Some("gemini:video".to_string());
         args.15 = Some("private prompt".to_string());
@@ -968,15 +939,15 @@ mod tests {
             args.28, args.29, args.30, args.31, args.32, args.33, args.34, args.35, args.36,
         )
         .expect("stored task should build");
-        assert_eq!(task.prompt, None);
+        assert_eq!(task.prompt.as_deref(), Some("private prompt"));
         assert_eq!(
             task.video_url.as_deref(),
-            Some("https://cdn.example.test/video.mp4?alt=media")
+            Some("https://cdn.example.test/video.mp4?key=secret&alt=media&signature=private")
         );
     }
 
     #[test]
-    fn upsert_sanitization_uses_client_format_when_legacy_provider_format_is_blank() {
+    fn stored_task_preserves_download_url_when_legacy_provider_format_is_blank() {
         let mut args = base_new_args();
         args.11 = Some("gemini:video".to_string());
         args.12 = Some("   ".to_string());
@@ -992,7 +963,32 @@ mod tests {
 
         assert_eq!(
             task.video_url.as_deref(),
-            Some("https://cdn.example.test/video.mp4?alt=media")
+            Some("https://cdn.example.test/video.mp4?key=secret&alt=media")
         );
+    }
+
+    #[test]
+    fn video_url_sanitization_preserves_signed_query_encoding_and_order() {
+        let video_url =
+            "https://cdn.example.test/video.mp4?signature=a%2Fb%2Bc%3D&part=2&part=1&name=a%20b";
+        assert_eq!(
+            super::sanitize_video_task_url(Some(format!("{video_url}#fragment"))).as_deref(),
+            Some(video_url)
+        );
+    }
+
+    #[test]
+    fn video_url_sanitization_rejects_invalid_schemes_and_embedded_credentials() {
+        for video_url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:video/mp4;base64,AAAA",
+            "https://user:password@cdn.example.test/video.mp4",
+            "https://user@cdn.example.test/video.mp4",
+            "/relative/video.mp4",
+            "not a url",
+        ] {
+            assert!(super::sanitize_video_task_url(Some(video_url.to_string())).is_none());
+        }
     }
 }

@@ -45,5 +45,5 @@ EXPOSE 8084
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/opt/aether/current/bin/aether-gateway", "--healthcheck"]
 
-USER 65532:65532
+USER 0:0
 ENTRYPOINT ["/opt/aether/current/bin/aether-gateway"]

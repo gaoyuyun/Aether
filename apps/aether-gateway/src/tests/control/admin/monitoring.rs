@@ -196,7 +196,15 @@ async fn gateway_handles_admin_monitoring_system_status_locally_with_trusted_adm
         }),
     );
 
-    let now = chrono::Utc::now().timestamp();
+    let now = chrono::Utc::now();
+    let today_start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+    let now = now.timestamp();
+    // Recent fixtures must remain in today's UTC bucket just after midnight.
     let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider(), sample_inactive_provider()],
         vec![],
@@ -211,7 +219,7 @@ async fn gateway_handles_admin_monitoring_system_status_locally_with_trusted_adm
             0.25,
             "success",
             Some(200),
-            now - 300,
+            (now - 300).max(today_start),
         ),
         sample_usage(
             "request-today-failed",
@@ -221,7 +229,7 @@ async fn gateway_handles_admin_monitoring_system_status_locally_with_trusted_adm
             0.10,
             "failed",
             Some(502),
-            now - 120,
+            (now - 120).max(today_start),
         ),
         sample_usage(
             "request-old",
@@ -473,6 +481,23 @@ async fn gateway_handles_admin_monitoring_trace_request_locally_with_trusted_adm
         }),
     );
 
+    let mut failed_candidate = sample_candidate(
+        "cand-used",
+        "request-1",
+        1,
+        RequestCandidateStatus::Failed,
+        Some(101),
+        Some(33),
+        Some(502),
+    );
+    failed_candidate.error_message = Some("private upstream diagnostic".to_string());
+    failed_candidate.extra_data = Some(json!({
+        "upstream_response": {
+            "status_code": 502,
+            "headers": {"x-request-id": "upstream-diagnostic-id"},
+            "body": {"error": {"message": "private upstream diagnostic"}}
+        }
+    }));
     let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
         sample_candidate(
             "cand-unused",
@@ -483,15 +508,7 @@ async fn gateway_handles_admin_monitoring_trace_request_locally_with_trusted_adm
             None,
             None,
         ),
-        sample_candidate(
-            "cand-used",
-            "request-1",
-            1,
-            RequestCandidateStatus::Failed,
-            Some(101),
-            Some(33),
-            Some(502),
-        ),
+        failed_candidate,
     ]));
     let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider()],
@@ -538,6 +555,37 @@ async fn gateway_handles_admin_monitoring_trace_request_locally_with_trusted_adm
     assert_eq!(payload["candidates"][0]["key_auth_type"], json!("api_key"));
     assert_eq!(payload["candidates"][0]["latency_ms"], json!(33));
     assert_eq!(payload["candidates"][0]["status_code"], json!(502));
+    assert_eq!(
+        payload["candidates"][0]["error_message"],
+        "private upstream diagnostic"
+    );
+    assert_eq!(
+        payload["candidates"][0]["extra_data"]["upstream_response"]["body"]["error"]["message"],
+        "private upstream diagnostic"
+    );
+    for role in [None, Some("user")] {
+        let mut request = reqwest::Client::new().get(format!(
+            "{gateway_url}/api/admin/monitoring/trace/request-1"
+        ));
+        if let Some(role) = role {
+            request = request
+                .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+                .header(TRUSTED_ADMIN_USER_ID_HEADER, "regular-user")
+                .header(TRUSTED_ADMIN_USER_ROLE_HEADER, role)
+                .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "regular-session");
+        }
+        let response = request
+            .send()
+            .await
+            .expect("unauthorized probe should complete");
+        assert!(matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+        let body = response.text().await.expect("denial body should read");
+        assert!(!body.contains("private upstream diagnostic"));
+        assert!(!body.contains("upstream-diagnostic-id"));
+    }
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

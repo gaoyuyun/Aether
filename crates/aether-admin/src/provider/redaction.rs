@@ -1,5 +1,4 @@
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
 
 const REDACTED_VALUE: &str = "***";
 const REDACTED_UPSTREAM_DIAGNOSTIC: &str = "[REDACTED upstream diagnostic]";
@@ -188,6 +187,20 @@ pub fn admin_secret_safe_body_rules(rules: Option<&Value>) -> Value {
 
 pub fn admin_restore_secret_safe_body_rules(existing: Option<&Value>, incoming: &Value) -> Value {
     restore_rule_array(existing, incoming, RuleKind::Body)
+}
+
+pub fn admin_validate_retained_header_rule_secrets(
+    existing: Option<&Value>,
+    incoming: &Value,
+) -> Result<(), String> {
+    validate_retained_rule_secrets(existing, incoming, RuleKind::Header)
+}
+
+pub fn admin_validate_retained_body_rule_secrets(
+    existing: Option<&Value>,
+    incoming: &Value,
+) -> Result<(), String> {
+    validate_retained_rule_secrets(existing, incoming, RuleKind::Body)
 }
 
 pub fn admin_secret_safe_url(value: Option<&str>) -> Value {
@@ -1234,11 +1247,7 @@ fn redact_proxy_json_value_for_key(key: &str, value: &Value) -> Value {
         return redact_proxy_secret_value(value);
     }
     if json_url_key(&compact_key) {
-        return value
-            .as_str()
-            .and_then(sanitize_network_url)
-            .map(Value::String)
-            .unwrap_or(Value::Null);
+        return redact_json_url_value(value);
     }
     if compact_key == "proxy" {
         return admin_secret_safe_proxy(Some(value));
@@ -1261,11 +1270,7 @@ fn redact_json_value_for_key(key: &str, value: &Value) -> Value {
         return redact_secret_value(value);
     }
     if json_url_key(&compact_key) {
-        return value
-            .as_str()
-            .and_then(sanitize_network_url)
-            .map(Value::String)
-            .unwrap_or(Value::Null);
+        return redact_json_url_value(value);
     }
     if compact_key == "proxy" {
         return admin_secret_safe_proxy(Some(value));
@@ -1280,6 +1285,17 @@ fn redact_json_value_for_key(key: &str, value: &Value) -> Value {
         return redact_header_values(value);
     }
     redact_json_value(value)
+}
+
+fn redact_json_url_value(value: &Value) -> Value {
+    match value {
+        Value::String(raw) if url::Url::parse(raw).is_ok_and(|url| url.scheme() == "data") => {
+            value.clone()
+        }
+        Value::String(raw) => admin_secret_safe_url(Some(raw)),
+        Value::Array(values) => Value::Array(values.iter().map(redact_json_url_value).collect()),
+        _ => redact_json_value(value),
+    }
 }
 
 fn redact_body_rule(rule: &Value) -> Value {
@@ -1320,7 +1336,12 @@ fn redact_header_rule(rule: &Value) -> Value {
         .map(|(key, value)| (key.clone(), redact_json_value_for_key(key, value)))
         .collect::<Map<_, _>>();
     let is_set = normalized_string_field(rule, "action").as_deref() == Some("set");
-    if is_set {
+    if is_set
+        && rule
+            .get("key")
+            .and_then(Value::as_str)
+            .is_none_or(header_value_is_secret)
+    {
         redact_rule_secret_field(rule, &mut projected, "value", "has_value");
     }
     if let Some(condition) = rule.get("condition") {
@@ -1374,7 +1395,14 @@ fn redact_header_values(value: &Value) -> Value {
     Value::Object(
         headers
             .iter()
-            .map(|(key, value)| (key.clone(), redact_secret_value(value)))
+            .map(|(key, value)| {
+                let value = if header_value_is_secret(key) {
+                    redact_secret_value(value)
+                } else {
+                    redact_json_value(value)
+                };
+                (key.clone(), value)
+            })
             .collect(),
     )
 }
@@ -1395,10 +1423,25 @@ fn restore_json_value(existing: Option<&Value>, incoming: &Value, key: Option<&s
             return restore_header_values(existing, incoming);
         }
         if json_url_key(&compact_key) {
-            return incoming
-                .as_str()
-                .map(|incoming_url| restore_url_value(existing, incoming_url))
-                .unwrap_or_else(|| incoming.clone());
+            if let Some(incoming_url) = incoming.as_str() {
+                return restore_url_value(existing, incoming_url);
+            }
+            if let Some(values) = incoming.as_array() {
+                let existing_values = existing.and_then(Value::as_array);
+                return Value::Array(
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            restore_json_value(
+                                existing_values.and_then(|values| values.get(index)),
+                                value,
+                                Some(key),
+                            )
+                        })
+                        .collect(),
+                );
+            }
         }
         if json_secret_key(&compact_key, incoming) {
             return restore_masked_secret(existing, incoming, true);
@@ -1448,29 +1491,20 @@ fn restore_rule_array(existing: Option<&Value>, incoming: &Value, kind: RuleKind
     let Some(incoming_values) = incoming.as_array() else {
         return incoming.clone();
     };
-    let existing_values = existing.and_then(Value::as_array);
-    let incoming_identities = identity_counts(incoming_values, kind);
-    let existing_identities = existing_values
-        .map(|values| identity_counts(values, kind))
+    if unchanged_projected_rules(existing, incoming, kind) {
+        return existing.cloned().unwrap_or_else(|| incoming.clone());
+    }
+    let existing_values = existing
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .unwrap_or_default();
 
     Value::Array(
         incoming_values
             .iter()
             .map(|incoming_rule| {
-                let identity = rule_identity(incoming_rule, kind);
-                let existing_rule = identity.as_ref().and_then(|identity| {
-                    (incoming_identities.get(identity) == Some(&1)
-                        && existing_identities.get(identity) == Some(&1))
-                    .then(|| {
-                        existing_values.and_then(|values| {
-                            values.iter().find(|candidate| {
-                                rule_identity(candidate, kind).as_ref() == Some(identity)
-                            })
-                        })
-                    })
-                    .flatten()
-                });
+                let existing_rule =
+                    match_existing_rule(existing_values, incoming_values, incoming_rule, kind);
                 restore_rule(existing_rule, incoming_rule, kind)
             })
             .collect(),
@@ -1546,7 +1580,10 @@ fn restore_condition(existing: Option<&Value>, incoming: &Value) -> Value {
             continue;
         }
         let existing_value = existing_object.and_then(|object| object.get(key));
-        let value = if key == "value" && condition_value_is_secret(incoming_object) {
+        let value = if key == "value"
+            && (condition_value_is_secret(incoming_object)
+                || incoming_object.get("has_value").and_then(Value::as_bool) == Some(true))
+        {
             let marker_set =
                 incoming_object.get("has_value").and_then(Value::as_bool) == Some(true);
             restore_masked_secret(existing_value, incoming_value, marker_set)
@@ -1562,29 +1599,25 @@ fn restore_condition_array(existing: Option<&Value>, incoming: &Value) -> Value 
     let Some(incoming_values) = incoming.as_array() else {
         return incoming.clone();
     };
-    let existing_values = existing.and_then(Value::as_array);
-    let incoming_counts = condition_identity_counts(incoming_values);
-    let existing_counts = existing_values
-        .map(|values| condition_identity_counts(values))
+    let existing_values = existing
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .unwrap_or_default();
+    if projected_conditions_unchanged(existing_values, incoming_values) {
+        return Value::Array(existing_values.to_vec());
+    }
 
     Value::Array(
         incoming_values
             .iter()
             .map(|incoming_condition| {
-                let identity = condition_identity(incoming_condition);
-                let existing_condition = identity.as_ref().and_then(|identity| {
-                    (incoming_counts.get(identity) == Some(&1)
-                        && existing_counts.get(identity) == Some(&1))
-                    .then(|| {
-                        existing_values.and_then(|values| {
-                            values.iter().find(|candidate| {
-                                condition_identity(candidate).as_ref() == Some(identity)
-                            })
-                        })
-                    })
-                    .flatten()
-                });
+                let existing_condition = match_existing_entry(
+                    existing_values,
+                    incoming_values,
+                    incoming_condition,
+                    condition_identity,
+                    redact_condition,
+                );
                 restore_condition(existing_condition, incoming_condition)
             })
             .collect(),
@@ -1633,20 +1666,174 @@ fn restore_url_value(existing: Option<&Value>, incoming_url: &str) -> Value {
     Value::String(incoming_url.to_string())
 }
 
-fn identity_counts(values: &[Value], kind: RuleKind) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for identity in values.iter().filter_map(|value| rule_identity(value, kind)) {
-        *counts.entry(identity).or_insert(0) += 1;
+fn project_rule(rule: &Value, kind: RuleKind) -> Value {
+    match kind {
+        RuleKind::Header => redact_header_rule(rule),
+        RuleKind::Body => redact_body_rule(rule),
     }
-    counts
 }
 
-fn condition_identity_counts(values: &[Value]) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    for identity in values.iter().filter_map(condition_identity) {
-        *counts.entry(identity).or_insert(0) += 1;
+fn unchanged_projected_rules(existing: Option<&Value>, incoming: &Value, kind: RuleKind) -> bool {
+    existing.and_then(Value::as_array).is_some_and(|rules| {
+        Value::Array(rules.iter().map(|rule| project_rule(rule, kind)).collect()) == *incoming
+    })
+}
+
+fn rule_match_shape(rule: &Value, kind: RuleKind) -> Value {
+    let mut projected = project_rule(rule, kind);
+    if let Some(object) = projected.as_object_mut() {
+        for field in [
+            "enabled",
+            "value",
+            "has_value",
+            "pattern",
+            "has_pattern",
+            "replacement",
+            "has_replacement",
+        ] {
+            object.remove(field);
+        }
     }
-    counts
+    projected
+}
+
+fn match_existing_rule<'a>(
+    existing: &'a [Value],
+    incoming: &[Value],
+    rule: &Value,
+    kind: RuleKind,
+) -> Option<&'a Value> {
+    match_existing_entry(
+        existing,
+        incoming,
+        rule,
+        |value| rule_identity(value, kind),
+        |value| rule_match_shape(value, kind),
+    )
+}
+
+fn match_existing_entry<'a>(
+    existing: &'a [Value],
+    incoming: &[Value],
+    entry: &Value,
+    identity: impl Fn(&Value) -> Option<String>,
+    project: impl Fn(&Value) -> Value,
+) -> Option<&'a Value> {
+    let entry_identity = identity(entry)?;
+    let same_identity = |value: &&Value| identity(value).as_ref() == Some(&entry_identity);
+    let candidates = existing.iter().filter(same_identity).collect::<Vec<_>>();
+    if candidates.len() == 1 && incoming.iter().filter(same_identity).count() == 1 {
+        return candidates.first().copied();
+    }
+    let projected = project(entry);
+    let mut matching = candidates
+        .into_iter()
+        .filter(|candidate| project(candidate) == projected);
+    let matched = matching.next()?;
+    if matching.next().is_some()
+        || incoming
+            .iter()
+            .filter(same_identity)
+            .filter(|value| project(value) == projected)
+            .count()
+            != 1
+    {
+        return None;
+    }
+    Some(matched)
+}
+
+fn projected_conditions_unchanged(existing: &[Value], incoming: &[Value]) -> bool {
+    existing.len() == incoming.len()
+        && existing
+            .iter()
+            .zip(incoming)
+            .all(|(existing, incoming)| redact_condition(existing) == *incoming)
+}
+
+fn validate_retained_rule_secrets(
+    existing: Option<&Value>,
+    incoming: &Value,
+    kind: RuleKind,
+) -> Result<(), String> {
+    let Some(incoming_values) = incoming.as_array() else {
+        return Ok(());
+    };
+    if unchanged_projected_rules(existing, incoming, kind) {
+        return Ok(());
+    }
+    let existing_values = existing
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for rule in incoming_values {
+        let existing_rule = match_existing_rule(existing_values, incoming_values, rule, kind);
+        validate_retained_secret_fields(existing_rule, rule)?;
+        if let Some(condition) = rule.get("condition") {
+            validate_retained_condition_secrets(
+                existing_rule.and_then(|rule| rule.get("condition")),
+                condition,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_retained_secret_fields(
+    existing: Option<&Value>,
+    incoming: &Value,
+) -> Result<(), String> {
+    for (field, marker) in [
+        ("value", "has_value"),
+        ("pattern", "has_pattern"),
+        ("replacement", "has_replacement"),
+    ] {
+        if incoming.get(marker).and_then(Value::as_bool) == Some(true)
+            && incoming.get(field).and_then(Value::as_str) == Some(REDACTED_VALUE)
+            && existing
+                .and_then(|value| value.get(field))
+                .filter(|value| secret_value_is_set(value))
+                .is_none()
+        {
+            return Err(
+                "无法匹配脱敏规则的原值，请查看原值后重新填写，避免将占位符保存为实际配置"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_retained_condition_secrets(
+    existing: Option<&Value>,
+    incoming: &Value,
+) -> Result<(), String> {
+    for group_key in ["all", "any"] {
+        if let Some(children) = incoming.get(group_key).and_then(Value::as_array) {
+            let existing_children = existing
+                .and_then(|value| value.get(group_key))
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if projected_conditions_unchanged(existing_children, children) {
+                return Ok(());
+            }
+            for child in children {
+                let existing_child = match_existing_entry(
+                    existing_children,
+                    children,
+                    child,
+                    condition_identity,
+                    redact_condition,
+                );
+                validate_retained_condition_secrets(existing_child, child)?;
+            }
+            return Ok(());
+        }
+    }
+    let existing =
+        existing.filter(|value| condition_identity(value) == condition_identity(incoming));
+    validate_retained_secret_fields(existing, incoming)
 }
 
 fn rule_identity(value: &Value, kind: RuleKind) -> Option<String> {
@@ -1676,8 +1863,18 @@ fn rule_identity(value: &Value, kind: RuleKind) -> Option<String> {
 
 fn condition_identity(value: &Value) -> Option<String> {
     let value = value.as_object()?;
-    if value.contains_key("all") || value.contains_key("any") {
-        return None;
+    for group_key in ["all", "any"] {
+        if let Some(children) = value.get(group_key).and_then(Value::as_array) {
+            let mut identities = children
+                .iter()
+                .map(condition_identity)
+                .collect::<Option<Vec<_>>>()?;
+            identities.sort();
+            return Some(format!(
+                "condition:{group_key}:{}",
+                serde_json::to_string(&identities).ok()?
+            ));
+        }
     }
     let path = trimmed_string_field(value, "path")?;
     let op = normalized_string_field(value, "op")?;
@@ -1720,11 +1917,36 @@ fn is_rule_marker(key: &str) -> bool {
 
 fn condition_value_is_secret(condition: &Map<String, Value>) -> bool {
     let source = normalized_condition_source(condition.get("source").and_then(Value::as_str));
-    source == "request_headers"
-        || condition
-            .get("path")
-            .and_then(Value::as_str)
-            .is_some_and(json_path_targets_secret)
+    let path = condition.get("path").and_then(Value::as_str);
+    if source == "request_headers" {
+        path.is_none_or(header_value_is_secret)
+    } else {
+        path.is_some_and(json_path_targets_secret)
+    }
+}
+
+fn header_value_is_secret(name: &str) -> bool {
+    !matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "accept"
+            | "accept-encoding"
+            | "accept-language"
+            | "cache-control"
+            | "content-encoding"
+            | "content-type"
+            | "user-agent"
+            | "anthropic-version"
+            | "anthropic-beta"
+            | "openai-beta"
+            | "x-stainless-lang"
+            | "x-stainless-package-version"
+            | "x-stainless-os"
+            | "x-stainless-arch"
+            | "x-stainless-runtime"
+            | "x-stainless-runtime-version"
+            | "x-stainless-retry-count"
+            | "x-stainless-timeout"
+    )
 }
 
 fn normalized_condition_source(source: Option<&str>) -> String {
@@ -2541,5 +2763,168 @@ mod tests {
 
         assert_eq!(projected, "https://api.example/v1");
         assert_eq!(admin_secret_safe_url(Some("not a url")), json!(null));
+    }
+
+    #[test]
+    fn public_protocol_headers_and_conditions_remain_editable() {
+        let rules = json!([
+            {"action": "set", "key": "Content-Type", "value": "application/json"},
+            {"action": "set", "key": "User-Agent", "value": "client/1.0"},
+            {"action": "set", "key": "anthropic-version", "value": "2023-06-01"},
+            {"action": "set", "key": "OpenAI-Beta", "value": "responses=experimental", "condition": {
+                "source": "request_headers", "path": "Accept", "op": "eq", "value": "text/event-stream"
+            }}
+        ]);
+        assert_eq!(admin_secret_safe_header_rules(Some(&rules)), rules);
+        let mut legacy_projection = rules.clone();
+        legacy_projection[0]["value"] = json!("***");
+        legacy_projection[0]["has_value"] = json!(true);
+        legacy_projection[3]["condition"]["value"] = json!("***");
+        legacy_projection[3]["condition"]["has_value"] = json!(true);
+        assert_eq!(
+            admin_restore_secret_safe_header_rules(Some(&rules), &legacy_projection),
+            rules
+        );
+    }
+
+    #[test]
+    fn header_maps_keep_protocol_values_but_hide_credentials_and_unknown_headers() {
+        let projected = admin_secret_safe_json(Some(&json!({"headers": {
+            "Content-Type": "application/json",
+            "User-Agent": "client/1.0",
+            "Authorization": "Bearer secret",
+            "Cookie": "session=secret",
+            "x-custom-auth": "custom-secret"
+        }})));
+        assert_eq!(projected["headers"]["Content-Type"], "application/json");
+        assert_eq!(projected["headers"]["User-Agent"], "client/1.0");
+        for header in ["Authorization", "Cookie", "x-custom-auth"] {
+            assert_eq!(projected["headers"][header], "***");
+        }
+    }
+
+    #[test]
+    fn duplicate_conditional_rules_retain_secrets_when_reordered_or_disabled() {
+        let existing = json!([
+            {"action": "set", "key": "x-auth", "value": "first-secret", "condition": {
+                "path": "model", "op": "eq", "value": "first-model"
+            }},
+            {"action": "set", "key": "x-auth", "value": "second-secret", "condition": {
+                "path": "model", "op": "eq", "value": "second-model"
+            }}
+        ]);
+        let mut incoming = admin_secret_safe_header_rules(Some(&existing));
+        incoming.as_array_mut().unwrap().reverse();
+        incoming[0]["enabled"] = json!(false);
+        super::admin_validate_retained_header_rule_secrets(Some(&existing), &incoming).unwrap();
+        let restored = admin_restore_secret_safe_header_rules(Some(&existing), &incoming);
+        assert_eq!(restored[0]["value"], "second-secret");
+        assert_eq!(restored[0]["enabled"], false);
+        assert_eq!(restored[1]["value"], "first-secret");
+        assert!(restored[0].get("has_value").is_none());
+    }
+
+    #[test]
+    fn unchanged_duplicate_body_rules_preserve_their_original_values() {
+        let existing = json!([
+            {"action": "append", "path": "auth.cookies", "value": "first-secret"},
+            {"action": "append", "path": "auth.cookies", "value": "second-secret"}
+        ]);
+        let incoming = admin_secret_safe_body_rules(Some(&existing));
+        super::admin_validate_retained_body_rule_secrets(Some(&existing), &incoming).unwrap();
+        assert_eq!(
+            admin_restore_secret_safe_body_rules(Some(&existing), &incoming),
+            existing
+        );
+    }
+
+    #[test]
+    fn nested_condition_groups_preserve_secrets_after_sibling_edits_and_reordering() {
+        let existing = json!([{
+            "action": "set", "key": "x-output", "value": "header-secret",
+            "condition": {"all": [
+                {"any": [
+                    {"path": "auth.token", "op": "eq", "value": "condition-secret"},
+                    {"path": "model", "op": "eq", "value": "old-model"}
+                ]},
+                {"path": "metadata.enabled", "op": "eq", "value": true}
+            ]}
+        }]);
+        let mut incoming = admin_secret_safe_header_rules(Some(&existing));
+        incoming[0]["condition"]["all"][0]["any"][1]["value"] = json!("new-model");
+        incoming[0]["condition"]["all"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        super::admin_validate_retained_header_rule_secrets(Some(&existing), &incoming).unwrap();
+        let restored = admin_restore_secret_safe_header_rules(Some(&existing), &incoming);
+        assert_eq!(restored[0]["value"], "header-secret");
+        assert_eq!(
+            restored[0]["condition"]["all"][1]["any"][0]["value"],
+            "condition-secret"
+        );
+        assert_eq!(
+            restored[0]["condition"]["all"][1]["any"][1]["value"],
+            "new-model"
+        );
+        assert!(!restored.to_string().contains("has_value"));
+    }
+
+    #[test]
+    fn retained_masks_cannot_silently_overwrite_changed_or_ambiguous_rules() {
+        let existing = json!([
+            {"action": "set", "key": "x-auth", "value": "first-secret"},
+            {"action": "set", "key": "x-auth", "value": "second-secret"}
+        ]);
+        let mut incoming = admin_secret_safe_header_rules(Some(&existing));
+        incoming[0]["enabled"] = json!(false);
+        assert!(
+            super::admin_validate_retained_header_rule_secrets(Some(&existing), &incoming).is_err()
+        );
+
+        let existing = json!([{"action": "set", "path": "auth.token", "value": "secret"}]);
+        let mut incoming = admin_secret_safe_body_rules(Some(&existing));
+        incoming[0]["path"] = json!("auth.api_key");
+        assert!(
+            super::admin_validate_retained_body_rule_secrets(Some(&existing), &incoming).is_err()
+        );
+        incoming[0]["value"] = json!("replacement-secret");
+        incoming[0].as_object_mut().unwrap().remove("has_value");
+        assert!(
+            super::admin_validate_retained_body_rule_secrets(Some(&existing), &incoming).is_ok()
+        );
+    }
+
+    #[test]
+    fn body_rule_projection_preserves_structured_image_urls_and_inline_data() {
+        let existing = json!([{
+            "action": "append", "path": "messages[0].content",
+            "value": {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U=", "detail": "high"}}
+        }]);
+        let projected = admin_secret_safe_body_rules(Some(&existing));
+        assert_eq!(projected, existing);
+        assert_eq!(
+            admin_restore_secret_safe_body_rules(Some(&existing), &projected),
+            existing
+        );
+    }
+
+    #[test]
+    fn structured_url_values_still_hide_and_restore_network_credentials() {
+        let existing = json!({
+            "image_url": {"url": "https://user:password@example.test/image?token=secret", "detail": "auto"},
+            "url": ["https://example.test/file?token=secret", "data:image/png;base64,aW1hZ2U="]
+        });
+        let projected = admin_secret_safe_json(Some(&existing));
+        assert_eq!(projected["image_url"]["url"], "https://example.test/image");
+        assert_eq!(projected["image_url"]["detail"], "auto");
+        assert_eq!(projected["url"][0], "https://example.test/file");
+        assert_eq!(projected["url"][1], existing["url"][1]);
+        assert!(!projected.to_string().contains("secret"));
+        assert!(!projected.to_string().contains("password"));
+        assert_eq!(
+            admin_restore_secret_safe_json(Some(&existing), &projected),
+            existing
+        );
     }
 }

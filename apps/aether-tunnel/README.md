@@ -4,6 +4,15 @@ Aether Tunnel 代理节点，部署在海外 VPS 上，通过 WebSocket 隧道�
 
 Tunnel 模式下代理节点**无需对外监听端口**，仅需出站连接到 Aether 服务器。
 
+## 流式传输与升级注意事项
+
+- 协议 v3 连接在 `HELLO` / `SETTINGS` 协商后才接收业务请求。实际双向流窗口取 gateway 与 agent 配置的较小值，信用更新阈值不超过该窗口的四分之一；单帧也不会超过协商窗口。
+- 响应缓冲按字节限额并合并小帧，结束和错误状态独立保存。慢消费者不会阻塞同一隧道其他流的读取；超出窗口或缓冲预算的流会被明确终止，不会静默截断。
+- 信用更新在消费数据后可靠入队；启用重定向重放时，进入有界重放缓存也视为请求体消费。持续无法投递关键控制帧时会关闭连接并向在途请求报告错误。
+- 客户端取消会终止对应上游请求，断连会回收 session 的 writer、heartbeat 和请求任务。正常 drain 在配置期限内继续处理已有流，期限到达后终止残留任务。
+- 建议先升级 gateway，再升级 agent。既有 v3 agent 已发送 `HELLO` / `SETTINGS`，可连接新 gateway；自定义 v3 节点必须完成这两步握手。协议 v1/v2 保留旧握手。与旧 gateway 混用时应保持默认窗口配置，不能依赖旧 gateway 应用新的窗口协商。
+- 自动重连恢复后续请求，不会自动续传已经输出的 SSE，也不会无条件重放已经发送的请求。
+
 ## 安装
 
 `aether-tunnel` 会根据宿主机自动选择服务管理器：
@@ -15,13 +24,13 @@ Tunnel 模式下代理节点**无需对外监听端口**，仅需出站连接到
 <!-- DOWNLOAD_TABLE_START -->
 | Platform | Download |
 |----------|----------|
-| Linux x86_64 (GNU) | [aether-tunnel-linux-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.16/aether-tunnel-linux-amd64.tar.gz) |
-| Linux ARM64 (GNU) | [aether-tunnel-linux-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.16/aether-tunnel-linux-arm64.tar.gz) |
-| Linux x86_64 (musl) | [aether-tunnel-linux-musl-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.16/aether-tunnel-linux-musl-amd64.tar.gz) |
-| Linux ARM64 (musl) | [aether-tunnel-linux-musl-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.16/aether-tunnel-linux-musl-arm64.tar.gz) |
-| macOS x86_64 | [aether-tunnel-macos-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.16/aether-tunnel-macos-amd64.tar.gz) |
-| macOS ARM64 | [aether-tunnel-macos-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.16/aether-tunnel-macos-arm64.tar.gz) |
-| Windows x86_64 | [aether-tunnel-windows-amd64.zip](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.16/aether-tunnel-windows-amd64.zip) |
+| Linux x86_64 (GNU) | [aether-tunnel-linux-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.17/aether-tunnel-linux-amd64.tar.gz) |
+| Linux ARM64 (GNU) | [aether-tunnel-linux-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.17/aether-tunnel-linux-arm64.tar.gz) |
+| Linux x86_64 (musl) | [aether-tunnel-linux-musl-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.17/aether-tunnel-linux-musl-amd64.tar.gz) |
+| Linux ARM64 (musl) | [aether-tunnel-linux-musl-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.17/aether-tunnel-linux-musl-arm64.tar.gz) |
+| macOS x86_64 | [aether-tunnel-macos-amd64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.17/aether-tunnel-macos-amd64.tar.gz) |
+| macOS ARM64 | [aether-tunnel-macos-arm64.tar.gz](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.17/aether-tunnel-macos-arm64.tar.gz) |
+| Windows x86_64 | [aether-tunnel-windows-amd64.zip](https://github.com/fawney19/Aether/releases/download/tunnel-v0.3.17/aether-tunnel-windows-amd64.zip) |
 <!-- DOWNLOAD_TABLE_END -->
 
 上表展示的是最新已发布版本的下载链接。从下一次 `tunnel-v*` 发布开始，表格会自动补上 `Linux x86_64 (musl)` / `Linux ARM64 (musl)` 包，供 Alpine 等 musl 系统直接使用。

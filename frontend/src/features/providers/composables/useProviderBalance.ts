@@ -63,7 +63,7 @@ export function useProviderBalance() {
   }
 
   // 异步加载余额数据（使用批量接口）
-  async function loadBalances(providers: ProviderWithEndpointsSummary[], fullReload = true) {
+  async function loadBalances(providers: Pick<ProviderWithEndpointsSummary, 'id' | 'ops_configured'>[], fullReload = true) {
     if (fullReload) {
       balanceCache.value = {}
     }
@@ -112,6 +112,7 @@ export function useProviderBalance() {
   async function retryPendingBalances(providerIds: string[], loadVersion: number, retryCount: number) {
     try {
       const results = await batchQueryBalance(providerIds)
+      if (loadVersion !== balanceLoadVersion) return
       const stillPending: string[] = []
 
       for (const [providerId, result] of Object.entries(results)) {
@@ -229,7 +230,7 @@ export function useProviderBalance() {
     }
     const data = result.data as Record<string, unknown>
     const extra = asRecord(data.extra)
-    if (!extra || extra.checkin_success === undefined) {
+    if (!extra || (extra.checkin_success !== null && typeof extra.checkin_success !== 'boolean')) {
       return null
     }
     return {
@@ -325,6 +326,7 @@ export function useProviderBalance() {
 
   // 组件卸载时清理
   function cleanup() {
+    balanceLoadVersion++
     stopTick()
     pendingTimers.forEach(clearTimeout)
     pendingTimers.clear()

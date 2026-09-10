@@ -13,7 +13,7 @@
             class="space-y-4"
             @submit.prevent="updateProfile"
           >
-            <div class="flex items-center justify-between">
+            <div class="flex flex-wrap items-center justify-between gap-3">
               <h3 class="text-lg font-medium text-foreground">
                 基本信息
               </h3>
@@ -82,8 +82,8 @@
         </Card>
 
         <Card class="p-6">
-          <div class="flex items-center justify-between mb-4">
-            <div>
+          <div class="flex flex-col items-start gap-3 mb-4 sm:flex-row sm:justify-between">
+            <div class="min-w-0 flex-1">
               <h3 class="text-lg font-medium text-foreground">
                 敏感信息保护
               </h3>
@@ -93,6 +93,7 @@
             </div>
             <Button
               variant="outline"
+              class="shrink-0"
               :disabled="savingFeatureSettings || !hasFeatureSettingsChanges"
               @click="updateFeatureSettings"
             >
@@ -152,7 +153,7 @@
             class="space-y-4"
             @submit.prevent="changePassword"
           >
-            <div class="flex items-center justify-between">
+            <div class="flex flex-wrap items-center justify-between gap-3">
               <h3 class="text-lg font-medium text-foreground">
                 {{ profile?.has_password ? '修改密码' : '设置密码' }}
               </h3>
@@ -198,7 +199,7 @@
               </p>
             </div>
             <div>
-              <Label for="confirm-password">确认{{ profile?.has_password ? '新' : '' }}密码</Label>
+              <Label for="confirm-password">{{ profile?.has_password ? '确认新密码' : '确认密码' }}</Label>
               <Input
                 id="confirm-password"
                 v-model="passwordForm.confirm_password"
@@ -218,8 +219,8 @@
         </Card>
 
         <Card class="p-6">
-          <div class="flex items-center justify-between mb-4">
-            <div>
+          <div class="flex flex-col items-start gap-3 mb-4 sm:flex-row sm:justify-between">
+            <div class="min-w-0 flex-1">
               <h3 class="text-lg font-medium text-foreground">
                 登录设备
               </h3>
@@ -229,6 +230,7 @@
             </div>
             <Button
               variant="outline"
+              class="shrink-0"
               :disabled="sessionsLoading || otherSessionCount === 0 || sessionActionLoading === 'others'"
               @click="handleRevokeOtherSessions"
             >
@@ -255,7 +257,7 @@
             <div
               v-for="session in userSessions"
               :key="session.id"
-              class="flex items-start justify-between gap-4 rounded-lg border border-border/60 bg-muted/20 p-4"
+              class="flex min-w-0 flex-col items-start gap-3 rounded-lg border border-border/60 bg-muted/20 p-4 sm:flex-row sm:justify-between"
             >
               <div class="min-w-0">
                 <div class="flex items-center gap-2 flex-wrap">
@@ -263,14 +265,15 @@
                     <Input
                       v-model="sessionLabelDraft"
                       size="sm"
-                      class="h-8 w-56"
+                      class="h-8 w-full sm:w-56"
                       maxlength="120"
                       @keyup.enter="saveSessionLabel(session.id)"
                     />
                   </template>
                   <span
                     v-else
-                    class="font-medium text-foreground"
+                    translate="no"
+                    class="break-words font-medium text-foreground"
                   >{{ session.device_label }}</span>
                   <Badge
                     v-if="session.is_current"
@@ -287,7 +290,7 @@
                   <span v-if="session.ip_address"> · IP {{ session.ip_address }}</span>
                 </p>
               </div>
-              <div class="flex items-center gap-2">
+              <div class="flex shrink-0 flex-wrap items-center gap-2">
                 <template v-if="editingSessionId === session.id">
                   <Button
                     size="sm"
@@ -490,7 +493,7 @@
                     <SelectItem value="zh-CN">
                       简体中文
                     </SelectItem>
-                    <SelectItem value="en">
+                    <SelectItem value="en-US">
                       English
                     </SelectItem>
                   </SelectContent>
@@ -665,7 +668,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
+import { getI18nLocale, normalizeLocale, useI18n } from '@/i18n'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useModuleStore } from '@/stores/modules'
@@ -712,6 +716,7 @@ const route = useRoute()
 const router = useRouter()
 const { success, error: showError } = useToast()
 const { setThemeMode } = useDarkMode()
+const { locale, setLocale } = useI18n()
 
 const profile = ref<Profile | null>(null)
 const walletModuleActive = computed(() => moduleStore.isActive('wallet'))
@@ -737,7 +742,7 @@ const preferencesForm = ref({
   avatar_url: '',
   bio: '',
   theme: 'light',
-  language: 'zh-CN',
+  language: locale.value,
   timezone: 'Asia/Shanghai',
   notifications: {
     email: true,
@@ -820,10 +825,17 @@ function handleThemeChange(value: string) {
 }
 
 function handleLanguageChange(value: string) {
-  preferencesForm.value.language = value
+  const nextLocale = normalizeLocale(value)
+  if (!nextLocale) return
+  preferencesForm.value.language = nextLocale
+  setLocale(nextLocale)
   languageSelectOpen.value = false
   updatePreferences()
 }
+
+watch(locale, value => {
+  preferencesForm.value.language = value
+})
 
 onMounted(async () => {
   const profilePromise = loadProfile()
@@ -1014,7 +1026,7 @@ async function loadPreferences() {
       avatar_url: prefs.avatar_url || '',
       bio: prefs.bio || '',
       theme: localTheme,  // 使用本地主题，而非服务端返回值
-      language: prefs.language || 'zh-CN',
+      language: locale.value,
       timezone: prefs.timezone || 'Asia/Shanghai',
       notifications: {
         email: prefs.notifications?.email ?? true,
@@ -1208,7 +1220,7 @@ function isUnlimitedBilling(): boolean {
 
 function formatDate(dateString?: string): string {
   if (!dateString) return '未知'
-  return new Date(dateString).toLocaleDateString('zh-CN', {
+  return new Date(dateString).toLocaleDateString(getI18nLocale(), {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',

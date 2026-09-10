@@ -67,7 +67,10 @@ INSERT INTO proxy_nodes (
   estimated_max_concurrency, tunnel_mode, tunnel_connected, tunnel_connected_at,
   failed_requests, dns_failures, stream_errors, proxy_metadata
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+WHERE ? OR NOT EXISTS (
+  SELECT 1 FROM proxy_nodes WHERE ip = ? AND port = ? AND is_manual = 0
+)
 ON DUPLICATE KEY UPDATE
   name = VALUES(name),
   ip = VALUES(ip),
@@ -105,7 +108,7 @@ ON DUPLICATE KEY UPDATE
                 .map(|(insert_sql, _)| insert_sql)
                 .expect("proxy node upsert SQL should contain its conflict clause")
         };
-        sqlx::query(sql)
+        let result = sqlx::query(sql)
             .bind(&node.id)
             .bind(&node.tunnel_generation)
             .bind(&node.name)
@@ -151,9 +154,15 @@ ON DUPLICATE KEY UPDATE
                 &node.proxy_metadata,
                 "proxy_nodes.proxy_metadata",
             )?)
+            .bind(update_existing || node.is_manual)
+            .bind(&node.ip)
+            .bind(node.port)
             .execute(&self.pool)
             .await
             .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Err(proxy_node_registration_changed_error());
+        }
         Ok(())
     }
 
@@ -1961,6 +1970,76 @@ mod tests {
             .contains("is_manual = 0 AND BINARY ip = BINARY ? AND port = ?"));
         assert!(super::UPDATE_PROXY_NODE_REGISTRATION_SQL
             .contains("CAST(proxy_metadata AS JSON) = CAST(? AS JSON)"));
+    }
+
+    #[tokio::test]
+    async fn mysql_concurrent_registration_keeps_one_endpoint_identity_when_url_is_set() {
+        let Ok(database_url) = std::env::var("AETHER_TEST_MYSQL_URL") else {
+            eprintln!("skipping MySQL registration race test: AETHER_TEST_MYSQL_URL is unset");
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let repository = MysqlProxyNodeReadRepository::new(pool.clone());
+        let endpoint = format!("registration-{}.test", uuid::Uuid::new_v4());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let repository = repository.clone();
+            let ip = endpoint.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                repository
+                    .register_node(&ProxyNodeRegistrationMutation {
+                        node_id: Some(uuid::Uuid::new_v4().to_string()),
+                        name: "concurrent tunnel".to_string(),
+                        ip,
+                        port: 7042,
+                        region: None,
+                        heartbeat_interval: 30,
+                        active_connections: None,
+                        total_requests: None,
+                        avg_latency_ms: None,
+                        hardware_info: None,
+                        estimated_max_concurrency: None,
+                        proxy_metadata: None,
+                        proxy_version: None,
+                        registered_by: None,
+                        tunnel_mode: true,
+                    })
+                    .await
+            }));
+        }
+        let mut successes = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => successes += 1,
+                Err(error) => assert!(
+                    error.to_string().contains("identity changed"),
+                    "unexpected concurrent registration error: {error}"
+                ),
+            }
+        }
+        assert_eq!(successes, 1);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proxy_nodes WHERE ip = ? AND port = ?")
+                .bind(&endpoint)
+                .bind(7042_i32)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        sqlx::query("DELETE FROM proxy_nodes WHERE ip = ?")
+            .bind(endpoint)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
     }
 
     #[tokio::test]

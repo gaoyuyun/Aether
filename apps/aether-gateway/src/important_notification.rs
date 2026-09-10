@@ -238,9 +238,11 @@ async fn read_notification_channel_readiness(
     state: &AppState,
     config: &ImportantNotificationConfig,
 ) -> Result<NotificationChannelReadiness, GatewayError> {
-    let smtp_config = read_smtp_delivery_config(state).await?;
+    let email = config.email_enabled
+        && !config.email_recipients.is_empty()
+        && matches!(read_smtp_delivery_config(state).await, Ok(Some(_)));
     Ok(NotificationChannelReadiness {
-        email: config.email_enabled && !config.email_recipients.is_empty() && smtp_config.is_some(),
+        email,
         server_chan: config.server_chan.enabled && config.server_chan.send_key.is_some(),
         bark: config.bark.enabled && config.bark.device_key.is_some(),
     })
@@ -840,12 +842,49 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_notification_item_template, parse_channel_filter, parse_notification_items,
-        parse_recipient_list, ImportantNotification, ImportantNotificationChannelFilter,
-        MAX_NOTIFICATION_ITEMS, MAX_NOTIFICATION_RECIPIENTS, MAX_NOTIFICATION_RECIPIENT_BYTES,
+        apply_notification_item_template, important_notification_configured, parse_channel_filter,
+        parse_notification_items, parse_recipient_list, ImportantNotification,
+        ImportantNotificationChannelFilter, IMPORTANT_NOTIFICATION_EMAIL_ENABLED_KEY,
+        IMPORTANT_NOTIFICATION_EMAIL_RECIPIENTS_KEY, MAX_NOTIFICATION_ITEMS,
+        MAX_NOTIFICATION_RECIPIENTS, MAX_NOTIFICATION_RECIPIENT_BYTES,
         MAX_NOTIFICATION_TEMPLATE_BYTES,
     };
+    use crate::{data::GatewayDataState, AppState};
+    use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn unused_email_channel_does_not_load_or_migrate_smtp_password() {
+        for (email_enabled, recipients) in [(false, "ops@example.com"), (true, "")] {
+            let data = GatewayDataState::disabled()
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY)
+                .with_system_config_values_for_tests(vec![
+                    (
+                        IMPORTANT_NOTIFICATION_EMAIL_ENABLED_KEY.to_string(),
+                        json!(email_enabled),
+                    ),
+                    (
+                        IMPORTANT_NOTIFICATION_EMAIL_RECIPIENTS_KEY.to_string(),
+                        json!(recipients),
+                    ),
+                    ("smtp_host".to_string(), json!("smtp.example.com")),
+                    ("smtp_user".to_string(), json!("ops@example.com")),
+                    ("smtp_password".to_string(), json!("unused-smtp-password")),
+                    ("smtp_from_email".to_string(), json!("ops@example.com")),
+                ]);
+            let state = AppState::new()
+                .expect("gateway state should build")
+                .with_data_state_for_tests(data);
+            assert!(!important_notification_configured(&state).await.unwrap());
+            assert_eq!(
+                state
+                    .read_system_config_json_value_strong("smtp_password")
+                    .await
+                    .unwrap(),
+                Some(json!("unused-smtp-password"))
+            );
+        }
+    }
 
     #[test]
     fn parse_recipient_list_accepts_arrays_and_delimiters() {

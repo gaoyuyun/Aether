@@ -5,7 +5,6 @@ use super::shared::{
     quota_key_auto_removed, quota_refresh_success_invalid_state,
     resolve_provider_quota_execution_timeouts, ProviderQuotaExecutionOutcome,
 };
-use crate::handlers::admin::provider::shared::payloads::AdminImportProviderModelsRequest;
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::GatewayError;
 use aether_admin::provider::quota::{
@@ -23,63 +22,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
-
-fn antigravity_discovered_model_ids(metadata_update: Option<&serde_json::Value>) -> Vec<String> {
-    metadata_update
-        .and_then(|value| value.pointer("/antigravity/quota_by_model"))
-        .and_then(serde_json::Value::as_object)
-        .into_iter()
-        .flat_map(|models| models.keys())
-        .map(String::as_str)
-        .filter(|model_id| aether_model_fetch::antigravity_model_id_is_routable(model_id))
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-async fn sync_antigravity_discovered_models(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-    metadata_update: Option<&serde_json::Value>,
-) {
-    if !state.has_global_model_data_reader() || !state.has_global_model_data_writer() {
-        return;
-    }
-    let model_ids = antigravity_discovered_model_ids(metadata_update);
-    if model_ids.is_empty() {
-        return;
-    }
-
-    let result = state
-        .build_admin_import_provider_models_payload(
-            provider_id,
-            AdminImportProviderModelsRequest {
-                model_ids,
-                tiered_pricing: None,
-                price_per_request: None,
-            },
-        )
-        .await;
-    match result {
-        Ok(payload) => {
-            let errors = payload
-                .get("errors")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            if errors > 0 {
-                warn!(
-                    provider_id,
-                    errors, "Antigravity discovered-model catalog sync completed with item errors"
-                );
-            }
-        }
-        Err(error) => warn!(
-            provider_id,
-            error = %error,
-            "Antigravity discovered-model catalog sync failed"
-        ),
-    }
-}
 
 async fn execute_antigravity_quota_plan(
     state: &AdminAppState<'_>,
@@ -378,10 +320,6 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
                 "message": "Key 状态写入失败",
             }));
             continue;
-        }
-
-        if status == "success" {
-            sync_antigravity_discovered_models(state, &provider.id, metadata_update.as_ref()).await;
         }
 
         if status == "success" {

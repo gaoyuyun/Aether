@@ -8,6 +8,11 @@ import type { ApiKeyInstallSession, InstallSessionTargetSystem, InstallTargetCli
 const SYSTEM_DATA_IMPORT_TIMEOUT_MS = 10 * 60 * 1000
 const ALL_SYSTEM_CONFIGS_CACHE_KEY = 'admin:system:configs'
 
+export interface AdminTimeSeriesPoint extends Record<string, unknown> {
+  date: string
+  total_cost: number
+}
+
 export interface AdminSystemConfigItem {
   key: string
   value: unknown
@@ -1594,12 +1599,12 @@ export const adminApi = {
       provider_name?: string
     },
     options?: AdminAnalyticsRequestOptions
-  ): Promise<Array<Record<string, unknown>>> {
+  ): Promise<AdminTimeSeriesPoint[]> {
     const cacheKey = buildCacheKey('admin:stats:time-series', params)
     return cachedRequest(
       cacheKey,
       async () => {
-        const response = await apiClient.get<Array<Record<string, unknown>>>('/api/admin/stats/time-series', { params })
+        const response = await apiClient.get<AdminTimeSeriesPoint[]>('/api/admin/stats/time-series', { params })
         return response.data
       },
       options?.skipCache ? 0 : 20 * 1000
