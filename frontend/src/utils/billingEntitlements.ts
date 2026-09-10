@@ -1,3 +1,5 @@
+import { getI18nLocale } from '@/i18n'
+
 import type {
   BillingEntitlement,
   UsagePolicyEntitlement,
@@ -100,7 +102,7 @@ function formatCalendarWeek(timezone?: string, weekStart?: number): string {
 }
 
 function formatUsd(limit: number): string {
-  return `$${Number(limit || 0).toLocaleString('zh-CN', { maximumFractionDigits: 8 })}`
+  return `$${Number(limit || 0).toLocaleString(getI18nLocale(), { maximumFractionDigits: 8 })}`
 }
 
 function formatWindowDuration(seconds: number): string {
@@ -111,5 +113,5 @@ function formatWindowDuration(seconds: number): string {
 }
 
 function formatLimit(limit: number): string {
-  return Number(limit || 0).toLocaleString('zh-CN')
+  return Number(limit || 0).toLocaleString(getI18nLocale())
 }

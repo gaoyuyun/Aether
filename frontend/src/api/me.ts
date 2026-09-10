@@ -1,11 +1,11 @@
 import apiClient from './client'
+import type { ImageProgress } from './requestTrace'
 import type { ActivityHeatmap } from '@/types/activity'
 import type { TieredPricingConfig } from './endpoints/types'
 import { cachedRequest, buildCacheKey } from '@/utils/cache'
 import type { BillingSummary } from './auth'
 import type { UserSession } from '@/types/session'
 import type { FeatureSettingsMap } from '@/utils/featureSettings'
-import type { ImageProgress } from './requestTrace'
 
 const ACTIVITY_HEATMAP_CACHE_TTL_MS = 30 * 60 * 1000
 
@@ -483,6 +483,7 @@ export const meApi = {
       reasoning_effort?: string | null
       service_tier?: string | null
       actual_service_tier?: string | null
+      image_progress?: ImageProgress | null
     }>
   }>('/api/users/me/usage/active', { params })
     return response.data
@@ -623,7 +624,12 @@ export const meApi = {
     return cachedRequest(
       cacheKey,
       async () => {
-        const response = await apiClient.get<{ analysis_period_hours: number; total_points: number; points: Array<{ x: string; y: number; model?: string }>; models?: string[] }>('/api/users/me/usage/interval-timeline', { params })
+        const response = await apiClient.get<{
+          analysis_period_hours: number
+          total_points: number
+          points: Array<{ x: string; y: number; model?: string }>
+          models?: string[]
+        }>('/api/users/me/usage/interval-timeline', { params })
         return response.data
       },
       30000

@@ -203,19 +203,34 @@ pub async fn connect_and_run(
     let (ws_sink, ws_read) = futures_util::StreamExt::split(ws_stream);
 
     // Spawn writer task (with WebSocket ping keepalive)
-    let (frame_tx, mut writer_handle) = writer::spawn_writer_with_metrics_and_security(
+    let (frame_tx, writer_handle) = writer::spawn_writer_with_metrics_and_security(
         ws_sink,
         ping_interval,
         Some(Arc::clone(&server.tunnel_metrics)),
         security.clone(),
     );
+    let mut writer_handle = super::task::SessionTask::new(writer_handle);
     send_protocol_v3_hello(&frame_tx, &security_session, state).await;
-    let drain_signal = spawn_drain_signal(
+    let (session_drain_tx, session_drain_rx) = watch::channel(*drain.borrow());
+    let forward_drain_tx = session_drain_tx.clone();
+    let mut external_drain = drain;
+    let forward_drain = super::task::SessionTask::new(tokio::spawn(async move {
+        loop {
+            if *external_drain.borrow() {
+                let _ = forward_drain_tx.send(true);
+                break;
+            }
+            if external_drain.changed().await.is_err() {
+                break;
+            }
+        }
+    }));
+    let drain_signal = super::task::SessionTask::new(spawn_drain_signal(
         conn_idx,
         frame_tx.clone(),
-        drain.clone(),
+        session_drain_rx.clone(),
         state.config.tunnel_drain_deadline_ms,
-    );
+    ));
 
     // Spawn heartbeat task (only for primary connection to avoid
     // resetting shared atomic metrics via swap(0))
@@ -237,16 +252,19 @@ pub async fn connect_and_run(
     // ensures we detect this and trigger a reconnect promptly.
     let state_clone = Arc::clone(state);
     let server_clone = Arc::clone(server);
-    let outcome = tokio::select! {
-        result = dispatcher::run_with_security(
+    let outcome = {
+        let dispatch = dispatcher::run_with_security(
             state_clone,
             server_clone,
             ws_read,
             frame_tx.clone(),
             hb_handle,
-            drain.clone(),
+            session_drain_rx,
             security.clone(),
-        ) => {
+        );
+        tokio::pin!(dispatch);
+        tokio::select! {
+        result = &mut dispatch => {
             match result {
                 Ok(()) => Ok(TunnelOutcome::Disconnected),
                 Err(e) => {
@@ -258,6 +276,8 @@ pub async fn connect_and_run(
             }
         }
         writer_result = &mut writer_handle => {
+            frame_tx.close();
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut dispatch).await;
             match writer_result {
                 Ok(()) => warn!("writer task exited normally, triggering reconnect"),
                 Err(e) => {
@@ -278,24 +298,37 @@ pub async fn connect_and_run(
         }
         _ = shutdown.changed() => {
             debug!("shutdown during tunnel dispatch");
+            let _ = session_drain_tx.send(true);
+            let deadline = Duration::from_millis(state.config.tunnel_drain_deadline_ms).saturating_add(Duration::from_secs(1));
+            let _ = tokio::time::timeout(deadline, &mut dispatch).await;
             Ok(TunnelOutcome::Shutdown)
+        }
         }
     };
 
     // Drop our sender; the writer will exit once all stream handler clones
     // are also dropped (i.e. after they finish their in-flight work).
     drop(frame_tx);
+    forward_drain.abort();
+    let _ = forward_drain.await;
     if !drain_signal.is_finished() {
         drain_signal.abort();
         let _ = drain_signal.await;
     }
 
-    // Wait for the writer task to finish with a generous timeout — the
-    // dispatcher already waits up to 30s for stream handlers, so 35s here
-    // covers that plus a small margin.
-    // Skip if the writer already exited (the select branch that fired).
     if !writer_handle.is_finished() {
-        let _ = tokio::time::timeout(Duration::from_secs(35), writer_handle).await;
+        let flush_timeout = if *session_drain_tx.borrow() {
+            Duration::from_millis(state.config.tunnel_drain_deadline_ms)
+        } else {
+            Duration::from_secs(1)
+        };
+        if tokio::time::timeout(flush_timeout, &mut writer_handle)
+            .await
+            .is_err()
+        {
+            writer_handle.abort();
+            let _ = writer_handle.await;
+        }
     }
 
     let connected_for = connected_at.elapsed();

@@ -4,7 +4,7 @@ export function safePaymentTargetUrl(value: string): string | null {
 
   try {
     const parsed = new URL(trimmed)
-    if (parsed.username || parsed.password || parsed.hash) return null
+    if (parsed.username || parsed.password) return null
     return parsed.protocol === 'https:' ? parsed.href : null
   } catch {
     return null

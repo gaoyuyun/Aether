@@ -362,9 +362,9 @@ async fn gateway_updates_admin_provider_strategy_billing_locally_with_trusted_ad
             sample_provider("provider-openai", "openai", 7).with_billing_fields(
                 Some("pay_as_you_go".to_string()),
                 None,
-                Some(12.5),
+                Some(0.0),
                 Some(9),
-                Some(1_711_000_000),
+                None,
                 None,
             ),
         ],

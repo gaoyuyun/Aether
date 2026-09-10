@@ -744,7 +744,7 @@ async function executeAction(actionOverride?: PoolBatchActionValue): Promise<voi
           const result = await batchActionPoolKeys(props.providerId, {
             key_ids: batch,
             action: selectedAction.value as 'enable' | 'disable' | 'clear_proxy' | 'set_proxy' | 'update_settings',
-            ...(payload ? { payload } : {}),
+            ...(payload ? { payload: { ...payload } } : {}),
           })
           successCount += result.affected
         } catch (err) {

@@ -610,7 +610,7 @@ impl OpenAiVideoTaskSeed {
             updated_at_unix_secs: self.completed_at_unix_secs.unwrap_or(now_unix_secs),
             error_code: self.error_code.clone(),
             error_message: None,
-            video_url: None,
+            video_url: self.video_url.clone(),
             request_metadata: None,
         };
         record.sanitize_for_persistence();
@@ -626,8 +626,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        LocalVideoTaskPersistence, LocalVideoTaskStatus, LocalVideoTaskTransport,
-        OpenAiVideoTaskSeed,
+        LocalVideoTaskContentAction, LocalVideoTaskPersistence, LocalVideoTaskSnapshot,
+        LocalVideoTaskStatus, LocalVideoTaskTransport, OpenAiVideoTaskSeed,
     };
 
     use super::map_openai_stored_task_to_read_response;
@@ -751,9 +751,33 @@ mod tests {
         assert!(record.original_request_body.is_none());
         assert!(record.progress_message.is_none());
         assert!(record.error_message.is_none());
-        assert!(record.video_url.is_none());
+        assert_eq!(record.video_url, seed.video_url);
+        assert_eq!(record.prompt, seed.prompt);
         assert!(record.request_metadata.is_none());
         assert_eq!(record.duration_seconds, Some(4));
         assert_eq!(record.size.as_deref(), Some("1280x720"));
+
+        let mut stored = record.into_stored();
+        stored.status = VideoTaskStatus::Completed;
+        let snapshot =
+            LocalVideoTaskSnapshot::from_stored_task_with_transport(&stored, seed.transport)
+                .expect("stored task should reconstruct with current transport");
+        let LocalVideoTaskSnapshot::OpenAi(restored) = snapshot else {
+            panic!("expected OpenAI snapshot");
+        };
+        assert_eq!(restored.prompt, stored.prompt);
+        assert_eq!(restored.to_upsert_record().video_url, stored.video_url);
+        let Some(LocalVideoTaskContentAction::StreamPlan(plan)) =
+            restored.build_content_stream_action(None, "trace-download")
+        else {
+            panic!("completed stored task should stream content");
+        };
+        assert_eq!(Some(plan.url.as_str()), stored.video_url.as_deref());
+        assert!(plan.headers.is_empty());
+        let response = map_openai_stored_task_to_read_response(stored.clone());
+        assert_eq!(
+            response.body_json["video_url"].as_str(),
+            stored.video_url.as_deref()
+        );
     }
 }

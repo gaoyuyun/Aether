@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
+use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::auth_modules::InMemoryAuthModuleReadRepository;
 use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
 use aether_data::repository::management_tokens::{
@@ -51,6 +51,155 @@ where
     if let Err(payload) = handle.join() {
         std::panic::resume_unwind(payload);
     }
+}
+
+async fn assert_admin_modules_status_with_smtp_password(
+    stored_password: &str,
+    notification_ready: bool,
+    server_chan_enabled: bool,
+) -> AppState {
+    let data = GatewayDataState::with_auth_module_reader_for_tests(Arc::new(
+        InMemoryAuthModuleReadRepository::seed(Vec::new(), None),
+    ))
+    .with_provider_catalog_reader(Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )))
+    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY)
+    .with_system_config_values_for_tests(vec![
+        ("module.management_tokens.enabled".to_string(), json!(true)),
+        (
+            "module.important_notification.enabled".to_string(),
+            json!(true),
+        ),
+        (
+            "module.important_notification.email_enabled".to_string(),
+            json!(true),
+        ),
+        (
+            "module.important_notification.email_recipients".to_string(),
+            json!("ops@example.com"),
+        ),
+        (
+            "module.server_chan_push.enabled".to_string(),
+            json!(server_chan_enabled),
+        ),
+        (
+            "module.server_chan_push.send_key".to_string(),
+            json!(if server_chan_enabled {
+                "SCT-test-send-key"
+            } else {
+                ""
+            }),
+        ),
+        ("smtp_host".to_string(), json!("smtp.example.com")),
+        ("smtp_port".to_string(), json!(587)),
+        ("smtp_user".to_string(), json!("ops@example.com")),
+        ("smtp_password".to_string(), json!(stored_password)),
+        ("smtp_use_tls".to_string(), json!(true)),
+        ("smtp_from_email".to_string(), json!("ops@example.com")),
+    ]);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data);
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state.clone())).await;
+    let client = reqwest::Client::new();
+
+    for path in [
+        "/api/admin/modules/status",
+        "/api/admin/modules/status/important_notification",
+    ] {
+        let response = client
+            .get(format!("{gateway_url}{path}"))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .send()
+            .await
+            .expect("module status request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.expect("module status should parse");
+        assert!(!payload.to_string().contains(stored_password));
+        let notification = if path == "/api/admin/modules/status" {
+            assert_eq!(
+                payload
+                    .as_object()
+                    .expect("module list should be an object")
+                    .len(),
+                18
+            );
+            assert_eq!(payload["management_tokens"]["active"], json!(true));
+            &payload["important_notification"]
+        } else {
+            &payload
+        };
+        assert_eq!(notification["enabled"], json!(true));
+        assert_eq!(notification["config_validated"], json!(notification_ready));
+        assert_eq!(notification["active"], json!(notification_ready));
+        assert_eq!(notification["config_error"].is_null(), notification_ready);
+    }
+    gateway_handle.abort();
+
+    assert_eq!(
+        crate::important_notification::important_notification_dispatch_ready_for_item(
+            &state,
+            crate::important_notification::PROVIDER_QUOTA_ALERT_ITEM_KEY,
+        )
+        .await
+        .expect("SMTP errors should not abort notification readiness"),
+        notification_ready
+    );
+    let summary = crate::maintenance::perform_provider_quota_alert_once(&state)
+        .await
+        .expect("SMTP errors should not abort the quota alert worker");
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.alerted, 0);
+    state
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_modules_status_with_legacy_smtp_password() {
+    let ciphertext =
+        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "legacy-smtp-password")
+            .expect("legacy SMTP password should encrypt");
+    let state = assert_admin_modules_status_with_smtp_password(&ciphertext, true, false).await;
+    let stored = state
+        .read_system_config_json_value_strong("smtp_password")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored
+        .as_str()
+        .unwrap()
+        .starts_with("aether-smtp-password-v3:"));
+    let smtp = crate::email_delivery::read_smtp_delivery_config(&state)
+        .await
+        .expect("migrated SMTP config should load")
+        .expect("SMTP should be configured");
+    assert_eq!(smtp.password.as_deref(), Some("legacy-smtp-password"));
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_modules_status_with_invalid_smtp_password() {
+    let ciphertext =
+        encrypt_python_fernet_plaintext("unavailable-historical-key", "legacy-smtp-password")
+            .expect("unknown-key SMTP password should encrypt");
+    let state = assert_admin_modules_status_with_smtp_password(&ciphertext, false, false).await;
+    assert_eq!(
+        state
+            .read_system_config_json_value_strong("smtp_password")
+            .await
+            .unwrap(),
+        Some(json!(ciphertext))
+    );
+}
+
+#[tokio::test]
+async fn gateway_handles_admin_modules_status_with_invalid_smtp_and_working_push() {
+    assert_admin_modules_status_with_smtp_password("aether-smtp-password-v3:invalid", true, true)
+        .await;
 }
 
 #[tokio::test]

@@ -1,9 +1,9 @@
 use aether_data_contracts::repository::{
     candidates::{
         sanitize_request_candidate_api_formats, sanitize_request_candidate_error_type,
-        sanitize_request_candidate_extra_data, sanitize_request_candidate_required_capabilities,
-        sanitize_request_candidate_skip_reason, DecisionTrace, DecisionTraceCandidate,
-        RequestCandidateStatus,
+        sanitize_request_candidate_extra_data_for_persistence,
+        sanitize_request_candidate_required_capabilities, sanitize_request_candidate_skip_reason,
+        DecisionTrace, DecisionTraceCandidate, RequestCandidateStatus,
     },
     provider_catalog::StoredProviderCatalogKey,
     usage::StoredRequestUsageAudit,
@@ -335,10 +335,13 @@ pub fn build_admin_monitoring_trace_request_candidate_payload_with_key_accounts(
     key_accounts: &BTreeMap<String, AdminMonitoringKeyAccountDisplay>,
 ) -> Value {
     let mut item = item.clone();
-    item.sanitize_sensitive_diagnostics();
+    item.sanitize_for_admin();
     let candidate = &item.candidate;
-    let sanitized_extra_data =
-        build_admin_monitoring_trace_candidate_extra_data(candidate.extra_data.as_ref(), usage);
+    let sanitized_extra_data = build_admin_monitoring_trace_candidate_extra_data(
+        candidate.extra_data.as_ref(),
+        candidate.status_code,
+        usage,
+    );
     let sanitized_extra_data_ref =
         (!sanitized_extra_data.is_null()).then_some(&sanitized_extra_data);
     let sanitized_key_api_formats =
@@ -383,7 +386,7 @@ pub fn build_admin_monitoring_trace_request_candidate_payload_with_key_accounts(
         "is_cached": candidate.is_cached,
         "status_code": candidate.status_code,
         "error_type": sanitize_request_candidate_error_type(candidate.error_type.clone()),
-        "error_message": serde_json::Value::Null,
+        "error_message": candidate.error_message,
         "latency_ms": candidate.latency_ms,
         "concurrent_requests": candidate.concurrent_requests,
         "ranking": build_admin_monitoring_trace_candidate_ranking(sanitized_extra_data_ref),
@@ -517,9 +520,10 @@ fn build_admin_monitoring_trace_candidate_ranking(existing: Option<&Value>) -> V
 
 fn build_admin_monitoring_trace_candidate_extra_data(
     existing: Option<&Value>,
+    candidate_status_code: Option<u16>,
     usage: Option<&StoredRequestUsageAudit>,
 ) -> Value {
-    let mut extra_data = sanitize_request_candidate_extra_data(existing.cloned())
+    let mut extra_data = sanitize_request_candidate_extra_data_for_persistence(existing.cloned())
         .and_then(|value| value.as_object().cloned());
 
     if let Some(usage) = usage {
@@ -547,7 +551,7 @@ fn build_admin_monitoring_trace_candidate_extra_data(
         if admin_monitoring_usage_is_error_node(usage) {
             if let Some(response) = admin_monitoring_trace_response_data(
                 "upstream_response",
-                usage.status_code,
+                candidate_status_code,
                 usage.response_body_state,
             ) {
                 merge_admin_monitoring_trace_response(extra_object, "upstream_response", response);
@@ -574,7 +578,8 @@ fn build_admin_monitoring_trace_candidate_extra_data(
         }
     }
 
-    sanitize_request_candidate_extra_data(extra_data.map(Value::Object)).unwrap_or(Value::Null)
+    sanitize_request_candidate_extra_data_for_persistence(extra_data.map(Value::Object))
+        .unwrap_or(Value::Null)
 }
 
 fn admin_monitoring_trace_response_data(
@@ -608,6 +613,9 @@ fn merge_admin_monitoring_trace_response(
     };
 
     for (field, value) in response_object {
+        if field == "status_code" && existing_object.get(field).is_some_and(Value::is_number) {
+            continue;
+        }
         if admin_monitoring_trace_response_value_empty(value)
             && existing_object
                 .get(field)

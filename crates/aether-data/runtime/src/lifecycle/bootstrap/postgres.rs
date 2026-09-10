@@ -8,14 +8,9 @@ use tracing::info;
 pub(crate) static EMPTY_DATABASE_SNAPSHOT_SQL: &str =
     include_str!(concat!(env!("OUT_DIR"), "/empty_database_snapshot.sql"));
 pub(crate) const EMPTY_DATABASE_SNAPSHOT_CUTOFF_VERSION: i64 = 20260821130000;
-// The upstream snapshot contains the schema through this frontier. Fork
-// migrations still need to run, including their data initialization steps.
-pub(crate) const FORK_POST_SNAPSHOT_MIGRATIONS: &[i64] = &[
-    20260815010000,
-    20260816000000,
-    20260817000000,
-    20260817020000,
-];
+// The snapshot already includes the fork's rolling quota columns and tables.
+// Only fork migrations not represented in the snapshot remain pending.
+pub(crate) const FORK_POST_SNAPSHOT_MIGRATIONS: &[i64] = &[20260815010000, 20260817020000];
 
 const PUBLIC_BASE_TABLE_COUNT_SQL: &str = r#"
 SELECT COUNT(*)::BIGINT

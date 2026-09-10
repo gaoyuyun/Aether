@@ -273,6 +273,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_state_reads_redacted_key_summaries_without_opening_credentials() {
+        for (api_key, auth_config) in [
+            (Some("summary"), None),
+            (None, Some("{}")),
+            (Some("summary"), Some("{}")),
+        ] {
+            let health = serde_json::json!({"openai:chat": {"health_score": 0.75}});
+            let key = sample_key(
+                "key-1",
+                "provider-1",
+                api_key.map(ToOwned::to_owned),
+                auth_config.map(ToOwned::to_owned),
+            )
+            .with_health_fields(Some(health.clone()), None);
+            let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                vec![sample_provider("provider-1")],
+                Vec::new(),
+                vec![key],
+            ));
+            let state = AppState::new()
+                .expect("test state should build")
+                .with_data_state_for_tests(
+                    GatewayDataState::with_provider_catalog_reader_for_tests(repository)
+                        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+                );
+            let provider_ids = ["provider-1".to_string()];
+
+            let summaries = state
+                .list_provider_catalog_key_summaries_by_provider_ids(&provider_ids)
+                .await
+                .expect("redacted summaries should not require credential authentication");
+
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].health_by_format.as_ref(), Some(&health));
+            assert_eq!(summaries[0].encrypted_api_key.as_deref(), api_key);
+            assert_eq!(summaries[0].encrypted_auth_config.as_deref(), auth_config);
+            assert!(state
+                .list_provider_catalog_keys_by_provider_ids(&provider_ids)
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn app_state_migrates_both_legacy_fields_with_one_exact_cas() {
         let legacy_api =
             encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "legacy-api-key")

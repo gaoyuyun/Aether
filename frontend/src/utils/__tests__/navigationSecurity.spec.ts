@@ -6,11 +6,28 @@ import {
   safeInternalNavigationPath,
 } from '../navigationSecurity'
 
+const unicodeSegments = ['👩\u200d💻', 'راهنمای\u200cکاربر', '\ue000']
+const controlCodePoints = [
+  ...Array.from({ length: 32 }, (_value, index) => index),
+  ...Array.from({ length: 33 }, (_value, index) => index + 0x7f),
+]
+
 describe('safeInternalNavigationPath', () => {
   it('keeps normalized same-origin paths, queries, and fragments', () => {
     expect(safeInternalNavigationPath('/dashboard/../dashboard/api-keys?tab=active#key-1')).toBe(
       '/dashboard/api-keys?tab=active#key-1',
     )
+  })
+
+  it.each(unicodeSegments)('keeps valid Unicode query values: %s', (segment) => {
+    expect(safeInternalNavigationPath(`/dashboard?search=${segment}`)).toBe(
+      `/dashboard?search=${encodeURIComponent(segment)}`,
+    )
+  })
+
+  it.each(controlCodePoints)('rejects control character code point %i', (codePoint) => {
+    expect(safeInternalNavigationPath(`/dashboard/before${String.fromCodePoint(codePoint)}after`))
+      .toBeNull()
   })
 
   it.each([
@@ -32,6 +49,17 @@ describe('safeExternalHttpsUrl', () => {
     )
   })
 
+  it.each(unicodeSegments)('allows valid Unicode URL paths: %s', (segment) => {
+    expect(safeExternalHttpsUrl(`https://provider.example/docs/${segment}`)).toBe(
+      `https://provider.example/docs/${encodeURIComponent(segment)}`,
+    )
+  })
+
+  it.each(controlCodePoints)('rejects control character code point %i', (codePoint) => {
+    expect(safeExternalHttpsUrl(`https://provider.example/before${String.fromCodePoint(codePoint)}after`))
+      .toBeNull()
+  })
+
   it.each([
     'javascript:alert(1)',
     'data:text/html,attack',
@@ -51,6 +79,17 @@ describe('safeExternalWebUrl', () => {
     [' http://127.0.0.1:8080/docs ', 'http://127.0.0.1:8080/docs'],
   ])('allows an absolute provider website: %s', (value, expected) => {
     expect(safeExternalWebUrl(value)).toBe(expected)
+  })
+
+  it.each(unicodeSegments)('allows valid Unicode provider websites: %s', (segment) => {
+    expect(safeExternalWebUrl(`https://provider.example/docs/${segment}`)).toBe(
+      `https://provider.example/docs/${encodeURIComponent(segment)}`,
+    )
+  })
+
+  it.each(controlCodePoints)('rejects control character code point %i', (codePoint) => {
+    expect(safeExternalWebUrl(`https://provider.example/before${String.fromCodePoint(codePoint)}after`))
+      .toBeNull()
   })
 
   it.each([

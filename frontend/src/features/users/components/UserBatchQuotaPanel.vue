@@ -24,7 +24,7 @@
         </div>
         <Select
           :model-value="modelValue"
-          @update:model-value="handleModelValueUpdate"
+          @update:model-value="($event === 'skip' || $event === 'wallet' || $event === 'unlimited') && $emit('update:modelValue', $event)"
         >
           <SelectTrigger class="h-9 w-full">
             <SelectValue />

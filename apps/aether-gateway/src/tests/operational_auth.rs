@@ -9,8 +9,8 @@ use hmac::Mac;
 use sha2::{Digest, Sha256};
 
 use super::{
-    build_router_with_state, send_request, start_server, AppState, Body, Request, StatusCode,
-    OPERATIONAL_ADMIN_DEVICE_ID,
+    build_router_with_operational_routes_for_tests, send_request, start_server, AppState, Body,
+    Request, StatusCode, OPERATIONAL_ADMIN_DEVICE_ID,
 };
 use crate::data::GatewayDataState;
 
@@ -192,7 +192,7 @@ async fn operational_session_requires_matching_device_id() {
     let access_token =
         super::control::issue_shared_test_admin_access_token(&state, OPERATIONAL_ADMIN_DEVICE_ID)
             .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -227,7 +227,7 @@ async fn operational_session_rejects_a_stale_user_security_version() {
         .with_security_version(1)
         .expect("admin security version should update");
     let state = state.with_auth_users_for_tests([user]);
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -255,7 +255,7 @@ async fn operational_session_rejects_a_replaced_user_identity() {
         .created_at
         .map(|created_at| created_at + chrono::Duration::days(1));
     let state = state.with_auth_users_for_tests([user]);
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -282,7 +282,7 @@ async fn operational_routes_reject_duplicate_authorization_headers() {
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let mut request = Request::builder()
         .uri("/_gateway/metrics")
         .body(Body::empty())
@@ -324,7 +324,7 @@ async fn monitoring_management_token_cannot_read_video_tasks() {
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -368,7 +368,7 @@ async fn monitoring_read_management_token_cannot_read_request_candidate_traces()
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -406,7 +406,7 @@ async fn monitoring_admin_management_token_may_reach_request_candidate_trace_han
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -439,7 +439,7 @@ async fn usage_management_token_cannot_read_audit_bundle_candidate_trace() {
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -469,7 +469,7 @@ async fn usage_and_api_key_management_token_cannot_read_audit_bundle_candidate_t
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -503,7 +503,7 @@ async fn three_permission_management_token_may_reach_audit_bundle_handler() {
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -538,7 +538,7 @@ async fn downgraded_audit_admin_management_token_cannot_read_full_admin_audit_ro
         "audit_admin",
     )
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -571,7 +571,7 @@ async fn audit_admin_session_cannot_read_candidate_audit_routes() {
     let access_token =
         issue_operational_session_access_token(&state, OPERATIONAL_ADMIN_DEVICE_ID, "audit_admin")
             .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -620,7 +620,7 @@ async fn malformed_management_token_ip_rules_fail_closed() {
     );
     stored.token.allowed_ips = Some(serde_json::json!(["!not-an-ip"]));
     let state = state_with_management_tokens(vec![(raw_token, stored)]).await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -644,7 +644,7 @@ async fn json_null_management_token_permissions_fail_closed() {
     );
     stored.token.permissions = Some(serde_json::Value::Null);
     let state = state_with_management_tokens(vec![(raw_token, stored)]).await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -670,7 +670,7 @@ async fn video_read_management_token_cannot_cancel_tasks() {
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -700,7 +700,7 @@ async fn video_admin_management_token_may_reach_cancel_handler() {
         ),
     )])
     .await;
-    let gateway = build_router_with_state(state);
+    let gateway = build_router_with_operational_routes_for_tests(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()

@@ -215,7 +215,7 @@ import {
 import { EmptyState, LoadingState, StripePaymentDialog } from '@/components/common'
 import { CardSection, PageContainer, PageHeader } from '@/components/layout'
 import { useToast } from '@/composables/useToast'
-import { useI18n } from '@/i18n'
+import { getI18nLocale, useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
 import {
   entitlementReplacementGroups,
@@ -521,6 +521,6 @@ function formatDuration(unit: BillingDurationUnit, value: number): string {
 
 function formatDate(value: string | null | undefined): string {
   if (!value) return '-'
-  return new Date(value).toLocaleDateString('zh-CN')
+  return new Date(value).toLocaleDateString(getI18nLocale())
 }
 </script>

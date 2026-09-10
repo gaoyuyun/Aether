@@ -76,7 +76,7 @@
                 class="flex-1 min-w-0 pt-1"
                 :class="{ 'pr-8': tool.module }"
               >
-                <h4 class="font-semibold text-base truncate">
+                <h4 class="break-words font-semibold text-base">
                   {{ tool.name }}
                 </h4>
               </div>
@@ -191,7 +191,7 @@
               />
             </div>
             <div class="flex-1 min-w-0 pt-1 pr-8">
-              <h4 class="font-semibold text-base truncate">
+              <h4 class="break-words font-semibold text-base">
                 {{ module.display_name }}
               </h4>
             </div>
@@ -218,7 +218,7 @@
           </div>
 
           <!-- 操作区域 -->
-          <div class="mt-5 pt-4 border-t border-border/50 flex items-center justify-between">
+          <div class="mt-5 pt-4 border-t border-border/50 flex flex-wrap items-center justify-between gap-3">
             <div class="flex items-center gap-3">
               <Switch
                 :model-value="module.enabled"
@@ -245,11 +245,11 @@
               v-if="module.admin_route"
               variant="outline"
               size="sm"
-              class="gap-1.5"
+              class="shrink-0 gap-1.5"
               @click="router.push(module.admin_route)"
             >
               <Settings class="w-3.5 h-3.5" />
-              配置
+              {{ t('common.configure') }}
             </Button>
           </div>
         </div>
@@ -281,6 +281,7 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
@@ -307,6 +308,7 @@ import { modulesApi, type ModuleStatus } from '@/api/modules'
 
 const router = useRouter()
 const { success, error } = useToast()
+const { t } = useI18n()
 const moduleStore = useModuleStore()
 
 const loading = ref(false)

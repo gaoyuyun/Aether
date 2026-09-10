@@ -37,9 +37,19 @@ pub(crate) async fn security_headers_middleware(request: Request, next: Next) ->
         "base-uri 'self'; frame-ancestors 'none'; object-src 'none'",
     );
     if sensitive_api {
+        let no_transform = headers
+            .get_all(http::header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|directive| directive.trim().eq_ignore_ascii_case("no-transform"));
         headers.insert(
             http::header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
+            HeaderValue::from_static(if no_transform {
+                "no-store, no-transform"
+            } else {
+                "no-store"
+            }),
         );
         headers.insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
     }

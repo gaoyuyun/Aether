@@ -68,7 +68,10 @@ INSERT INTO proxy_nodes (
   estimated_max_concurrency, tunnel_mode, tunnel_connected, tunnel_connected_at,
   failed_requests, dns_failures, stream_errors, proxy_metadata
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+WHERE ? OR NOT EXISTS (
+  SELECT 1 FROM proxy_nodes WHERE ip = ? AND port = ? AND is_manual = 0
+)
 ON CONFLICT(id) DO UPDATE SET
   name = excluded.name,
   ip = excluded.ip,
@@ -106,7 +109,7 @@ ON CONFLICT(id) DO UPDATE SET
                 .map(|(insert_sql, _)| insert_sql)
                 .expect("proxy node upsert SQL should contain its conflict clause")
         };
-        sqlx::query(sql)
+        let result = sqlx::query(sql)
             .bind(&node.id)
             .bind(&node.tunnel_generation)
             .bind(&node.name)
@@ -152,9 +155,15 @@ ON CONFLICT(id) DO UPDATE SET
                 &node.proxy_metadata,
                 "proxy_nodes.proxy_metadata",
             )?)
+            .bind(update_existing || node.is_manual)
+            .bind(&node.ip)
+            .bind(node.port)
             .execute(&self.pool)
             .await
             .map_sql_err()?;
+        if result.rows_affected() == 0 {
+            return Err(proxy_node_registration_changed_error());
+        }
         Ok(())
     }
 

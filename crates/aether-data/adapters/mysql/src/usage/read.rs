@@ -278,11 +278,57 @@ impl MysqlUsageStorage {
         }
     }
 
+    pub async fn find_by_request_id_shallow(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
+        let mut projection = USAGE_COLUMNS.to_string();
+        for field in [
+            "request_body",
+            "provider_request_body",
+            "response_body",
+            "client_response_body",
+        ] {
+            // Retain legacy body presence without transferring or decoding its payload.
+            projection = projection
+                .replace(
+                    &format!("CAST(`usage`.{field} AS CHAR) AS {field},"),
+                    &format!("NULL AS {field},"),
+                )
+                .replace(
+                    &format!("`usage`.{field}_compressed,"),
+                    &format!(
+                        "CASE WHEN `usage`.{field} IS NOT NULL OR `usage`.{field}_compressed IS NOT NULL THEN X'' ELSE NULL END AS {field}_compressed,"
+                    ),
+                );
+        }
+        let row = sqlx::query(&format!(
+            "{projection} WHERE `usage`.request_id = ? LIMIT 1"
+        ))
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+        row.as_ref()
+            .map(|row| map_usage_row(row, false))
+            .transpose()
+    }
+
     pub async fn resolve_body_ref(
         &self,
         body_ref: &str,
     ) -> Result<Option<serde_json::Value>, DataLayerError> {
         http_capture::resolve_body_ref(&self.pool, body_ref).await
+    }
+
+    pub async fn read_body_payload(
+        &self,
+        body_ref: &str,
+    ) -> Result<
+        Option<aether_data_contracts::repository::usage::StoredUsageBodyPayload>,
+        DataLayerError,
+    > {
+        http_capture::read_body_payload(&self.pool, body_ref).await
     }
 
     pub async fn list_usage_audits(

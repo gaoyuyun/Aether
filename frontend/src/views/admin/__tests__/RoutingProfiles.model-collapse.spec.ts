@@ -66,6 +66,7 @@ vi.mock('@/components/ui', async () => {
     Button: component('button'),
     Card: component('section'),
     Input: component('input'),
+    Switch: component('button'),
     Textarea: component('textarea'),
     Table: component('table'),
     TableBody: component('tbody'),

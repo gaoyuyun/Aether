@@ -5,29 +5,45 @@ import { renderToString } from '@vue/server-renderer'
 import type { ProviderMappingPreviewResponse, ProviderWithEndpointsSummary } from '@/api/endpoints'
 import ModelMappingTab from '../provider-tabs/ModelMappingTab.vue'
 
-const provider = {
+const provider: ProviderWithEndpointsSummary = {
   id: 'provider-demo',
   name: 'Demo Provider',
   provider_type: 'custom',
   is_active: true,
   active_keys: 0,
   api_formats: [],
-} as unknown as ProviderWithEndpointsSummary
+  provider_priority: 0,
+  keep_priority_on_conversion: false,
+  enable_format_conversion: true,
+  total_endpoints: 0,
+  active_endpoints: 0,
+  total_keys: 0,
+  total_models: 0,
+  active_models: 0,
+  global_model_ids: [],
+  avg_health_score: null,
+  unhealthy_endpoints: 0,
+  endpoint_health_details: [],
+  ops_configured: false,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+}
 
 describe('ModelMappingTab response contracts', () => {
   it('keeps the module visible when a legacy or malformed preview reaches the component', async () => {
-    const app = createSSRApp({
-      render: () => h(ModelMappingTab, {
+    const props: InstanceType<typeof ModelMappingTab>['$props'] = {
         provider,
         models: [],
         endpoints: [],
         providerKeys: [],
-        mappingPreview: {
+      loading: false,
+    }
+    Reflect.set(props, 'mappingPreview', {
           message: '演示模式：该接口暂未模拟',
           demo_mode: true,
-        } as unknown as ProviderMappingPreviewResponse,
-        loading: false,
-      }),
+    })
+    const app = createSSRApp({
+      render: () => h(ModelMappingTab, props),
     })
 
     const html = await renderToString(app)

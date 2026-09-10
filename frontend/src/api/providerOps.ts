@@ -8,7 +8,7 @@
  */
 
 import client from './client'
-import type { CredentialsSchema } from '@/features/providers/auth-templates/schema-utils'
+import type { CredentialsSchema } from './providerCredentials'
 
 // ==================== Types ====================
 

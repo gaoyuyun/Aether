@@ -1019,6 +1019,7 @@
 </template>
 
 <script setup lang="ts">
+import { getI18nLocale } from '@/i18n'
 import { computed, defineComponent, h, onMounted, onUnmounted, ref, watch, type Component } from 'vue'
 import { RouterLink } from 'vue-router'
 import type { ChartData, ChartOptions } from 'chart.js'
@@ -1300,7 +1301,7 @@ function formatShortDate(value?: string | null): string {
   if (!value) return '-'
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return '-'
-  return date.toLocaleString('zh-CN', {
+  return date.toLocaleString(getI18nLocale(), {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',

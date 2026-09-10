@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
@@ -41,13 +41,25 @@ impl AsRef<[u8]> for BudgetedFramePayload {
 enum StreamDispatchStatus {
     Delivered,
     Closed,
-    TimedOut,
+    Congested,
 }
 
 #[derive(Clone)]
 struct StreamDispatchTarget {
     body_tx: mpsc::Sender<Frame>,
     response_window: Arc<StreamSendWindow>,
+    handler: Option<AbortHandle>,
+}
+
+struct StreamCompletion {
+    stream_id: u32,
+    finished_tx: mpsc::UnboundedSender<u32>,
+}
+
+impl Drop for StreamCompletion {
+    fn drop(&mut self) {
+        let _ = self.finished_tx.send(self.stream_id);
+    }
 }
 
 /// A request stream is identified by a non-zero id and may only be opened
@@ -109,7 +121,7 @@ where
     // reopen the same id and bypass the stream admission limit.
     let mut active_handler_ids: HashSet<u32> = HashSet::new();
     // Track spawned stream handlers so we can wait for them on shutdown
-    let mut handler_handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut handler_handles = JoinSet::new();
     let (handler_finished_tx, mut handler_finished_rx) = mpsc::unbounded_channel::<u32>();
     let max_streams = state.config.tunnel_max_streams.unwrap_or(128) as usize;
     let mut frames_since_cleanup: u32 = 0;
@@ -121,30 +133,48 @@ where
     // Track last time we received any data to detect stale connections
     let mut last_data_at = tokio::time::Instant::now();
     let mut draining = *drain.borrow();
+    let mut drain_open = true;
+    let mut drain_deadline = draining.then(|| {
+        tokio::time::Instant::now() + Duration::from_millis(state.config.tunnel_drain_deadline_ms)
+    });
+    let mut initial_window_bytes = state.config.tunnel_stream_initial_window_bytes;
+    let mut close_rx = frame_tx.subscribe_close();
 
     let read_err = loop {
+        if *close_rx.borrow() {
+            break None;
+        }
         if draining && streams.is_empty() && active_handler_ids.is_empty() {
             info!("tunnel drained after in-flight streams completed");
             break None;
         }
 
         let msg_result = tokio::select! {
+            _ = close_rx.changed() => break None,
             msg = ws_stream.next() => {
                 match msg {
                     Some(r) => r,
                     None => break None,
                 }
             }
-            changed = drain.changed() => {
+            changed = drain.changed(), if drain_open => {
                 if changed.is_err() {
+                    drain_open = false;
                     continue;
                 }
                 if *drain.borrow() {
                     info!("tunnel drain requested, waiting for in-flight streams");
                     draining = true;
+                    drain_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_millis(state.config.tunnel_drain_deadline_ms));
                 }
                 continue;
             }
+            _ = async {
+                match drain_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => break None,
             finished = handler_finished_rx.recv() => {
                 if let Some(stream_id) = finished {
                     active_handler_ids.remove(&stream_id);
@@ -238,20 +268,7 @@ where
                     continue;
                 }
                 if draining {
-                    if frame_tx
-                        .try_send(Frame::new(
-                            frame.stream_id,
-                            MsgType::StreamError,
-                            0,
-                            Bytes::from("tunnel draining"),
-                        ))
-                        .is_err()
-                    {
-                        warn!(
-                            stream_id = frame.stream_id,
-                            "writer channel full, StreamError dropped during drain"
-                        );
-                    }
+                    try_send_stream_error(&frame_tx, frame.stream_id, "tunnel draining");
                     continue;
                 }
 
@@ -263,6 +280,11 @@ where
                     Ok(p) => p,
                     Err(e) => {
                         warn!(stream_id = frame.stream_id, error = %e, "frame decompress failed");
+                        try_send_stream_error(
+                            &frame_tx,
+                            frame.stream_id,
+                            "invalid request metadata",
+                        );
                         continue;
                     }
                 };
@@ -270,21 +292,11 @@ where
                     Ok(m) => m,
                     Err(e) => {
                         warn!(stream_id = frame.stream_id, error = %e, "invalid request metadata");
-                        // Use try_send to avoid blocking the read loop
-                        if frame_tx
-                            .try_send(Frame::new(
-                                frame.stream_id,
-                                MsgType::StreamError,
-                                0,
-                                Bytes::from(format!("invalid request metadata: {e}")),
-                            ))
-                            .is_err()
-                        {
-                            warn!(
-                                stream_id = frame.stream_id,
-                                "writer channel full, StreamError dropped"
-                            );
-                        }
+                        try_send_stream_error(
+                            &frame_tx,
+                            frame.stream_id,
+                            "invalid request metadata",
+                        );
                         continue;
                     }
                 };
@@ -294,33 +306,27 @@ where
                         stream_id = frame.stream_id,
                         "max concurrent streams reached"
                     );
-                    if frame_tx
-                        .try_send(Frame::new(
-                            frame.stream_id,
-                            MsgType::StreamError,
-                            0,
-                            Bytes::from("max concurrent streams reached"),
-                        ))
-                        .is_err()
-                    {
-                        warn!(
-                            stream_id = frame.stream_id,
-                            "writer channel full, StreamError dropped"
-                        );
-                    }
+                    try_send_stream_error(
+                        &frame_tx,
+                        frame.stream_id,
+                        "max concurrent streams reached",
+                    );
                     continue;
                 }
 
                 // Create body channel and spawn handler
-                let (body_tx, body_rx) = mpsc::channel::<Frame>(64);
-                let response_window = Arc::new(StreamSendWindow::new(
-                    state.config.tunnel_stream_initial_window_bytes,
-                ));
+                let body_capacity = (initial_window_bytes as usize)
+                    .div_ceil(32 * 1024)
+                    .saturating_add(1)
+                    .max(64);
+                let (body_tx, body_rx) = mpsc::channel::<Frame>(body_capacity);
+                let response_window = Arc::new(StreamSendWindow::new(initial_window_bytes));
                 streams.insert(
                     frame.stream_id,
                     StreamDispatchTarget {
                         body_tx,
                         response_window: Arc::clone(&response_window),
+                        handler: None,
                     },
                 );
                 active_handler_ids.insert(frame.stream_id);
@@ -329,9 +335,13 @@ where
                 let state_clone = Arc::clone(&state);
                 let server_clone = Arc::clone(&server);
                 let tx_clone = frame_tx.clone();
-                let finished_tx = handler_finished_tx.clone();
                 let sid = frame.stream_id;
-                let handle = tokio::spawn(async move {
+                let completion = StreamCompletion {
+                    stream_id: sid,
+                    finished_tx: handler_finished_tx.clone(),
+                };
+                let handle = handler_handles.spawn(async move {
+                    let _completion = completion;
                     stream_handler::handle_stream(
                         state_clone,
                         server_clone,
@@ -342,9 +352,8 @@ where
                         response_window,
                     )
                     .await;
-                    let _ = finished_tx.send(sid);
                 });
-                handler_handles.push(handle);
+                streams.get_mut(&sid).expect("new stream exists").handler = Some(handle);
 
                 if request_headers_end_stream {
                     if let Some(target) = streams.get(&sid) {
@@ -365,19 +374,21 @@ where
                     let is_end = frame.is_end_stream();
                     let sid = frame.stream_id;
                     let dispatch = dispatch_stream_frame(&target.body_tx, frame).await;
-                    if dispatch != StreamDispatchStatus::Delivered {
-                        streams.remove(&sid);
-                        if dispatch == StreamDispatchStatus::TimedOut {
-                            server.tunnel_metrics.record_error(
-                                "stream_dispatch_timeout",
-                                &format!("request body dispatch timed out for stream {}", sid),
-                            );
-                            try_send_stream_error(
-                                &frame_tx,
-                                sid,
-                                "tunnel request body dispatch stalled",
-                            );
+                    if dispatch == StreamDispatchStatus::Congested {
+                        if let Some(target) = streams.remove(&sid) {
+                            if let Some(handler) = target.handler {
+                                handler.abort();
+                            }
                         }
+                        server.tunnel_metrics.record_error(
+                            "stream_dispatch_timeout",
+                            &format!("request body dispatch congested for stream {}", sid),
+                        );
+                        try_send_stream_error(
+                            &frame_tx,
+                            sid,
+                            "tunnel request body dispatch stalled",
+                        );
                         if is_end && draining && streams.is_empty() && active_handler_ids.is_empty()
                         {
                             info!("tunnel drained after request body completion");
@@ -387,10 +398,29 @@ where
                 }
             }
 
-            MsgType::StreamEnd | MsgType::StreamError | MsgType::ResetStream => {
+            MsgType::StreamEnd => {
+                if let Some(target) = streams.get(&frame.stream_id) {
+                    if dispatch_stream_frame(&target.body_tx, frame.clone()).await
+                        == StreamDispatchStatus::Congested
+                    {
+                        if let Some(handler) = &target.handler {
+                            handler.abort();
+                        }
+                        try_send_stream_error(
+                            &frame_tx,
+                            frame.stream_id,
+                            "tunnel request body dispatch stalled",
+                        );
+                    }
+                }
+            }
+
+            MsgType::StreamError | MsgType::ResetStream => {
                 // Client-side cancellation or end
                 if let Some(target) = streams.remove(&frame.stream_id) {
-                    let _ = dispatch_stream_frame(&target.body_tx, frame).await;
+                    if let Some(handler) = target.handler {
+                        handler.abort();
+                    }
                     if draining && streams.is_empty() && active_handler_ids.is_empty() {
                         info!("tunnel drained after stream termination");
                         break None;
@@ -409,12 +439,22 @@ where
             }
 
             MsgType::HeartbeatAck => {
-                heartbeat.on_ack(frame.payload).await;
+                heartbeat.on_ack(frame.payload);
             }
 
             MsgType::GoAway => {
                 info!("received GOAWAY");
-                break None;
+                draining = true;
+                let deadline_ms =
+                    serde_json::from_slice::<aether_contracts::tunnel::GoAwayPayload>(
+                        &frame.payload,
+                    )
+                    .map(|payload| payload.drain_deadline_ms)
+                    .unwrap_or(state.config.tunnel_drain_deadline_ms)
+                    .min(state.config.tunnel_drain_deadline_ms);
+                drain_deadline.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + Duration::from_millis(deadline_ms)
+                });
             }
 
             MsgType::WindowUpdate => {
@@ -433,7 +473,31 @@ where
                 );
             }
 
-            MsgType::Hello | MsgType::Settings | MsgType::LoadReport => {
+            MsgType::Settings => {
+                if frame.stream_id != 0 || frame.flags != 0 {
+                    break None;
+                }
+                let settings = serde_json::from_slice::<aether_contracts::tunnel::SettingsPayload>(
+                    &frame.payload,
+                )
+                .ok()
+                .filter(|settings| settings.is_valid());
+                let Some(settings) = settings else {
+                    warn!("invalid tunnel SETTINGS");
+                    break None;
+                };
+                if !streams.is_empty()
+                    && settings.initial_stream_window_bytes != initial_window_bytes
+                {
+                    warn!("tunnel SETTINGS changed with active streams");
+                    break None;
+                }
+                initial_window_bytes = settings
+                    .initial_stream_window_bytes
+                    .min(state.config.tunnel_stream_initial_window_bytes);
+            }
+
+            MsgType::Hello | MsgType::LoadReport => {
                 debug!(
                     msg_type = ?frame.msg_type,
                     stream_id = frame.stream_id,
@@ -455,7 +519,7 @@ where
         // Trigger every 64 frames OR when the count exceeds max_streams.
         frames_since_cleanup += 1;
         if frames_since_cleanup >= 64 || handler_handles.len() > max_streams {
-            handler_handles.retain(|h| !h.is_finished());
+            while handler_handles.try_join_next().is_some() {}
             frames_since_cleanup = 0;
             if draining && streams.is_empty() && active_handler_ids.is_empty() {
                 info!("tunnel drained after cleanup");
@@ -467,9 +531,7 @@ where
     // Drop body senders so stream handlers waiting on body_rx will unblock
     streams.clear();
 
-    // Wait for active stream handlers to finish so their frame_tx clones
-    // are dropped before the writer closes the sink.
-    drain_handlers(handler_handles).await;
+    handler_handles.shutdown().await;
 
     match read_err {
         Some(e) => Err(e.into()),
@@ -478,30 +540,13 @@ where
 }
 
 async fn dispatch_stream_frame(tx: &mpsc::Sender<Frame>, frame: Frame) -> StreamDispatchStatus {
-    let stream_id = frame.stream_id;
-    let dispatched = tokio::time::timeout(stream_frame_dispatch_timeout(), async {
-        let frame = attach_request_body_queue_budget(frame).await?;
-        tx.send(frame).await.ok()?;
-        Some(())
-    })
-    .await;
-    match dispatched {
-        Ok(Some(())) => StreamDispatchStatus::Delivered,
-        Ok(None) => {
-            warn!(
-                stream_id,
-                "stream handler channel or request body budget closed while dispatching tunnel frame"
-            );
-            StreamDispatchStatus::Closed
-        }
-        Err(_) => {
-            warn!(
-                stream_id,
-                timeout_ms = stream_frame_dispatch_timeout().as_millis(),
-                "stream handler channel blocked while dispatching tunnel frame"
-            );
-            StreamDispatchStatus::TimedOut
-        }
+    let Some(frame) = attach_request_body_queue_budget(frame).await else {
+        return StreamDispatchStatus::Congested;
+    };
+    match tx.try_send(frame) {
+        Ok(()) => StreamDispatchStatus::Delivered,
+        Err(mpsc::error::TrySendError::Closed(_)) => StreamDispatchStatus::Closed,
+        Err(mpsc::error::TrySendError::Full(_)) => StreamDispatchStatus::Congested,
     }
 }
 
@@ -523,7 +568,7 @@ async fn attach_request_body_queue_budget_with(
         return Some(frame);
     }
     let permits = request_body_queue_permits(&frame, budget_bytes)?;
-    let permit = budget.acquire_many_owned(permits).await.ok()?;
+    let permit = budget.try_acquire_many_owned(permits).ok()?;
     frame.payload = Bytes::from_owner(BudgetedFramePayload {
         bytes: frame.payload,
         _permit: permit,
@@ -549,20 +594,6 @@ fn request_body_queue_permits(frame: &Frame, budget_bytes: usize) -> Option<u32>
     u32::try_from(retained_bytes).ok()
 }
 
-/// Bound how long a single stream handler is allowed to block the shared
-/// WebSocket read loop while receiving request-body frames.
-fn stream_frame_dispatch_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        Duration::from_millis(25)
-    }
-
-    #[cfg(not(test))]
-    {
-        Duration::from_millis(500)
-    }
-}
-
 fn try_send_stream_error(frame_tx: &FrameSender, stream_id: u32, message: &'static str) {
     if frame_tx
         .try_send(Frame::new(
@@ -573,6 +604,7 @@ fn try_send_stream_error(frame_tx: &FrameSender, stream_id: u32, message: &'stat
         ))
         .is_err()
     {
+        frame_tx.close();
         warn!(
             stream_id,
             "writer channel full, StreamError dropped while aborting stalled stream"
@@ -585,21 +617,6 @@ fn prune_closed_stream_senders(streams: &mut HashMap<u32, StreamDispatchTarget>)
     let before = streams.len();
     streams.retain(|_, target| !target.body_tx.is_closed());
     before.saturating_sub(streams.len())
-}
-
-/// Wait for all active stream handlers to finish (with a timeout).
-async fn drain_handlers(handles: Vec<JoinHandle<()>>) {
-    if handles.is_empty() {
-        return;
-    }
-    let count = handles.len();
-    debug!(count, "waiting for active stream handlers to finish");
-    let _ = tokio::time::timeout(Duration::from_secs(30), async {
-        for h in handles {
-            let _ = h.await;
-        }
-    })
-    .await;
 }
 
 #[cfg(test)]
@@ -633,7 +650,7 @@ mod tests {
 
         assert_eq!(
             stalled_send.await.expect("dispatch task should join"),
-            StreamDispatchStatus::TimedOut
+            StreamDispatchStatus::Congested
         );
 
         let retained = rx
@@ -737,6 +754,7 @@ mod tests {
                 StreamDispatchTarget {
                     body_tx: closed_tx,
                     response_window: Arc::new(StreamSendWindow::new(1024)),
+                    handler: None,
                 },
             ),
             (
@@ -744,6 +762,7 @@ mod tests {
                 StreamDispatchTarget {
                     body_tx: open_tx,
                     response_window: Arc::new(StreamSendWindow::new(1024)),
+                    handler: None,
                 },
             ),
         ]);
@@ -763,6 +782,7 @@ mod tests {
             StreamDispatchTarget {
                 body_tx: tx,
                 response_window: Arc::new(StreamSendWindow::new(1024)),
+                handler: None,
             },
         )]);
         let mut active_handler_ids = HashSet::from([7]);

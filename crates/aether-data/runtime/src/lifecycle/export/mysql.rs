@@ -64,13 +64,29 @@ pub async fn import_mysql_jsonl(
     pool: &crate::driver::mysql::MysqlPool,
     input: &str,
 ) -> Result<usize, DataLayerError> {
+    import_mysql_jsonl_with_options(pool, input, DataImportOptions::default()).await
+}
+
+pub(super) async fn import_mysql_jsonl_with_options(
+    pool: &crate::driver::mysql::MysqlPool,
+    input: &str,
+    options: DataImportOptions,
+) -> Result<usize, DataLayerError> {
     let plan = build_import_plan(input)?;
-    import_mysql_plan(pool, &plan).await
+    import_mysql_plan_with_options(pool, &plan, options).await
 }
 
 pub async fn import_mysql_plan(
     pool: &crate::driver::mysql::MysqlPool,
     plan: &DataImportPlan,
+) -> Result<usize, DataLayerError> {
+    import_mysql_plan_with_options(pool, plan, DataImportOptions::default()).await
+}
+
+async fn import_mysql_plan_with_options(
+    pool: &crate::driver::mysql::MysqlPool,
+    plan: &DataImportPlan,
+    options: DataImportOptions,
 ) -> Result<usize, DataLayerError> {
     let identity_scope = IdentityImportScope::from_plan(plan)?;
     let mut tx = pool.begin().await.map_sql_err()?;
@@ -80,21 +96,21 @@ pub async fn import_mysql_plan(
     for domain in &plan.manifest.domains {
         if *domain == ExportDomain::Auxiliary {
             for row in plan.rows(*domain) {
-                import_mysql_auxiliary_row(&mut tx, row, &mut column_cache).await?;
+                import_mysql_auxiliary_row(&mut tx, row, &mut column_cache, options).await?;
                 imported = imported.saturating_add(1);
             }
             continue;
         }
         if *domain == ExportDomain::Billing {
             for row in plan.rows(*domain) {
-                import_mysql_billing_row(&mut tx, row, &mut column_cache).await?;
+                import_mysql_billing_row(&mut tx, row, &mut column_cache, options).await?;
                 imported = imported.saturating_add(1);
             }
             continue;
         }
         if *domain == ExportDomain::Wallets {
             for row in plan.rows(*domain) {
-                import_mysql_wallet_row(&mut tx, row, &mut column_cache).await?;
+                import_mysql_wallet_row(&mut tx, row, &mut column_cache, options).await?;
                 imported = imported.saturating_add(1);
             }
             continue;
@@ -103,7 +119,7 @@ pub async fn import_mysql_plan(
         let target_columns =
             mysql_import_columns_cached(&mut tx, &mut column_cache, table_name).await?;
         for row in plan.rows(*domain) {
-            import_mysql_row(&mut tx, table_name, *domain, row, &target_columns).await?;
+            import_mysql_row(&mut tx, table_name, *domain, row, &target_columns, options).await?;
             imported = imported.saturating_add(1);
         }
     }
@@ -463,12 +479,16 @@ async fn import_mysql_row(
     domain: ExportDomain,
     row: &ExportRow,
     target_columns: &MysqlImportColumns,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let mut object =
         filter_import_payload("mysql", table_name, domain, row, &target_columns.names)?;
-    deactivate_imported_credentials(table_name, &mut object, |column_name| {
-        target_columns.names.contains(column_name)
-    });
+    apply_import_credential_policy(
+        table_name,
+        &mut object,
+        |column_name| target_columns.names.contains(column_name),
+        options,
+    );
 
     let columns = object.keys().map(String::as_str).collect::<Vec<_>>();
     for primary_key in &target_columns.primary_key {
@@ -565,6 +585,7 @@ async fn import_mysql_billing_row(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     row: &ExportRow,
     column_cache: &mut BTreeMap<String, MysqlImportColumns>,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let (table_name, payload) = billing_payload_table(row)?;
     let table_name = mysql_billing_table_name(&table_name)?;
@@ -578,6 +599,7 @@ async fn import_mysql_billing_row(
             payload,
         },
         &target_columns,
+        options,
     )
     .await
 }
@@ -586,6 +608,7 @@ async fn import_mysql_auxiliary_row(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     row: &ExportRow,
     column_cache: &mut BTreeMap<String, MysqlImportColumns>,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let (table_name, payload) = domain_payload_table(row, "auxiliary", None)?;
     let table = auxiliary_table(&table_name)?;
@@ -599,6 +622,7 @@ async fn import_mysql_auxiliary_row(
             payload,
         },
         &target_columns,
+        options,
     )
     .await
 }
@@ -618,6 +642,7 @@ async fn import_mysql_wallet_row(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     row: &ExportRow,
     column_cache: &mut BTreeMap<String, MysqlImportColumns>,
+    options: DataImportOptions,
 ) -> Result<(), DataLayerError> {
     let (table_name, payload) = domain_payload_table(row, "wallet", Some("wallets"))?;
     let table_name = mysql_wallet_table_name(&table_name)?;
@@ -631,6 +656,7 @@ async fn import_mysql_wallet_row(
             payload,
         },
         &target_columns,
+        options,
     )
     .await
 }
@@ -872,10 +898,18 @@ fn mysql_value_to_json(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<Valu
                 .map_sql_err()?
                 .to_string(),
         )),
+        // Keep JSON encoded as text, like the portable TEXT columns. This also
+        // distinguishes JSON null and string scalars from SQL NULL on import.
+        "JSON" => Ok(Value::String(
+            row.try_get::<sqlx::types::Json<Value>, _>(index)
+                .map_sql_err()?
+                .0
+                .to_string(),
+        )),
         "VARCHAR" | "VAR_STRING" | "STRING" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
-        | "JSON" | "ENUM" | "SET" | "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" => Ok(
-            Value::String(row.try_get::<String, _>(index).map_sql_err()?),
-        ),
+        | "ENUM" | "SET" | "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" => Ok(Value::String(
+            row.try_get::<String, _>(index).map_sql_err()?,
+        )),
         "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BIT" | "GEOMETRY" => {
             let bytes = row.try_get::<Vec<u8>, _>(index).map_sql_err()?;
             Ok(Value::Array(bytes.into_iter().map(Value::from).collect()))
@@ -888,8 +922,82 @@ fn mysql_value_to_json(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<Valu
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_mysql_decimal_value;
-    use serde_json::json;
+    use super::{bind_mysql_import_value, mysql_row_payload, normalize_mysql_decimal_value};
+    use serde_json::{json, Value};
+    use sqlx::Row;
+
+    #[tokio::test]
+    async fn mysql_native_json_export_round_trips_scalars_and_sql_null() {
+        let Ok(database_url) = std::env::var("AETHER_TEST_MYSQL_URL") else {
+            eprintln!("skipping native JSON round trip: AETHER_TEST_MYSQL_URL is unset");
+            return;
+        };
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TEMPORARY TABLE export_json_fixture (id INT PRIMARY KEY, payload JSON)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (index, expected) in [
+            Some(json!({"nested": [1, true, null]})),
+            Some(json!(["provider-a", "provider-b"])),
+            Some(json!("plain string")),
+            Some(json!("null")),
+            Some(Value::Null),
+            Some(json!(false)),
+            Some(json!(42)),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = i32::try_from(index).unwrap();
+            sqlx::query("INSERT INTO export_json_fixture VALUES (?, ?)")
+                .bind(id)
+                .bind(expected.as_ref().map(sqlx::types::Json))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let row = sqlx::query("SELECT * FROM export_json_fixture WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let exported = mysql_row_payload(&row).unwrap();
+            assert_eq!(
+                exported["payload"],
+                expected
+                    .as_ref()
+                    .map_or(Value::Null, |v| Value::String(v.to_string()))
+            );
+            let query = sqlx::query("UPDATE export_json_fixture SET payload = ? WHERE id = ?");
+            bind_mysql_import_value(
+                query,
+                &exported["payload"],
+                "export_json_fixture",
+                "payload",
+                "json",
+            )
+            .unwrap()
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let imported = sqlx::query("SELECT payload FROM export_json_fixture WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get::<Option<sqlx::types::Json<Value>>, _>("payload")
+                .map(|v| v.0);
+            assert_eq!(imported, expected);
+        }
+    }
 
     #[test]
     fn decimal_import_binds_numbers_and_strings_as_decimal_text() {

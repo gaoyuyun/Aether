@@ -77,11 +77,28 @@ impl UsageReadRepository for MysqlUsageReadRepository {
         self.storage.find_by_request_id(request_id).await
     }
 
+    async fn find_by_request_id_shallow(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
+        self.storage.find_by_request_id_shallow(request_id).await
+    }
+
     async fn resolve_body_ref(
         &self,
         body_ref: &str,
     ) -> Result<Option<serde_json::Value>, DataLayerError> {
         self.storage.resolve_body_ref(body_ref).await
+    }
+
+    async fn read_body_payload(
+        &self,
+        body_ref: &str,
+    ) -> Result<
+        Option<aether_data_contracts::repository::usage::StoredUsageBodyPayload>,
+        DataLayerError,
+    > {
+        self.storage.read_body_payload(body_ref).await
     }
 
     async fn list_usage_audits(

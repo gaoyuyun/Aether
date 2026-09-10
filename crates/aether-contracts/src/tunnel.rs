@@ -588,6 +588,68 @@ pub struct SettingsPayload {
     pub drain_deadline_ms: u64,
 }
 
+impl SettingsPayload {
+    pub fn is_valid(&self) -> bool {
+        self.initial_stream_window_bytes > 0
+            && u64::from(self.initial_stream_window_bytes)
+                <= MAX_TUNNEL_DECOMPRESSED_PAYLOAD_BYTES as u64
+            && self.min_window_update_bytes > 0
+            && self.min_window_update_bytes <= self.initial_stream_window_bytes
+            && self.drain_deadline_ms > 0
+    }
+
+    pub fn negotiate(&self, initial_window_bytes: u32, drain_deadline_ms: u64) -> Self {
+        let window = self
+            .initial_stream_window_bytes
+            .min(initial_window_bytes)
+            .max(1);
+        Self {
+            initial_stream_window_bytes: window,
+            min_window_update_bytes: self.min_window_update_bytes.min((window / 4).max(1)),
+            drain_deadline_ms: self.drain_deadline_ms.min(drain_deadline_ms),
+        }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn negotiation_bounds_window_updates_by_the_smaller_window() {
+        let settings = SettingsPayload {
+            initial_stream_window_bytes: 512 * 1024,
+            min_window_update_bytes: 128 * 1024,
+            drain_deadline_ms: 30_000,
+        };
+        let negotiated = settings.negotiate(4 * 1024 * 1024, 1000);
+        assert_eq!(negotiated.initial_stream_window_bytes, 512 * 1024);
+        assert_eq!(negotiated.min_window_update_bytes, 128 * 1024);
+        assert_eq!(negotiated.drain_deadline_ms, 1000);
+        assert!(negotiated.is_valid());
+        let tiny = settings.negotiate(1, 1);
+        assert_eq!(tiny.initial_stream_window_bytes, 1);
+        assert_eq!(tiny.min_window_update_bytes, 1);
+        assert!(tiny.is_valid());
+    }
+
+    #[test]
+    fn invalid_window_settings_are_rejected() {
+        let mut settings = SettingsPayload {
+            initial_stream_window_bytes: 1024,
+            min_window_update_bytes: 256,
+            drain_deadline_ms: 1,
+        };
+        settings.min_window_update_bytes = 1025;
+        assert!(!settings.is_valid());
+        settings.min_window_update_bytes = 0;
+        assert!(!settings.is_valid());
+        settings.initial_stream_window_bytes = u32::MAX;
+        settings.min_window_update_bytes = 1;
+        assert!(!settings.is_valid());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowUpdatePayload {
     pub delta_bytes: u32,

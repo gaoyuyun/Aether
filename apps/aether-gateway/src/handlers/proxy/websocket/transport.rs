@@ -157,16 +157,22 @@ pub(crate) fn websocket_upstream_url(
         return Err(invalid_code);
     }
     let websocket_scheme = match url.scheme() {
-        "https" => "wss",
-        "http" => "ws",
-        "wss" => return Ok(url),
-        "ws" if aether_http::url_has_literal_loopback_host(&url) => return Ok(url),
-        "ws" => return Err(invalid_code),
+        "https" | "wss" => "wss",
+        "http" | "ws" => "ws",
         _ => return Err(invalid_code),
     };
     url.set_scheme(websocket_scheme).map_err(|_| invalid_code)?;
-    if url.scheme() == "ws" && !aether_http::url_has_literal_loopback_host(&url) {
-        return Err(invalid_code);
+    if url.scheme() == "ws" {
+        let literal_ip = match url.host() {
+            Some(url::Host::Ipv4(address)) => Some(std::net::IpAddr::V4(address)),
+            Some(url::Host::Ipv6(address)) => Some(std::net::IpAddr::V6(address)),
+            _ => None,
+        };
+        if literal_ip.is_some_and(|address| {
+            aether_http::is_private_or_reserved_ip(address) && !address.is_loopback()
+        }) {
+            return Err(invalid_code);
+        }
     }
     Ok(url)
 }
@@ -844,15 +850,17 @@ mod tests {
 
     #[test]
     fn maps_http_url_to_websocket_url_without_losing_path_or_query() {
-        let url = websocket_upstream_url(
-            "https://example.test/backend-api/codex/responses?x=1",
-            "invalid",
-        )
-        .expect("URL should be converted");
-        assert_eq!(
-            url.as_str(),
-            "wss://example.test/backend-api/codex/responses?x=1"
-        );
+        for (http_scheme, websocket_scheme) in [("https", "wss"), ("http", "ws")] {
+            let url = websocket_upstream_url(
+                &format!("{http_scheme}://example.test:8080/backend-api/codex/responses?x=1"),
+                "invalid",
+            )
+            .expect("URL should be converted");
+            assert_eq!(
+                url.as_str(),
+                format!("{websocket_scheme}://example.test:8080/backend-api/codex/responses?x=1")
+            );
+        }
     }
 
     #[test]
@@ -861,10 +869,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_websocket_requires_wss_but_loopback_ws_is_allowed() {
+    fn websocket_upstream_url_accepts_ws_and_wss_with_safe_targets() {
         for allowed in [
             "wss://example.test/v1/responses",
             "https://example.test/v1/responses",
+            "ws://example.test:8080/v1/responses",
+            "http://example.test:8080/v1/responses",
+            "http://8.8.8.8:8080/v1/responses",
+            "ws://[2606:4700:4700::1111]:8080/v1/responses",
             "ws://localhost:8080/v1/responses",
             "http://127.42.0.1:8080/v1/responses",
             "ws://[::1]:8080/v1/responses",
@@ -875,11 +887,14 @@ mod tests {
             );
         }
         for rejected in [
-            "ws://example.test/v1/responses",
             "http://10.0.0.1/v1/responses",
             "ws://0.0.0.0:8080/v1/responses",
             "ws://[::ffff:127.0.0.1]:8080/v1/responses",
             "wss://example.test/v1/responses#secret",
+            "ws://example.test/v1/responses#secret",
+            "http://token@example.test/v1/responses",
+            "ws://token@example.test/v1/responses",
+            "ftp://example.test/v1/responses",
         ] {
             assert!(
                 websocket_upstream_url(rejected, "invalid").is_err(),

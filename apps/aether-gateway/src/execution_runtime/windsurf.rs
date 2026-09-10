@@ -4564,12 +4564,11 @@ mod tests {
     fn windsurf_language_server_binary_must_be_trusted_and_already_executable() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
-        let root = std::env::current_dir()
-            .expect("current directory")
-            .join(format!(
-                ".aether-windsurf-binary-test-{}",
-                uuid::Uuid::new_v4()
-            ));
+        // Executables require trusted ancestors; a checkout may be group-writable.
+        let root = super::home_dir().join(format!(
+            ".aether-windsurf-binary-test-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir(&root).expect("test directory should be created");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("test directory mode should be private");

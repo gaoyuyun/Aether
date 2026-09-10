@@ -4,6 +4,13 @@
     @mousedown="$emit('mousedown', $event)"
     @click="$emit('rowClick', $event, provider.id)"
   >
+    <TableCell
+      v-if="$slots['drag-handle']"
+      class="w-9 px-2 py-3.5"
+      @click.stop
+    >
+      <slot name="drag-handle" />
+    </TableCell>
     <TableCell class="py-3.5">
       <div class="space-y-0.5">
         <div class="flex items-center gap-1.5">

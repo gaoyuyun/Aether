@@ -10,7 +10,8 @@ use super::redaction::{
     admin_restore_secret_safe_body_rules, admin_restore_secret_safe_header_rules,
     admin_restore_secret_safe_json, admin_restore_secret_safe_proxy, admin_restore_secret_safe_url,
     admin_secret_safe_body_rules, admin_secret_safe_header_rules, admin_secret_safe_json,
-    admin_secret_safe_proxy, admin_secret_safe_url,
+    admin_secret_safe_proxy, admin_secret_safe_url, admin_validate_retained_body_rule_secrets,
+    admin_validate_retained_header_rule_secrets,
 };
 
 pub fn normalize_endpoint_api_format(api_format: &str) -> String {
@@ -201,6 +202,55 @@ mod endpoint_key_count_tests {
     }
 
     #[test]
+    fn endpoint_updates_reject_unresolved_rule_masks_before_persistence() {
+        let header_rules = json!([{"action": "set", "key": "x-auth", "value": "header-secret"}]);
+        let body_rules = json!([{"action": "set", "path": "auth.token", "value": "body-secret"}]);
+        let mut endpoint = sample_endpoint("chat", "openai:chat");
+        endpoint.header_rules = Some(header_rules.clone());
+        endpoint.body_rules = Some(body_rules.clone());
+        endpoint.config = Some(json!({"response_header_rules": header_rules}));
+        let moved_header =
+            json!([{"action": "set", "key": "x-other-auth", "value": "***", "has_value": true}]);
+        let cases = [
+            (
+                "header_rules",
+                super::AdminProviderEndpointUpdateFields {
+                    header_rules: Some(moved_header.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "body_rules",
+                super::AdminProviderEndpointUpdateFields {
+                    body_rules: Some(
+                        json!([{"action": "set", "path": "auth.api_key", "value": "***", "has_value": true}]),
+                    ),
+                    ..Default::default()
+                },
+            ),
+            (
+                "config",
+                super::AdminProviderEndpointUpdateFields {
+                    config: Some(json!({"response_header_rules": moved_header})),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, payload) in cases {
+            let error = super::apply_admin_provider_endpoint_update_fields(
+                &endpoint,
+                |key| key == field,
+                |_| false,
+                &payload,
+            )
+            .expect_err("unresolved masks must not overwrite saved secrets");
+            assert!(error.contains("无法匹配"));
+            assert!(!error.contains("header-secret"));
+            assert!(!error.contains("body-secret"));
+        }
+    }
+
+    #[test]
     fn inherited_endpoint_counts_only_include_active_formats() {
         let responses_endpoint = sample_endpoint("responses", "openai:responses");
         let mut search_endpoint = sample_endpoint("search", "openai:search");
@@ -352,6 +402,10 @@ where
             if !header_rules.is_array() {
                 return Err("header_rules 必须是数组或 null".to_string());
             }
+            admin_validate_retained_header_rule_secrets(
+                existing_endpoint.header_rules.as_ref(),
+                header_rules,
+            )?;
             Some(admin_restore_secret_safe_header_rules(
                 existing_endpoint.header_rules.as_ref(),
                 header_rules,
@@ -369,6 +423,10 @@ where
             if !body_rules.is_array() {
                 return Err("body_rules 必须是数组或 null".to_string());
             }
+            admin_validate_retained_body_rule_secrets(
+                existing_endpoint.body_rules.as_ref(),
+                body_rules,
+            )?;
             Some(admin_restore_secret_safe_body_rules(
                 existing_endpoint.body_rules.as_ref(),
                 body_rules,
@@ -406,6 +464,15 @@ where
             };
             if !config.is_object() {
                 return Err("config 必须是对象或 null".to_string());
+            }
+            if let Some(rules) = config.get("response_header_rules") {
+                admin_validate_retained_header_rule_secrets(
+                    existing_endpoint
+                        .config
+                        .as_ref()
+                        .and_then(|config| config.get("response_header_rules")),
+                    rules,
+                )?;
             }
             Some(admin_restore_secret_safe_json(
                 existing_endpoint.config.as_ref(),

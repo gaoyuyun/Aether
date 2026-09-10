@@ -9,14 +9,13 @@ use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
-use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::api::response::apply_streaming_response_headers;
 use crate::headers::should_skip_response_header;
 use crate::maintenance::record_proxy_upgrade_traffic_success_for_generation;
 
-use super::hub::{LocalBodyEvent, LocalStream};
+use super::hub::{LocalBodyEvent, LocalBodyReceiver, LocalStream};
 use super::protocol;
 use super::{AppState, RelayRequestAuthenticated};
 
@@ -40,7 +39,7 @@ impl Drop for StreamGuard {
 pub(crate) struct DirectRelayResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    body_rx: mpsc::Receiver<LocalBodyEvent>,
+    body_rx: LocalBodyReceiver,
     request_guard: StreamGuard,
     _request_permit: Option<AdmissionPermit>,
 }
@@ -55,10 +54,13 @@ impl DirectRelayResponse {
     }
 
     pub(crate) async fn next_chunk(&mut self) -> Result<Option<Bytes>, String> {
+        if self.request_guard.finished {
+            return Ok(None);
+        }
         let event = self.body_rx.recv().await;
         match event {
             Some(LocalBodyEvent::Chunk(chunk)) => Ok(Some(chunk)),
-            Some(LocalBodyEvent::End) | None => {
+            Some(LocalBodyEvent::End) => {
                 self.request_guard.finished = true;
                 Ok(None)
             }
@@ -66,6 +68,7 @@ impl DirectRelayResponse {
                 self.request_guard.finished = true;
                 Err(error)
             }
+            None => Err("tunnel response ended without a terminal frame".to_string()),
         }
     }
 }
@@ -84,6 +87,11 @@ pub(crate) async fn open_direct_relay_stream(
         .open_authorized_local_stream(node_id, &meta)
         .await
         .map_err(|error| format!("connect: {error}"))?;
+    let request_guard = StreamGuard {
+        hub: state.hub.clone(),
+        stream_id: stream.id,
+        finished: false,
+    };
     if let Err(error) = state
         .hub
         .push_local_request_body(stream.id, body, true)
@@ -126,11 +134,7 @@ pub(crate) async fn open_direct_relay_stream(
         status: response_head.status,
         headers: response_head.headers,
         body_rx,
-        request_guard: StreamGuard {
-            hub: state.hub.clone(),
-            stream_id: stream.id,
-            finished: false,
-        },
+        request_guard,
         _request_permit: request_permit,
     })
 }
@@ -259,6 +263,11 @@ pub async fn relay_request(
             );
         }
     };
+    let request_guard = StreamGuard {
+        hub: state.hub.clone(),
+        stream_id: stream.id,
+        finished: false,
+    };
     let body_stream = match spool.body_stream().await {
         Ok(stream) => stream,
         Err(error) => {
@@ -305,12 +314,6 @@ pub async fn relay_request(
             request_permit,
         );
     }
-
-    let request_guard = StreamGuard {
-        hub: state.hub.clone(),
-        stream_id: stream.id,
-        finished: false,
-    };
 
     let wait_timeout = relay_header_timeout(&meta);
     let response_head = match stream.wait_headers(wait_timeout).await {
@@ -372,6 +375,9 @@ pub async fn relay_request(
                     break;
                 }
             }
+        }
+        if !guard.finished {
+            yield Err(io::Error::other("tunnel response ended without a terminal frame"));
         }
         guard.finished = true;
     };
@@ -561,6 +567,100 @@ mod tests {
         request.extensions_mut().insert(RelayRequestAuthenticated);
         request.extensions_mut().insert(spool);
         request
+    }
+
+    #[tokio::test]
+    async fn cancelled_relays_reset_streams_during_upload_and_header_wait() {
+        for direct in [true, false] {
+            for during_upload in [true, false] {
+                let repository = Arc::new(InMemoryProxyNodeRepository::seed(vec![
+                    sample_connected_proxy_node("node-123"),
+                ]));
+                let data = Arc::new(
+                    GatewayDataState::with_proxy_node_repository_for_tests(repository)
+                        .with_system_config_values_for_tests(
+                            Vec::<(String, serde_json::Value)>::new(),
+                        )
+                        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+                );
+                let state = test_app_state().with_data(data);
+                let (proxy_tx, mut proxy_rx) = aether_runtime::bounded_queue(8);
+                let (proxy_close_tx, _) = watch::channel(false);
+                let connection = Arc::new(
+                    ProxyConn::new(
+                        500,
+                        "node-123".into(),
+                        "Node 123".into(),
+                        proxy_tx,
+                        proxy_close_tx,
+                        16,
+                        3,
+                    )
+                    .with_tunnel_generation(LOCAL_TUNNEL_TEST_GENERATION.to_string())
+                    .with_authenticated_key(LOCAL_TUNNEL_TEST_PSK.to_string())
+                    .with_settings(protocol::SettingsPayload {
+                        initial_stream_window_bytes: 128,
+                        min_window_update_bytes: 32,
+                        drain_deadline_ms: 1000,
+                    }),
+                );
+                state.hub.register_proxy(Arc::clone(&connection));
+                let meta = protocol::RequestMeta {
+                    provider_id: None,
+                    endpoint_id: None,
+                    key_id: None,
+                    method: "POST".into(),
+                    url: "https://example.com/".into(),
+                    headers: HashMap::new(),
+                    stream: true,
+                    request_timeout_ms: None,
+                    stream_first_byte_timeout_ms: None,
+                    timeout: 30,
+                    follow_redirects: None,
+                    http1_only: false,
+                    transport_profile: None,
+                };
+                let body = Bytes::from(vec![b'x'; if during_upload { 256 } else { 0 }]);
+                let relay = tokio::spawn(async move {
+                    if direct {
+                        let _response =
+                            super::open_direct_relay_stream(&state, "node-123", meta, body)
+                                .await
+                                .unwrap();
+                    } else {
+                        let request =
+                            authenticated_request(encode_relay_envelope(&meta, &body)).await;
+                        let _response = relay_request(
+                            Path("node-123".into()),
+                            State(state),
+                            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4242))),
+                            request,
+                        )
+                        .await;
+                    }
+                });
+                recv_tunnel_test_frame(&mut proxy_rx, "request headers").await;
+                recv_tunnel_test_frame(&mut proxy_rx, "request body").await;
+                relay.abort();
+                assert!(relay.await.unwrap_err().is_cancelled());
+                let Message::Binary(frame) = recv_tunnel_test_frame(&mut proxy_rx, "reset").await
+                else {
+                    panic!("expected binary reset frame")
+                };
+                let frame = aether_contracts::tunnel::Frame::decode(frame).unwrap();
+                assert_eq!(
+                    frame.msg_type,
+                    aether_contracts::tunnel::MsgType::ResetStream
+                );
+                assert_eq!(
+                    connection
+                        .stream_count
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0
+                );
+                assert!(connection.is_available());
+            }
+        }
     }
 
     #[test]

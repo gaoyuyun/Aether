@@ -722,7 +722,7 @@ async fn gateway_defaults_admin_stats_error_distribution_to_bounded_recent_windo
         10,
         0.02,
         0.02,
-        recent_unix_secs(5),
+        Utc::now().timestamp(),
     );
     recent_error.status_code = Some(429);
     recent_error.error_category = Some("rate_limit".to_string());
@@ -1470,7 +1470,7 @@ async fn gateway_defaults_admin_stats_leaderboard_models_to_bounded_recent_windo
         50,
         0.4,
         0.4,
-        recent_unix_secs(10),
+        Utc::now().timestamp(),
     );
     let stale_row = sample_usage_row(
         "usage-model-stale",

@@ -1,3 +1,4 @@
+mod body;
 mod control_plane;
 mod hub;
 mod local_relay;

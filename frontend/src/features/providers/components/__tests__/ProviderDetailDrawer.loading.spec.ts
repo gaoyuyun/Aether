@@ -74,10 +74,15 @@ describe('ProviderDetailDrawer loading priorities', () => {
       ?.split('// 切换密钥启用状态')[0]
 
     expect(handler).toBeTruthy()
-    expect(handler).toContain('providerKeys.value[keyIndex] = updatedKey')
-    expect(handler).toContain('editingKey.value = updatedKey')
-    expect(handler?.indexOf('providerKeys.value[keyIndex] = updatedKey'))
-      .toBeLessThan(handler?.indexOf('await Promise.all([loadEndpoints(), loadMappingPreview()])') ?? -1)
+    const snapshot = source
+      .split('function applyUpdatedKeySnapshot(updatedKey: EndpointAPIKey) {')[1]
+      ?.split('async function handleKeyChanged')[0]
+    expect(snapshot).toContain('providerKeys.value.splice(index, 1, updatedKey)')
+    expect(snapshot).toContain('editingKey.value = updatedKey')
+    const refresh = handler?.indexOf('await Promise.all([loadProvider(), loadEndpoints(), loadMappingPreview()])') ?? -1
+    expect(refresh).toBeGreaterThan(0)
+    expect(handler?.indexOf('applyUpdatedKeySnapshot(updatedKey)')).toBeLessThan(refresh)
+    expect(handler?.lastIndexOf('applyUpdatedKeySnapshot(updatedKey)')).toBeGreaterThan(refresh)
   })
 
   it('initializes the model permission dialog when it is mounted on demand', () => {

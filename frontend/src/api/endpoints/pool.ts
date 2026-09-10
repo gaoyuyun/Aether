@@ -2,6 +2,7 @@ import client from '../client'
 import { buildCacheKey, cachedRequest } from '@/utils/cache'
 import type {
   AllowedModels,
+  ProviderType,
   OAuthOrganizationInfo,
   ProxyConfig,
   UpstreamMetadata,
@@ -77,7 +78,7 @@ export async function resetPoolCost(
 export interface PoolOverviewItem {
   provider_id: string
   provider_name: string
-  provider_type: string
+  provider_type: ProviderType
   total_keys: number
   active_keys: number
   cooldown_count: number

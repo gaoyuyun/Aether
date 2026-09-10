@@ -1170,15 +1170,21 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         assert_eq!(failed_candidate.retry_index, retry_index as u32);
         assert_eq!(failed_candidate.status, RequestCandidateStatus::Failed);
         assert_eq!(failed_candidate.status_code, Some(401));
-        assert!(failed_candidate.error_message.is_none());
+        assert!(failed_candidate.error_message.is_some());
         let failed_upstream_response = failed_candidate
             .extra_data
             .as_ref()
             .and_then(|value| value.get("upstream_response"))
             .expect("failed candidate should keep its upstream response");
         assert_eq!(failed_upstream_response["status_code"], json!(401));
-        assert!(failed_upstream_response.get("headers").is_none());
-        assert!(failed_upstream_response.get("body").is_none());
+        assert_eq!(
+            failed_upstream_response["headers"]["content-type"],
+            "application/json"
+        );
+        assert_eq!(
+            failed_upstream_response["body"]["error"]["message"],
+            "invalid auth token"
+        );
     }
     assert_eq!(stored_candidates[2].candidate_index, 1);
     assert_eq!(stored_candidates[2].status, RequestCandidateStatus::Success);

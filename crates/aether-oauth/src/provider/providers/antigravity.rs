@@ -179,7 +179,8 @@ impl ProviderOAuthAdapter for AntigravityProviderOAuthAdapter {
         ctx: &crate::provider::ProviderOAuthTransportContext,
         input: crate::provider::ProviderOAuthImportInput,
     ) -> Result<crate::provider::ProviderOAuthTokenSet, crate::core::OAuthError> {
-        self.inner.import_credentials(executor, ctx, input).await
+        let result = self.inner.import_credentials(executor, ctx, input).await?;
+        self.enrich_google_identity(executor, ctx, result).await
     }
 
     async fn refresh(
@@ -223,10 +224,11 @@ mod tests {
     use super::{AntigravityProviderOAuthAdapter, ANTIGRAVITY_USER_INFO_URL};
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::{
-        ProviderOAuthAccount, ProviderOAuthAdapter, ProviderOAuthTransportContext,
+        ProviderOAuthAccount, ProviderOAuthAdapter, ProviderOAuthImportInput,
+        ProviderOAuthTransportContext,
     };
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -235,6 +237,8 @@ mod tests {
     #[derive(Default)]
     struct GoogleOAuthExecutor {
         requests: Mutex<Vec<OAuthHttpRequest>>,
+        token_payload: Option<Value>,
+        user_info_response: Option<OAuthHttpResponse>,
     }
 
     fn transport_context() -> ProviderOAuthTransportContext {
@@ -275,26 +279,36 @@ mod tests {
                 .expect("requests should lock")
                 .push(request);
             match request_id.as_str() {
-                "provider-oauth:exchange-code" => Ok(OAuthHttpResponse {
-                    status_code: 200,
-                    body_text: json!({
-                        "access_token": "google-access-token",
-                        "refresh_token": "google-refresh-token",
-                        "token_type": "Bearer",
-                        "expires_in": 3600
+                "provider-oauth:exchange-code" | "provider-oauth:refresh-token" => {
+                    Ok(OAuthHttpResponse {
+                        status_code: 200,
+                        body_text: self
+                            .token_payload
+                            .clone()
+                            .unwrap_or_else(|| {
+                                json!({
+                                    "access_token": "google-access-token",
+                                    "refresh_token": "google-refresh-token",
+                                    "token_type": "Bearer",
+                                    "expires_in": 3600
+                                })
+                            })
+                            .to_string(),
+                        json_body: None,
                     })
-                    .to_string(),
-                    json_body: None,
-                }),
-                "provider-oauth:antigravity-user-info" => Ok(OAuthHttpResponse {
-                    status_code: 200,
-                    body_text: json!({
-                        "email": "antigravity@example.com",
-                        "verified_email": true
-                    })
-                    .to_string(),
-                    json_body: None,
-                }),
+                }
+                "provider-oauth:antigravity-user-info" => Ok(self
+                    .user_info_response
+                    .clone()
+                    .unwrap_or_else(|| OAuthHttpResponse {
+                        status_code: 200,
+                        body_text: json!({
+                            "email": "antigravity@example.com",
+                            "verified_email": true
+                        })
+                        .to_string(),
+                        json_body: None,
+                    })),
                 other => panic!("unexpected OAuth request: {other}"),
             }
         }
@@ -363,6 +377,133 @@ mod tests {
             Some("Bearer google-access-token")
         );
         assert_eq!(requests[1].network, ctx.network);
+    }
+
+    #[tokio::test]
+    async fn antigravity_import_fetches_google_email_for_account_identity() {
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
+        let ctx = transport_context();
+        let executor = GoogleOAuthExecutor::default();
+
+        let result = adapter
+            .import_credentials(
+                &executor,
+                &ctx,
+                ProviderOAuthImportInput {
+                    provider_type: "antigravity".to_string(),
+                    name: None,
+                    refresh_token: Some("google-refresh-token".to_string()),
+                    raw_credentials: None,
+                    network: ctx.network.clone(),
+                },
+            )
+            .await
+            .expect("Antigravity OAuth import should succeed");
+
+        assert_eq!(result.auth_config["email"], "antigravity@example.com");
+        assert_eq!(
+            result
+                .token_set
+                .raw_payload
+                .as_ref()
+                .and_then(|payload| payload.get("email")),
+            Some(&json!("antigravity@example.com"))
+        );
+        let requests = executor.requests.lock().expect("requests should lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].request_id, "provider-oauth:refresh-token");
+        assert_eq!(requests[1].url, ANTIGRAVITY_USER_INFO_URL);
+        assert_eq!(requests[1].method, reqwest::Method::GET);
+        assert_eq!(
+            requests[1].headers.get("authorization").map(String::as_str),
+            Some("Bearer google-access-token")
+        );
+        assert_eq!(requests[1].network, ctx.network);
+    }
+
+    #[tokio::test]
+    async fn antigravity_import_skips_userinfo_when_token_payload_has_email() {
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
+        let ctx = transport_context();
+        let executor = GoogleOAuthExecutor {
+            token_payload: Some(json!({
+                "access_token": "google-access-token",
+                "email": "token-email@example.com"
+            })),
+            ..Default::default()
+        };
+
+        let result = adapter
+            .import_credentials(
+                &executor,
+                &ctx,
+                ProviderOAuthImportInput {
+                    provider_type: "antigravity".to_string(),
+                    name: None,
+                    refresh_token: Some("google-refresh-token".to_string()),
+                    raw_credentials: None,
+                    network: ctx.network.clone(),
+                },
+            )
+            .await
+            .expect("Antigravity OAuth import should succeed");
+
+        assert_eq!(result.auth_config["email"], "token-email@example.com");
+        assert_eq!(
+            executor
+                .requests
+                .lock()
+                .expect("requests should lock")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_import_rejects_unavailable_or_invalid_google_identity() {
+        let adapter = AntigravityProviderOAuthAdapter::default()
+            .with_oauth_credentials_for_tests("test-client-id", "test-client-secret");
+        let ctx = transport_context();
+
+        for (status_code, profile) in [
+            (401, json!({"error": "unauthorized"})),
+            (200, json!({})),
+            (200, json!({"email": "  "})),
+            (
+                200,
+                json!({"email": "unverified@example.com", "verified_email": false}),
+            ),
+        ] {
+            let executor = GoogleOAuthExecutor {
+                user_info_response: Some(OAuthHttpResponse {
+                    status_code,
+                    body_text: profile.to_string(),
+                    json_body: None,
+                }),
+                ..Default::default()
+            };
+
+            let result = adapter
+                .import_credentials(
+                    &executor,
+                    &ctx,
+                    ProviderOAuthImportInput {
+                        provider_type: "antigravity".to_string(),
+                        name: None,
+                        refresh_token: Some("google-refresh-token".to_string()),
+                        raw_credentials: None,
+                        network: ctx.network.clone(),
+                    },
+                )
+                .await;
+
+            assert!(
+                result.is_err(),
+                "invalid Google identity should reject import: {profile}"
+            );
+        }
     }
 
     #[tokio::test]

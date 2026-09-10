@@ -3399,6 +3399,60 @@ mod tests {
     }
 
     #[test]
+    fn detail_payload_preserves_original_headers_with_or_without_bodies() {
+        let item = StoredRequestUsageAudit {
+            request_headers: Some(json!({
+                "authorization": "Bearer original-client-token",
+                "originator": "codex-cli",
+                "session-id": "original-session",
+                "thread-id": "original-thread",
+                "x-codex-turn-metadata": "{\"turn_id\":\"original-turn\"}",
+                "x-openai-subagent": "reviewer"
+            })),
+            provider_request_headers: Some(json!({
+                "authorization": "Bearer original-provider-token",
+                "x-api-key": "original-provider-key"
+            })),
+            response_headers: Some(json!({
+                "set-cookie": ["session=original-upstream", "preference=original"],
+                "x-upstream-custom": "original-upstream-value"
+            })),
+            client_response_headers: Some(json!({
+                "set-cookie": "session=original-client",
+                "x-client-custom": "original-client-value"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        for include_bodies in [false, true] {
+            let payload = build_admin_usage_detail_payload(
+                &item,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                false,
+                false,
+                None,
+                include_bodies,
+                None,
+                &BTreeMap::new(),
+            );
+
+            for (field, expected) in [
+                ("request_headers", &item.request_headers),
+                ("provider_request_headers", &item.provider_request_headers),
+                ("response_headers", &item.response_headers),
+                ("client_response_headers", &item.client_response_headers),
+            ] {
+                assert_eq!(
+                    &payload[field],
+                    expected.as_ref().unwrap(),
+                    "{field} should retain original values when include_bodies={include_bodies}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn detail_payload_marks_reference_backed_bodies_as_available() {
         let item = StoredRequestUsageAudit {
             request_body: None,

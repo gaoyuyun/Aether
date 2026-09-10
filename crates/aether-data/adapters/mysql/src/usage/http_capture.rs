@@ -1,9 +1,12 @@
+use aether_data_contracts::repository::usage::StoredUsageBodyPayload;
+use std::io::Write;
+
 use aether_data_contracts::repository::usage::{
     canonical_usage_body_ref_for, parse_usage_body_ref, read_decompressed_usage_json,
     usage_body_ref, StoredRequestUsageAudit, UpsertUsageRecord, UsageBodyCaptureState,
     UsageBodyField,
 };
-use flate2::read::GzDecoder;
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde_json::{Map, Value};
 use sqlx::{mysql::MySqlRow, Row};
 
@@ -27,7 +30,9 @@ pub(crate) struct PreparedUsageHttpCapture {
 
 #[derive(Debug)]
 struct PreparedBody {
+    field: UsageBodyField,
     payload_gzip: Option<Vec<u8>>,
+    clear_existing: bool,
 }
 
 #[derive(Debug, Default)]
@@ -129,10 +134,26 @@ pub(crate) fn prepare_usage_http_capture(
         .then_some(usage.client_response_body.as_ref())
         .flatten();
 
-    let request_body = prepare_body(request_body_value)?;
-    let provider_request_body = prepare_body(provider_request_body_value)?;
-    let response_body = prepare_body(response_body_value)?;
-    let client_response_body = prepare_body(client_response_body_value)?;
+    let request_body = prepare_body(
+        UsageBodyField::RequestBody,
+        request_body_value,
+        clear_request,
+    )?;
+    let provider_request_body = prepare_body(
+        UsageBodyField::ProviderRequestBody,
+        provider_request_body_value,
+        clear_provider_request,
+    )?;
+    let response_body = prepare_body(
+        UsageBodyField::ResponseBody,
+        response_body_value,
+        clear_response,
+    )?;
+    let client_response_body = prepare_body(
+        UsageBodyField::ClientResponseBody,
+        client_response_body_value,
+        clear_client_response,
+    )?;
 
     let refs = HttpAuditRefs {
         request_body_ref: resolved_write_ref(
@@ -248,13 +269,16 @@ pub(crate) fn prepare_usage_http_capture(
     })
 }
 
-fn prepare_body(value: Option<&Value>) -> Result<PreparedBody, DataLayerError> {
-    if value.is_some() {
-        return Err(DataLayerError::InvalidInput(
-            "usage body persistence is disabled".to_string(),
-        ));
-    }
-    Ok(PreparedBody { payload_gzip: None })
+fn prepare_body(
+    field: UsageBodyField,
+    value: Option<&Value>,
+    clear_existing: bool,
+) -> Result<PreparedBody, DataLayerError> {
+    Ok(PreparedBody {
+        field,
+        payload_gzip: value.map(compress_json).transpose()?,
+        clear_existing,
+    })
 }
 
 fn resolved_write_ref(
@@ -332,63 +356,23 @@ pub(crate) async fn sync_usage_http_capture(
     request_id: &str,
     prepared: &PreparedUsageHttpCapture,
 ) -> Result<(), DataLayerError> {
-    let bodies = [
+    for body in [
         &prepared.request_body,
         &prepared.provider_request_body,
         &prepared.response_body,
         &prepared.client_response_body,
-    ];
-    let contains_capture = prepared.request_headers.is_some()
-        || prepared.provider_request_headers.is_some()
-        || prepared.response_headers.is_some()
-        || prepared.client_response_headers.is_some()
-        || prepared.refs.any_present()
-        || bodies.iter().any(|body| body.payload_gzip.is_some())
-        || prepared.capture_mode != "none";
-    if contains_capture {
-        return Err(DataLayerError::InvalidInput(
-            "usage HTTP capture persistence is disabled".to_string(),
-        ));
+    ] {
+        sync_body(tx, request_id, body).await?;
     }
-
-    sqlx::query("DELETE FROM usage_http_audits WHERE request_id = ?")
-        .bind(request_id)
-        .execute(&mut **tx)
-        .await
-        .map_sql_err()?;
-    sqlx::query("DELETE FROM usage_body_blobs WHERE request_id = ?")
-        .bind(request_id)
-        .execute(&mut **tx)
-        .await
-        .map_sql_err()?;
-    sqlx::query(
-        r#"
-UPDATE `usage`
-SET request_headers = NULL,
-    request_body = NULL,
-    provider_request_headers = NULL,
-    provider_request_body = NULL,
-    response_headers = NULL,
-    response_body = NULL,
-    client_response_headers = NULL,
-    client_response_body = NULL,
-    request_body_compressed = NULL,
-    provider_request_body_compressed = NULL,
-    response_body_compressed = NULL,
-    client_response_body_compressed = NULL
-WHERE request_id = ?
-"#,
-    )
-    .bind(request_id)
-    .execute(&mut **tx)
-    .await
-    .map_sql_err()?;
-
     let headers_present = prepared.request_headers.is_some()
         || prepared.provider_request_headers.is_some()
         || prepared.response_headers.is_some()
         || prepared.client_response_headers.is_some();
-    if !headers_present && !prepared.refs.any_present() {
+    if !headers_present
+        && !prepared.refs.any_present()
+        && !prepared.states.any_present()
+        && prepared.capture_mode == "none"
+    {
         return Ok(());
     }
 
@@ -693,17 +677,21 @@ pub(crate) async fn hydrate_usage_body_refs(
     Ok(usage)
 }
 
-pub(crate) async fn resolve_body_ref(
+pub(crate) async fn read_body_payload(
     pool: &MysqlPool,
     body_ref: &str,
-) -> Result<Option<Value>, DataLayerError> {
+) -> Result<Option<StoredUsageBodyPayload>, DataLayerError> {
+    let json_limit =
+        aether_data_contracts::repository::usage::MAX_DECOMPRESSED_USAGE_JSON_BYTES as i64;
+    let encoded_limit = json_limit + 1024 * 1024;
     let Some((request_id, field)) = parse_usage_body_ref(body_ref) else {
         return Ok(None);
     };
     let canonical_ref = usage_body_ref(&request_id, field);
-    if let Some(payload_gzip) = sqlx::query_scalar::<_, Vec<u8>>(
-        "SELECT payload_gzip FROM usage_body_blobs WHERE body_ref = ? AND request_id = ? AND body_field = ? LIMIT 1",
+    if let Some(row) = sqlx::query(
+        "SELECT CASE WHEN LENGTH(payload_gzip) <= ? THEN payload_gzip END AS payload_gzip FROM usage_body_blobs WHERE body_ref = ? AND request_id = ? AND body_field = ? LIMIT 1",
     )
+    .bind(encoded_limit)
     .bind(&canonical_ref)
     .bind(&request_id)
     .bind(field.as_storage_field())
@@ -711,31 +699,75 @@ pub(crate) async fn resolve_body_ref(
     .await
     .map_sql_err()?
     {
-        return inflate_json(&payload_gzip).map(Some);
+        return row.try_get::<Option<Vec<u8>>, _>("payload_gzip")
+            .map_sql_err()?
+            .map(|bytes| Some(StoredUsageBodyPayload::Gzip(bytes)))
+            .ok_or_else(|| DataLayerError::UnexpectedValue(format!("encoded usage json exceeds {encoded_limit} bytes")));
     }
     let (inline_column, compressed_column) = usage_body_sql_columns(field);
     let row = sqlx::query(&format!(
-        "SELECT CAST({inline_column} AS CHAR) AS inline_body, {compressed_column} AS compressed_body FROM `usage` WHERE request_id = ? LIMIT 1"
+        "SELECT CASE WHEN OCTET_LENGTH({inline_column}) <= ? THEN CAST({inline_column} AS CHAR) END AS inline_body, CASE WHEN LENGTH({compressed_column}) <= ? THEN {compressed_column} END AS compressed_body, (COALESCE(OCTET_LENGTH({inline_column}) > ?, false) OR ({inline_column} IS NULL AND COALESCE(LENGTH({compressed_column}) > ?, false))) AS too_large FROM `usage` WHERE request_id = ? LIMIT 1"
     ))
+    .bind(json_limit)
+    .bind(encoded_limit)
+    .bind(json_limit)
+    .bind(encoded_limit)
     .bind(request_id)
     .fetch_optional(pool)
     .await
     .map_sql_err()?;
-    let Some(row) = row.as_ref() else {
+    let Some(row) = row else {
         return Ok(None);
     };
-    if let Some(raw) = row
+    if row.try_get::<bool, _>("too_large").map_sql_err()? {
+        return Err(DataLayerError::UnexpectedValue(
+            "encoded usage json exceeds preview limit".to_string(),
+        ));
+    }
+    if let Some(body) = row
         .try_get::<Option<String>, _>("inline_body")
         .map_sql_err()?
     {
-        return serde_json::from_str(&raw).map(Some).map_err(|err| {
-            DataLayerError::UnexpectedValue(format!("invalid inline usage body JSON: {err}"))
-        });
+        return Ok(Some(StoredUsageBodyPayload::Json(body.into_bytes())));
     }
-    row.try_get::<Option<Vec<u8>>, _>("compressed_body")
+    Ok(row
+        .try_get::<Option<Vec<u8>>, _>("compressed_body")
         .map_sql_err()?
-        .map(|bytes| inflate_json(&bytes))
-        .transpose()
+        .map(StoredUsageBodyPayload::Gzip))
+}
+
+static USAGE_BODY_DECODE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+pub(crate) async fn resolve_body_ref(
+    pool: &MysqlPool,
+    body_ref: &str,
+) -> Result<Option<Value>, DataLayerError> {
+    let Some(payload) = read_body_payload(pool, body_ref).await? else {
+        return Ok(None);
+    };
+    let permit = USAGE_BODY_DECODE_SLOTS.acquire().await.map_err(|error| {
+        DataLayerError::UnexpectedValue(format!("usage body decoder unavailable: {error}"))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match payload {
+            StoredUsageBodyPayload::Gzip(bytes) => inflate_json(&bytes).map(Some),
+            StoredUsageBodyPayload::Json(bytes) => {
+                let bytes = aether_data_contracts::repository::usage::read_decompressed_usage_json(
+                    std::io::Cursor::new(bytes),
+                )?;
+                serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                    DataLayerError::UnexpectedValue(format!(
+                        "invalid inline usage body JSON: {error}"
+                    ))
+                })
+            }
+        }
+    })
+    .await
+    .map_err(|error| {
+        DataLayerError::UnexpectedValue(format!("usage body decoder failed: {error}"))
+    })?
 }
 
 fn usage_body_sql_columns(field: UsageBodyField) -> (&'static str, &'static str) {
@@ -756,4 +788,87 @@ fn inflate_json(bytes: &[u8]) -> Result<Value, DataLayerError> {
     serde_json::from_slice(&decoded).map_err(|err| {
         DataLayerError::UnexpectedValue(format!("failed to decode usage body JSON: {err}"))
     })
+}
+
+fn compress_json(value: &Value) -> Result<Vec<u8>, DataLayerError> {
+    let bytes = serde_json::to_vec(value).map_err(|err| {
+        DataLayerError::UnexpectedValue(format!("failed to serialize usage body: {err}"))
+    })?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
+    encoder.write_all(&bytes).map_err(|err| {
+        DataLayerError::UnexpectedValue(format!("failed to gzip usage body: {err}"))
+    })?;
+    encoder.finish().map_err(|err| {
+        DataLayerError::UnexpectedValue(format!("failed to finish usage body gzip: {err}"))
+    })
+}
+
+async fn sync_body(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    request_id: &str,
+    body: &PreparedBody,
+) -> Result<(), DataLayerError> {
+    let body_ref = usage_body_ref(request_id, body.field);
+    if body.clear_existing || body.payload_gzip.is_some() {
+        sqlx::query(clear_legacy_body_sql(body.field))
+            .bind(request_id)
+            .execute(&mut **tx)
+            .await
+            .map_sql_err()?;
+    }
+    if body.clear_existing {
+        sqlx::query("DELETE FROM usage_body_blobs WHERE body_ref = ?")
+            .bind(body_ref)
+            .execute(&mut **tx)
+            .await
+            .map_sql_err()?;
+        return Ok(());
+    }
+    if let Some(payload_gzip) = body.payload_gzip.as_deref() {
+        sqlx::query(
+            r#"
+INSERT INTO usage_body_blobs (body_ref, request_id, body_field, payload_gzip)
+VALUES (?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  request_id = VALUES(request_id),
+  body_field = VALUES(body_field),
+  payload_gzip = VALUES(payload_gzip),
+  updated_at = UNIX_TIMESTAMP()
+"#,
+        )
+        .bind(body_ref)
+        .bind(request_id)
+        .bind(body.field.as_storage_field())
+        .bind(payload_gzip)
+        .execute(&mut **tx)
+        .await
+        .map_sql_err()?;
+    }
+    Ok(())
+}
+
+fn clear_legacy_body_sql(field: UsageBodyField) -> &'static str {
+    match field {
+        UsageBodyField::RequestBody => {
+            "UPDATE `usage` SET request_body = NULL, request_body_compressed = NULL WHERE request_id = ?"
+        }
+        UsageBodyField::ProviderRequestBody => {
+            "UPDATE `usage` SET provider_request_body = NULL, provider_request_body_compressed = NULL WHERE request_id = ?"
+        }
+        UsageBodyField::ResponseBody => {
+            "UPDATE `usage` SET response_body = NULL, response_body_compressed = NULL WHERE request_id = ?"
+        }
+        UsageBodyField::ClientResponseBody => {
+            "UPDATE `usage` SET client_response_body = NULL, client_response_body_compressed = NULL WHERE request_id = ?"
+        }
+    }
+}
+
+impl HttpAuditStates {
+    fn any_present(&self) -> bool {
+        self.request_body_state.is_some()
+            || self.provider_request_body_state.is_some()
+            || self.response_body_state.is_some()
+            || self.client_response_body_state.is_some()
+    }
 }

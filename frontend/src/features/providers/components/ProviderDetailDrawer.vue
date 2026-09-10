@@ -136,7 +136,7 @@
                         <ProviderKeyIdentityBlock
                           :api-key="key"
                           :masked-secret-label="getProviderMaskedSecretLabel(key, provider.provider_type)"
-                          :oauth-plan-label="key.oauth_plan_type ? formatOAuthPlanType(key.oauth_plan_type) : null"
+                          :oauth-plan-label="key.oauth_plan_type ? formatOAuthPlanType(key.oauth_plan_type ?? '') : null"
                           :oauth-plan-class="key.oauth_plan_type ? getOAuthPlanTypeClass(key.oauth_plan_type) : ''"
                           :oauth-org-badge="getOAuthOrgBadge(key)"
                           :kiro-subscription-label="shouldShowKiroSubscriptionBadge(key) ? getKiroSubscriptionBadgeLabel(key) : null"
@@ -160,7 +160,7 @@
                       </div>
                       <ProviderKeyActionCluster
                         :api-key="key"
-                        :provider-type="provider.provider_type ?? undefined"
+                        :provider-type="provider.provider_type ?? null"
                         :recoverable="isKeyRecoverable(key)"
                         :recover-title="getRecoverKeyTitle(key)"
                         :circuit-breaker-title="getKeyCircuitBreakerTitle(key)"
@@ -947,7 +947,7 @@ import {
 } from 'lucide-vue-next'
 import { parseApiError } from '@/utils/errorParser'
 import { useEscapeKey } from '@/composables/useEscapeKey'
-import { useI18n } from '@/i18n'
+import { getI18nLocale, useI18n } from '@/i18n'
 import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import { useToast } from '@/composables/useToast'
@@ -987,6 +987,7 @@ import ProviderQuotaProgressRow from '@/features/providers/components/ProviderQu
 import ProviderQuotaSectionHeader from '@/features/providers/components/ProviderQuotaSectionHeader.vue'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
+import { refreshQuotaInBackground } from '@/features/providers/utils/refreshQuotaInBackground'
 import {
   deleteEndpointKey,
   recoverKeyHealth,
@@ -1561,8 +1562,7 @@ async function downloadRefreshToken(key: EndpointAPIKey) {
   try {
     const data = await exportKey(key.id)
     const providerType = provider.value?.provider_type || 'unknown'
-    const rawName = typeof data.email === 'string' ? data.email : (key.name || key.id.slice(0, 8))
-    const safeName = rawName.replace(/[^a-zA-Z0-9_\-@.]/g, '_')
+    const safeName = ((typeof data.email === 'string' && data.email) || key.name || key.id.slice(0, 8)).replace(/[^a-zA-Z0-9_\-@.]/g, '_')
 
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
@@ -2482,10 +2482,10 @@ function isKiroBannedKey(key: EndpointAPIKey): boolean {
 }
 
 // 格式化封禁/禁止时间（后端返回秒级时间戳，Kiro/Antigravity 通用）
-function formatBanTimestamp(timestamp: number | undefined): string {
+function formatBanTimestamp(timestamp: number | null | undefined): string {
   if (!timestamp) return ''
   const date = new Date(timestamp * 1000)
-  return date.toLocaleString('zh-CN', {
+  return date.toLocaleString(getI18nLocale(), {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
@@ -2576,7 +2576,7 @@ function shouldShowKiroSubscriptionBadge(key: EndpointAPIKey): boolean {
   const kiroLabel = getKiroSubscriptionBadgeLabel(key)
   if (!kiroLabel) return false
 
-  const oauthPlanLabel = formatOAuthPlanType(key.oauth_plan_type)
+  const oauthPlanLabel = formatOAuthPlanType(key.oauth_plan_type ?? '')
   if (!oauthPlanLabel) return true
 
   return oauthPlanLabel.trim().toLowerCase() !== kiroLabel.trim().toLowerCase()
@@ -2871,15 +2871,21 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
   }
 
   refreshingQuota.value = true
+  const isCurrent = () => props.open && props.providerId === providerId
   try {
-    const result = await refreshProviderQuota(providerId)
+    const result = await refreshQuotaInBackground({
+      refresh: () => refreshProviderQuota(providerId),
+      isCurrent,
+      retryInitialEmptyQuota: providerType === 'antigravity' && !hadCachedQuota,
+    })
+    if (!result) return false
     const applied = applyQuotaResults(result.results)
     if (result.success <= 0 && applied === 0 && !hadCachedQuota && providerType === 'antigravity') {
-      showError(legacyT('没有获取到配额信息（请检查账号是否已授权、project_id 是否存在）'), legacyT('提示'))
+      showWarning(legacyT('配额暂未就绪，请稍后刷新'), legacyT('提示'))
     }
     return applied > 0
   } catch (err: unknown) {
-    if (!hadCachedQuota && providerType === 'antigravity') {
+    if (isCurrent() && !hadCachedQuota && providerType === 'antigravity') {
       showError(localizedApiError(err, '后台刷新配额失败'), legacyT('错误'))
     }
     return false
@@ -2889,6 +2895,8 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
 }
 
 async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
+  const providerId = props.providerId
+  if (!providerId) return
   antigravityQuotaDialogKey.value = key
   antigravityQuotaDialogOpen.value = true
 
@@ -2897,9 +2905,8 @@ async function openAntigravityQuotaDialog(key: EndpointAPIKey) {
     if (refreshingQuota.value) return
     refreshingQuota.value = true
     try {
-      const providerId = props.providerId
-      if (!providerId) return
       const result = await refreshProviderQuota(providerId)
+      if (providerId !== props.providerId) return
       applyQuotaResults(result.results)
       // 更新弹窗引用的 key 数据
       const updated = allKeys.value.find(({ key: k }) => k.id === key.id)

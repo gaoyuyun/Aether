@@ -56,7 +56,7 @@ pub(super) async fn start_authenticated_operational_server(
 ) -> (String, tokio::task::JoinHandle<()>, String) {
     let access_token =
         control::issue_shared_test_admin_access_token(&state, OPERATIONAL_ADMIN_DEVICE_ID).await;
-    let (url, handle) = start_server(build_router_with_state(state)).await;
+    let (url, handle) = start_server(build_router_with_operational_routes_for_tests(state)).await;
     (url, handle, access_token)
 }
 

@@ -567,6 +567,8 @@ mod tests {
         );
         decision.public_query_string = query.map(str::to_string);
         decision.auth_context = Some(GatewayControlAuthContext {
+            wallet_billing_enabled: true,
+            billing_plans_enabled: true,
             user_id: "user-1".to_string(),
             api_key_id: "key-1".to_string(),
             username: None,

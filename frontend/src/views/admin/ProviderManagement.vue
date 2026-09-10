@@ -1,5 +1,10 @@
 <template>
-  <div class="space-y-4">
+  <div
+    ref="providerListRef"
+    class="space-y-4"
+    :class="{ 'select-none [&_*]:!cursor-grabbing': draggingProvider }"
+    @click.capture="handleSortClick"
+  >
     <ProviderDeleteProgressCard
       :progress="providerDeleteProgress"
       :stage-label="providerDeleteStageLabel"
@@ -25,6 +30,7 @@
         :model-filters="modelFilters"
         :has-active-filters="hasActiveFilters"
         :loading="loading"
+        :card-view="cardView"
         @update:search-query="searchQuery = $event"
         @update:filter-status="filterStatus = $event"
         @update:filter-api-format="filterApiFormat = $event"
@@ -33,6 +39,7 @@
         @batch-process="openProviderBatchDialog"
         @add-provider="openAddProviderDialog"
         @refresh="loadProviders"
+        @toggle-view="cardView = !cardView"
       />
 
       <!-- 加载状态 -->
@@ -54,6 +61,50 @@
         />
       </div>
 
+      <div
+        v-else-if="cardView"
+        class="grid grid-cols-[repeat(auto-fill,minmax(min(100%,22rem),1fr))] gap-4 p-4 sm:p-6"
+      >
+        <ProviderCard
+          v-for="provider in displayedProviders"
+          :key="provider.id"
+          :provider="provider"
+          :data-provider-sort-id="provider.id"
+          :class="sortItemClass(provider.id)"
+          :editing-description-id="editingDescriptionId"
+          :is-balance-loading="isBalanceLoading"
+          :get-provider-balance="getProviderBalance"
+          :get-provider-balance-breakdown="getProviderBalanceBreakdown"
+          :get-provider-balance-error="getProviderBalanceError"
+          :get-provider-checkin="getProviderCheckin"
+          :get-provider-cookie-expired="getProviderCookieExpired"
+          :get-provider-balance-extra="getProviderBalanceExtra"
+          :format-balance-display="formatBalanceDisplay"
+          :format-reset-countdown="formatResetCountdown"
+          :get-quota-used-color-class="getQuotaUsedColorClass"
+          @mousedown="handleMouseDown"
+          @row-click="handleRowClick"
+          @view-detail="openProviderDrawer"
+          @edit-provider="openEditProviderDialog"
+          @open-ops-config="openOpsConfigDialog"
+          @toggle-status="toggleProviderStatus"
+          @delete-provider="handleDeleteProvider"
+          @start-edit-description="startEditDescription"
+          @save-description="saveDescription"
+          @cancel-edit-description="cancelEditDescription"
+        >
+          <template #drag-handle>
+            <ProviderDragHandle
+              class="-ml-2 h-10 w-4"
+              :provider-name="provider.name"
+              :disabled="loading || displayedProviders.length < 2"
+              @pointerdown="startDrag(provider.id, $event)"
+              @keydown="handleSortKeydown(provider.id, $event)"
+            />
+          </template>
+        </ProviderCard>
+      </div>
+
       <!-- 桌面端表格 -->
       <div
         v-else
@@ -62,6 +113,9 @@
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead class="w-9 px-2">
+                <span class="sr-only">{{ legacyT('调整展示顺序') }}</span>
+              </TableHead>
               <TableHead class="w-[18%] min-w-[140px]">
                 {{ legacyT('提供商信息') }}
               </TableHead>
@@ -131,6 +185,8 @@
               v-for="provider in displayedProviders"
               :key="provider.id"
               :provider="provider"
+              :data-provider-sort-id="provider.id"
+              :class="sortItemClass(provider.id)"
               :editing-description-id="editingDescriptionId"
               :is-balance-loading="isBalanceLoading"
               :get-provider-balance="getProviderBalance"
@@ -152,20 +208,31 @@
               @start-edit-description="startEditDescription"
               @save-description="saveDescription"
               @cancel-edit-description="cancelEditDescription"
-            />
+            >
+              <template #drag-handle>
+                <ProviderDragHandle
+                  :provider-name="provider.name"
+                  :disabled="loading || displayedProviders.length < 2"
+                  @pointerdown="startDrag(provider.id, $event)"
+                  @keydown="handleSortKeydown(provider.id, $event)"
+                />
+              </template>
+            </ProviderTableRow>
           </TableBody>
         </Table>
       </div>
 
       <!-- 移动端卡片列表 -->
       <div
-        v-if="!loading && providers.length > 0"
+        v-if="!cardView && !loading && providers.length > 0"
         class="xl:hidden divide-y divide-border/40"
       >
         <ProviderMobileCard
           v-for="provider in displayedProviders"
           :key="provider.id"
           :provider="provider"
+          :data-provider-sort-id="provider.id"
+          :class="sortItemClass(provider.id)"
           :editing-description-id="editingDescriptionId"
           :is-balance-loading="isBalanceLoading"
           :get-provider-balance="getProviderBalance"
@@ -182,7 +249,17 @@
           @start-edit-description="startEditDescription"
           @save-description="saveDescription"
           @cancel-edit-description="cancelEditDescription"
-        />
+        >
+          <template #drag-handle>
+            <ProviderDragHandle
+              class="-ml-2 w-4"
+              :provider-name="provider.name"
+              :disabled="loading || displayedProviders.length < 2"
+              @pointerdown="startDrag(provider.id, $event)"
+              @keydown="handleSortKeydown(provider.id, $event)"
+            />
+          </template>
+        </ProviderMobileCard>
       </div>
 
       <!-- 分页 -->
@@ -196,7 +273,24 @@
         @update:page-size="pageSize = $event"
       />
     </Card>
+    <span
+      class="sr-only"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+    >{{ announcement }}</span>
   </div>
+
+  <Teleport to="body">
+    <div
+      v-if="draggingProvider"
+      class="pointer-events-none fixed z-[100] w-[200px] truncate rounded-xl border border-primary/40 bg-card px-3 py-2 text-sm font-medium text-foreground shadow-lg"
+      :style="dragPreviewStyle"
+      aria-hidden="true"
+    >
+      {{ draggingProvider.name }}
+    </div>
+  </Teleport>
 
   <!-- 对话框 -->
   <ProviderFormDialog
@@ -234,6 +328,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
+import { useLocalStorage } from '@vueuse/core'
 import Card from '@/components/ui/card.vue'
 import Table from '@/components/ui/table.vue'
 import TableHeader from '@/components/ui/table-header.vue'
@@ -248,6 +343,8 @@ import ProviderBatchActionDialog from '@/features/providers/components/ProviderB
 import ProviderTableHeader from '@/features/providers/components/ProviderTableHeader.vue'
 import ProviderTableRow from '@/features/providers/components/ProviderTableRow.vue'
 import ProviderMobileCard from '@/features/providers/components/ProviderMobileCard.vue'
+import ProviderCard from '@/features/providers/components/ProviderCard.vue'
+import ProviderDragHandle from '@/features/providers/components/ProviderDragHandle.vue'
 import ProviderDeleteProgressCard from '@/features/providers/components/ProviderDeleteProgressCard.vue'
 import ProviderEmptyState from '@/features/providers/components/ProviderEmptyState.vue'
 import { useToast } from '@/composables/useToast'
@@ -255,6 +352,7 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useRowClick } from '@/composables/useRowClick'
 import { useProviderFilters } from '@/features/providers/composables/useProviderFilters'
 import { useProviderBalance } from '@/features/providers/composables/useProviderBalance'
+import { useProviderDisplayOrder } from '@/features/providers/composables/useProviderDisplayOrder'
 import {
   getProvidersSummary,
   getProvider,
@@ -294,6 +392,7 @@ function showLegacyError(err: unknown, fallback: string, title = '错误') {
 
 // 状态
 const loading = ref(false)
+const cardView = useLocalStorage('aether-provider-card-view', false, { flush: 'sync' })
 const providers = ref<ProviderWithEndpointsSummary[]>([])
 let providersRequestId = 0
 const providerDialogOpen = ref(false)
@@ -475,7 +574,20 @@ function sortProvidersByActiveAndPriority(items: ProviderWithEndpointsSummary[])
   })
 }
 
-const displayedProviders = computed(() => sortProvidersByActiveAndPriority(providers.value))
+const providerListRef = ref<HTMLElement | null>(null)
+const {
+  orderedProviders: displayedProviders,
+  draggingProvider,
+  dragPreviewStyle,
+  announcement,
+  startDrag,
+  cancelDrag,
+  handleSortKeydown,
+  handleSortClick,
+  sortItemClass,
+} = useProviderDisplayOrder(() => sortProvidersByActiveAndPriority(providers.value), providerListRef)
+
+watch([loading, cardView, queryParams], cancelDrag)
 
 function startEditDescription(_event: Event, provider: ProviderWithEndpointsSummary) {
   editingDescriptionId.value = provider.id

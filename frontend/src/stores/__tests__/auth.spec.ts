@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from 'pinia'
 
 const { logoutMock, getTokenMock, getCurrentUserMock, restoreSessionMock, clearAuthMock } = vi.hoisted(() => ({
   logoutMock: vi.fn(),
-  getTokenMock: vi.fn<() => string | null>(() => null),
+  getTokenMock: vi.fn((): string | null => null),
   getCurrentUserMock: vi.fn(),
   restoreSessionMock: vi.fn(),
   clearAuthMock: vi.fn(),
@@ -39,7 +39,7 @@ describe('auth store logout', () => {
   })
 
   it('waits for backend logout before resolving', async () => {
-    let resolveLogout: () => void = () => {}
+    let resolveLogout!: () => void
     logoutMock.mockImplementation(
       () =>
         new Promise<void>((resolve) => {
@@ -100,6 +100,51 @@ describe('auth store logout', () => {
     expect(clearAuthMock).toHaveBeenCalledWith(false, false)
   })
 
+  it.each(['synchronous', 'asynchronous'] as const)(
+    'allows a forced retry after a %s restore failure',
+    async (failureMode) => {
+      const failure = new Error('temporary refresh failure')
+      if (failureMode === 'synchronous') {
+        restoreSessionMock.mockImplementationOnce(() => {
+          throw failure
+        })
+      } else {
+        restoreSessionMock.mockRejectedValueOnce(failure)
+      }
+      restoreSessionMock.mockResolvedValueOnce('retry-access-token')
+      const store = useAuthStore()
+
+      await expect(store.restoreSession()).resolves.toBe(false)
+      expect(clearAuthMock).toHaveBeenCalledWith(false, false)
+
+      await expect(store.restoreSession(true)).resolves.toBe(true)
+      expect(store.token).toBe('retry-access-token')
+      expect(restoreSessionMock).toHaveBeenCalledTimes(2)
+    },
+  )
+
+  it('deduplicates in-flight restores and allows a refresh after completion', async () => {
+    let resolveRestore!: (token: string) => void
+    const pendingRestore = new Promise<string>((resolve) => {
+      resolveRestore = resolve
+    })
+    restoreSessionMock.mockReturnValueOnce(pendingRestore)
+    const store = useAuthStore()
+
+    const firstRestore = store.restoreSession()
+    const secondRestore = store.restoreSession()
+    expect(restoreSessionMock).toHaveBeenCalledTimes(1)
+
+    resolveRestore('restored-access-token')
+    await expect(Promise.all([firstRestore, secondRestore])).resolves.toEqual([true, true])
+    expect(store.token).toBe('restored-access-token')
+
+    restoreSessionMock.mockResolvedValueOnce('refreshed-access-token')
+    await expect(store.restoreSession(true)).resolves.toBe(true)
+    expect(store.token).toBe('refreshed-access-token')
+    expect(restoreSessionMock).toHaveBeenCalledTimes(2)
+  })
+
   it('preserves an existing access token when a forced restore fails', async () => {
     getTokenMock.mockReturnValue('still-valid-access-token')
     restoreSessionMock.mockRejectedValue(new Error('temporary refresh conflict'))
@@ -150,13 +195,13 @@ describe('auth store logout', () => {
   })
 
   it('deduplicates concurrent current-user requests', async () => {
-    let resolveCurrentUser: (user: {
+    let resolveCurrentUser!: (user: {
       id: string
       username: string
       role: string
       is_active: boolean
       created_at: string
-    }) => void = () => {}
+    }) => void
     getTokenMock.mockReturnValue('access-token')
     getCurrentUserMock.mockImplementation(
       () => new Promise((resolve) => {
@@ -196,14 +241,41 @@ describe('auth store logout', () => {
     expect(getCurrentUserMock).toHaveBeenCalledTimes(1)
   })
 
+  it('retries a synchronous current-user failure after the backoff expires', async () => {
+    let now = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      getTokenMock.mockReturnValue('access-token')
+      const user = {
+        id: 'user-1',
+        username: 'tester',
+        role: 'user',
+        is_active: true,
+        created_at: '2026-03-16T00:00:00Z',
+      }
+      getCurrentUserMock
+        .mockImplementationOnce(() => { throw new Error('synchronous transport failure') })
+        .mockResolvedValueOnce(user)
+      const store = useAuthStore()
+
+      await expect(store.fetchCurrentUser()).resolves.toBeNull()
+      now += 16_000
+      await expect(store.fetchCurrentUser()).resolves.toEqual(user)
+      expect(getCurrentUserMock).toHaveBeenCalledTimes(2)
+      expect(store.user).toEqual(user)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   it('does not restore a stale user after logout while the request is in flight', async () => {
-    let resolveCurrentUser: (user: {
+    let resolveCurrentUser!: (user: {
       id: string
       username: string
       role: string
       is_active: boolean
       created_at: string
-    }) => void = () => {}
+    }) => void
     getTokenMock.mockReturnValue('access-token')
     getCurrentUserMock.mockImplementation(
       () => new Promise((resolve) => {
@@ -228,7 +300,7 @@ describe('auth store logout', () => {
   })
 
   it('does not restore a stale token when an in-flight request fails after logout', async () => {
-    let rejectCurrentUser: (error: Error) => void = () => {}
+    let rejectCurrentUser!: (error: Error) => void
     getTokenMock.mockReturnValue('access-token')
     getCurrentUserMock.mockImplementation(
       () => new Promise((_resolve, reject) => {

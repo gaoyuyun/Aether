@@ -3924,11 +3924,47 @@ async fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_ad
 fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email() {
     run_admin_oauth_test(
         "gateway_names_new_antigravity_oauth_account_from_google_userinfo_email",
-        gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_impl,
+        || {
+            assert_antigravity_oauth_account_uses_google_userinfo_email(
+                "complete",
+                json!({
+                    "callback_url": "http://localhost:51121/oauth2callback?code=antigravity-code-123&state=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                }),
+            )
+        },
     );
 }
 
-async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_impl() {
+#[test]
+fn gateway_names_imported_antigravity_oauth_account_from_google_userinfo_email() {
+    run_admin_oauth_test(
+        "gateway_names_imported_antigravity_oauth_account_from_google_userinfo_email",
+        || {
+            assert_antigravity_oauth_account_uses_google_userinfo_email(
+                "import-refresh-token",
+                json!({"refresh_token": "antigravity-import-refresh-token"}),
+            )
+        },
+    );
+}
+
+#[test]
+fn gateway_names_batch_imported_antigravity_oauth_account_from_google_userinfo_email() {
+    run_admin_oauth_test(
+        "gateway_names_batch_imported_antigravity_oauth_account_from_google_userinfo_email",
+        || {
+            assert_antigravity_oauth_account_uses_google_userinfo_email(
+                "batch-import",
+                json!({"credentials": "antigravity-import-refresh-token"}),
+            )
+        },
+    );
+}
+
+async fn assert_antigravity_oauth_account_uses_google_userinfo_email(
+    operation: &str,
+    request_body: Value,
+) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -4033,15 +4069,13 @@ async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_
 
     let response = reqwest::Client::new()
         .post(format!(
-            "{gateway_url}/api/admin/provider-oauth/providers/provider-antigravity/complete"
+            "{gateway_url}/api/admin/provider-oauth/providers/provider-antigravity/{operation}"
         ))
         .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
         .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
-        .json(&json!({
-            "callback_url": "http://localhost:51121/oauth2callback?code=antigravity-code-123&state=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-        }))
+        .json(&request_body)
         .send()
         .await
         .expect("request should succeed");
@@ -4049,9 +4083,22 @@ async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_
     let status = response.status();
     let payload: Value = response.json().await.expect("json body should parse");
     assert_eq!(status, StatusCode::OK, "payload={payload}");
-    assert_eq!(payload["provider_type"], "antigravity");
-    assert_eq!(payload["email"], "new-antigravity@example.com");
-    assert_eq!(payload["replaced"], false);
+    let account_result = if operation == "batch-import" {
+        assert_eq!(payload["total"], 1);
+        assert_eq!(payload["success"], 1, "payload={payload}");
+        assert_eq!(payload["failed"], 0);
+        assert_eq!(payload["results"][0]["status"], "success");
+        assert_eq!(
+            payload["results"][0]["key_name"],
+            "new-antigravity@example.com"
+        );
+        &payload["results"][0]
+    } else {
+        assert_eq!(payload["provider_type"], "antigravity");
+        assert_eq!(payload["email"], "new-antigravity@example.com");
+        &payload
+    };
+    assert_eq!(account_result["replaced"], false);
     assert_eq!(*token_hits.lock().expect("mutex should lock"), 1);
     assert_eq!(*user_info_hits.lock().expect("mutex should lock"), 1);
     assert_eq!(
@@ -4063,7 +4110,7 @@ async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
-    let key_id = payload["key_id"]
+    let key_id = account_result["key_id"]
         .as_str()
         .expect("created key id should be returned")
         .to_string();

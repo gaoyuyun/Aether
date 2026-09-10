@@ -129,7 +129,13 @@ async fn run_backfills_locked(conn: &mut MySqlConnection) -> Result<(), MigrateE
 
         let mut tx = conn.begin().await?;
         let started_at = std::time::Instant::now();
-        sqlx::raw_sql(&backfill.sql).execute(&mut *tx).await?;
+        // Older portable backfills used the reserved MySQL keyword `usage`
+        // without quoting. Keep their recorded checksums stable while executing
+        // the equivalent, valid identifier spelling.
+        let sql = backfill
+            .sql
+            .replace("JOIN usage AS usage_record", "JOIN `usage` AS usage_record");
+        sqlx::raw_sql(&sql).execute(&mut *tx).await?;
         let elapsed_ms = i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
         query(INSERT_APPLIED_BACKFILL_SQL)
             .bind(backfill.version)

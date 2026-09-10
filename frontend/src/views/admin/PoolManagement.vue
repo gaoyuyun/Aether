@@ -980,7 +980,7 @@
       v-model="showAccountBatchDialog"
       :provider-id="selectedProviderId"
       :provider-name="selectedProviderData?.name || ''"
-      :provider-type="(selectedProviderData?.provider_type || selectedProviderType) as any"
+      :provider-type="selectedProviderData?.provider_type ?? selectedProviderOverview?.provider_type ?? undefined"
       :batch-concurrency="selectedProviderConfig?.batch_concurrency"
       :selected-keys="selectedPoolKeys"
       :select-all-filtered="selectAllFilteredPoolKeys"
@@ -1004,7 +1004,7 @@
       v-if="selectedProviderId"
       :open="keyFormDialogOpen"
       :endpoint="null"
-      :provider-type="(selectedProviderData?.provider_type || selectedProviderType) as any"
+      :provider-type="selectedProviderData?.provider_type ?? selectedProviderOverview?.provider_type ?? null"
       :editing-key="editingKey"
       :provider-id="selectedProviderId"
       :available-api-formats="selectedProviderData?.api_formats || []"
@@ -1139,6 +1139,7 @@ import {
 } from '@/features/pool/utils/poolManagementState'
 import type { PoolBatchActionValue } from '@/features/pool/utils/poolBatchActions'
 import {
+  buildAccountTotalStatsDisplay,
   buildPoolStatsDisplay,
   type PoolCodexCycleStatsGroup,
   type PoolStatsDisplay,
@@ -1506,7 +1507,7 @@ function appendDemandMetricSample(overview: PoolOverviewItem | null): void {
   const existing = providerDemandMetricSamples.value.filter(
     sample => sample.providerId === overview.provider_id,
   )
-  const lastSample = existing.at(-1)
+  const lastSample = existing[existing.length - 1]
   if (
     lastSample
     && nextSample.sampledAt - lastSample.sampledAt < 1000
@@ -2140,10 +2141,7 @@ function getPoolKeyAccountStatsMetrics(key: PoolKeyDetail): PoolStatsMetric[] {
   const display = getPoolKeyStatsDisplay(key)
   return display.kind === 'account_total'
     ? display.metrics
-    : (() => {
-        const fallback = buildPoolStatsDisplay(key, selectedProviderType.value, 'account_total')
-        return fallback.kind === 'account_total' ? fallback.metrics : []
-      })()
+    : buildAccountTotalStatsDisplay(key).metrics
 }
 
 const quotaRefreshSupported = computed(() => {

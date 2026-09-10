@@ -764,6 +764,13 @@ impl Config {
         if self.tunnel_stream_initial_window_bytes == 0 {
             anyhow::bail!("tunnel_stream_initial_window_bytes must be > 0");
         }
+        if u64::from(self.tunnel_stream_initial_window_bytes)
+            > aether_contracts::tunnel::MAX_TUNNEL_DECOMPRESSED_PAYLOAD_BYTES as u64
+        {
+            anyhow::bail!(
+                "tunnel_stream_initial_window_bytes exceeds the maximum tunnel payload size"
+            );
+        }
         if self.tunnel_drain_deadline_ms == 0 {
             anyhow::bail!("tunnel_drain_deadline_ms must be > 0");
         }

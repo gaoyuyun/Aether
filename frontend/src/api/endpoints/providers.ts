@@ -15,6 +15,7 @@ import {
   normalizePoolAdvancedConfig as normalizePoolAdvanced,
 } from './types'
 
+export type { ProviderWithEndpointsSummary } from './types'
 interface ProviderRequestOptions {
   timeout?: number
 }

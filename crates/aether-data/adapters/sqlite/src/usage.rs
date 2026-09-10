@@ -12,10 +12,9 @@ use crate::{sqlite_optional_real, sqlite_real, SqlitePool};
 use aether_data_contracts::repository::usage::{
     read_decompressed_usage_json, sanitize_usage_capture_controls_for_persistence,
     sanitize_usage_for_persistence, sanitize_usage_request_metadata,
-    strip_deprecated_usage_display_fields, usage_can_recover_terminal_failure,
-    usage_error_category_for_status_code, usage_lifecycle_update_allowed,
-    usage_request_metadata_client_family, PendingUsageCleanupSummary,
-    ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
+    usage_can_recover_terminal_failure, usage_error_category_for_status_code,
+    usage_lifecycle_update_allowed, usage_request_metadata_client_family,
+    PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest, ProviderQuotaWindowUsageRequest,
     StoredProviderApiKeyUsageSummary, StoredProviderApiKeyWindowUsageSummary,
     StoredProviderQuotaWindowUsage, StoredProviderUsageSummary, StoredRequestUsageAudit,
     StoredUsageAuditAggregation, StoredUsageAuditDimensionsAggregation, StoredUsageAuditSummary,
@@ -3138,11 +3137,54 @@ impl UsageReadRepository for SqliteUsageReadRepository {
         }
     }
 
+    async fn find_by_request_id_shallow(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
+        let mut projection = usage_columns(true);
+        for field in [
+            "request_body",
+            "provider_request_body",
+            "response_body",
+            "client_response_body",
+        ] {
+            // Retain legacy body presence without transferring or decoding its payload.
+            projection = projection
+                .replace(&format!("\"usage\".{field},"), &format!("NULL AS {field},"))
+                .replace(
+                    &format!("\"usage\".{field}_compressed,"),
+                    &format!(
+                        "CASE WHEN \"usage\".{field} IS NOT NULL OR \"usage\".{field}_compressed IS NOT NULL THEN X'' ELSE NULL END AS {field}_compressed,"
+                    ),
+                );
+        }
+        let row = sqlx::query(&format!(
+            "{projection} WHERE \"usage\".request_id = ? LIMIT 1"
+        ))
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_sql_err()?;
+        row.as_ref()
+            .map(|row| map_usage_row(row, false))
+            .transpose()
+    }
+
     async fn resolve_body_ref(
         &self,
         body_ref: &str,
     ) -> Result<Option<serde_json::Value>, DataLayerError> {
         http_capture::resolve_body_ref(&self.pool, body_ref).await
+    }
+
+    async fn read_body_payload(
+        &self,
+        body_ref: &str,
+    ) -> Result<
+        Option<aether_data_contracts::repository::usage::StoredUsageBodyPayload>,
+        DataLayerError,
+    > {
+        http_capture::read_body_payload(&self.pool, body_ref).await
     }
 
     async fn list_usage_audits(
@@ -5199,7 +5241,7 @@ impl SqliteUsageWriteRepository {
         usage: UpsertUsageRecord,
     ) -> Result<(), DataLayerError> {
         usage.validate()?;
-        // Auxiliary tables may receive only clear tombstones, never request or response content.
+        // Keep capture controls for the detached HTTP audit/body tables.
         let capture_usage = usage.clone();
         let mut usage = sanitize_usage_for_persistence(usage);
         usage.validate()?;

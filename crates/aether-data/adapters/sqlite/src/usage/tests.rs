@@ -678,7 +678,123 @@ WHERE request_id = 'rebuild-completed';
 }
 
 #[tokio::test]
-async fn sqlite_usage_http_capture_is_not_persisted() {
+async fn sqlite_shallow_capture_preserves_legacy_refs_without_decoding_bodies() {
+    use aether_data_contracts::repository::usage::{StoredUsageBodyPayload, UsageBodyField};
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations(&pool).await.unwrap();
+
+    let request_id = format!("shallow-capture-{}", uuid::Uuid::new_v4().simple());
+    let inline_body = serde_json::json!({"legacy": "inline"});
+    let corrupt_gzip = b"invalid gzip payload".to_vec();
+    sqlx::query(
+        r#"INSERT INTO "usage"
+           (id, request_id, request_headers, request_body, provider_request_body_compressed)
+           VALUES (?, ?, ?, ?, ?)"#,
+    )
+    .bind(&request_id)
+    .bind(&request_id)
+    .bind(serde_json::json!({"x-request": "retained"}).to_string())
+    .bind(inline_body.to_string())
+    .bind(&corrupt_gzip)
+    .execute(&pool)
+    .await
+    .expect("legacy capture should seed");
+    let response_ref = format!("usage://request/{request_id}/response_body");
+    sqlx::query(
+        "INSERT INTO usage_http_audits (request_id, response_body_ref, response_body_state) VALUES (?, ?, 'reference')",
+    )
+    .bind(&request_id)
+    .bind(&response_ref)
+    .execute(&pool)
+    .await
+    .expect("detached capture reference should seed");
+    sqlx::query(
+        "INSERT INTO usage_body_blobs (body_ref, request_id, body_field, payload_gzip) VALUES (?, ?, 'response_body', ?)",
+    )
+    .bind(&response_ref)
+    .bind(&request_id)
+    .bind(&corrupt_gzip)
+    .execute(&pool)
+    .await
+    .expect("detached body should seed");
+
+    let reader = SqliteUsageReadRepository::new(pool.clone());
+    let shallow = reader
+        .find_by_request_id_shallow(&request_id)
+        .await
+        .expect("detail metadata must not decode bodies")
+        .expect("usage should exist");
+    assert_eq!(
+        shallow.request_headers,
+        Some(serde_json::json!({"x-request": "retained"}))
+    );
+    for field in [
+        UsageBodyField::RequestBody,
+        UsageBodyField::ProviderRequestBody,
+        UsageBodyField::ResponseBody,
+    ] {
+        assert!(shallow.body_value(field).is_none());
+        assert_eq!(
+            shallow.body_ref(field),
+            Some(format!("usage://request/{request_id}/{}", field.as_storage_field()).as_str())
+        );
+    }
+    assert!(shallow.client_response_body.is_none());
+    assert!(shallow.client_response_body_ref.is_none());
+    assert_eq!(
+        shallow.response_body_state,
+        Some(UsageBodyCaptureState::Reference)
+    );
+
+    let inline_ref = shallow.request_body_ref.as_deref().unwrap();
+    let Some(StoredUsageBodyPayload::Json(raw)) =
+        reader.read_body_payload(inline_ref).await.unwrap()
+    else {
+        panic!("legacy inline JSON must remain available for on-demand reads");
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+        inline_body
+    );
+    assert_eq!(
+        reader.resolve_body_ref(inline_ref).await.unwrap(),
+        Some(inline_body)
+    );
+    for body_ref in [
+        shallow.provider_request_body_ref.as_deref().unwrap(),
+        shallow.response_body_ref.as_deref().unwrap(),
+    ] {
+        assert_eq!(
+            reader.read_body_payload(body_ref).await.unwrap(),
+            Some(StoredUsageBodyPayload::Gzip(corrupt_gzip.clone()))
+        );
+        assert!(reader.resolve_body_ref(body_ref).await.is_err());
+    }
+
+    sqlx::query("DELETE FROM usage_body_blobs WHERE request_id = ?")
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM usage_http_audits WHERE request_id = ?")
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(r#"DELETE FROM "usage" WHERE request_id = ?"#)
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_usage_http_capture_round_trips_and_preserves_sparse_updates() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -712,13 +828,31 @@ async fn sqlite_usage_http_capture_is_not_persisted() {
         .upsert(rich)
         .await
         .expect("canonical capture should upsert");
-    assert!(stored.request_headers.is_none());
-    assert!(stored.request_body.is_none());
-    assert!(stored.provider_request_body.is_none());
-    assert!(stored.response_body.is_none());
-    assert!(stored.client_response_body.is_none());
-    assert!(stored.request_body_state.is_none());
-    assert!(stored.request_body_ref.is_none());
+    assert_eq!(
+        stored.request_headers,
+        Some(serde_json::json!({"x-client": "one"}))
+    );
+    assert_eq!(stored.request_body, Some(serde_json::json!({"request": 1})));
+    assert_eq!(
+        stored.provider_request_body,
+        Some(serde_json::json!({"provider_request": 2}))
+    );
+    assert_eq!(
+        stored.response_body,
+        Some(serde_json::json!({"response": 3}))
+    );
+    assert_eq!(
+        stored.client_response_body,
+        Some(serde_json::json!({"client_response": 4}))
+    );
+    assert_eq!(
+        stored.request_body_state,
+        Some(UsageBodyCaptureState::Reference)
+    );
+    assert_eq!(
+        stored.request_body_ref.as_deref(),
+        Some("usage://request/canonical-capture/request_body")
+    );
     assert_eq!(
         stored.request_metadata.as_ref().unwrap()["trace_id"],
         "canonical-trace"
@@ -737,64 +871,41 @@ async fn sqlite_usage_http_capture_is_not_persisted() {
     .await
     .expect("legacy columns should load");
     assert_eq!(legacy_columns, (None, None, None));
-    let audit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM usage_http_audits WHERE request_id = 'canonical-capture'",
+    let audit: (String, String, String) = sqlx::query_as(
+        "SELECT request_headers, request_body_ref, request_body_state FROM usage_http_audits WHERE request_id = 'canonical-capture'",
     )
     .fetch_one(&pool)
     .await
-    .expect("canonical audits should count");
-    assert_eq!(audit_count, 0);
+    .expect("canonical audit should load");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&audit.0).expect("header JSON should decode"),
+        serde_json::json!({"x-client": "one"})
+    );
+    assert_eq!(audit.1, "usage://request/canonical-capture/request_body");
+    assert_eq!(audit.2, "reference");
     let blob_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = 'canonical-capture'",
     )
     .fetch_one(&pool)
     .await
     .expect("canonical blobs should count");
-    assert_eq!(blob_count, 0);
-
-    let reader = SqliteUsageReadRepository::new(pool.clone());
-    let listed = reader
-        .list_usage_audits(&UsageAuditListQuery {
-            provider_name: Some("Provider One".to_string()),
-            limit: Some(10),
-            newest_first: true,
-            ..UsageAuditListQuery::default()
-        })
-        .await
-        .expect("usage list should load")
-        .into_iter()
-        .find(|item| item.request_id == "canonical-capture")
-        .expect("captured usage should be listed");
-    assert!(listed.request_headers.is_none());
-    assert!(listed.provider_request_headers.is_none());
-    assert!(listed.response_headers.is_none());
-    assert!(listed.client_response_headers.is_none());
-    assert!(listed.request_body.is_none());
-    assert!(listed.provider_request_body.is_none());
-    assert!(listed.response_body.is_none());
-    assert!(listed.client_response_body.is_none());
-    assert!(listed.request_body_ref.is_none());
-    assert!(listed.provider_request_body_ref.is_none());
-    assert_eq!(
-        listed.request_metadata.as_ref().unwrap()["trace_id"],
-        "canonical-trace"
-    );
+    assert_eq!(blob_count, 4);
 
     let sparse = sample_usage("canonical-capture", "streaming", "pending", 1_001);
     let sparse_stored = writer
         .upsert(sparse)
         .await
         .expect("sparse lifecycle update should upsert");
-    assert!(sparse_stored.request_headers.is_none());
-    assert!(sparse_stored.request_body.is_none());
-    assert!(sparse_stored.response_body.is_none());
+    assert_eq!(sparse_stored.request_headers, stored.request_headers);
+    assert_eq!(sparse_stored.request_body, stored.request_body);
+    assert_eq!(sparse_stored.response_body, stored.response_body);
     let sparse_blob_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = 'canonical-capture'",
     )
     .fetch_one(&pool)
     .await
     .expect("preserved blobs should count");
-    assert_eq!(sparse_blob_count, 0);
+    assert_eq!(sparse_blob_count, 4);
 
     let mut clear = sample_usage("canonical-capture", "streaming", "pending", 1_002);
     clear.request_body = Some(serde_json::json!({"residual": true}));
@@ -806,28 +917,35 @@ async fn sqlite_usage_http_capture_is_not_persisted() {
         .expect("explicit none capture should clear");
     assert!(cleared.request_body.is_none());
     assert!(cleared.request_body_ref.is_none());
-    assert!(cleared.request_body_state.is_none());
-    assert!(cleared.provider_request_body.is_none());
+    assert_eq!(
+        cleared.request_body_state,
+        Some(UsageBodyCaptureState::None)
+    );
+    assert_eq!(cleared.provider_request_body, stored.provider_request_body);
     let cleared_blob_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = 'canonical-capture'",
     )
     .fetch_one(&pool)
     .await
     .expect("remaining blobs should count");
-    assert_eq!(cleared_blob_count, 0);
+    assert_eq!(cleared_blob_count, 3);
 
+    let reader = SqliteUsageReadRepository::new(pool.clone());
     let resolved = reader
         .resolve_body_ref("usage://request/canonical-capture/provider_request_body")
         .await
         .expect("body ref should resolve");
-    assert!(resolved.is_none());
+    assert_eq!(resolved, stored.provider_request_body);
     let loaded = reader
         .find_by_request_id("canonical-capture")
         .await
         .expect("canonical usage should load")
         .expect("canonical usage should exist");
-    assert!(loaded.provider_request_headers.is_none());
-    assert!(loaded.provider_request_body.is_none());
+    assert_eq!(
+        loaded.provider_request_headers,
+        stored.provider_request_headers
+    );
+    assert_eq!(loaded.provider_request_body, stored.provider_request_body);
 }
 
 #[tokio::test]
@@ -897,7 +1015,10 @@ WHERE request_id = 'legacy-capture';
         .expect("explicit none should clear legacy fallback storage");
     assert!(cleared.request_body.is_none());
     assert!(cleared.request_body_ref.is_none());
-    assert!(cleared.request_body_state.is_none());
+    assert_eq!(
+        cleared.request_body_state,
+        Some(UsageBodyCaptureState::None)
+    );
     assert!(cleared
         .request_metadata
         .as_ref()
@@ -1396,13 +1517,16 @@ VALUES (
     .expect("stale blobs should count");
     assert_eq!(stale_blobs, 0);
 
-    let detail_blobs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM usage_body_blobs WHERE request_id = 'cleanup-detail'",
+    let detail_blob: Vec<u8> = sqlx::query_scalar(
+        "SELECT payload_gzip FROM usage_body_blobs WHERE request_id = 'cleanup-detail'",
     )
     .fetch_one(&pool)
     .await
-    .expect("purged body blobs should count");
-    assert_eq!(detail_blobs, 0);
+    .expect("externalized body should load");
+    assert_eq!(
+        super::inflate_usage_json_value(&detail_blob).expect("body gzip should decode"),
+        serde_json::json!({"detail": true})
+    );
     let detail_inline: Option<String> = sqlx::query_scalar(
         "SELECT request_body FROM \"usage\" WHERE request_id = 'cleanup-detail'",
     )
@@ -1421,13 +1545,16 @@ VALUES (
         serde_json::from_str::<serde_json::Value>(&legacy_metadata).expect("valid metadata"),
         serde_json::json!({"trace": "kept"})
     );
-    let legacy_audits: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM usage_http_audits WHERE request_id = 'cleanup-legacy'",
+    let legacy_ref: String = sqlx::query_scalar(
+        "SELECT request_body_ref FROM usage_http_audits WHERE request_id = 'cleanup-legacy'",
     )
     .fetch_one(&pool)
     .await
-    .expect("legacy audit refs should count");
-    assert_eq!(legacy_audits, 0);
+    .expect("legacy ref should migrate");
+    assert_eq!(
+        legacy_ref,
+        "usage://request/cleanup-legacy/request_body".to_string()
+    );
 
     let disabled_key: i64 =
         sqlx::query_scalar("SELECT is_active FROM api_keys WHERE id = 'cleanup-disable-key'")
@@ -2774,8 +2901,14 @@ async fn sqlite_first_byte_fast_path_preserves_lifecycle_state_and_counters() {
         duplicate.request_metadata.as_ref().unwrap()["trace_id"],
         "pending-first-byte-duplicate"
     );
-    assert!(duplicate.request_body.is_none());
-    assert!(duplicate.request_body_ref.is_none());
+    assert_eq!(
+        duplicate.request_body,
+        Some(serde_json::json!({"prompt": "first-byte-duplicate"}))
+    );
+    assert_eq!(
+        duplicate.request_body_ref.as_deref(),
+        Some("usage://request/first-byte-duplicate/request_body")
+    );
 
     let unique = repository
         .find_by_request_id("first-byte-unique")
@@ -2952,7 +3085,7 @@ SELECT
     .fetch_one(&pool)
     .await
     .expect("pending batch auxiliary rows should count");
-    assert_eq!(committed, (2, 0, 0, 2, 2));
+    assert_eq!(committed, (2, 2, 1, 2, 2));
 
     let provider_deltas: i64 = sqlx::query_scalar(
         r#"

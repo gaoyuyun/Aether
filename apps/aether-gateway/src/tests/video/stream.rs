@@ -32,6 +32,7 @@ async fn gateway_executes_openai_video_content_from_reconstructed_data_task_with
     struct SeenExecutionRuntimeStreamRequest {
         method: String,
         url: String,
+        headers: serde_json::Value,
     }
 
     fn hash_api_key(value: &str) -> String {
@@ -159,6 +160,7 @@ async fn gateway_executes_openai_video_content_from_reconstructed_data_task_with
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    headers: payload.get("headers").cloned().unwrap_or_else(|| json!({})),
                 });
 
                 let frames = [
@@ -252,7 +254,10 @@ async fn gateway_executes_openai_video_content_from_reconstructed_data_task_with
             updated_at_unix_secs: 456,
             error_code: None,
             error_message: None,
-            video_url: Some("https://cdn.example.com/video-content.mp4".to_string()),
+            video_url: Some(
+                "https://cdn.example.com/video-content.mp4?signature=a%2Fb%2Bc%3D&part=2&part=1"
+                    .to_string(),
+            ),
             request_metadata: None,
         })
         .await
@@ -358,8 +363,9 @@ async fn gateway_executes_openai_video_content_from_reconstructed_data_task_with
     assert_eq!(seen_stream_request.method, "GET");
     assert_eq!(
         seen_stream_request.url,
-        "https://api.openai.example/v1/videos/ext-video-content-followup-123/content"
+        "https://cdn.example.com/video-content.mp4?signature=a%2Fb%2Bc%3D&part=2&part=1"
     );
+    assert!(seen_stream_request.headers.get("authorization").is_none());
     assert_eq!(*decision_stream_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*execute_stream_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);

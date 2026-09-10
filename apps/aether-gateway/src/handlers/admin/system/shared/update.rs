@@ -1399,7 +1399,8 @@ fn rename_release_dir_noreplace(source: &Path, destination: &Path) -> Result<(),
         #[cfg(target_os = "linux")]
         // SAFETY: both paths are valid NUL-terminated strings and remain alive for the call.
         let status = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 source.as_ptr(),
                 libc::AT_FDCWD,
@@ -2621,6 +2622,27 @@ mod tests {
 
         assert!(err.contains("拒绝覆盖"));
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"known-good");
+        assert!(source.is_dir(), "failed install must retain its source");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn update_preserves_existing_empty_release_destination() {
+        let dir = temp_test_dir("existing-empty-release");
+        let source = dir.join("prepared-v1.2.3");
+        let release = dir.join("releases/v1.2.3");
+        std::fs::create_dir_all(&source).expect("prepared release should be created");
+        std::fs::create_dir_all(&release).expect("existing release should be created");
+
+        let err = rename_release_dir_noreplace(&source, &release)
+            .expect_err("existing empty release must not be replaceable");
+
+        assert!(err.contains("拒绝覆盖"));
+        assert!(
+            release.is_dir(),
+            "failed install must retain its destination"
+        );
         assert!(source.is_dir(), "failed install must retain its source");
         std::fs::remove_dir_all(dir).ok();
     }

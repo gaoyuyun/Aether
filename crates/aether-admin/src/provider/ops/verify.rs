@@ -849,14 +849,16 @@ mod tests {
 
     #[test]
     fn architecture_verify_failures_do_not_reflect_upstream_messages() {
-        let cubence = admin_provider_ops_cubence_verify_payload(
+        let generic = parse_verify_payload(
+            "generic",
             StatusCode::OK,
             &json!({
                 "success": false,
                 "message": "authorization=Bearer upstream-secret"
             }),
+            None,
         );
-        assert_eq!(cubence["message"], json!("验证失败"));
+        assert_eq!(generic["message"], json!("验证失败"));
 
         let sub2api = admin_provider_ops_sub2api_verify_payload(
             StatusCode::OK,

@@ -1396,7 +1396,7 @@ async fn gateway_commits_admin_usage_failure_when_candidate_owns_the_response_im
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["status"], "failed");
     assert_eq!(requests[0]["status_code"], 503);
-    assert_eq!(requests[0]["error_message"], "upstream failed");
+    assert_eq!(requests[0]["error_message"], "http_503");
 
     gateway_handle.abort();
 }
@@ -2594,6 +2594,265 @@ async fn gateway_handles_admin_usage_detail_with_ref_backed_bodies() {
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+fn sample_selective_body_usage() -> StoredRequestUsageAudit {
+    let mut usage = sample_usage_row(
+        "usage-selected-body",
+        "req-selected-body",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "OpenAI",
+        "gpt-5",
+        "completed",
+        120,
+        30,
+        0.3,
+        0.36,
+        DAY_1_UNIX_SECS,
+    );
+    usage.request_body = Some(json!({ "marker": "request_body" }));
+    usage.provider_request_body = Some(json!({ "marker": "provider_request_body" }));
+    usage.response_body = Some(json!({ "marker": "response_body" }));
+    usage.client_response_body = Some(json!({ "marker": "client_response_body" }));
+    usage
+}
+
+#[tokio::test]
+async fn gateway_admin_usage_detail_returns_only_the_selected_body() {
+    let fields = [
+        "request_body",
+        "provider_request_body",
+        "response_body",
+        "client_response_body",
+    ];
+    for detached in [false, true] {
+        let usage = sample_selective_body_usage();
+        let repository = if detached {
+            InMemoryUsageReadRepository::seed_with_detached_bodies(vec![usage])
+        } else {
+            InMemoryUsageReadRepository::seed(vec![usage])
+        };
+        let state = AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(Arc::new(
+                repository,
+            )));
+        for selected in fields {
+            let response = local_admin_usage_response(
+                &state, http::Method::GET,
+                &format!("/api/admin/usage/usage-selected-body?include_bodies=true&body_field={selected}"),
+                None,
+            ).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should collect");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("json should parse");
+            for field in fields {
+                assert_eq!(payload[format!("has_{field}")], true);
+                if field == selected {
+                    assert_eq!(payload[field]["marker"], selected);
+                } else {
+                    assert!(
+                        payload[field].is_null(),
+                        "unselected {field} must not be returned"
+                    );
+                }
+            }
+            assert!(payload["body_load_errors"].is_null());
+            assert!(payload["body_load_error_codes"].is_null());
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_admin_usage_detail_validates_body_field_selection() {
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(Arc::new(
+            InMemoryUsageReadRepository::seed(vec![sample_selective_body_usage()]),
+        )));
+    for query in [
+        "body_field=unknown",
+        "body_field=",
+        "include_bodies=false&body_field=request_body",
+        "body_format=raw",
+        "body_format=unknown&body_field=request_body",
+        "body_format=&body_field=request_body",
+    ] {
+        let response = local_admin_usage_response(
+            &state,
+            http::Method::GET,
+            &format!("/api/admin/usage/usage-selected-body?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "invalid query: {query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gateway_admin_usage_detail_raw_reads_only_selected_body_and_is_not_cacheable() {
+    for detached in [false, true] {
+        let repository = if detached {
+            InMemoryUsageReadRepository::seed_with_detached_bodies(vec![
+                sample_selective_body_usage(),
+            ])
+        } else {
+            InMemoryUsageReadRepository::seed(vec![sample_selective_body_usage()])
+        };
+        let state = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::with_usage_reader_for_tests(Arc::new(repository)),
+        );
+        for field in [
+            "request_body",
+            "provider_request_body",
+            "response_body",
+            "client_response_body",
+        ] {
+            let response = local_admin_usage_response(
+                &state,
+                http::Method::GET,
+                &format!("/api/admin/usage/usage-selected-body?body_field={field}&body_format=raw"),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["cache-control"],
+                "no-store, no-transform"
+            );
+            assert_eq!(
+                response.headers()["x-aether-usage-id"],
+                "usage-selected-body"
+            );
+            assert_eq!(response.headers()["x-aether-body-field"], field);
+            assert_eq!(response.headers()["x-aether-body-encoding"], "json");
+            assert!(response.extensions().get::<AdminAuditEvent>().is_some());
+            let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                json!({ "marker": field })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_admin_usage_detail_raw_rejects_foreign_refs_and_disabled_capture() {
+    for body_state in [
+        UsageBodyCaptureState::Reference,
+        UsageBodyCaptureState::Disabled,
+    ] {
+        let mut usage = sample_selective_body_usage();
+        usage.response_body = None;
+        usage.response_body_ref = Some("usage://request/foreign-request/response_body".to_string());
+        usage.response_body_state = Some(body_state);
+        let mut foreign = sample_selective_body_usage();
+        foreign.id = "foreign-usage".to_string();
+        foreign.request_id = "foreign-request".to_string();
+        foreign.response_body = Some(json!({ "secret": "must not leak" }));
+        let state = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::with_usage_reader_for_tests(Arc::new(
+                InMemoryUsageReadRepository::seed_with_detached_bodies(vec![usage, foreign]),
+            )),
+        );
+        let response = local_admin_usage_response(
+            &state,
+            http::Method::GET,
+            "/api/admin/usage/usage-selected-body?body_field=response_body&body_format=raw",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["x-aether-body-error"], "missing");
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("secret"));
+    }
+}
+
+#[tokio::test]
+async fn gateway_admin_usage_detail_raw_preserves_authorization_and_binary_headers() {
+    let state = AppState::new().unwrap().with_data_state_for_tests(
+        GatewayDataState::with_usage_reader_for_tests(Arc::new(
+            InMemoryUsageReadRepository::seed_with_detached_bodies(vec![
+                sample_selective_body_usage(),
+            ]),
+        )),
+    );
+    let gateway =
+        build_router_with_state(state).layer(tower_http::compression::CompressionLayer::new());
+    let (url, server) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+    let endpoint = format!(
+        "{url}/api/admin/usage/usage-selected-body?body_field=response_body&body_format=raw"
+    );
+    let unauthorized = client.get(&endpoint).send().await.unwrap();
+    assert!(matches!(
+        unauthorized.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+    let response = admin_request(client.get(&endpoint))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-encoding"], "identity");
+    assert_eq!(response.headers()["x-aether-body-encoding"], "json");
+    assert_eq!(
+        response.headers()["cache-control"],
+        "no-store, no-transform"
+    );
+    let bytes = response.bytes().await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        json!({ "marker": "response_body" })
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn gateway_admin_usage_detail_isolates_missing_body_errors() {
+    let mut usage = sample_selective_body_usage();
+    usage.request_body = None;
+    usage.request_body_ref = Some("usage://request/req-selected-body/request_body".to_string());
+    usage.request_body_state = Some(UsageBodyCaptureState::Reference);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(Arc::new(
+            InMemoryUsageReadRepository::seed_with_detached_bodies(vec![usage]),
+        )));
+    for selected in ["response_body", "request_body"] {
+        let response = local_admin_usage_response(
+            &state,
+            http::Method::GET,
+            &format!("/api/admin/usage/usage-selected-body?body_field={selected}"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should collect");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json should parse");
+        if selected == "request_body" {
+            assert_eq!(payload["body_load_errors"]["request_body"], true);
+            assert_eq!(payload["body_load_error_codes"]["request_body"], "missing");
+            assert!(payload["request_body"].is_null());
+        } else {
+            assert_eq!(payload["response_body"]["marker"], "response_body");
+            assert!(payload["body_load_errors"].is_null());
+            assert!(payload["body_load_error_codes"].is_null());
+        }
+    }
 }
 
 #[tokio::test]

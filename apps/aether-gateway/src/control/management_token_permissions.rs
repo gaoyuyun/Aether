@@ -496,6 +496,7 @@ fn access_for_route(method: &http::Method, decision: &GatewayControlDecision) ->
             Some("admin:endpoints_manage"),
             Some(
                 "reveal_key"
+                    | "reveal_endpoint_rules"
                     | "export_key"
                     | "create_provider_key"
                     | "update_key"
@@ -1490,6 +1491,12 @@ mod tests {
     fn plaintext_credential_reads_require_admin_permission() {
         let read_only_permissions = read_only_management_token_permissions();
         let cases = [
+            (
+                "admin:endpoints_manage",
+                "reveal_endpoint_rules",
+                None,
+                "admin:endpoints_manage:admin",
+            ),
             (
                 "admin:endpoints_manage",
                 "reveal_key",

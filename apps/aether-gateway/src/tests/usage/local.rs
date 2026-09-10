@@ -12,6 +12,7 @@ use super::{
     UsageReadRepository, UsageRuntimeConfig, DEVELOPMENT_ENCRYPTION_KEY, TRACE_ID_HEADER,
 };
 use crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER;
+use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 
 fn deep_nested_metadata(levels: usize) -> serde_json::Value {
     let mut current = json!({"leaf": "value"});
@@ -82,6 +83,58 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     stored.expect("usage should be present once the expected status is observed")
+}
+
+async fn load_admin_usage_capture_detail(
+    state: &crate::AppState,
+    usage_id: &str,
+    include_bodies: bool,
+) -> serde_json::Value {
+    use crate::admin_api::{maybe_build_local_admin_response, AdminRouteRequest};
+    use crate::constants::{
+        GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
+        TRUSTED_ADMIN_USER_ROLE_HEADER,
+    };
+    use crate::control::resolve_public_request_context;
+    use http_body_util::BodyExt;
+
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in [
+        (GATEWAY_HEADER, "rust-phase3b"),
+        (TRUSTED_ADMIN_USER_ID_HEADER, "admin-user"),
+        (TRUSTED_ADMIN_USER_ROLE_HEADER, "admin"),
+        (TRUSTED_ADMIN_SESSION_ID_HEADER, "admin-session"),
+    ] {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    let uri = format!("/api/admin/usage/{usage_id}?include_bodies={include_bodies}")
+        .parse()
+        .unwrap();
+    let context = resolve_public_request_context(
+        state,
+        &http::Method::GET,
+        &uri,
+        &headers,
+        "usage-full-detail",
+    )
+    .await
+    .unwrap();
+    let response = maybe_build_local_admin_response(AdminRouteRequest::new(
+        state,
+        &context,
+        &"127.0.0.1:12345".parse().unwrap(),
+        &headers,
+        None,
+    ))
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .extensions()
+        .get::<crate::audit::AdminAuditEvent>()
+        .is_some());
+    serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
 }
 
 #[test]
@@ -352,7 +405,7 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage_im
                     Arc::clone(&request_candidate_repository),
                     Arc::clone(&usage_repository),
                     DEVELOPMENT_ENCRYPTION_KEY,
-                ),
+                ).with_system_config_values_for_tests([("request_record_level".to_string(), json!("full"))]),
             )
             .with_usage_runtime_for_tests(UsageRuntimeConfig {
                 enabled: true,
@@ -406,10 +459,28 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage_im
     let stored_usage = stored_usage.expect("usage should be recorded");
     assert_eq!(stored_usage.status, "completed");
     assert_eq!(stored_usage.total_tokens, 5);
-    assert!(stored_usage.request_body.is_none());
+    let request_body = stored_usage.request_body.as_ref().unwrap();
+    assert_eq!(
+        request_body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .len(),
+        128 * 1024
+    );
+    assert!(
+        request_body["metadata"]["child"]["child"]["child"]["child"]["child"]
+            .get("depth")
+            .is_some()
+    );
     assert!(stored_usage.request_body_ref.is_none());
-    assert!(stored_usage.request_body_state.is_none());
-    assert!(stored_usage.request_headers.is_none());
+    assert_eq!(
+        stored_usage.request_body_state,
+        Some(UsageBodyCaptureState::Inline)
+    );
+    assert_eq!(
+        stored_usage.request_headers.as_ref().unwrap()["authorization"],
+        "Bearer sk-client-openai-local-report-sync-deep"
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -495,10 +566,10 @@ async fn gateway_ignores_legacy_max_request_body_size_for_local_openai_chat_sync
                 Arc::clone(&usage_repository),
                 DEVELOPMENT_ENCRYPTION_KEY,
             )
-            .with_system_config_values_for_tests([(
-                "max_request_body_size".to_string(),
-                json!(128),
-            )]),
+            .with_system_config_values_for_tests([
+                ("max_request_body_size".to_string(), json!(128)),
+                ("request_record_level".to_string(), json!("full")),
+            ]),
         )
         .with_usage_runtime_for_tests(UsageRuntimeConfig {
             enabled: true,
@@ -541,12 +612,30 @@ async fn gateway_ignores_legacy_max_request_body_size_for_local_openai_chat_sync
     )
     .await;
     assert_eq!(stored_usage.total_tokens, 5);
-    assert!(stored_usage.request_body.is_none());
+    assert!(
+        stored_usage.request_body.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 128
+    );
     assert!(stored_usage.request_body_ref.is_none());
-    assert!(stored_usage.request_body_state.is_none());
-    assert!(stored_usage.provider_request_body.is_none());
+    assert_eq!(
+        stored_usage.request_body_state,
+        Some(UsageBodyCaptureState::Inline)
+    );
+    assert!(
+        stored_usage.provider_request_body.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 128
+    );
     assert!(stored_usage.provider_request_body_ref.is_none());
-    assert!(stored_usage.provider_request_body_state.is_none());
+    assert_eq!(
+        stored_usage.provider_request_body_state,
+        Some(UsageBodyCaptureState::Inline)
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -557,11 +646,19 @@ async fn gateway_ignores_legacy_max_request_body_size_for_local_openai_chat_sync
 fn gateway_strips_request_and_response_bodies_when_request_record_level_is_base() {
     run_async_test_on_large_stack(
         "gateway_strips_request_and_response_bodies_when_request_record_level_is_base",
-        gateway_strips_request_and_response_bodies_when_request_record_level_is_base_impl(),
+        gateway_honors_request_record_level_impl("base"),
     );
 }
 
-async fn gateway_strips_request_and_response_bodies_when_request_record_level_is_base_impl() {
+#[test]
+fn gateway_full_request_record_level_preserves_sync_bodies_in_admin_detail() {
+    run_async_test_on_large_stack(
+        "gateway_full_request_record_level_preserves_sync_bodies_in_admin_detail",
+        gateway_honors_request_record_level_impl("full"),
+    );
+}
+
+async fn gateway_honors_request_record_level_impl(record_level: &str) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
 
@@ -636,14 +733,14 @@ async fn gateway_strips_request_and_response_bodies_when_request_record_level_is
             )
             .with_system_config_values_for_tests([(
                 "request_record_level".to_string(),
-                json!("base"),
+                json!(record_level),
             )]),
         )
         .with_usage_runtime_for_tests(UsageRuntimeConfig {
             enabled: true,
             ..UsageRuntimeConfig::default()
         });
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_state(gateway_state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -684,14 +781,39 @@ async fn gateway_strips_request_and_response_bodies_when_request_record_level_is
     assert_eq!(stored_usage.status, "completed");
     assert_eq!(stored_usage.total_tokens, 5);
     assert_eq!(stored_usage.response_time_ms, Some(25));
-    assert!(stored_usage.request_body.is_none());
-    assert!(stored_usage.request_body_ref.is_none());
-    assert!(stored_usage.provider_request_body.is_none());
-    assert!(stored_usage.provider_request_body_ref.is_none());
-    assert!(stored_usage.response_body.is_none());
-    assert!(stored_usage.response_body_ref.is_none());
-    assert!(stored_usage.client_response_body.is_none());
-    assert!(stored_usage.client_response_body_ref.is_none());
+    let detail = load_admin_usage_capture_detail(&gateway_state, &stored_usage.id, true).await;
+    let shallow = load_admin_usage_capture_detail(&gateway_state, &stored_usage.id, false).await;
+    for field in [
+        "request_body",
+        "provider_request_body",
+        "response_body",
+        "client_response_body",
+    ] {
+        assert!(shallow[field].is_null());
+        let expected_captured = record_level == "full" && field != "client_response_body";
+        assert_eq!(
+            shallow[format!("has_{field}")],
+            expected_captured,
+            "availability for {field}"
+        );
+        if expected_captured {
+            assert!(!detail[field].is_null(), "full should expose {field}");
+        } else {
+            assert!(
+                detail[field].is_null(),
+                "uncaptured {field} must remain absent"
+            );
+        }
+    }
+    if record_level == "full" {
+        assert_eq!(
+            detail["request_body"]["messages"][0]["content"],
+            "request body should not be persisted"
+        );
+        assert_eq!(detail["provider_request_body"]["model"], "gpt-5-upstream");
+        assert_eq!(detail["response_body"], body_json);
+        assert!(detail["client_response_body"].is_null());
+    }
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-chat-local-report-sync-base-123")
@@ -831,10 +953,16 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
     );
     assert!(stored_usage.response_body.is_none());
     assert!(stored_usage.response_body_ref.is_none());
-    assert!(stored_usage.response_body_state.is_none());
+    assert_eq!(
+        stored_usage.response_body_state,
+        Some(UsageBodyCaptureState::Disabled)
+    );
     assert!(stored_usage.client_response_body.is_none());
     assert!(stored_usage.client_response_body_ref.is_none());
-    assert!(stored_usage.client_response_body_state.is_none());
+    assert_eq!(
+        stored_usage.client_response_body_state,
+        Some(UsageBodyCaptureState::Disabled)
+    );
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-chat-local-report-sync-failure-123")
@@ -936,7 +1064,10 @@ async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable
     assert_eq!(stored_usage.status_code, Some(503));
     assert!(stored_usage.response_body.is_none());
     assert!(stored_usage.response_body_ref.is_none());
-    assert!(stored_usage.response_body_state.is_none());
+    assert_eq!(
+        stored_usage.response_body_state,
+        Some(UsageBodyCaptureState::Disabled)
+    );
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-chat-local-transport-unavailable-123")
@@ -1282,7 +1413,10 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
     );
     assert!(stored_usage.client_response_body.is_none());
     assert!(stored_usage.client_response_body_ref.is_none());
-    assert!(stored_usage.client_response_body_state.is_none());
+    assert_eq!(
+        stored_usage.client_response_body_state,
+        Some(UsageBodyCaptureState::Disabled)
+    );
     assert!(stored_usage.error_message.is_none());
 
     let stored_candidates = request_candidate_repository
@@ -1306,11 +1440,20 @@ fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usa
 {
     run_async_test_on_large_stack(
         "gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled",
-        gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled_impl(),
+        gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled_impl("basic"),
+    );
+}
+
+#[test]
+fn gateway_full_request_record_level_preserves_stream_bodies_in_admin_detail() {
+    run_async_test_on_large_stack(
+        "gateway_full_request_record_level_preserves_stream_bodies_in_admin_detail",
+        gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled_impl("full"),
     );
 }
 
 async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_when_usage_runtime_enabled_impl(
+    record_level: &str,
 ) {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
@@ -1416,13 +1559,13 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
             Arc::clone(&request_candidate_repository),
             Arc::clone(&usage_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
-        ),
+        ).with_system_config_values_for_tests([("request_record_level".to_string(), json!(record_level))]),
     )
     .with_usage_runtime_for_tests(UsageRuntimeConfig {
         enabled: true,
         ..UsageRuntimeConfig::default()
     });
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_state(gateway_state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -1457,6 +1600,30 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
     assert!(stored_usage.first_byte_time_ms.is_some());
     assert!(stored_usage.response_time_ms >= stored_usage.first_byte_time_ms);
     assert!(stored_usage.is_stream);
+
+    let detail = load_admin_usage_capture_detail(&gateway_state, &stored_usage.id, true).await;
+    for field in [
+        "request_body",
+        "provider_request_body",
+        "response_body",
+        "client_response_body",
+    ] {
+        if record_level == "full" {
+            assert!(
+                !detail[field].is_null(),
+                "full stream should expose {field}"
+            );
+        } else {
+            assert!(
+                detail[field].is_null(),
+                "basic stream must not persist {field}"
+            );
+        }
+    }
+    if record_level == "full" {
+        assert!(detail["response_body"].to_string().contains("hello"));
+        assert!(detail["client_response_body"].to_string().contains("hello"));
+    }
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-chat-local-report-stream-123")
@@ -1595,10 +1762,10 @@ async fn gateway_ignores_legacy_max_response_body_size_for_stream_usage_impl() {
                 Arc::clone(&usage_repository),
                 DEVELOPMENT_ENCRYPTION_KEY,
             )
-            .with_system_config_values_for_tests([(
-                "max_response_body_size".to_string(),
-                json!(128),
-            )]),
+            .with_system_config_values_for_tests([
+                ("max_response_body_size".to_string(), json!(128)),
+                ("request_record_level".to_string(), json!("full")),
+            ]),
         )
         .with_usage_runtime_for_tests(UsageRuntimeConfig {
             enabled: true,
@@ -1634,12 +1801,34 @@ async fn gateway_ignores_legacy_max_response_body_size_for_stream_usage_impl() {
     )
     .await;
     assert_eq!(stored_usage.total_tokens, 6);
-    assert!(stored_usage.response_body.is_none());
+    assert!(
+        stored_usage
+            .response_body
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .len()
+            > 128
+    );
     assert!(stored_usage.response_body_ref.is_none());
-    assert!(stored_usage.response_body_state.is_none());
-    assert!(stored_usage.client_response_body.is_none());
+    assert_eq!(
+        stored_usage.response_body_state,
+        Some(UsageBodyCaptureState::Inline)
+    );
+    assert!(
+        stored_usage
+            .client_response_body
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .len()
+            > 128
+    );
     assert!(stored_usage.client_response_body_ref.is_none());
-    assert!(stored_usage.client_response_body_state.is_none());
+    assert_eq!(
+        stored_usage.client_response_body_state,
+        Some(UsageBodyCaptureState::Inline)
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -1913,10 +2102,16 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         Some("all_candidates_skipped")
     );
     assert!(stored_usage.error_message.is_none());
-    assert!(stored_usage.request_headers.is_none());
+    assert_eq!(
+        stored_usage.request_headers.as_ref().unwrap()["authorization"],
+        "Bearer sk-client-claude-cli-usage-local-miss"
+    );
     assert!(stored_usage.request_body.is_none());
     assert!(stored_usage.request_body_ref.is_none());
-    assert!(stored_usage.request_body_state.is_none());
+    assert_eq!(
+        stored_usage.request_body_state,
+        Some(UsageBodyCaptureState::Disabled)
+    );
     assert!(stored_usage.provider_request_body.is_none());
     assert_eq!(
         stored_usage
@@ -2179,7 +2374,10 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
         )
         .await;
         assert_eq!(stored_usage.status, "failed");
-        assert!(stored_usage.request_body_state.is_none());
+        assert_eq!(
+            stored_usage.request_body_state,
+            Some(UsageBodyCaptureState::Disabled)
+        );
         assert!(stored_usage.request_body.is_none());
         assert!(stored_usage.request_body_ref.is_none());
         assert!(stored_usage.provider_request_body.is_none());
@@ -2609,11 +2807,13 @@ async fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_req
         Some(429),
         "the request records the status the client received, not a synthetic exhaustion code"
     );
-    assert_eq!(stored_usage.error_message.as_deref(), Some("slow down"));
+    assert!(stored_usage.error_message.is_none());
+    assert_eq!(stored_usage.error_category.as_deref(), Some("client_error"));
+    assert!(stored_usage.client_response_body.is_none());
     assert_eq!(
-        stored_usage.client_response_body.as_ref(),
-        Some(&response_body),
-        "usage must capture the exact final response body instead of synthesizing another error"
+        stored_usage.client_response_body_state,
+        Some(UsageBodyCaptureState::Disabled),
+        "the default recording policy disables stored bodies even for preserved errors"
     );
 
     let stored_candidates = request_candidate_repository

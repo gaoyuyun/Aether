@@ -8423,7 +8423,7 @@ mod tests {
         wrap_non_json_binary_stream_error_for_client, ClientVisibleStreamCompletionTracker,
         DirectPassthroughFinalizer, DirectPassthroughFinalizerCore,
         DirectPassthroughInlineBodyState, DirectPassthroughMode, PostStopFrameReadBudget,
-        PostStopLimitedStreamReader, ProviderStreamErrorInspection, StreamAttemptTerminalGuard,
+        PostStopLimitedStreamReader, ProviderStreamErrorInspection,
         ANTHROPIC_POST_STOP_DRAIN_MAX_BYTES, GEMINI_FILES_DOWNLOAD_PLAN_KIND,
         OPENAI_CHAT_STREAM_PLAN_KIND, OPENAI_RESPONSES_STREAM_PLAN_KIND,
         POST_STOP_MAX_EMPTY_CHUNKS_PER_POLL, PROVIDER_STREAM_ERROR_INSPECTION_MAX_BYTES,
@@ -10504,7 +10504,7 @@ mod tests {
         assert_eq!(candidates[0].status_code, Some(499));
         assert_eq!(
             candidates[0].error_type.as_deref(),
-            Some("downstream_disconnect")
+            Some("local_stream_attempt_cancelled")
         );
 
         server.abort();
@@ -14900,15 +14900,19 @@ mod tests {
         assert_eq!(usage.status_code, Some(302));
         assert_eq!(usage.error_category.as_deref(), Some("redirect"));
         assert!(usage.error_message.is_none());
-        // HTTP capture is intentionally disabled at the persistence boundary. Keep the
-        // protocol facts above, but do not turn provider/client headers into an audit store.
-        assert!(usage.client_response_headers.is_none());
-        assert!(usage.response_headers.is_none());
+        assert_eq!(
+            usage.client_response_headers.as_ref().unwrap()["content-type"],
+            json!("application/json")
+        );
+        assert_eq!(
+            usage.response_headers.as_ref().unwrap()["content-type"],
+            json!("text/html")
+        );
         assert!(
             usage.response_body.is_none(),
             "upstream redirect did not include a body"
         );
-        assert!(usage.client_response_body.is_none());
+        assert_eq!(usage.client_response_body.as_ref(), Some(&body_json));
         let candidates = request_candidate_repository
             .list_by_request_id("req-remote-runtime-stream-redirect")
             .await
@@ -14921,9 +14925,10 @@ mod tests {
             candidate_extra["upstream_response"]["status_code"],
             json!(302)
         );
-        assert!(candidate_extra["upstream_response"]
-            .get("headers")
-            .is_none());
+        assert_eq!(
+            candidate_extra["upstream_response"]["headers"]["location"],
+            "/"
+        );
         assert!(candidate_extra["upstream_response"].get("body").is_none());
         assert!(candidate_extra.get("client_response").is_none());
 

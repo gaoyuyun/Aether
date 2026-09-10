@@ -1,3 +1,4 @@
+use super::super::helpers::admin_provider_oauth_key_name_from_auth_config;
 use super::super::kiro::{
     admin_provider_oauth_kiro_refresh_base_url_override, fetch_admin_provider_oauth_kiro_email,
     refresh_admin_provider_oauth_kiro_auth_config,
@@ -79,7 +80,7 @@ fn kiro_social_key_name(
                 .collect::<String>()
         })
         .unwrap_or_else(|| "unknown".to_string());
-    format!("kiro_{fallback} ({provider})")
+    format!("账号_{fallback} ({provider})")
 }
 
 fn kiro_social_poll_error_response(error: impl Into<String>) -> Response<Body> {
@@ -1004,10 +1005,11 @@ async fn handle_admin_provider_oauth_windsurf_browser_device_poll(
             }
         }
     } else {
-        let key_name = email
-            .as_deref()
-            .map(|email| format!("windsurf_{email}"))
-            .unwrap_or_else(|| format!("windsurf_{}", current_unix_secs()));
+        let key_name = admin_provider_oauth_key_name_from_auth_config(
+            &provider.provider_type,
+            &auth_config,
+            None,
+        );
         match state
             .create_provider_oauth_catalog_key(
                 &provider.id,
@@ -1355,6 +1357,32 @@ mod tests {
     use super::admin_provider_oauth_device_session_matches_resolved_principal;
     use crate::control::GatewayAdminPrincipalContext;
     use aether_data::repository::provider_oauth::StoredAdminProviderOAuthDeviceSession;
+
+    #[test]
+    fn kiro_social_key_name_preserves_email_and_auth_method() {
+        assert_eq!(
+            super::kiro_social_key_name(
+                Some("  kiro_user@example.com  "),
+                Some("Github"),
+                Some("refresh-token-1"),
+            ),
+            "kiro_user@example.com (Github)"
+        );
+    }
+
+    #[test]
+    fn kiro_social_key_name_without_email_uses_generic_account_prefix() {
+        for email in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                super::kiro_social_key_name(email, Some("Google"), Some("refresh-token-1")),
+                "账号_154f43 (Google)"
+            );
+            assert_eq!(
+                super::kiro_social_key_name(email, None, None),
+                "账号_unknown (social)"
+            );
+        }
+    }
 
     fn device_session() -> StoredAdminProviderOAuthDeviceSession {
         StoredAdminProviderOAuthDeviceSession {

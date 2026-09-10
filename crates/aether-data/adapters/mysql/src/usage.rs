@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use async_trait::async_trait;
@@ -1293,6 +1293,104 @@ impl MysqlUsageWriteRepository {
         Self { pool }
     }
 
+    async fn upsert_transaction(
+        &self,
+        usage: &UpsertUsageRecord,
+        capture_usage: &mut UpsertUsageRecord,
+        prepared_capture: &mut Option<http_capture::PreparedUsageHttpCapture>,
+    ) -> Result<Option<StoredRequestUsageAudit>, DataLayerError> {
+        let mut usage = usage.clone();
+        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let existing = counters::lock_and_load_usage(&mut tx, &usage.request_id).await?;
+        if let Some(existing) = existing.as_ref() {
+            if !usage_lifecycle_update_allowed(
+                &existing.status,
+                &existing.billing_status,
+                existing.updated_at_unix_secs,
+                existing.finalized_at_unix_secs,
+                &usage.status,
+                &usage.billing_status,
+                usage.updated_at_unix_secs,
+                usage.finalized_at_unix_secs,
+            ) {
+                let existing = existing.clone();
+                tx.rollback().await.map_sql_err()?;
+                return Ok(Some(existing));
+            }
+        }
+        let recovers_terminal_failure = existing.as_ref().is_some_and(|existing| {
+            usage_can_recover_terminal_failure(
+                &existing.status,
+                &existing.billing_status,
+                &usage.status,
+                &usage.billing_status,
+            )
+        });
+        if let Some(existing) = existing.as_ref() {
+            if (existing.billing_status == "settled" || existing.billing_status == "void")
+                && !recovers_terminal_failure
+            {
+                let existing = existing.clone();
+                tx.rollback().await.map_sql_err()?;
+                return Ok(Some(existing));
+            }
+        }
+
+        if prepared_capture.is_none() {
+            *prepared_capture = Some(http_capture::prepare_usage_http_capture(capture_usage)?);
+            // Compression runs only once, after lifecycle checks. Retries clone
+            // the small control projection and reuse the prepared payloads.
+            capture_usage.request_headers = None;
+            capture_usage.provider_request_headers = None;
+            capture_usage.response_headers = None;
+            capture_usage.client_response_headers = None;
+            capture_usage.request_body = None;
+            capture_usage.provider_request_body = None;
+            capture_usage.response_body = None;
+            capture_usage.client_response_body = None;
+        }
+        let prepared_capture = prepared_capture.as_ref().expect("capture was prepared");
+        let mut capture_usage = capture_usage.clone();
+        let capture_update_allowed = recovers_terminal_failure
+            || http_capture::capture_update_allowed(existing.as_ref(), &usage.status);
+        if capture_update_allowed {
+            http_capture::apply_previous_metadata_tombstones(&mut capture_usage, existing.as_ref());
+            usage.request_metadata =
+                sanitize_usage_request_metadata(capture_usage.request_metadata.clone());
+        }
+        let prepared_snapshots = capture_update_allowed
+            // The control projection preserves safe typed routing and allow-listed billing facts.
+            .then(|| snapshots::from_usage(&capture_usage))
+            .transpose()?;
+        bind_upsert(sqlx::query(UPSERT_USAGE_SQL), &usage)?
+            .execute(&mut *tx)
+            .await
+            .map_sql_err()?;
+        if capture_update_allowed {
+            http_capture::sync_usage_http_capture(&mut tx, &usage.request_id, prepared_capture)
+                .await?;
+            let (routing_snapshot, settlement_snapshot) = prepared_snapshots
+                .as_ref()
+                .expect("capture-allowed usage has prepared snapshots");
+            snapshots::sync(
+                &mut tx,
+                &usage.request_id,
+                routing_snapshot,
+                settlement_snapshot,
+                matches!(usage.status.as_str(), "completed" | "failed" | "cancelled"),
+            )
+            .await?;
+        }
+        counters::enqueue_usage_transition_for_request(
+            &mut tx,
+            &usage.request_id,
+            existing.as_ref(),
+        )
+        .await?;
+        tx.commit().await.map_sql_err()?;
+        Ok(None)
+    }
+
     pub async fn find_by_request_id(
         &self,
         request_id: &str,
@@ -1317,6 +1415,14 @@ impl MysqlUsageWriteRepository {
     }
 }
 
+fn is_mysql_deadlock(error: &DataLayerError) -> bool {
+    // The shared error contract retains SQL errors as strings. Match sqlx's
+    // exact MySQL deadlock code; never replay an ambiguous connection failure
+    // or a lock wait timeout, which need not roll back the whole transaction.
+    matches!(error, DataLayerError::Sql(message)
+        if message.starts_with("error returned from database: 1213 (40001):"))
+}
+
 #[async_trait]
 impl UsageWriteRepository for MysqlUsageWriteRepository {
     async fn upsert(
@@ -1324,85 +1430,29 @@ impl UsageWriteRepository for MysqlUsageWriteRepository {
         usage: UpsertUsageRecord,
     ) -> Result<StoredRequestUsageAudit, DataLayerError> {
         usage.validate()?;
-        // Auxiliary tables may receive only clear tombstones, never request or response content.
-        let capture_usage = usage.clone();
-        let mut usage = sanitize_usage_for_persistence(usage);
+        let mut capture_usage = sanitize_usage_capture_controls_for_persistence(usage.clone());
+        let usage = sanitize_usage_for_persistence(usage);
         usage.validate()?;
-        let mut tx = self.pool.begin().await.map_sql_err()?;
-        let existing = counters::lock_and_load_usage(&mut tx, &usage.request_id).await?;
-        if let Some(existing) = existing.as_ref() {
-            if !usage_lifecycle_update_allowed(
-                &existing.status,
-                &existing.billing_status,
-                existing.updated_at_unix_secs,
-                existing.finalized_at_unix_secs,
-                &usage.status,
-                &usage.billing_status,
-                usage.updated_at_unix_secs,
-                usage.finalized_at_unix_secs,
-            ) {
-                let existing = existing.clone();
-                tx.rollback().await.map_sql_err()?;
-                return http_capture::hydrate_usage_body_refs(&self.pool, existing).await;
-            }
-        }
-        let recovers_terminal_failure = existing.as_ref().is_some_and(|existing| {
-            usage_can_recover_terminal_failure(
-                &existing.status,
-                &existing.billing_status,
-                &usage.status,
-                &usage.billing_status,
-            )
-        });
-        if let Some(existing) = existing.as_ref() {
-            if (existing.billing_status == "settled" || existing.billing_status == "void")
-                && !recovers_terminal_failure
+        let mut prepared_capture = None;
+        let mut retries = 0;
+        let existing = loop {
+            match self
+                .upsert_transaction(&usage, &mut capture_usage, &mut prepared_capture)
+                .await
             {
-                let existing = existing.clone();
-                tx.rollback().await.map_sql_err()?;
-                return http_capture::hydrate_usage_body_refs(&self.pool, existing).await;
+                Ok(existing) => break existing,
+                Err(error) if retries < 5 && is_mysql_deadlock(&error) => {
+                    // InnoDB rolls back the entire deadlock victim transaction.
+                    // Reload the winning row before deciding counters/lifecycle.
+                    tokio::time::sleep(Duration::from_millis(5 << retries)).await;
+                    retries += 1;
+                }
+                Err(error) => return Err(error),
             }
+        };
+        if let Some(existing) = existing {
+            return http_capture::hydrate_usage_body_refs(&self.pool, existing).await;
         }
-
-        let mut capture_usage = sanitize_usage_capture_controls_for_persistence(capture_usage);
-        let prepared_capture = http_capture::prepare_usage_http_capture(&mut capture_usage)?;
-        let capture_update_allowed = recovers_terminal_failure
-            || http_capture::capture_update_allowed(existing.as_ref(), &usage.status);
-        if capture_update_allowed {
-            http_capture::apply_previous_metadata_tombstones(&mut capture_usage, existing.as_ref());
-            usage.request_metadata =
-                sanitize_usage_request_metadata(capture_usage.request_metadata.clone());
-        }
-        let prepared_snapshots = capture_update_allowed
-            // The control projection preserves safe typed routing and allow-listed billing facts.
-            .then(|| snapshots::from_usage(&capture_usage))
-            .transpose()?;
-        bind_upsert(sqlx::query(UPSERT_USAGE_SQL), &usage)?
-            .execute(&mut *tx)
-            .await
-            .map_sql_err()?;
-        if capture_update_allowed {
-            http_capture::sync_usage_http_capture(&mut tx, &usage.request_id, &prepared_capture)
-                .await?;
-            let (routing_snapshot, settlement_snapshot) = prepared_snapshots
-                .as_ref()
-                .expect("capture-allowed usage has prepared snapshots");
-            snapshots::sync(
-                &mut tx,
-                &usage.request_id,
-                routing_snapshot,
-                settlement_snapshot,
-                matches!(usage.status.as_str(), "completed" | "failed" | "cancelled"),
-            )
-            .await?;
-        }
-        counters::enqueue_usage_transition_for_request(
-            &mut tx,
-            &usage.request_id,
-            existing.as_ref(),
-        )
-        .await?;
-        tx.commit().await.map_sql_err()?;
         self.find_by_request_id(&usage.request_id)
             .await?
             .ok_or_else(|| {

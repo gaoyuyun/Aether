@@ -17,7 +17,7 @@ pub use types::{
     StoredProviderApiKeyWindowUsageSummary, StoredProviderQuotaWindowUsage,
     StoredProviderUsageSummary, StoredProviderUsageWindow, StoredRequestUsageAudit,
     StoredUsageAuditAggregation, StoredUsageAuditDimensionsAggregation, StoredUsageAuditSummary,
-    StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
+    StoredUsageBodyPayload, StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
     StoredUsageCacheAffinityIntervalRow, StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
     StoredUsageDailySummary, StoredUsageDashboardDailyBreakdownRow,
     StoredUsageDashboardProviderCount, StoredUsageDashboardStatsSummary,

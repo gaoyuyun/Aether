@@ -50,9 +50,13 @@ chmod 600 .env
 ./generate_keys.sh
 # 编辑 .env 设置 ADMIN_PASSWORD
 
-# 3. 首次部署 / 更新 (从以下部署形态任选其一)
-# Postgres + Redis (推荐)
+# 3. Docker 部署 / 更新（PostgreSQL + Redis）
 docker compose pull && docker compose up -d
+```
+
+SQLite 单节点部署使用独立配置，部署时执行以下命令：
+
+```bash
 # Single Node：默认容器身份为 65532:65532，先停止旧容器并检查/迁移 SQLite bind 目录
 docker compose -f docker-compose.single-node.yml stop app
 mkdir -p data
@@ -64,7 +68,9 @@ sudo find data -type f -exec chmod 0600 {} +
 docker compose -f docker-compose.single-node.yml pull && docker compose -f docker-compose.single-node.yml up -d
 ```
 
-应用镜像默认以固定非 root 身份 `65532:65532` 运行；Compose 同时移除全部 Linux capabilities、禁止提权、启用只读根文件系统，并仅提供带 `nosuid,nodev,noexec` 的 `/tmp` 临时文件系统。若宿主机不适合使用固定 UID/GID，可在 `.env` 中把 `AETHER_CONTAINER_UID` / `AETHER_CONTAINER_GID` 改成其他非零数字身份，并让 Single Node 的 `./data` 归该身份所有。`install.sh --mode compose-single-node` 会按安装用户自动生成这两个值；使用 `sudo` 运行时会采用原调用用户身份，并安全迁移已有 SQLite 数据。
+标准 Compose 沿用上游的 `0:0` 容器身份，仅保留 `DAC_OVERRIDE` 和 `FOWNER` capabilities。Single Node SQLite 默认使用非 root 身份 `65532:65532` 并移除全部 capabilities；两种配置都禁止提权、启用只读根文件系统，并提供带 `nosuid,nodev,noexec` 的 `/tmp` 临时文件系统。Single Node 可在 `.env` 中把 `AETHER_CONTAINER_UID` / `AETHER_CONTAINER_GID` 改成其他非零数字身份，并让 `./data` 归该身份所有。`install.sh --mode compose-single-node` 会按安装用户自动生成这两个值；使用 `sudo` 运行时会采用原调用用户身份，并安全迁移已有 SQLite 数据。
+
+MySQL 支持保留在标准 Compose 的可选 `mysql` profile 中。在 `.env` 中设置 `AETHER_DATABASE_DRIVER=mysql` 和 `AETHER_DATABASE_URL=mysql://aether:你的MYSQL_PASSWORD@mysql:3306/aether`，再执行 `docker compose --profile mysql up -d`。连接外部 MySQL 时，把 URL 中的主机、端口和数据库名替换为实际值。未显式选择数据库时，标准 Compose 默认使用 PostgreSQL。
 
 从旧版 root 容器升级 Single Node 时，必须先停止旧 `app` 容器，再在第一次启动新版 Compose 前完成一次数据目录迁移；安装器检测到容器仍在运行会拒绝迁移，避免并发改写造成检查竞态。停止容器后用 `sudo` 重新执行一键安装器会自动处理；非 root 安装器发现旧数据所有权不匹配时会拒绝启动并提示迁移，不会放宽目录权限。手工部署且仍使用默认身份时执行上面的检查、`chown` 和 `find ... chmod` 命令即可。迁移只改变 `./data` 的所有权和权限，不会删除数据库、WAL 或备份文件。
 
@@ -102,7 +108,7 @@ gh attestation verify "aether-${TAG}-linux-amd64.tar.gz" \
 
 源码或本地构建版本不会启用后台在线更新，请继续使用源码更新流程。Docker Compose 用户如果希望“容器重建后也保持镜像层面的新版本”，仍建议定期运行 `./update.sh` 拉取并重建 app 镜像。服务器访问 GitHub 需要代理时，可设置 `AETHER_UPDATE_PROXY_URL`，也兼容 `UPDATE_PROXY_URL`、`HTTPS_PROXY`、`ALL_PROXY`、`HTTP_PROXY` 以及 `NO_PROXY`。共享出口触发 GitHub API 限流时，可设置只读 `AETHER_UPDATE_GITHUB_TOKEN`，也兼容 `GITHUB_TOKEN` / `GH_TOKEN`。下载总超时默认 600 秒，连续无响应/无数据默认 30 秒，可通过 `AETHER_UPDATE_DOWNLOAD_TIMEOUT_SECS` 和 `AETHER_UPDATE_DOWNLOAD_IDLE_TIMEOUT_SECS` 调整。
 
-标准 Docker Compose 使用 Docker named volumes 存放 Postgres/Redis/MySQL 数据；Single Node 使用部署目录下的 `./data` 存放 SQLite 数据。
+标准 Docker Compose 使用 Docker named volumes 存放 PostgreSQL 和可选 MySQL 的数据，Redis 用作运行时缓存；Single Node 使用部署目录下的 `./data` 存放 SQLite 数据。
 
 ### 商业模块开关运维约定
 

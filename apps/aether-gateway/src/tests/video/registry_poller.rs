@@ -213,6 +213,13 @@ async fn gateway_background_video_task_poller_refreshes_due_openai_task_from_rep
     };
 
     assert_eq!(stored.status, VideoTaskStatus::Processing);
+    assert_eq!(stored.prompt.as_deref(), Some("hello"));
+    assert_eq!(stored.username.as_deref(), Some("video-user"));
+    assert_eq!(stored.api_key_name.as_deref(), Some("video-key"));
+    assert_eq!(stored.duration_seconds, Some(4));
+    assert_eq!(stored.resolution.as_deref(), Some("720p"));
+    assert_eq!(stored.aspect_ratio.as_deref(), Some("16:9"));
+    assert_eq!(stored.size.as_deref(), Some("1280x720"));
     assert_eq!(stored.progress_percent, 37);
     assert_eq!(stored.poll_count, 1);
     assert!(

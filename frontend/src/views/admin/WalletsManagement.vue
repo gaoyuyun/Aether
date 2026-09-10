@@ -1383,7 +1383,7 @@ import {
 import type { PaymentOrder } from '@/api/wallet'
 import { parseApiError } from '@/utils/errorParser'
 import { useToast } from '@/composables/useToast'
-import { useI18n } from '@/i18n'
+import { getI18nLocale, useI18n } from '@/i18n'
 import { log } from '@/utils/logger'
 import {
   callbackStatusBadge,
@@ -2222,7 +2222,7 @@ function ownerDisplayName(name: string | null | undefined, ownerType: 'user' | '
 
 function formatDateTime(value: string | null | undefined) {
   if (!value) return '-'
-  return new Date(value).toLocaleString('zh-CN', {
+  return new Date(value).toLocaleString(getI18nLocale(), {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',

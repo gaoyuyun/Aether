@@ -1995,7 +1995,7 @@ mod tests {
             unchanged.force_capabilities,
             Some(json!({"must_not_change": true}))
         );
-        assert_eq!(unchanged.feature_settings, Some(json!({"compact": true})));
+        assert_eq!(unchanged.feature_settings, zero_rate_limit.feature_settings);
 
         let active_user_key = repository
             .set_user_api_key_active("user-1", "key-created-user", false)

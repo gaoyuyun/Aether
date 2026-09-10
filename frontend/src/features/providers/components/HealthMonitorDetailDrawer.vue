@@ -235,7 +235,7 @@ async function loadRelated() {
     if (!props.isAdmin && target.source.kind === 'provider') {
       throw new Error('公开健康监控不支持 provider 详情')
     }
-    const dimension = target.source.kind as 'provider' | 'model' | 'endpoint'
+    const dimension = target.source.kind
     const params = {
       dimension,
       value: target.source.value,
@@ -245,10 +245,9 @@ async function loadRelated() {
     }
     const data = props.isAdmin
       ? await getHealthRelatedMonitor(params)
-      : await getPublicHealthRelatedMonitor({
-          ...params,
-          dimension: dimension as 'model' | 'endpoint'
-        })
+      : dimension === 'provider'
+        ? null
+        : await getPublicHealthRelatedMonitor({ ...params, dimension })
     if (seq === requestSeq) {
       related.value = data
     }

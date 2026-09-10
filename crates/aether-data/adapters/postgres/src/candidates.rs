@@ -172,7 +172,7 @@ DO UPDATE SET
       THEN __AETHER_SANITIZED_LEGACY_ERROR_TYPE__
     ELSE EXCLUDED.error_type
   END,
-  error_message = NULL,
+  error_message = __AETHER_CANDIDATE_ERROR_MESSAGE__,
   latency_ms = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status <> request_candidates.status
@@ -184,7 +184,7 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.latency_ms, request_candidates.latency_ms)
   END,
   concurrent_requests = COALESCE(EXCLUDED.concurrent_requests, request_candidates.concurrent_requests),
-  extra_data = EXCLUDED.extra_data,
+  extra_data = __AETHER_CANDIDATE_EXTRA_DATA__,
   required_capabilities = EXCLUDED.required_capabilities,
   created_at = CASE
     WHEN request_candidates.created_at <= TO_TIMESTAMP(1)
@@ -275,7 +275,7 @@ DO UPDATE SET
       THEN __AETHER_SANITIZED_LEGACY_ERROR_TYPE__
     ELSE EXCLUDED.error_type
   END,
-  error_message = NULL,
+  error_message = __AETHER_CANDIDATE_ERROR_MESSAGE__,
   latency_ms = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status <> request_candidates.status
@@ -287,7 +287,7 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.latency_ms, request_candidates.latency_ms)
   END,
   concurrent_requests = COALESCE(EXCLUDED.concurrent_requests, request_candidates.concurrent_requests),
-  extra_data = EXCLUDED.extra_data,
+  extra_data = __AETHER_CANDIDATE_EXTRA_DATA__,
   required_capabilities = EXCLUDED.required_capabilities,
   created_at = CASE
     WHEN request_candidates.created_at <= TO_TIMESTAMP(1)
@@ -353,7 +353,7 @@ DO UPDATE SET
       THEN __AETHER_SANITIZED_LEGACY_ERROR_TYPE__
     ELSE EXCLUDED.error_type
   END,
-  error_message = NULL,
+  error_message = __AETHER_CANDIDATE_ERROR_MESSAGE__,
   latency_ms = CASE
     WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped')
       AND EXCLUDED.status <> request_candidates.status
@@ -365,7 +365,7 @@ DO UPDATE SET
     ELSE COALESCE(EXCLUDED.latency_ms, request_candidates.latency_ms)
   END,
   concurrent_requests = COALESCE(EXCLUDED.concurrent_requests, request_candidates.concurrent_requests),
-  extra_data = EXCLUDED.extra_data,
+  extra_data = __AETHER_CANDIDATE_EXTRA_DATA__,
   required_capabilities = EXCLUDED.required_capabilities,
   created_at = CASE
     WHEN request_candidates.created_at <= TO_TIMESTAMP(1)
@@ -445,6 +445,23 @@ fn postgres_candidate_upsert_sql(template: &str) -> String {
                 "unclassified_error",
             )
             .as_str(),
+        )
+        .replace(
+            "__AETHER_CANDIDATE_ERROR_MESSAGE__",
+            "CASE WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped') \
+             AND EXCLUDED.status <> request_candidates.status \
+             THEN request_candidates.error_message \
+             WHEN request_candidates.status = 'pending' AND EXCLUDED.status IN ('available', 'unused') \
+             THEN request_candidates.error_message \
+             WHEN request_candidates.status = 'streaming' AND EXCLUDED.status IN ('available', 'unused', 'pending') \
+             THEN request_candidates.error_message \
+             ELSE COALESCE(EXCLUDED.error_message, request_candidates.error_message) END",
+        )
+        .replace(
+            "__AETHER_CANDIDATE_EXTRA_DATA__",
+            "CASE WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped') \
+             AND (EXCLUDED.status <> request_candidates.status OR EXCLUDED.extra_data IS NULL) \
+             THEN request_candidates.extra_data ELSE EXCLUDED.extra_data END",
         )
 }
 
@@ -1530,33 +1547,35 @@ mod tests {
             finished_at_unix_ms: Some(2),
         };
 
-        assert_eq!(sanitize_request_candidate_for_postgres(&mut candidate), 0);
+        assert_eq!(sanitize_request_candidate_for_postgres(&mut candidate), 1);
         assert!(candidate.username.is_none());
         assert!(candidate.api_key_name.is_none());
         assert_eq!(candidate.skip_reason.as_deref(), Some("unclassified_skip"));
         assert_eq!(candidate.error_type.as_deref(), Some("unclassified_error"));
-        assert!(candidate.error_message.is_none());
+        assert_eq!(candidate.error_message.as_deref(), Some("bad�message"));
         assert!(candidate.extra_data.is_none());
         assert!(candidate.required_capabilities.is_none());
     }
 
     #[test]
-    fn every_postgres_candidate_conflict_path_discards_legacy_diagnostics() {
+    fn every_postgres_candidate_conflict_path_preserves_errors_without_unrelated_legacy_data() {
         for sql in [
             UPSERT_SQL.as_str(),
             UPSERT_CONFLICT_SQL.as_str(),
             UPSERT_CONFLICT_INHERIT_IS_CACHED_SQL.as_str(),
         ] {
-            assert!(sql.contains("error_message = NULL"));
-            assert!(sql.contains("extra_data = EXCLUDED.extra_data"));
+            assert!(
+                sql.contains("COALESCE(EXCLUDED.error_message, request_candidates.error_message)")
+            );
+            assert!(sql.contains("THEN request_candidates.extra_data ELSE EXCLUDED.extra_data END"));
             assert!(sql.contains("required_capabilities = EXCLUDED.required_capabilities"));
-            assert!(!sql.contains("request_candidates.error_message"));
-            assert!(!sql.contains("request_candidates.extra_data"));
+            assert!(!sql.contains("COALESCE(request_candidates.extra_data"));
             assert!(!sql.contains("request_candidates.required_capabilities"));
             assert!(sql.contains("ELSE 'unclassified_skip' END"));
             assert!(sql.contains("ELSE 'unclassified_error' END"));
             assert!(sql.contains("THEN 'first_byte_timeout'"));
             assert!(!sql.contains("__AETHER_SANITIZED_LEGACY_"));
+            assert!(!sql.contains("__AETHER_CANDIDATE_"));
         }
     }
 
@@ -1690,10 +1709,11 @@ VALUES ($1, $2, 0, 0, 'pending', $3, $4, $5::json, $6::json, $7, NOW())
             .fetch_one(repository.pool())
             .await
             .expect("raw candidate diagnostics should load");
-            assert!(
+            assert_eq!(
                 sqlx::Row::try_get::<Option<String>, _>(&raw, "error_message")
                     .expect("error_message should decode")
-                    .is_none()
+                    .as_deref(),
+                Some("bad�message")
             );
             assert_eq!(
                 sqlx::Row::try_get::<Option<String>, _>(&raw, "skip_reason")
@@ -1725,7 +1745,7 @@ VALUES ($1, $2, 0, 0, 'pending', $3, $4, $5::json, $6::json, $7, NOW())
                 .expect("sanitized candidate should be readable");
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].status, RequestCandidateStatus::Success);
-            assert!(rows[0].error_message.is_none());
+            assert_eq!(rows[0].error_message.as_deref(), Some("bad�message"));
             assert!(rows[0].extra_data.is_none());
             assert!(rows[0].required_capabilities.is_none());
         }
@@ -1738,12 +1758,92 @@ VALUES ($1, $2, 0, 0, 'pending', $3, $4, $5::json, $6::json, $7, NOW())
             1
         );
 
+        let mut cleanup_request_ids = vec![single_request_id, batch_request_id, healthy_request_id];
+        for write_path in 0..3 {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            cleanup_request_ids.push(request_id.clone());
+            let mut failed = candidate(&request_id, uuid::Uuid::new_v4().to_string());
+            failed.status = RequestCandidateStatus::Failed;
+            failed.status_code = Some(400);
+            failed.error_message = Some("original upstream failure".to_string());
+            failed.is_cached = (write_path != 2).then_some(false);
+            failed.extra_data = Some(json!({
+                "upstream_response": {
+                    "status_code": 400,
+                    "headers": {"x-request-id": "original-upstream-id"},
+                    "body": {"error": {"message": "original upstream failure", "param": "model"}}
+                },
+                "error_flow": {"status_code": 400, "message": "original upstream failure"}
+            }));
+            let mut pending = failed.clone();
+            pending.status = RequestCandidateStatus::Pending;
+            pending.status_code = None;
+            pending.error_message = None;
+            pending.extra_data = None;
+            repository
+                .upsert(pending.clone())
+                .await
+                .expect("pending seed should persist");
+            if write_path == 0 {
+                repository
+                    .upsert(failed)
+                    .await
+                    .expect("single failure should persist");
+            } else {
+                repository
+                    .upsert_many(vec![failed])
+                    .await
+                    .expect("batch failure should persist");
+            }
+            pending.status_code = Some(200);
+            pending.error_message = Some("late unrelated error".to_string());
+            pending.extra_data = Some(json!({
+                "upstream_response": {"status_code": 200, "body": "late unrelated response"}
+            }));
+            if write_path == 0 {
+                repository
+                    .upsert(pending)
+                    .await
+                    .expect("late update should persist");
+            } else {
+                repository
+                    .upsert_many(vec![pending])
+                    .await
+                    .expect("late batch should persist");
+            }
+            let stored = repository
+                .list_by_request_id(&request_id)
+                .await
+                .expect("failure should read");
+            assert_eq!(stored[0].status, RequestCandidateStatus::Failed);
+            assert_eq!(stored[0].status_code, Some(400));
+            assert_eq!(
+                stored[0].error_message.as_deref(),
+                Some("original upstream failure")
+            );
+            let extra = stored[0]
+                .extra_data
+                .as_ref()
+                .expect("failure details should remain");
+            assert_eq!(extra["upstream_response"]["status_code"], 400);
+            assert_eq!(
+                extra["upstream_response"]["headers"]["x-request-id"],
+                "original-upstream-id"
+            );
+            assert_eq!(
+                extra["upstream_response"]["body"]["error"]["param"],
+                "model"
+            );
+            assert_eq!(extra["error_flow"]["message"], "original upstream failure");
+            let mut public = stored[0].clone();
+            public.sanitize_sensitive_diagnostics();
+            assert!(!serde_json::to_string(&public)
+                .expect("public record should serialize")
+                .contains("original upstream failure"));
+        }
+
         sqlx::query("DELETE FROM request_candidates WHERE request_id = ANY($1)")
-            .bind(vec![
-                single_request_id,
-                batch_request_id,
-                healthy_request_id,
-            ])
+            .bind(cleanup_request_ids)
             .execute(repository.pool())
             .await
             .expect("candidate NUL test rows should clean up");

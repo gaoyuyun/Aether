@@ -43,16 +43,9 @@ fn usage_request_record_level_from_value(value: Option<&Value>) -> UsageRequestR
         return UsageRequestRecordLevel::Basic;
     };
 
-    if value.eq_ignore_ascii_case("basic")
-        || value.eq_ignore_ascii_case("base")
-        || value.eq_ignore_ascii_case("headers")
-        || value.eq_ignore_ascii_case("minimal")
-        || value.eq_ignore_ascii_case("none")
-    {
-        UsageRequestRecordLevel::Basic
+    if value.eq_ignore_ascii_case("full") {
+        UsageRequestRecordLevel::Full
     } else {
-        // Raw HTTP payload capture is disabled at the runtime boundary. The setting remains
-        // accepted for compatibility, but no longer authorizes collecting request/response data.
         UsageRequestRecordLevel::Basic
     }
 }
@@ -538,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_runtime_access_disables_full_http_capture() {
+    async fn usage_runtime_access_honors_explicit_full_http_capture() {
         let state = GatewayDataState::disabled().with_system_config_values_for_tests([(
             "request_record_level".to_string(),
             json!("full"),
@@ -548,7 +541,32 @@ mod tests {
             .await
             .expect("request record level should read");
 
-        assert_eq!(level, UsageRequestRecordLevel::Basic);
+        assert_eq!(level, UsageRequestRecordLevel::Full);
+    }
+
+    #[tokio::test]
+    async fn usage_runtime_access_honors_legacy_full_without_overriding_current_config() {
+        let state = GatewayDataState::disabled().with_system_config_values_for_tests([(
+            "request_log_level".to_string(),
+            json!(" FULL "),
+        )]);
+        assert_eq!(
+            UsageRuntimeAccess::request_record_level(&state)
+                .await
+                .unwrap(),
+            UsageRequestRecordLevel::Full
+        );
+
+        let state = state.with_system_config_values_for_tests([
+            ("request_log_level".to_string(), json!("full")),
+            ("request_record_level".to_string(), json!("basic")),
+        ]);
+        assert_eq!(
+            UsageRuntimeAccess::request_record_level(&state)
+                .await
+                .unwrap(),
+            UsageRequestRecordLevel::Basic
+        );
     }
 
     #[tokio::test]

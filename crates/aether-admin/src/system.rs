@@ -67,17 +67,6 @@ pub fn admin_email_template_html_is_valid(value: &str) -> bool {
 pub const ADMIN_SYSTEM_CONFIG_EXPORT_VERSION: &str = "2.3";
 pub const ADMIN_SYSTEM_CONFIG_SUPPORTED_VERSIONS: &[&str] =
     &["2.0", "2.1", "2.2", ADMIN_SYSTEM_CONFIG_EXPORT_VERSION];
-pub const EXECUTION_EXTRA_TRUSTED_DNS_HOSTS_CONFIG_KEY: &str = "execution_extra_trusted_dns_hosts";
-pub const EXECUTION_EXTRA_TRUSTED_DNS_HOSTS_MAX_ENTRIES: usize = 128;
-pub const EXECUTION_EXTRA_TRUSTED_DNS_HOST_MAX_BYTES: usize = 253;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionExtraTrustedDnsHostsConfigError {
-    InvalidValue,
-    TooManyEntries,
-    InvalidHost,
-}
-
 pub const ADMIN_SYSTEM_USERS_EXPORT_VERSION: &str = "1.6";
 pub const ADMIN_SYSTEM_USERS_SUPPORTED_VERSIONS: &[&str] =
     &["1.3", "1.4", "1.5", ADMIN_SYSTEM_USERS_EXPORT_VERSION];
@@ -2301,7 +2290,6 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "email_suffix_mode" => Some(json!("none")),
         "email_suffix_list" => Some(json!([])),
         "enable_format_conversion" => Some(json!(false)),
-        EXECUTION_EXTRA_TRUSTED_DNS_HOSTS_CONFIG_KEY => Some(json!([])),
         "enable_model_directives" => Some(json!(false)),
         // Failover after a provider-side Cyber policy refusal is an explicit
         // opt-in.  Keep the system-config fallback aligned with the routing
@@ -2340,58 +2328,6 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "module.chat_pii_redaction.placeholder_prefix" => Some(json!("AETHER")),
         _ => None,
     }
-}
-
-pub fn normalize_execution_extra_trusted_dns_hosts_config_value(
-    value: serde_json::Value,
-) -> Result<serde_json::Value, ExecutionExtraTrustedDnsHostsConfigError> {
-    let values = match value {
-        Value::Null => Vec::new(),
-        Value::Array(values) => values,
-        _ => return Err(ExecutionExtraTrustedDnsHostsConfigError::InvalidValue),
-    };
-    if values.len() > EXECUTION_EXTRA_TRUSTED_DNS_HOSTS_MAX_ENTRIES {
-        return Err(ExecutionExtraTrustedDnsHostsConfigError::TooManyEntries);
-    }
-
-    let mut hosts = BTreeSet::new();
-    for value in values {
-        let host = value
-            .as_str()
-            .map(str::trim)
-            .ok_or(ExecutionExtraTrustedDnsHostsConfigError::InvalidHost)?;
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        if !execution_extra_trusted_dns_host_is_valid(&host) {
-            return Err(ExecutionExtraTrustedDnsHostsConfigError::InvalidHost);
-        }
-        hosts.insert(host);
-    }
-
-    Ok(Value::Array(hosts.into_iter().map(Value::String).collect()))
-}
-
-fn execution_extra_trusted_dns_host_is_valid(host: &str) -> bool {
-    if host.is_empty()
-        || host.len() > EXECUTION_EXTRA_TRUSTED_DNS_HOST_MAX_BYTES
-        || !host.is_ascii()
-        || host.parse::<std::net::IpAddr>().is_ok()
-    {
-        return false;
-    }
-
-    let labels = host.split('.').collect::<Vec<_>>();
-    if labels.len() < 2 {
-        return false;
-    }
-    labels.iter().all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    })
 }
 
 pub fn build_admin_system_configs_payload(
@@ -2886,15 +2822,6 @@ pub fn parse_admin_system_config_update(
                     json!({ "detail": "请求数据验证失败" }),
                 )
             })?;
-        }
-        EXECUTION_EXTRA_TRUSTED_DNS_HOSTS_CONFIG_KEY => {
-            value =
-                normalize_execution_extra_trusted_dns_hosts_config_value(value).map_err(|_| {
-                    (
-                        http::StatusCode::BAD_REQUEST,
-                        json!({ "detail": "额外可信 Fake-IP 域名配置格式无效" }),
-                    )
-                })?;
         }
         "module.important_notification.default_channel" => {
             value = normalize_notification_channel_value(value).map_err(|_| {
@@ -4656,36 +4583,6 @@ mod tests {
         )
         .expect_err("provider visibility should require a boolean");
         assert_eq!(err.0, http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn extra_trusted_dns_hosts_update_normalizes_exact_hostnames() {
-        let update = parse_admin_system_config_update(
-            "execution_extra_trusted_dns_hosts",
-            br#"{"value":[" API.Example.COM. ","api.example.com"]}"#,
-        )
-        .expect("valid extra trusted DNS hosts should parse");
-        assert_eq!(update.value, json!(["api.example.com"]));
-    }
-
-    #[test]
-    fn extra_trusted_dns_hosts_update_rejects_non_exact_hostnames() {
-        for value in [
-            r#"["*.example.com"]"#,
-            r#"["example.com:443"]"#,
-            r#"["https://example.com/path"]"#,
-            r#"["10.0.0.1"]"#,
-            r#"["example..com"]"#,
-            r#"["localhost"]"#,
-        ] {
-            let body = format!(r#"{{"value":{value}}}"#);
-            let error = parse_admin_system_config_update(
-                "execution_extra_trusted_dns_hosts",
-                body.as_bytes(),
-            )
-            .expect_err("non-exact hostname should be rejected");
-            assert_eq!(error.0, http::StatusCode::BAD_REQUEST);
-        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod dispatcher;
 pub mod heartbeat;
 pub mod protocol;
 pub mod stream_handler;
+mod task;
 pub mod writer;
 
 use std::sync::Arc;
@@ -332,9 +333,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(gateway_state.force_close_all_tunnel_proxies(), 1);
-        tokio::time::sleep(Duration::from_millis(200)).await;
         gateway_handle.abort();
+        let _ = (&mut gateway_handle).await;
+        assert_eq!(gateway_state.force_close_all_tunnel_proxies(), 1);
 
         let (_restarted_gateway_state, restarted_gateway_handle) =
             start_gateway_on_port_retry(gateway_port)
@@ -349,6 +350,7 @@ mod tests {
         )
         .await;
 
+        assert!(server.tunnel_metrics.snapshot().connect_successes >= 2);
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(5), tunnel_task)
             .await
@@ -380,7 +382,17 @@ mod tests {
         gateway_base_url: &str,
         node_id: &str,
     ) -> Option<(StatusCode, String)> {
-        let payload = relay_probe_envelope();
+        let response = relay_response(gateway_base_url, node_id, relay_probe_envelope()).await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Some((status, body))
+    }
+
+    async fn relay_response(
+        gateway_base_url: &str,
+        node_id: &str,
+        payload: Vec<u8>,
+    ) -> Option<reqwest::Response> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("test clock should be after epoch")
@@ -398,7 +410,7 @@ mod tests {
             &nonce,
             &digest,
         );
-        let response = reqwest::Client::new()
+        reqwest::Client::new()
             .post(format!(
                 "{gateway_base_url}/api/internal/tunnel/relay/{node_id}"
             ))
@@ -421,10 +433,7 @@ mod tests {
             .body(payload)
             .send()
             .await
-            .ok()?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Some((status, body))
+            .ok()
     }
 
     fn relay_probe_envelope() -> Vec<u8> {
@@ -456,28 +465,148 @@ mod tests {
     ) -> Result<(GatewayAppState, tokio::task::JoinHandle<()>), std::io::Error> {
         // The embedded gateway now fails closed when relay authentication is
         // not configured. Keep this integration fixture explicitly authenticated.
-        let previous_secret = std::env::var_os("AETHER_TUNNEL_RELAY_AUTH_SECRET");
-        let previous_instance = std::env::var_os("AETHER_GATEWAY_INSTANCE_ID");
-        std::env::set_var(
-            "AETHER_TUNNEL_RELAY_AUTH_SECRET",
-            "tunnel-reconnect-test-secret-at-least-32-bytes",
-        );
-        std::env::set_var(
-            "AETHER_GATEWAY_INSTANCE_ID",
-            "tunnel-reconnect-test-gateway",
-        );
-        let mut state = GatewayAppState::new().expect("gateway test state should build");
-        aether_gateway::configure_test_tunnel_security(
-            &mut state,
-            "node-recovery",
-            "test-generation-1",
-            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
-        );
-        restore_test_env("AETHER_TUNNEL_RELAY_AUTH_SECRET", previous_secret);
-        restore_test_env("AETHER_GATEWAY_INSTANCE_ID", previous_instance);
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let state = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            let previous_secret = std::env::var_os("AETHER_TUNNEL_RELAY_AUTH_SECRET");
+            let previous_instance = std::env::var_os("AETHER_GATEWAY_INSTANCE_ID");
+            std::env::set_var(
+                "AETHER_TUNNEL_RELAY_AUTH_SECRET",
+                "tunnel-reconnect-test-secret-at-least-32-bytes",
+            );
+            std::env::set_var(
+                "AETHER_GATEWAY_INSTANCE_ID",
+                "tunnel-reconnect-test-gateway",
+            );
+            let mut state = GatewayAppState::new().expect("gateway test state should build");
+            aether_gateway::configure_test_tunnel_security(
+                &mut state,
+                "node-recovery",
+                "test-generation-1",
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+            );
+            restore_test_env("AETHER_TUNNEL_RELAY_AUTH_SECRET", previous_secret);
+            restore_test_env("AETHER_GATEWAY_INSTANCE_ID", previous_instance);
+            state
+        };
         let router = build_router_with_state(state.clone());
         let handle = spawn_router_on_port(port, router).await?;
         Ok((state, handle))
+    }
+
+    #[tokio::test]
+    async fn negotiated_small_window_streams_large_responses_and_cancels_idle_upstream() {
+        use axum::body::{Body, Bytes};
+        use axum::routing::get;
+        use futures_util::StreamExt;
+
+        ensure_rustls_provider();
+        let upstream_port = reserve_local_port().unwrap();
+        let upstream = Router::new()
+            .route(
+                "/large",
+                get(|| async { Body::from(vec![b'x'; 2 * 1024 * 1024]) }),
+            )
+            .route(
+                "/idle",
+                get(|| async {
+                    let first = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"data: started\n\n"))
+                    });
+                    (
+                        [("content-type", "text/event-stream")],
+                        Body::from_stream(first.chain(futures_util::stream::pending())),
+                    )
+                }),
+            );
+        let upstream_task = super::task::SessionTask::new(
+            spawn_router_on_port(upstream_port, upstream).await.unwrap(),
+        );
+        let gateway_port = reserve_local_port().unwrap();
+        let gateway_url = format!("http://127.0.0.1:{gateway_port}");
+        let (_, gateway_task) = start_gateway_on_port(gateway_port).await.unwrap();
+        let gateway_task = super::task::SessionTask::new(gateway_task);
+        let mut config = sample_config(&gateway_url);
+        config.tunnel_security = crate::config::TunnelSecurity::NonTlsRequired;
+        config.tunnel_encryption_key = Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".into());
+        config.tunnel_stream_initial_window_bytes = 512 * 1024;
+        config.tunnel_drain_deadline_ms = 100;
+        config.allow_private_targets = true;
+        config.allowed_ports.push(upstream_port);
+        let state = sample_state(config);
+        let server = sample_server(&state, "node-recovery");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        let tunnel_task = super::task::SessionTask::new(tokio::spawn({
+            let state = Arc::clone(&state);
+            let server = Arc::clone(&server);
+            async move {
+                run(&state, &server, 0, shutdown_rx, drain_rx).await;
+            }
+        }));
+        wait_until_relay_status(&gateway_url, "node-recovery", StatusCode::GATEWAY_TIMEOUT).await;
+
+        let envelope = |path: &str| {
+            let mut meta: protocol::RequestMeta =
+                serde_json::from_slice(&relay_probe_envelope()[4..]).unwrap();
+            meta.url = format!("http://127.0.0.1:{upstream_port}/{path}");
+            meta.stream = true;
+            meta.timeout = 10;
+            meta.stream_first_byte_timeout_ms = Some(10_000);
+            let encoded = serde_json::to_vec(&meta).unwrap();
+            let mut result = (encoded.len() as u32).to_be_bytes().to_vec();
+            result.extend(encoded);
+            result
+        };
+        let response = relay_response(&gateway_url, "node-recovery", envelope("large"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(Duration::from_secs(10), response.bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body.len(), 2 * 1024 * 1024);
+        assert!(body.iter().all(|byte| *byte == b'x'));
+
+        let mut response = relay_response(&gateway_url, "node-recovery", envelope("idle"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.chunk().await.unwrap().unwrap(),
+            "data: started\n\n"
+        );
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while server
+                .active_connections
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled SSE must release the upstream handler");
+
+        let mut response = relay_response(&gateway_url, "node-recovery", envelope("idle"))
+            .await
+            .unwrap();
+        assert!(response.chunk().await.unwrap().is_some());
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), tunnel_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            server
+                .active_connections
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        drop(response);
+        drop(gateway_task);
+        drop(upstream_task);
     }
 
     fn restore_test_env(key: &str, value: Option<std::ffi::OsString>) {

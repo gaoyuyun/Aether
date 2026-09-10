@@ -167,7 +167,13 @@ export const cacheApi = {
    * 获取缓存亲和性列表
    */
   async listAffinities(keyword?: string): Promise<AffinityListResponse> {
-    const response = await api.get<{ data?: { items?: AffinityListResponse['items']; meta?: { total?: number }; matched_user_id?: string | null } }>('/api/admin/monitoring/cache/affinities', {
+    const response = await api.get<{
+      data?: {
+        items?: UserAffinity[]
+        meta?: { total?: number }
+        matched_user_id?: string | null
+      }
+    }>('/api/admin/monitoring/cache/affinities', {
       params: keyword ? { keyword } : undefined
     })
     const data = response.data.data ?? {}

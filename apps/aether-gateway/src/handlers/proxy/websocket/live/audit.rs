@@ -1014,6 +1014,8 @@ mod tests {
             Some("codex:live".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            wallet_billing_enabled: true,
+            billing_plans_enabled: true,
             user_id: "user-live-preflight".to_string(),
             api_key_id: "key-live-preflight".to_string(),
             username: Some("live-user".to_string()),
@@ -1195,6 +1197,8 @@ mod tests {
             Some("codex:live".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            wallet_billing_enabled: true,
+            billing_plans_enabled: true,
             user_id: "user-live-ws-preflight".to_string(),
             api_key_id: "key-live-ws-preflight".to_string(),
             username: Some("live-ws-user".to_string()),

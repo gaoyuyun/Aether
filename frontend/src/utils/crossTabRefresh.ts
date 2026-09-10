@@ -93,7 +93,7 @@ function isDefinitiveRefreshRejection(error: unknown): boolean {
   // Refresh uses 409 exclusively for a previous-token rotation race. Every
   // other client-side rejection is deterministic and cannot be repaired by
   // waiting for another tab.
-  return status >= 400 && status < 500 && status !== 409
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 409
 }
 
 export class CrossTabRefreshCoordinator {
@@ -192,18 +192,18 @@ export class CrossTabRefreshCoordinator {
       }
 
       if (this.ownsLock(lock)) {
-      this.publishRefreshResult({
-        requestId: lock.requestId,
-        status: 'failure',
-        emittedAt: Date.now(),
-      })
+        this.publishRefreshResult({
+          requestId: lock.requestId,
+          status: 'failure',
+          emittedAt: Date.now(),
+        })
       }
 
       // The refresh endpoint reserves 409 for a concurrent token rotation.
       // Other 4xx responses are authoritative, so waiting for the HTTP
       // timeout cannot recover the session and would block initial navigation.
       if (isDefinitiveRefreshRejection(error)) {
-      throw error
+        throw error
       }
 
       // A failure is a hint, never a cross-tab verdict. Give a concurrent

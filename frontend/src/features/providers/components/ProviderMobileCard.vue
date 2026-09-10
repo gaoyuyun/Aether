@@ -5,6 +5,7 @@
   >
     <!-- 第一行：名称 + 状态 + 操作 -->
     <div class="flex items-start justify-between gap-3">
+      <slot name="drag-handle" />
       <div class="flex-1 min-w-0 space-y-0.5">
         <div class="flex items-center gap-1.5">
           <span class="font-medium text-foreground truncate">{{ provider.name }}</span>

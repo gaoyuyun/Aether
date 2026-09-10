@@ -211,9 +211,19 @@ fn apply_sensitive_route_cache_policy(
         return;
     }
 
+    let preserve_no_transform = headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|directive| directive.trim().eq_ignore_ascii_case("no-transform"));
     headers.insert(
         http::header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
+        HeaderValue::from_static(if preserve_no_transform {
+            "no-store, no-transform"
+        } else {
+            "no-store"
+        }),
     );
     headers.insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
 }
@@ -352,6 +362,29 @@ mod tests {
             headers.get(http::header::PRAGMA),
             Some(&HeaderValue::from_static("no-cache"))
         );
+    }
+
+    #[test]
+    fn raw_body_no_transform_survives_sensitive_cache_policy() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600"),
+        );
+        headers.append(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static(" No-Transform "),
+        );
+        apply_sensitive_route_cache_policy(
+            &mut headers,
+            "/api/admin/usage/usage-1?body_format=raw",
+            None,
+        );
+        assert_eq!(
+            headers[http::header::CACHE_CONTROL],
+            "no-store, no-transform"
+        );
+        assert_eq!(headers[http::header::PRAGMA], "no-cache");
     }
 
     #[test]

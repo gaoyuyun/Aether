@@ -426,11 +426,8 @@ mod tests {
         assert!(candidate.finished_at_unix_ms.is_some());
     }
 
-    /// The guard holds no request body, and the persistence boundary intentionally
-    /// rejects request/response capture material. A dropped-attempt settlement
-    /// must not re-introduce an inline body or a caller-controlled body reference.
     #[tokio::test]
-    async fn settling_a_dropped_attempt_does_not_reintroduce_request_body_capture() {
+    async fn settling_a_dropped_attempt_respects_disabled_request_body_capture() {
         let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
         let state = test_state(&usage_repository, &request_candidate_repository);
@@ -444,8 +441,6 @@ mod tests {
             candidate_started_unix_ms,
         )
         .await;
-        // This deliberately supplies capture material to prove that the usage
-        // persistence boundary strips it before either lifecycle write stores it.
         let captured_body = json!({"stream": true, "service_tier": "priority"});
         let mut capture = build_pending_usage_record(
             &plan,
@@ -481,7 +476,10 @@ mod tests {
         .expect("cancelled usage should be recorded");
         assert_eq!(usage.provider_request_body, None);
         assert_eq!(usage.provider_request_body_ref, None);
-        assert_eq!(usage.provider_request_body_state, None);
+        assert_eq!(
+            usage.provider_request_body_state,
+            Some(UsageBodyCaptureState::Disabled)
+        );
     }
 
     #[tokio::test]

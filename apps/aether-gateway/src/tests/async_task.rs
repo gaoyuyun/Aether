@@ -326,7 +326,7 @@ async fn gateway_reads_video_task_detail_via_internal_async_task_endpoint() {
 }
 
 #[tokio::test]
-async fn gateway_does_not_redirect_sanitized_openai_video_url_from_internal_endpoint() {
+async fn gateway_redirects_persisted_openai_video_url_from_authenticated_internal_endpoint() {
     let repository = Arc::new(InMemoryVideoTaskRepository::default());
     let mut task = sample_video_task(
         "task-redirect",
@@ -341,7 +341,10 @@ async fn gateway_does_not_redirect_sanitized_openai_video_url_from_internal_endp
         .upsert(task)
         .await
         .expect("upsert should succeed");
-    assert_eq!(stored.video_url, None);
+    assert_eq!(
+        stored.video_url.as_deref(),
+        Some("https://8.8.8.8/video-task-redirect.mp4")
+    );
 
     let state = AppState::new()
         .expect("gateway state should build")
@@ -349,7 +352,10 @@ async fn gateway_does_not_redirect_sanitized_openai_video_url_from_internal_endp
     let (gateway_url, gateway_handle, access_token) =
         start_authenticated_operational_server(state).await;
 
-    let client = authenticated_operational_client(&access_token);
+    let client = super::authenticated_operational_client_with_builder(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        &access_token,
+    );
     let response = client
         .get(format!(
             "{gateway_url}/_gateway/async-tasks/video-tasks/task-redirect/video"
@@ -358,7 +364,14 @@ async fn gateway_does_not_redirect_sanitized_openai_video_url_from_internal_endp
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok()),
+        stored.video_url.as_deref()
+    );
 
     gateway_handle.abort();
 }

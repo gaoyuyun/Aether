@@ -5,6 +5,7 @@ import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
 import { createI18n } from '@/i18n'
 import ProviderTableRow from '../ProviderTableRow.vue'
 import ProviderMobileCard from '../ProviderMobileCard.vue'
+import ProviderCard from '../ProviderCard.vue'
 
 vi.mock('../ProviderBalanceCell.vue', () => ({
   default: { render: () => null },
@@ -74,6 +75,7 @@ function mountProvider(component: Component, healthScore: number | null) {
 describe.each([
   ['desktop provider row', ProviderTableRow],
   ['mobile provider card', ProviderMobileCard],
+  ['grid provider card', ProviderCard],
 ] as const)('%s endpoint health', (_name, component) => {
   it.each([
     { score: null, label: '-', width: '100%', color: 'bg-muted-foreground/40' },
