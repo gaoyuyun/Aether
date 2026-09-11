@@ -230,6 +230,9 @@ mod tests {
         key_encrypted: Option<String>,
     ) -> aether_data::repository::auth::StoredAuthApiKeyExportRecord {
         aether_data::repository::auth::StoredAuthApiKeyExportRecord {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             user_id: user_id.to_string(),
             api_key_id: api_key_id.to_string(),
             key_hash: sha256_hex(plaintext),

@@ -339,6 +339,21 @@ type = "json"
 nullable = true
 
 [[table.api_keys.columns]]
+name = "denied_providers"
+type = "json"
+nullable = true
+
+[[table.api_keys.columns]]
+name = "denied_api_formats"
+type = "json"
+nullable = true
+
+[[table.api_keys.columns]]
+name = "denied_models"
+type = "json"
+nullable = true
+
+[[table.api_keys.columns]]
 name = "ip_rules"
 type = "json"
 nullable = true

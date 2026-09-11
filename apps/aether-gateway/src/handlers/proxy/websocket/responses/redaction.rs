@@ -344,6 +344,7 @@ mod tests {
             Some("openai:responses".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            denied_models: None,
             user_id: TEST_USER_ID.to_string(),
             api_key_id: TEST_API_KEY_ID.to_string(),
             username: Some("ws".to_string()),

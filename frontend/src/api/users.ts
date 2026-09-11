@@ -227,6 +227,9 @@ export interface ApiKey {
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
+  denied_providers?: string[] | null
+  denied_api_formats?: string[] | null
+  denied_models?: string[] | null
   total_requests?: number  // 总请求数
   total_cost_usd?: number  // 总费用
 }
@@ -239,6 +242,9 @@ export interface UpsertUserApiKeyRequest {
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
+  denied_providers?: string[] | null
+  denied_api_formats?: string[] | null
+  denied_models?: string[] | null
   feature_settings?: FeatureSettings | null
 }
 

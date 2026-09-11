@@ -147,6 +147,54 @@ pub(crate) async fn build_admin_update_user_api_key_response(
         },
         None => None,
     };
+    let denied_providers = match payload.denied_providers {
+        Some(value) => match normalize_admin_user_string_list(value, "denied_providers") {
+            Ok(value) => Some(value),
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        },
+        None => None,
+    };
+    let denied_api_formats = match payload.denied_api_formats {
+        Some(value) => match normalize_admin_user_api_formats(value) {
+            Ok(value) => Some(value),
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        },
+        None => None,
+    };
+    let denied_models = match payload.denied_models {
+        Some(value) => match normalize_admin_user_string_list(value, "denied_models") {
+            Ok(value) => Some(value),
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        },
+        None => None,
+    };
+    let (allowed_providers, denied_providers) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            allowed_providers,
+            denied_providers,
+            "providers",
+        ) {
+            Ok(value) => value,
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        };
+    let (allowed_api_formats, denied_api_formats) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            allowed_api_formats,
+            denied_api_formats,
+            "api_formats",
+        ) {
+            Ok(value) => value,
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        };
+    let (allowed_models, denied_models) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            allowed_models,
+            denied_models,
+            "models",
+        ) {
+            Ok(value) => value,
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        };
     let name_present = name.is_some();
     let rate_limit_present = payload.rate_limit.is_some();
     let concurrent_limit_present = concurrent_limit.is_some();
@@ -167,6 +215,9 @@ pub(crate) async fn build_admin_update_user_api_key_response(
             allowed_providers,
             allowed_api_formats,
             allowed_models,
+            denied_providers,
+            denied_api_formats,
+            denied_models,
             // Same atomic write as basic fields (None = leave unchanged).
             feature_settings,
         })

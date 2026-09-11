@@ -210,6 +210,9 @@ export interface ApiKey {
   allowed_api_formats?: string[] | null
   /** null/undefined = 跟随账户可用模型；列表 = 密钥级白名单 */
   allowed_models?: string[] | null
+  denied_providers?: string[] | null
+  denied_api_formats?: string[] | null
+  denied_models?: string[] | null
   force_capabilities?: Record<string, boolean> | null  // 强制能力配置
   feature_settings?: FeatureSettingsMap | null
 }
@@ -303,6 +306,9 @@ export const meApi = {
     allowed_providers?: string[] | null
     allowed_api_formats?: string[] | null
     allowed_models?: string[] | null
+    denied_providers?: string[] | null
+    denied_api_formats?: string[] | null
+    denied_models?: string[] | null
   }): Promise<ApiKey> {
     const response = await apiClient.post<ApiKey>('/api/users/me/api-keys', data)
     return response.data
@@ -355,6 +361,9 @@ export const meApi = {
       allowed_api_formats?: string[] | null
       /** null = inherit account allowance; list = key-level subset */
       allowed_models?: string[] | null
+      denied_providers?: string[] | null
+      denied_api_formats?: string[] | null
+      denied_models?: string[] | null
     }
   ): Promise<ApiKey & { message: string }> {
     const response = await apiClient.put<ApiKey & { message: string }>(
@@ -538,7 +547,7 @@ export const meApi = {
     return response.data
   },
 
-  async getAvailableModelOptions(params?: { limit?: number }): Promise<{
+  async getAvailableModelOptions(params?: { limit?: number; skip?: number }): Promise<{
     models: Array<{ id: string; name: string }>
     total: number
   }> {
@@ -546,7 +555,7 @@ export const meApi = {
     models: Array<{ id: string; name: string }>
     total: number
   }>('/api/users/me/available-models', {
-      params: { view: 'options', limit: params?.limit ?? 1000 },
+      params: { view: 'access-options', limit: params?.limit ?? 1000, ...(params?.skip == null ? {} : { skip: params.skip }) },
     })
     return response.data
   },

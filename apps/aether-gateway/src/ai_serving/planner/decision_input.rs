@@ -1380,6 +1380,9 @@ mod tests {
 
     fn sample_auth_snapshot() -> GatewayAuthApiKeySnapshot {
         GatewayAuthApiKeySnapshot {
+            api_key_denied_providers: None,
+            api_key_denied_api_formats: None,
+            api_key_denied_models: None,
             user_id: "user-1".to_string(),
             username: "alice".to_string(),
             email: None,

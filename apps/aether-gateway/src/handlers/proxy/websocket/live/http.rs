@@ -1098,6 +1098,7 @@ mod tests {
             Some("codex:live".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            denied_models: None,
             wallet_billing_enabled: true,
             billing_plans_enabled: true,
             user_id: "user-codex-realtime".to_string(),
@@ -1156,6 +1157,7 @@ mod tests {
             Some("openai:responses".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            denied_models: None,
             wallet_billing_enabled: true,
             billing_plans_enabled: true,
             user_id: "user-finite".to_string(),
@@ -1226,6 +1228,7 @@ mod tests {
             Some("codex:live".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            denied_models: None,
             wallet_billing_enabled: true,
             billing_plans_enabled: true,
             user_id: "user-live-unmapped".to_string(),

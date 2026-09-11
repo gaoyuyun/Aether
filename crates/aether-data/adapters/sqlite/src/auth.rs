@@ -36,6 +36,9 @@ SELECT
   api_keys.allowed_providers AS api_key_allowed_providers,
   api_keys.allowed_api_formats AS api_key_allowed_api_formats,
   api_keys.allowed_models AS api_key_allowed_models,
+  api_keys.denied_providers AS api_key_denied_providers,
+  api_keys.denied_api_formats AS api_key_denied_api_formats,
+  api_keys.denied_models AS api_key_denied_models,
   api_keys.ip_rules AS api_key_ip_rules
 FROM api_keys
 JOIN users ON users.id = api_keys.user_id
@@ -51,6 +54,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -170,12 +176,12 @@ impl SqliteAuthApiKeyReadRepository {
             r#"
 INSERT INTO api_keys (
   id, user_id, key_hash, key_encrypted, name, allowed_providers,
-  allowed_api_formats, allowed_models, ip_rules, rate_limit, concurrent_limit,
+  allowed_api_formats, allowed_models, denied_providers, denied_api_formats, denied_models, ip_rules, rate_limit, concurrent_limit,
   force_capabilities, feature_settings, is_active, expires_at, auto_delete_on_expiry,
   total_requests, total_tokens, total_cost_usd, is_standalone,
   created_at, updated_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 "#,
         )
         .bind(&record.api_key_id)
@@ -194,6 +200,18 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         .bind(json_string_from_string_list(
             record.allowed_models.as_ref(),
             "api_keys.allowed_models",
+        )?)
+        .bind(json_string_from_string_list(
+            record.denied_providers.as_ref(),
+            "api_keys.denied_providers",
+        )?)
+        .bind(json_string_from_string_list(
+            record.denied_api_formats.as_ref(),
+            "api_keys.denied_api_formats",
+        )?)
+        .bind(json_string_from_string_list(
+            record.denied_models.as_ref(),
+            "api_keys.denied_models",
         )?)
         .bind(json_string_from_string_list(
             record.ip_rules.as_ref(),
@@ -255,6 +273,9 @@ struct CreateApiKeyInsertRecord {
     allowed_providers: Option<Vec<String>>,
     allowed_api_formats: Option<Vec<String>>,
     allowed_models: Option<Vec<String>>,
+    denied_providers: Option<Vec<String>>,
+    denied_api_formats: Option<Vec<String>>,
+    denied_models: Option<Vec<String>>,
     ip_rules: Option<Vec<String>>,
     rate_limit: Option<i32>,
     concurrent_limit: Option<i32>,
@@ -271,6 +292,14 @@ struct CreateApiKeyInsertRecord {
 
 #[async_trait]
 impl AuthApiKeyReadRepository for SqliteAuthApiKeyReadRepository {
+    async fn list_user_api_keys_with_access_restrictions(
+        &self,
+    ) -> Result<Vec<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let mut builder = QueryBuilder::<Sqlite>::new(EXPORT_COLUMNS);
+        builder.push(" WHERE api_keys.is_standalone = 0 AND (api_keys.allowed_providers IS NOT NULL OR api_keys.allowed_api_formats IS NOT NULL OR api_keys.allowed_models IS NOT NULL OR api_keys.denied_providers IS NOT NULL OR api_keys.denied_api_formats IS NOT NULL OR api_keys.denied_models IS NOT NULL)");
+        self.fetch_export_rows(builder).await
+    }
+
     async fn find_api_key_snapshot(
         &self,
         key: AuthApiKeyLookupKey<'_>,
@@ -468,6 +497,90 @@ FROM api_keys
 
 #[async_trait]
 impl AuthApiKeyWriteRepository for SqliteAuthApiKeyReadRepository {
+    async fn compare_and_swap_user_api_key_access_lists(
+        &self,
+        expected: &StoredAuthApiKeyExportRecord,
+        replacement: &StoredAuthApiKeyExportRecord,
+    ) -> Result<bool, DataLayerError> {
+        let result = sqlx::query(
+            r#"
+UPDATE api_keys
+SET
+  allowed_providers = ?,
+  allowed_api_formats = ?,
+  allowed_models = ?,
+  denied_providers = ?,
+  denied_api_formats = ?,
+  denied_models = ?,
+  updated_at = ?
+WHERE id = ?
+  AND user_id = ?
+  AND is_standalone = 0
+  AND json(allowed_providers) IS json(?)
+  AND json(allowed_api_formats) IS json(?)
+  AND json(allowed_models) IS json(?)
+  AND json(denied_providers) IS json(?)
+  AND json(denied_api_formats) IS json(?)
+  AND json(denied_models) IS json(?)
+"#,
+        )
+        .bind(json_string_from_string_list(
+            replacement.allowed_providers.as_ref(),
+            "api_keys.allowed_providers",
+        )?)
+        .bind(json_string_from_string_list(
+            replacement.allowed_api_formats.as_ref(),
+            "api_keys.allowed_api_formats",
+        )?)
+        .bind(json_string_from_string_list(
+            replacement.allowed_models.as_ref(),
+            "api_keys.allowed_models",
+        )?)
+        .bind(json_string_from_string_list(
+            replacement.denied_providers.as_ref(),
+            "api_keys.denied_providers",
+        )?)
+        .bind(json_string_from_string_list(
+            replacement.denied_api_formats.as_ref(),
+            "api_keys.denied_api_formats",
+        )?)
+        .bind(json_string_from_string_list(
+            replacement.denied_models.as_ref(),
+            "api_keys.denied_models",
+        )?)
+        .bind(current_unix_secs() as i64)
+        .bind(&expected.api_key_id)
+        .bind(&expected.user_id)
+        .bind(json_string_from_string_list(
+            expected.allowed_providers.as_ref(),
+            "api_keys.allowed_providers",
+        )?)
+        .bind(json_string_from_string_list(
+            expected.allowed_api_formats.as_ref(),
+            "api_keys.allowed_api_formats",
+        )?)
+        .bind(json_string_from_string_list(
+            expected.allowed_models.as_ref(),
+            "api_keys.allowed_models",
+        )?)
+        .bind(json_string_from_string_list(
+            expected.denied_providers.as_ref(),
+            "api_keys.denied_providers",
+        )?)
+        .bind(json_string_from_string_list(
+            expected.denied_api_formats.as_ref(),
+            "api_keys.denied_api_formats",
+        )?)
+        .bind(json_string_from_string_list(
+            expected.denied_models.as_ref(),
+            "api_keys.denied_models",
+        )?)
+        .execute(&self.pool)
+        .await
+        .map_sql_err()?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn touch_last_used_at(&self, api_key_id: &str) -> Result<bool, DataLayerError> {
         let now = current_unix_secs() as i64;
         let rows_affected = sqlx::query(
@@ -500,6 +613,9 @@ WHERE id = ?
             allowed_providers: record.allowed_providers,
             allowed_api_formats: record.allowed_api_formats,
             allowed_models: record.allowed_models,
+            denied_providers: record.denied_providers,
+            denied_api_formats: record.denied_api_formats,
+            denied_models: record.denied_models,
             ip_rules: record.ip_rules,
             rate_limit: Some(record.rate_limit),
             concurrent_limit: record.concurrent_limit,
@@ -529,6 +645,9 @@ WHERE id = ?
             allowed_providers: record.allowed_providers,
             allowed_api_formats: record.allowed_api_formats,
             allowed_models: record.allowed_models,
+            denied_providers: record.denied_providers,
+            denied_api_formats: record.denied_api_formats,
+            denied_models: record.denied_models,
             ip_rules: record.ip_rules,
             rate_limit: record.rate_limit,
             concurrent_limit: record.concurrent_limit,
@@ -603,6 +722,9 @@ SET key_encrypted = CASE WHEN ? THEN ? ELSE key_encrypted END,
     allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
     allowed_api_formats = CASE WHEN ? THEN ? ELSE allowed_api_formats END,
     allowed_models = CASE WHEN ? THEN ? ELSE allowed_models END,
+    denied_providers = CASE WHEN ? THEN ? ELSE denied_providers END,
+    denied_api_formats = CASE WHEN ? THEN ? ELSE denied_api_formats END,
+    denied_models = CASE WHEN ? THEN ? ELSE denied_models END,
     ip_rules = CASE WHEN ? THEN ? ELSE ip_rules END,
     expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
     auto_delete_on_expiry = CASE WHEN ? THEN ? ELSE auto_delete_on_expiry END,
@@ -638,6 +760,21 @@ WHERE id = ?
         .bind(json_string_from_nested_string_list(
             &record.allowed_models,
             "api_keys.allowed_models",
+        )?)
+        .bind(record.denied_providers.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.denied_providers,
+            "api_keys.denied_providers",
+        )?)
+        .bind(record.denied_api_formats.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.denied_api_formats,
+            "api_keys.denied_api_formats",
+        )?)
+        .bind(record.denied_models.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.denied_models,
+            "api_keys.denied_models",
         )?)
         .bind(record.ip_rules.is_some())
         .bind(json_string_from_nested_string_list(
@@ -709,6 +846,9 @@ SET key_encrypted = ?,
     allowed_providers = ?,
     allowed_api_formats = ?,
     allowed_models = ?,
+    denied_providers = ?,
+    denied_api_formats = ?,
+    denied_models = ?,
     ip_rules = ?,
     rate_limit = ?,
     concurrent_limit = ?,
@@ -741,6 +881,18 @@ WHERE id = ?
         .bind(json_string_from_string_list(
             restored.allowed_models.as_ref(),
             "api_keys.allowed_models",
+        )?)
+        .bind(json_string_from_string_list(
+            restored.denied_providers.as_ref(),
+            "api_keys.denied_providers",
+        )?)
+        .bind(json_string_from_string_list(
+            restored.denied_api_formats.as_ref(),
+            "api_keys.denied_api_formats",
+        )?)
+        .bind(json_string_from_string_list(
+            restored.denied_models.as_ref(),
+            "api_keys.denied_models",
         )?)
         .bind(json_string_from_string_list(
             restored.ip_rules.as_ref(),
@@ -1020,6 +1172,9 @@ SET key_encrypted = CASE WHEN ? THEN ? ELSE key_encrypted END,
     allowed_providers = CASE WHEN ? THEN ? ELSE allowed_providers END,
     allowed_api_formats = CASE WHEN ? THEN ? ELSE allowed_api_formats END,
     allowed_models = CASE WHEN ? THEN ? ELSE allowed_models END,
+    denied_providers = CASE WHEN ? THEN ? ELSE denied_providers END,
+    denied_api_formats = CASE WHEN ? THEN ? ELSE denied_api_formats END,
+    denied_models = CASE WHEN ? THEN ? ELSE denied_models END,
     feature_settings = CASE WHEN ? THEN ? ELSE feature_settings END,
     updated_at = ?
 WHERE id = ?
@@ -1055,6 +1210,21 @@ WHERE id = ?
         .bind(json_string_from_nested_string_list(
             &record.allowed_models,
             "api_keys.allowed_models",
+        )?)
+        .bind(record.denied_providers.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.denied_providers,
+            "api_keys.denied_providers",
+        )?)
+        .bind(record.denied_api_formats.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.denied_api_formats,
+            "api_keys.denied_api_formats",
+        )?)
+        .bind(record.denied_models.is_some())
+        .bind(json_string_from_nested_string_list(
+            &record.denied_models,
+            "api_keys.denied_models",
         )?)
         .bind(record.feature_settings.is_some())
         .bind(optional_json_to_string(
@@ -1124,7 +1294,7 @@ WHERE id = ?
         let result = sqlx::query(
             r#"
 UPDATE api_keys
-SET allowed_providers = ?, updated_at = ?
+SET allowed_providers = ?, denied_providers = NULL, updated_at = ?
 WHERE id = ?
   AND user_id = ?
   AND is_standalone = 0
@@ -1465,6 +1635,20 @@ fn map_auth_api_key_snapshot_row(
             "api_keys.allowed_models",
         )?,
     )?
+    .with_denied_lists(
+        optional_json_from_string(
+            row.try_get("api_key_denied_providers").map_sql_err()?,
+            "api_keys.denied_providers",
+        )?,
+        optional_json_from_string(
+            row.try_get("api_key_denied_api_formats").map_sql_err()?,
+            "api_keys.denied_api_formats",
+        )?,
+        optional_json_from_string(
+            row.try_get("api_key_denied_models").map_sql_err()?,
+            "api_keys.denied_models",
+        )?,
+    )?
     .with_api_key_ip_rules(optional_json_from_string(
         row.try_get("api_key_ip_rules").map_sql_err()?,
         "api_keys.ip_rules",
@@ -1517,6 +1701,22 @@ fn map_auth_api_key_export_row(
             "api_keys.ip_rules",
         )?)
     })
+    .and_then(|record| {
+        record.with_denied_lists(
+            optional_json_from_string(
+                row.try_get("denied_providers").map_sql_err()?,
+                "api_keys.denied_providers",
+            )?,
+            optional_json_from_string(
+                row.try_get("denied_api_formats").map_sql_err()?,
+                "api_keys.denied_api_formats",
+            )?,
+            optional_json_from_string(
+                row.try_get("denied_models").map_sql_err()?,
+                "api_keys.denied_models",
+            )?,
+        )
+    })
     .map(|record| record.with_feature_settings(feature_settings))
     .and_then(|record| {
         record.with_activity_timestamps(
@@ -1537,6 +1737,89 @@ mod tests {
     };
     use serde_json::json;
     use sqlx::Row;
+
+    #[tokio::test]
+    async fn sqlite_user_key_denylists_roundtrip_and_cleanup_preserves_concurrent_edits() {
+        let pool = crate::test_support::migrated_pool().await;
+        seed_auth_api_key_rows(&pool).await;
+        let repository = SqliteAuthApiKeyReadRepository::new(pool.clone());
+        let created = repository
+            .create_user_api_key(CreateUserApiKeyRecord {
+                user_id: "user-1".into(),
+                api_key_id: "key-deny".into(),
+                key_hash: "hash-deny".into(),
+                key_encrypted: None,
+                name: Some("Deny key".into()),
+                allowed_providers: None,
+                allowed_api_formats: None,
+                allowed_models: None,
+                denied_providers: Some(vec!["provider-old".into()]),
+                denied_api_formats: Some(vec!["openai:responses".into()]),
+                denied_models: Some(vec!["gpt-old".into()]),
+                ip_rules: None,
+                rate_limit: 0,
+                concurrent_limit: None,
+                force_capabilities: None,
+                feature_settings: None,
+                is_active: true,
+                expires_at_unix_secs: None,
+                auto_delete_on_expiry: false,
+                total_requests: 0,
+                total_tokens: 0,
+                total_cost_usd: 0.0,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = repository
+            .find_api_key_snapshot(AuthApiKeyLookupKey::ApiKeyId("key-deny"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.api_key_denied_providers, created.denied_providers);
+        assert_eq!(
+            snapshot.api_key_denied_api_formats,
+            created.denied_api_formats
+        );
+        assert_eq!(snapshot.api_key_denied_models, created.denied_models);
+        let mut cleaned = created.clone();
+        cleaned.denied_providers = Some(Vec::new());
+        cleaned.denied_api_formats = Some(Vec::new());
+        cleaned.denied_models = Some(Vec::new());
+        sqlx::query("UPDATE api_keys SET denied_models = ? WHERE id = 'key-deny'")
+            .bind("[\"gpt-new\"]")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repository
+            .compare_and_swap_user_api_key_access_lists(&created, &cleaned)
+            .await
+            .unwrap());
+        let current = repository
+            .reload_export_by_id("key-deny")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.denied_models, Some(vec!["gpt-new".into()]));
+        cleaned.allowed_models = Some(Vec::new());
+        assert!(repository
+            .compare_and_swap_user_api_key_access_lists(&current, &cleaned)
+            .await
+            .unwrap());
+        let current = repository
+            .reload_export_by_id("key-deny")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.allowed_models, Some(Vec::new()));
+        assert_eq!(current.denied_models, Some(Vec::new()));
+        assert!(repository
+            .list_user_api_keys_with_access_restrictions()
+            .await
+            .unwrap()
+            .iter()
+            .all(|record| !record.is_standalone));
+    }
 
     #[tokio::test]
     async fn sqlite_repository_reads_auth_api_key_contract_views() {
@@ -1611,6 +1894,9 @@ mod tests {
         let repository = SqliteAuthApiKeyReadRepository::new(pool);
         let missing_owner_key = repository
             .create_user_api_key(CreateUserApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "missing-user".to_string(),
                 api_key_id: "key-missing-owner".to_string(),
                 key_hash: "hash-missing-owner".to_string(),
@@ -1636,6 +1922,9 @@ mod tests {
         assert!(missing_owner_key.is_none());
         let user_key = repository
             .create_user_api_key(CreateUserApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created-user".to_string(),
                 key_hash: "hash-created-user".to_string(),
@@ -1672,6 +1961,9 @@ mod tests {
 
         let wrong_owner_update = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 key_encrypted: None,
                 key_encrypted_present: false,
                 name_present: true,
@@ -1725,6 +2017,9 @@ mod tests {
 
         let updated_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created-user".to_string(),
                 key_encrypted: Some("enc-user-rotated".to_string()),
@@ -1759,6 +2054,9 @@ mod tests {
         // meaningful rate limit rather than being treated as an omitted field.
         let cleared_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 key_encrypted: None,
                 key_encrypted_present: false,
                 name_present: false,
@@ -1783,6 +2081,9 @@ mod tests {
 
         let denied_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 key_encrypted: None,
                 key_encrypted_present: false,
                 name_present: false,
@@ -1812,6 +2113,9 @@ mod tests {
 
         let restricted_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 key_encrypted: None,
                 key_encrypted_present: false,
                 name_present: false,
@@ -1849,6 +2153,9 @@ mod tests {
         );
         let cleared_user_key = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
@@ -1875,6 +2182,9 @@ mod tests {
 
         let zero_rate_limit = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
@@ -1909,6 +2219,9 @@ mod tests {
 
         assert!(repository
             .update_user_api_key_basic_if_unlocked(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
@@ -2037,6 +2350,9 @@ mod tests {
 
         let standalone = repository
             .create_standalone_api_key(CreateStandaloneApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created-standalone".to_string(),
                 key_hash: "hash-created-standalone".to_string(),
@@ -2063,6 +2379,9 @@ mod tests {
 
         let standalone = repository
             .update_standalone_api_key_basic(UpdateStandaloneApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 api_key_id: "key-created-standalone".to_string(),
                 key_encrypted: Some("enc-standalone-rotated".to_string()),
                 key_encrypted_present: true,

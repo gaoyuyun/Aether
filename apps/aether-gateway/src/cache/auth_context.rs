@@ -409,6 +409,7 @@ mod tests {
 
     fn context(api_key_id: &str) -> GatewayControlAuthContext {
         GatewayControlAuthContext {
+            denied_models: None,
             user_id: "user-1".to_string(),
             api_key_id: api_key_id.to_string(),
             username: None,

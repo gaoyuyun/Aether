@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 
 import MyApiKeys from '../MyApiKeys.vue'
+import { invalidateUserAccessControlOptions } from '@/features/users/composables/useUserAccessControlOptions'
 
 const toastMock = vi.hoisted(() => ({
   success: vi.fn(),
@@ -14,6 +15,7 @@ const meApiMock = vi.hoisted(() => ({
   getFullApiKey: vi.fn(),
   getClientConfig: vi.fn(),
   getAvailableModels: vi.fn(),
+  getAvailableModelOptions: vi.fn(),
   getAvailableProviders: vi.fn(),
   createApiKeyInstallSession: vi.fn(),
   updateApiKey: vi.fn(),
@@ -117,7 +119,9 @@ async function mountMyApiKeys() {
 }
 
 beforeEach(() => {
+  invalidateUserAccessControlOptions()
   vi.clearAllMocks()
+  meApiMock.getAvailableModelOptions.mockImplementation(() => meApiMock.getAvailableModels())
   meApiMock.getClientConfig.mockResolvedValue({
     base_url: 'https://aether.example.com',
     site_name: 'Aether Local',
@@ -308,7 +312,7 @@ describe('MyApiKeys CC Switch import', () => {
     expect(payload).toMatchObject({ name: 'renamed' })
   })
 
-  it('submits provider, endpoint, and model restrictions when creating a key', async () => {
+  it.each(['allow', 'deny'] as const)('submits provider, endpoint, and model restrictions in %s mode', async (mode) => {
     const createdKey = apiKey({
       id: 'restricted-key-1',
       key: 'sk-created-live',
@@ -343,6 +347,19 @@ describe('MyApiKeys CC Switch import', () => {
     document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-models-unrestricted"]')?.click()
     await flushPromises()
 
+    if (mode === 'deny') {
+      for (const dimension of ['providers', 'api-formats', 'models']) {
+        const trigger = document.querySelector<HTMLButtonElement>(`[data-testid="user-api-key-${dimension}-mode"]`)!
+        trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+        await flushPromises()
+        const option = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]')).find(item => item.textContent?.trim() === '拒绝')!
+        expect(option).toBeTruthy()
+        option.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+        await flushPromises()
+        expect(trigger.textContent).toContain('拒绝')
+      }
+    }
+
     document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-providers"]')?.click()
     document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-api-formats"]')?.click()
     document.querySelector<HTMLButtonElement>('[data-testid="user-api-key-models"]')?.click()
@@ -358,26 +375,52 @@ describe('MyApiKeys CC Switch import', () => {
 
     expect(meApiMock.createApiKey).toHaveBeenCalledWith(expect.objectContaining({
       name: 'restricted key',
-      allowed_providers: ['provider-openai'],
-      allowed_api_formats: ['openai:chat'],
-      allowed_models: ['gpt-5'],
+      allowed_providers: mode === 'allow' ? ['provider-openai'] : null,
+      denied_providers: mode === 'deny' ? ['provider-openai'] : null,
+      allowed_api_formats: mode === 'allow' ? ['openai:chat'] : null,
+      denied_api_formats: mode === 'deny' ? ['openai:chat'] : null,
+      allowed_models: mode === 'allow' ? ['gpt-5'] : null,
+      denied_models: mode === 'deny' ? ['gpt-5'] : null,
     }))
   })
 
-  it('caches empty access-control option responses when dialogs are reopened', async () => {
-    meApiMock.getApiKeys.mockResolvedValue([apiKey()])
-    meApiMock.getAvailableProviders.mockResolvedValue([])
-
+  it('reloads access options when reopening a dialog so deleted resources disappear', async () => {
+    meApiMock.getApiKeys.mockResolvedValue([apiKey({ allowed_providers: ['provider-openai'] })])
     await mountMyApiKeys()
+    expect(meApiMock.getAvailableProviders).not.toHaveBeenCalled()
+    document.querySelector<HTMLButtonElement>('[title="编辑"]')?.click()
+    await flushPromises()
     expect(meApiMock.getAvailableProviders).toHaveBeenCalledTimes(1)
-
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent?.trim() === '取消')?.click()
+    await flushPromises()
+    meApiMock.getAvailableProviders.mockResolvedValue([])
     document.querySelector<HTMLButtonElement>('[title="编辑"]')?.click()
     await flushPromises()
     expect(meApiMock.getAvailableProviders).toHaveBeenCalledTimes(2)
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent?.trim() === '保存')?.click()
+    await flushPromises()
+    expect(meApiMock.updateApiKey).toHaveBeenCalledWith('user-key-1', expect.objectContaining({ allowed_providers: [] }))
+  })
 
+  it('loads deny rules and clears both lists when the key follows the user again', async () => {
+    meApiMock.getApiKeys.mockResolvedValue([apiKey({
+      denied_providers: ['provider-openai'], denied_api_formats: ['openai:chat'], denied_models: ['gpt-5'],
+    })])
+    meApiMock.updateApiKey.mockResolvedValue({ message: 'updated' })
+    await mountMyApiKeys()
     document.querySelector<HTMLButtonElement>('[title="编辑"]')?.click()
     await flushPromises()
-
-    expect(meApiMock.getAvailableProviders).toHaveBeenCalledTimes(2)
+    for (const dimension of ['providers', 'api-formats', 'models']) {
+      expect(document.querySelector(`[data-testid="user-api-key-${dimension}-mode"]`)?.textContent).toContain('拒绝')
+      document.querySelector<HTMLButtonElement>(`[data-testid="user-api-key-${dimension}-unrestricted"]`)?.click()
+    }
+    await flushPromises()
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent?.trim() === '保存')?.click()
+    await flushPromises()
+    expect(meApiMock.updateApiKey).toHaveBeenCalledWith('user-key-1', expect.objectContaining({
+      allowed_providers: null, denied_providers: null,
+      allowed_api_formats: null, denied_api_formats: null,
+      allowed_models: null, denied_models: null,
+    }))
   })
 })

@@ -95,6 +95,30 @@ pub(crate) async fn request_model_local_rejection(
         }
     }
 
+    if let (Some(denied_models), Some(requested_model)) = (
+        auth_context.denied_models.as_deref(),
+        requested_model.as_deref(),
+    ) {
+        if contains_string(denied_models, requested_model)
+            || model_directive_base_model_is_allowed_for_request(
+                decision,
+                requested_model,
+                denied_models,
+            )
+            || request_model_resolves_to_allowed_model(
+                state,
+                decision,
+                requested_model,
+                denied_models,
+            )
+            .await?
+        {
+            return Ok(Some(GatewayLocalAuthRejection::ModelNotAllowed {
+                model: requested_model.to_string(),
+            }));
+        }
+    }
+
     Ok(None)
 }
 
@@ -919,6 +943,7 @@ mod tests {
             Some("openai:chat".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            denied_models: None,
             user_id: "user-1".to_string(),
             api_key_id: "api-key-1".to_string(),
             username: None,
@@ -1165,6 +1190,42 @@ mod tests {
             self.quota_calls.fetch_add(1, Ordering::AcqRel);
             Ok(Some(self.quota.clone()))
         }
+    }
+
+    #[tokio::test]
+    async fn model_denylists_reject_direct_names_and_aliases_without_an_allowlist() {
+        let state = state_with_model_mapping();
+        let mut decision = decision_with_allowed_models(Vec::new());
+        let auth = decision.auth_context.as_mut().unwrap();
+        auth.allowed_models = None;
+        auth.denied_models = Some(vec!["gpt-5".into()]);
+        let uri: Uri = "/v1/chat/completions".parse().unwrap();
+        for model in ["gpt-5", "gpt-5.2"] {
+            let body = Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"model": model, "messages": []})).unwrap(),
+            );
+            assert_eq!(
+                request_model_local_rejection(
+                    &state,
+                    Some(&decision),
+                    &uri,
+                    &json_headers(),
+                    &body
+                )
+                .await
+                .unwrap(),
+                Some(GatewayLocalAuthRejection::ModelNotAllowed {
+                    model: model.into()
+                })
+            );
+        }
+        let body = Bytes::from_static(br#"{"model":"new-model","messages":[]}"#);
+        assert_eq!(
+            request_model_local_rejection(&state, Some(&decision), &uri, &json_headers(), &body)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

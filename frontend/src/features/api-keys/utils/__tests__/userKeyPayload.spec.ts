@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest'
 
 import {
   buildUserApiKeyAllowedList,
+  buildUserApiKeyListRestriction,
+  readUserApiKeyListRestriction,
+  retainAvailableAccessValues,
   buildUserApiKeyAllowedProviders,
   buildUserApiKeyMutationPayload,
   formatUserApiKeyAllowedListSummary,
@@ -13,6 +16,28 @@ import {
 } from '@/features/api-keys/utils/userKeyPayload'
 
 describe('userKeyPayload', () => {
+  it('keeps empty allow and deny rules distinct when the last upstream entry is deleted', () => {
+    const values = retainAvailableAccessValues(['removed'], [{ value: 'new' }])
+    expect(buildUserApiKeyListRestriction(false, 'allow', values)).toEqual({ allowed: [], denied: null })
+    expect(buildUserApiKeyListRestriction(false, 'deny', values)).toEqual({ allowed: null, denied: [] })
+    expect(readUserApiKeyListRestriction(null, [])).toEqual({ unrestricted: false, mode: 'deny', values: [] })
+    expect(readUserApiKeyListRestriction(null, null)).toEqual({ unrestricted: true, mode: 'allow', values: [] })
+  })
+
+  it('writes independent deny rules for providers, endpoints and models and clears the opposite list', () => {
+    expect(buildUserApiKeyMutationPayload({
+      name: 'exclude', providerUnrestricted: false, providerMode: 'deny', allowedProviders: ['p1'],
+      apiFormatUnrestricted: false, apiFormatMode: 'deny', allowedApiFormats: ['openai:chat'],
+      modelUnrestricted: false, modelMode: 'deny', allowedModels: ['old-model'],
+    })).toEqual({
+      name: 'exclude', rate_limit: 0,
+      allowed_providers: null, denied_providers: ['p1'],
+      allowed_api_formats: null, denied_api_formats: ['openai:chat'],
+      allowed_models: null, denied_models: ['old-model'],
+    })
+    expect(buildUserApiKeyListRestriction(false, 'allow', ['p2'])).toEqual({ allowed: ['p2'], denied: null })
+  })
+
   it('omits concurrent_limit when the field is left blank', () => {
     expect(buildUserApiKeyMutationPayload({
       name: 'writer-key',

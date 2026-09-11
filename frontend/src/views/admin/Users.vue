@@ -245,8 +245,8 @@ import {
   resolveApiKeyRedactionFormState,
 } from '@/features/users/apiKeyFeatureSettings'
 import {
-  buildUserApiKeyAllowedList,
-  normalizeUserApiKeyAllowedList,
+  buildUserApiKeyMutationPayload,
+  readUserApiKeyListRestriction,
 } from '@/features/api-keys/utils/userKeyPayload'
 import type { UserManagementRow } from '@/features/users/components/user-management-types'
 import {
@@ -315,8 +315,11 @@ const userApiKeyForm = ref<UserApiKeyFormState>({
   concurrent_limit: undefined,
   ip_rules_text: '',
   provider_unrestricted: true,
+  provider_mode: 'allow',
   api_format_unrestricted: true,
+  api_format_mode: 'allow',
   model_unrestricted: true,
+  model_mode: 'allow',
   allowed_providers: [],
   allowed_api_formats: [],
   allowed_models: [],
@@ -1007,8 +1010,11 @@ function openCreateUserApiKeyDialog() {
     concurrent_limit: undefined,
     ip_rules_text: '',
     provider_unrestricted: true,
+    provider_mode: 'allow',
     api_format_unrestricted: true,
+    api_format_mode: 'allow',
     model_unrestricted: true,
+    model_mode: 'allow',
     allowed_providers: [],
     allowed_api_formats: [],
     allowed_models: [],
@@ -1025,21 +1031,24 @@ function openEditUserApiKeyDialog(apiKey: ApiKey) {
     apiKey.feature_settings,
     selectedUser.value?.feature_settings,
   )
-  const allowedProviders = normalizeUserApiKeyAllowedList(apiKey.allowed_providers)
-  const allowedApiFormats = normalizeUserApiKeyAllowedList(apiKey.allowed_api_formats)
-  const allowedModels = normalizeUserApiKeyAllowedList(apiKey.allowed_models)
+  const providerRestriction = readUserApiKeyListRestriction(apiKey.allowed_providers, apiKey.denied_providers)
+  const api_formatRestriction = readUserApiKeyListRestriction(apiKey.allowed_api_formats, apiKey.denied_api_formats)
+  const modelRestriction = readUserApiKeyListRestriction(apiKey.allowed_models, apiKey.denied_models)
   editingUserApiKey.value = apiKey
   userApiKeyForm.value = {
     name: apiKey.name || '',
     rate_limit: apiKey.rate_limit ?? undefined,
     concurrent_limit: apiKey.concurrent_limit ?? undefined,
     ip_rules_text: apiKey.ip_rules?.join(', ') ?? '',
-    provider_unrestricted: allowedProviders == null,
-    api_format_unrestricted: allowedApiFormats == null,
-    model_unrestricted: allowedModels == null,
-    allowed_providers: allowedProviders ? [...allowedProviders] : [],
-    allowed_api_formats: allowedApiFormats ? [...allowedApiFormats] : [],
-    allowed_models: allowedModels ? [...allowedModels] : [],
+    provider_unrestricted: providerRestriction.unrestricted,
+    provider_mode: providerRestriction.mode,
+    api_format_unrestricted: api_formatRestriction.unrestricted,
+    api_format_mode: api_formatRestriction.mode,
+    model_unrestricted: modelRestriction.unrestricted,
+    model_mode: modelRestriction.mode,
+    allowed_providers: [...providerRestriction.values],
+    allowed_api_formats: [...api_formatRestriction.values],
+    allowed_models: [...modelRestriction.values],
     chat_pii_redaction_mode: redactionFeature.mode,
     chat_pii_redaction_enabled: redactionFeature.enabled,
     chat_pii_redaction_placeholder_notice: redactionFeature.inject_model_instruction,
@@ -1060,8 +1069,11 @@ function closeUserApiKeyFormDialog() {
     concurrent_limit: undefined,
     ip_rules_text: '',
     provider_unrestricted: true,
+    provider_mode: 'allow',
     api_format_unrestricted: true,
+    api_format_mode: 'allow',
     model_unrestricted: true,
+    model_mode: 'allow',
     allowed_providers: [],
     allowed_api_formats: [],
     allowed_models: [],
@@ -1091,20 +1103,20 @@ async function submitUserApiKeyForm() {
   creatingApiKey.value = true
   try {
     const ipRules = parseIpRulesInput(form.ip_rules_text)
-    const accessRestrictions = {
-      allowed_providers: buildUserApiKeyAllowedList(
-        form.provider_unrestricted,
-        form.allowed_providers,
-      ),
-      allowed_api_formats: buildUserApiKeyAllowedList(
-        form.api_format_unrestricted,
-        form.allowed_api_formats,
-      ),
-      allowed_models: buildUserApiKeyAllowedList(
-        form.model_unrestricted,
-        form.allowed_models,
-      ),
-    }
+    const accessRestrictions = buildUserApiKeyMutationPayload({
+      name: form.name,
+      rate_limit: form.rate_limit,
+      concurrent_limit: form.concurrent_limit,
+      providerUnrestricted: form.provider_unrestricted,
+      providerMode: form.provider_mode,
+      allowedProviders: form.allowed_providers,
+      apiFormatUnrestricted: form.api_format_unrestricted,
+      apiFormatMode: form.api_format_mode,
+      allowedApiFormats: form.allowed_api_formats,
+      modelUnrestricted: form.model_unrestricted,
+      modelMode: form.model_mode,
+      allowedModels: form.allowed_models,
+    })
     const featureSettingsPatch = buildApiKeyRedactionFeatureSettingsPatch({
       isEditing: Boolean(editingApiKey),
       currentFeatureSettings: editingApiKey?.feature_settings,
@@ -1116,22 +1128,16 @@ async function submitUserApiKeyForm() {
     })
     if (editingApiKey) {
       await usersStore.updateApiKey(targetUserId, editingApiKey.id, {
-        name: form.name,
-        rate_limit: form.rate_limit ?? 0,
-        concurrent_limit: form.concurrent_limit,
-        ip_rules: ipRules,
         ...accessRestrictions,
+        ip_rules: ipRules,
         ...featureSettingsPatch,
       })
       if (!mutationIsCurrent()) return
       success(legacyT('API Key已更新'))
     } else {
       const response = await usersStore.createApiKey(targetUserId, {
-        name: form.name,
-        rate_limit: form.rate_limit ?? 0,
-        concurrent_limit: form.concurrent_limit,
-        ip_rules: ipRules,
         ...accessRestrictions,
+        ip_rules: ipRules,
         ...featureSettingsPatch,
       })
       if (!mutationIsCurrent()) return

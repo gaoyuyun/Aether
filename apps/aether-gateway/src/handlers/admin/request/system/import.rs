@@ -7634,6 +7634,14 @@ impl<'a> AdminAppState<'a> {
                 ));
                 let allowed_models =
                     invalid_value!(normalize_imported_user_string_list(key, "allowed_models"));
+                let denied_providers =
+                    invalid_value!(normalize_imported_user_string_list(key, "denied_providers"));
+                let denied_api_formats = invalid_value!(normalize_imported_user_api_formats(
+                    key,
+                    "denied_api_formats"
+                ));
+                let denied_models =
+                    invalid_value!(normalize_imported_user_string_list(key, "denied_models"));
                 let ip_rules = invalid_value!(normalize_imported_user_ip_rules(key));
                 let imported_rate_limit =
                     invalid_value!(imported_optional_i32(key.get("rate_limit"), "rate_limit"));
@@ -7716,6 +7724,15 @@ impl<'a> AdminAppState<'a> {
                             let updated = self
                                 .update_user_api_key_basic(
                                     aether_data::repository::auth::UpdateUserApiKeyBasicRecord {
+                                        denied_providers: key
+                                            .contains_key("denied_providers")
+                                            .then(|| denied_providers.clone()),
+                                        denied_api_formats: key
+                                            .contains_key("denied_api_formats")
+                                            .then(|| denied_api_formats.clone()),
+                                        denied_models: key
+                                            .contains_key("denied_models")
+                                            .then(|| denied_models.clone()),
                                         user_id: user_id.clone(),
                                         api_key_id: existing_key.api_key_id.clone(),
                                         key_encrypted: key_encrypted.clone(),
@@ -7852,6 +7869,9 @@ impl<'a> AdminAppState<'a> {
                 ));
                 let created = self
                     .create_user_api_key(aether_data::repository::auth::CreateUserApiKeyRecord {
+                        denied_providers,
+                        denied_api_formats,
+                        denied_models,
                         user_id: user_id.clone(),
                         // Preserve a checkpoint API-key ID when a missing row must be recreated;
                         // ordinary imports continue to receive fresh IDs.
@@ -7971,6 +7991,14 @@ impl<'a> AdminAppState<'a> {
                 ));
                 let allowed_models =
                     invalid_value!(normalize_imported_user_string_list(key, "allowed_models"));
+                let denied_providers =
+                    invalid_value!(normalize_imported_user_string_list(key, "denied_providers"));
+                let denied_api_formats = invalid_value!(normalize_imported_user_api_formats(
+                    key,
+                    "denied_api_formats"
+                ));
+                let denied_models =
+                    invalid_value!(normalize_imported_user_string_list(key, "denied_models"));
                 let ip_rules = invalid_value!(normalize_imported_user_ip_rules(key));
                 let rate_limit =
                     invalid_value!(imported_optional_i32(key.get("rate_limit"), "rate_limit"))
@@ -8056,6 +8084,9 @@ impl<'a> AdminAppState<'a> {
                             let updated = self
                             .update_standalone_api_key_basic(
                                 aether_data::repository::auth::UpdateStandaloneApiKeyBasicRecord {
+                                    denied_providers: key.contains_key("denied_providers").then(|| denied_providers.clone()),
+                                    denied_api_formats: key.contains_key("denied_api_formats").then(|| denied_api_formats.clone()),
+                                    denied_models: key.contains_key("denied_models").then(|| denied_models.clone()),
                                     api_key_id: existing_key.api_key_id.clone(),
                                     key_encrypted: key_encrypted.clone(),
                                     key_encrypted_present: key_encrypted.is_some()
@@ -8191,6 +8222,9 @@ impl<'a> AdminAppState<'a> {
                 let created = self
                     .create_standalone_api_key(
                         aether_data::repository::auth::CreateStandaloneApiKeyRecord {
+                            denied_providers,
+                            denied_api_formats,
+                            denied_models,
                             user_id: standalone_owner_id.clone(),
                             api_key_id,
                             key_hash: key_hash.clone(),

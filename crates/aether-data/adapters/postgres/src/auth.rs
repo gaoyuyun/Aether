@@ -36,6 +36,9 @@ SELECT
   api_keys.allowed_providers AS api_key_allowed_providers,
   api_keys.allowed_api_formats AS api_key_allowed_api_formats,
   api_keys.allowed_models AS api_key_allowed_models,
+  api_keys.denied_providers AS api_key_denied_providers,
+  api_keys.denied_api_formats AS api_key_denied_api_formats,
+  api_keys.denied_models AS api_key_denied_models,
   api_keys.ip_rules AS api_key_ip_rules
 FROM api_keys
 JOIN users ON users.id = api_keys.user_id
@@ -67,6 +70,9 @@ SELECT
   api_keys.allowed_providers AS api_key_allowed_providers,
   api_keys.allowed_api_formats AS api_key_allowed_api_formats,
   api_keys.allowed_models AS api_key_allowed_models,
+  api_keys.denied_providers AS api_key_denied_providers,
+  api_keys.denied_api_formats AS api_key_denied_api_formats,
+  api_keys.denied_models AS api_key_denied_models,
   api_keys.ip_rules AS api_key_ip_rules
 FROM api_keys
 JOIN users ON users.id = api_keys.user_id
@@ -98,6 +104,9 @@ SELECT
   api_keys.allowed_providers AS api_key_allowed_providers,
   api_keys.allowed_api_formats AS api_key_allowed_api_formats,
   api_keys.allowed_models AS api_key_allowed_models,
+  api_keys.denied_providers AS api_key_denied_providers,
+  api_keys.denied_api_formats AS api_key_denied_api_formats,
+  api_keys.denied_models AS api_key_denied_models,
   api_keys.ip_rules AS api_key_ip_rules
 FROM api_keys
 JOIN users ON users.id = api_keys.user_id
@@ -129,6 +138,9 @@ SELECT
   api_keys.allowed_providers AS api_key_allowed_providers,
   api_keys.allowed_api_formats AS api_key_allowed_api_formats,
   api_keys.allowed_models AS api_key_allowed_models,
+  api_keys.denied_providers AS api_key_denied_providers,
+  api_keys.denied_api_formats AS api_key_denied_api_formats,
+  api_keys.denied_models AS api_key_denied_models,
   api_keys.ip_rules AS api_key_ip_rules
 FROM api_keys
 JOIN users ON users.id = api_keys.user_id
@@ -146,6 +158,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -177,6 +192,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -207,6 +225,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -238,6 +259,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -268,6 +292,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -298,6 +325,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -372,6 +402,9 @@ SELECT
   api_keys.allowed_providers,
   api_keys.allowed_api_formats,
   api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
   api_keys.ip_rules,
   api_keys.rate_limit,
   api_keys.concurrent_limit,
@@ -423,7 +456,10 @@ INSERT INTO api_keys (
   total_tokens,
   total_cost_usd,
   created_at,
-  updated_at
+  updated_at,
+  denied_providers,
+  denied_api_formats,
+  denied_models
 )
 VALUES (
   $1,
@@ -448,7 +484,10 @@ VALUES (
   $18,
   $19,
   NOW(),
-  NOW()
+  NOW(),
+  $20,
+  $21,
+  $22
 )
 RETURNING
   user_id,
@@ -459,6 +498,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -500,7 +542,10 @@ INSERT INTO api_keys (
   total_tokens,
   total_cost_usd,
   created_at,
-  updated_at
+  updated_at,
+  denied_providers,
+  denied_api_formats,
+  denied_models
 )
 VALUES (
   $1,
@@ -525,7 +570,10 @@ VALUES (
   $17,
   $18,
   NOW(),
-  NOW()
+  NOW(),
+  $19,
+  $20,
+  $21
 )
 RETURNING
   user_id,
@@ -536,6 +584,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -565,6 +616,9 @@ SET
   allowed_providers = CASE WHEN $16 THEN $17::json ELSE allowed_providers END,
   allowed_api_formats = CASE WHEN $18 THEN $19::json ELSE allowed_api_formats END,
   allowed_models = CASE WHEN $20 THEN $21::json ELSE allowed_models END,
+  denied_providers = CASE WHEN $22 THEN $23::jsonb ELSE denied_providers END,
+  denied_api_formats = CASE WHEN $24 THEN $25::jsonb ELSE denied_api_formats END,
+  denied_models = CASE WHEN $26 THEN $27::jsonb ELSE denied_models END,
   updated_at = NOW()
 WHERE user_id = $1
   AND id = $2
@@ -579,6 +633,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -610,6 +667,9 @@ SET
   ip_rules = CASE WHEN $18 THEN $19::jsonb ELSE ip_rules END,
   expires_at = CASE WHEN $20 THEN $21::timestamptz ELSE expires_at END,
   auto_delete_on_expiry = CASE WHEN $22 THEN $23 ELSE auto_delete_on_expiry END,
+  denied_providers = CASE WHEN $24 THEN $25::jsonb ELSE denied_providers END,
+  denied_api_formats = CASE WHEN $26 THEN $27::jsonb ELSE denied_api_formats END,
+  denied_models = CASE WHEN $28 THEN $29::jsonb ELSE denied_models END,
   updated_at = NOW()
 WHERE id = $1
   AND is_standalone = TRUE
@@ -622,6 +682,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -657,6 +720,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -690,6 +756,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -724,6 +793,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -755,6 +827,7 @@ const SET_USER_API_KEY_ALLOWED_PROVIDERS_SQL: &str = r#"
 UPDATE api_keys
 SET
   allowed_providers = $3,
+  denied_providers = NULL,
   updated_at = NOW()
 WHERE user_id = $1
   AND id = $2
@@ -769,6 +842,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -804,6 +880,9 @@ RETURNING
   allowed_providers,
   allowed_api_formats,
   allowed_models,
+  denied_providers,
+  denied_api_formats,
+  denied_models,
   ip_rules,
   rate_limit,
   concurrent_limit,
@@ -1095,6 +1174,43 @@ impl SqlxAuthApiKeySnapshotReadRepository {
 
 #[async_trait]
 impl AuthApiKeyReadRepository for SqlxAuthApiKeySnapshotReadRepository {
+    async fn list_user_api_keys_with_access_restrictions(
+        &self,
+    ) -> Result<Vec<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let rows = sqlx::query(r#"
+SELECT
+  api_keys.user_id,
+  api_keys.id AS api_key_id,
+  api_keys.key_hash,
+  api_keys.key_encrypted,
+  api_keys.name,
+  api_keys.allowed_providers,
+  api_keys.allowed_api_formats,
+  api_keys.allowed_models,
+  api_keys.denied_providers,
+  api_keys.denied_api_formats,
+  api_keys.denied_models,
+  api_keys.ip_rules,
+  api_keys.rate_limit,
+  api_keys.concurrent_limit,
+  api_keys.force_capabilities,
+  api_keys.feature_settings,
+  api_keys.is_active,
+  CAST(EXTRACT(EPOCH FROM api_keys.expires_at) AS BIGINT) AS expires_at_unix_secs,
+  api_keys.auto_delete_on_expiry,
+  api_keys.total_requests,
+  COALESCE(api_keys.total_tokens, 0)::BIGINT AS total_tokens,
+  COALESCE(CAST(api_keys.total_cost_usd AS DOUBLE PRECISION), 0) AS total_cost_usd,
+  CAST(EXTRACT(EPOCH FROM api_keys.last_used_at) AS BIGINT) AS last_used_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM api_keys.created_at) AS BIGINT) AS created_at_unix_secs,
+  CAST(EXTRACT(EPOCH FROM api_keys.updated_at) AS BIGINT) AS updated_at_unix_secs,
+  api_keys.is_standalone
+FROM api_keys
+ WHERE api_keys.is_standalone = FALSE AND (api_keys.allowed_providers IS NOT NULL OR api_keys.allowed_api_formats IS NOT NULL OR api_keys.allowed_models IS NOT NULL OR api_keys.denied_providers IS NOT NULL OR api_keys.denied_api_formats IS NOT NULL OR api_keys.denied_models IS NOT NULL)"#)
+            .fetch_all(&self.pool).await.map_postgres_err()?;
+        rows.iter().map(map_auth_api_key_export_row).collect()
+    }
+
     async fn find_api_key_snapshot(
         &self,
         key: AuthApiKeyLookupKey<'_>,
@@ -1182,6 +1298,68 @@ impl AuthApiKeyReadRepository for SqlxAuthApiKeySnapshotReadRepository {
 
 #[async_trait]
 impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
+    async fn compare_and_swap_user_api_key_access_lists(
+        &self,
+        expected: &StoredAuthApiKeyExportRecord,
+        replacement: &StoredAuthApiKeyExportRecord,
+    ) -> Result<bool, DataLayerError> {
+        let result = sqlx::query(
+            r#"
+UPDATE api_keys
+SET
+  allowed_providers = $1::json,
+  allowed_api_formats = $2::json,
+  allowed_models = $3::json,
+  denied_providers = $4::jsonb,
+  denied_api_formats = $5::jsonb,
+  denied_models = $6::jsonb,
+  updated_at = NOW()
+WHERE id = $7
+  AND user_id = $8
+  AND is_standalone = FALSE
+  AND allowed_providers::jsonb IS NOT DISTINCT FROM $9::jsonb
+  AND allowed_api_formats::jsonb IS NOT DISTINCT FROM $10::jsonb
+  AND allowed_models::jsonb IS NOT DISTINCT FROM $11::jsonb
+  AND denied_providers::jsonb IS NOT DISTINCT FROM $12::jsonb
+  AND denied_api_formats::jsonb IS NOT DISTINCT FROM $13::jsonb
+  AND denied_models::jsonb IS NOT DISTINCT FROM $14::jsonb
+"#,
+        )
+        .bind(
+            replacement
+                .allowed_providers
+                .as_ref()
+                .map(sqlx::types::Json),
+        )
+        .bind(
+            replacement
+                .allowed_api_formats
+                .as_ref()
+                .map(sqlx::types::Json),
+        )
+        .bind(replacement.allowed_models.as_ref().map(sqlx::types::Json))
+        .bind(replacement.denied_providers.as_ref().map(sqlx::types::Json))
+        .bind(
+            replacement
+                .denied_api_formats
+                .as_ref()
+                .map(sqlx::types::Json),
+        )
+        .bind(replacement.denied_models.as_ref().map(sqlx::types::Json))
+        .bind(&expected.api_key_id)
+        .bind(&expected.user_id)
+        .bind(expected.allowed_providers.as_ref().map(sqlx::types::Json))
+        .bind(expected.allowed_api_formats.as_ref().map(sqlx::types::Json))
+        .bind(expected.allowed_models.as_ref().map(sqlx::types::Json))
+        .bind(expected.denied_providers.as_ref().map(sqlx::types::Json))
+        .bind(expected.denied_api_formats.as_ref().map(sqlx::types::Json))
+        .bind(expected.denied_models.as_ref().map(sqlx::types::Json))
+        .execute(&self.pool)
+        .await
+        .map_postgres_err()?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn touch_last_used_at(&self, api_key_id: &str) -> Result<bool, DataLayerError> {
         let result = sqlx::query(TOUCH_LAST_USED_AT_SQL)
             .bind(api_key_id)
@@ -1254,6 +1432,9 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             )?)
             .bind(i64_from_u64(record.total_tokens, "api_keys.total_tokens")?)
             .bind(record.total_cost_usd)
+            .bind(record.denied_providers.map(sqlx::types::Json))
+            .bind(record.denied_api_formats.map(sqlx::types::Json))
+            .bind(record.denied_models.map(sqlx::types::Json))
             .fetch_optional(&mut *tx)
             .await
             .map_postgres_err()?;
@@ -1324,6 +1505,9 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             )?)
             .bind(i64_from_u64(record.total_tokens, "api_keys.total_tokens")?)
             .bind(record.total_cost_usd)
+            .bind(record.denied_providers.map(sqlx::types::Json))
+            .bind(record.denied_api_formats.map(sqlx::types::Json))
+            .bind(record.denied_models.map(sqlx::types::Json))
             .fetch_optional(&mut *tx)
             .await
             .map_postgres_err()?;
@@ -1380,6 +1564,30 @@ impl AuthApiKeyWriteRepository for SqlxAuthApiKeySnapshotReadRepository {
             .bind(
                 record
                     .allowed_models
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
+            .bind(record.denied_providers.is_some())
+            .bind(
+                record
+                    .denied_providers
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
+            .bind(record.denied_api_formats.is_some())
+            .bind(
+                record
+                    .denied_api_formats
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
+            .bind(record.denied_models.is_some())
+            .bind(
+                record
+                    .denied_models
                     .clone()
                     .flatten()
                     .map(sqlx::types::Json),
@@ -1469,6 +1677,30 @@ WHERE id = $2
                     .flatten()
                     .map(sqlx::types::Json),
             )
+            .bind(record.denied_providers.is_some())
+            .bind(
+                record
+                    .denied_providers
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
+            .bind(record.denied_api_formats.is_some())
+            .bind(
+                record
+                    .denied_api_formats
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
+            .bind(record.denied_models.is_some())
+            .bind(
+                record
+                    .denied_models
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
             .fetch_optional(&self.pool)
             .await
             .map_postgres_err()?;
@@ -1535,6 +1767,30 @@ WHERE id = $2
             .bind(expires_at)
             .bind(record.auto_delete_on_expiry_present)
             .bind(record.auto_delete_on_expiry)
+            .bind(record.denied_providers.is_some())
+            .bind(
+                record
+                    .denied_providers
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
+            .bind(record.denied_api_formats.is_some())
+            .bind(
+                record
+                    .denied_api_formats
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
+            .bind(record.denied_models.is_some())
+            .bind(
+                record
+                    .denied_models
+                    .clone()
+                    .flatten()
+                    .map(sqlx::types::Json),
+            )
             .fetch_optional(&self.pool)
             .await
             .map_postgres_err()?;
@@ -1623,6 +1879,9 @@ SET key_encrypted = $1,
     total_tokens = $15,
     total_cost_usd = $16,
     last_used_at = $17,
+    denied_providers = $22::jsonb,
+    denied_api_formats = $23::jsonb,
+    denied_models = $24::jsonb,
     updated_at = NOW()
 WHERE id = $18
   AND user_id = $19
@@ -1657,6 +1916,9 @@ WHERE id = $18
         .bind(&restored.user_id)
         .bind(&restored.key_hash)
         .bind(restored.is_standalone)
+        .bind(restored.denied_providers.as_ref().map(sqlx::types::Json))
+        .bind(restored.denied_api_formats.as_ref().map(sqlx::types::Json))
+        .bind(restored.denied_models.as_ref().map(sqlx::types::Json))
         .execute(&mut *tx)
         .await
         .map_postgres_err()?;
@@ -2055,6 +2317,11 @@ fn map_auth_api_key_snapshot_row(
         row_get(row, "api_key_allowed_api_formats")?,
         row_get(row, "api_key_allowed_models")?,
     )?
+    .with_denied_lists(
+        row_get(row, "api_key_denied_providers")?,
+        row_get(row, "api_key_denied_api_formats")?,
+        row_get(row, "api_key_denied_models")?,
+    )?
     .with_api_key_ip_rules(row_get(row, "api_key_ip_rules")?)?;
     Ok(snapshot.with_user_rate_limit(row_get(row, "user_rate_limit")?))
 }
@@ -2084,6 +2351,13 @@ fn map_auth_api_key_export_row(
         row_get(row, "is_standalone")?,
     )
     .and_then(|record| record.with_ip_rules(row_get(row, "ip_rules")?))
+    .and_then(|record| {
+        record.with_denied_lists(
+            row_get(row, "denied_providers")?,
+            row_get(row, "denied_api_formats")?,
+            row_get(row, "denied_models")?,
+        )
+    })
     .map(|record| record.with_feature_settings(feature_settings))
     .and_then(|record| {
         record.with_activity_timestamps(

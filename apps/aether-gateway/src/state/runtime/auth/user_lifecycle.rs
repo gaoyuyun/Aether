@@ -1384,6 +1384,7 @@ mod tests {
 
     fn cached_auth_context() -> GatewayControlAuthContext {
         GatewayControlAuthContext {
+            denied_models: None,
             user_id: "user-1".to_string(),
             api_key_id: "key-1".to_string(),
             username: Some("alice".to_string()),

@@ -1778,6 +1778,9 @@ async fn seed_client_api_key(backends: &DataBackends, user_id: &str) -> Result<(
         .auth_api_keys()
         .ok_or("auth API key writer unavailable")?
         .create_standalone_api_key(CreateStandaloneApiKeyRecord {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             user_id: user_id.to_string(),
             api_key_id: API_KEY_ID.to_string(),
             key_hash: sha256_hex(CLIENT_API_KEY),
@@ -1841,6 +1844,9 @@ async fn seed_weekly_request_limit(
         .auth_api_keys()
         .ok_or("auth API key writer unavailable")?
         .create_user_api_key(CreateUserApiKeyRecord {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             user_id: user_id.clone(),
             api_key_id: API_KEY_ID.to_string(),
             key_hash: sha256_hex(CLIENT_API_KEY),

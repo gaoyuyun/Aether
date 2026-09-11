@@ -21,6 +21,41 @@ afterEach(() => {
 })
 
 describe('useUserAccessControlOptions', () => {
+  it('loads every model page before replacing the catalog', async () => {
+    meApiMock.getAvailableProviders.mockResolvedValue([])
+    meApiMock.getAvailableModelOptions
+      .mockResolvedValueOnce({ models: [{ name: 'first' }], total: 2 })
+      .mockResolvedValueOnce({ models: [{ name: 'last' }], total: 2 })
+    const options = useUserAccessControlOptions()
+    await options.loadAccessControlOptions()
+    expect(meApiMock.getAvailableModelOptions).toHaveBeenLastCalledWith({ limit: 1000, skip: 1 })
+    expect(options.modelOptions.value.map(item => item.value)).toEqual(['first', 'last'])
+  })
+
+  it('keeps the last complete catalog when a later page fails', async () => {
+    meApiMock.getAvailableProviders.mockResolvedValue([])
+    meApiMock.getAvailableModelOptions.mockResolvedValueOnce({ models: [{ name: 'keep' }], total: 1 })
+    const options = useUserAccessControlOptions()
+    await options.loadAccessControlOptions()
+    meApiMock.getAvailableModelOptions
+      .mockResolvedValueOnce({ models: [{ name: 'partial' }], total: 2 })
+      .mockRejectedValueOnce(new Error('network unavailable'))
+    await expect(options.loadAccessControlOptions({ force: true })).rejects.toThrow('network unavailable')
+    expect(options.modelOptions.value.map(item => item.value)).toEqual(['keep'])
+  })
+
+  it('ignores an in-flight catalog after invalidation', async () => {
+    let finish!: (value: { models: Array<{ name: string }>; total: number }) => void
+    meApiMock.getAvailableProviders.mockResolvedValue([])
+    meApiMock.getAvailableModelOptions.mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    const options = useUserAccessControlOptions()
+    const pending = options.loadAccessControlOptions()
+    invalidateUserAccessControlOptions()
+    finish({ models: [{ name: 'removed' }], total: 1 })
+    await expect(pending).rejects.toThrow('访问限制选项已更新')
+    expect(options.modelOptions.value).toEqual([])
+  })
+
   it('shares one lightweight catalog load across repeated consumers', async () => {
     meApiMock.getAvailableProviders.mockResolvedValue([
       {

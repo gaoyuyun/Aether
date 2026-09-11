@@ -350,6 +350,7 @@ impl GatewayDataState {
         };
         if result.as_ref().is_ok_and(Option::is_some) {
             self.clear_billing_model_context_cache();
+            self.prune_user_api_key_access_restrictions().await?;
         }
         result
     }
@@ -364,6 +365,7 @@ impl GatewayDataState {
         };
         if result.as_ref().is_ok_and(|changed| *changed) {
             self.clear_billing_model_context_cache();
+            self.prune_user_api_key_access_restrictions().await?;
         }
         result
     }

@@ -1,5 +1,27 @@
 use async_trait::async_trait;
 
+/// Normalize one key restriction dimension for the allow/deny mode editor.
+/// Missing patch fields remain unchanged; setting either list clears the opposite list.
+#[allow(clippy::type_complexity)]
+pub fn normalize_api_key_access_list_patch(
+    mut allowed: Option<Option<Vec<String>>>,
+    mut denied: Option<Option<Vec<String>>>,
+    dimension: &str,
+) -> Result<(Option<Option<Vec<String>>>, Option<Option<Vec<String>>>), String> {
+    let sets_allowed = matches!(&allowed, Some(Some(_)));
+    let sets_denied = matches!(&denied, Some(Some(_)));
+    if sets_allowed && sets_denied {
+        return Err(format!("{dimension} 的允许列表和拒绝列表不能同时设置"));
+    }
+    if sets_allowed {
+        denied = Some(None);
+    }
+    if sets_denied {
+        allowed = Some(None);
+    }
+    Ok((allowed, denied))
+}
+
 fn redacted_optional_secret<T>(value: &Option<T>) -> Option<&'static str> {
     value.as_ref().map(|_| "[REDACTED]")
 }
@@ -29,9 +51,28 @@ pub struct StoredAuthApiKeySnapshot {
     pub api_key_allowed_api_formats: Option<Vec<String>>,
     pub api_key_allowed_models: Option<Vec<String>>,
     pub api_key_ip_rules: Option<Vec<String>>,
+    #[serde(default)]
+    pub api_key_denied_providers: Option<Vec<String>>,
+    #[serde(default)]
+    pub api_key_denied_api_formats: Option<Vec<String>>,
+    #[serde(default)]
+    pub api_key_denied_models: Option<Vec<String>>,
 }
 
 impl StoredAuthApiKeySnapshot {
+    pub fn with_denied_lists(
+        mut self,
+        providers: Option<serde_json::Value>,
+        api_formats: Option<serde_json::Value>,
+        models: Option<serde_json::Value>,
+    ) -> Result<Self, crate::DataLayerError> {
+        self.api_key_denied_providers = parse_string_list(providers, "api_keys.denied_providers")?;
+        self.api_key_denied_api_formats =
+            parse_string_list(api_formats, "api_keys.denied_api_formats")?;
+        self.api_key_denied_models = parse_string_list(models, "api_keys.denied_models")?;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_id: String,
@@ -103,6 +144,9 @@ impl StoredAuthApiKeySnapshot {
                 "api_keys.allowed_models",
             )?,
             api_key_ip_rules: None,
+            api_key_denied_providers: None,
+            api_key_denied_api_formats: None,
+            api_key_denied_models: None,
         })
     }
 
@@ -164,6 +208,12 @@ pub struct ResolvedAuthApiKeySnapshot {
     pub api_key_allowed_models: Option<Vec<String>>,
     pub api_key_ip_rules: Option<Vec<String>>,
     pub currently_usable: bool,
+    #[serde(default)]
+    pub api_key_denied_providers: Option<Vec<String>>,
+    #[serde(default)]
+    pub api_key_denied_api_formats: Option<Vec<String>>,
+    #[serde(default)]
+    pub api_key_denied_models: Option<Vec<String>>,
 }
 
 impl ResolvedAuthApiKeySnapshot {
@@ -193,6 +243,9 @@ impl ResolvedAuthApiKeySnapshot {
             api_key_allowed_api_formats: snapshot.api_key_allowed_api_formats,
             api_key_allowed_models: snapshot.api_key_allowed_models,
             api_key_ip_rules: snapshot.api_key_ip_rules,
+            api_key_denied_providers: snapshot.api_key_denied_providers,
+            api_key_denied_api_formats: snapshot.api_key_denied_api_formats,
+            api_key_denied_models: snapshot.api_key_denied_models,
             currently_usable,
         };
         resolved.constrain_non_standalone_api_key_policy_to_user_policy();
@@ -227,6 +280,17 @@ impl ResolvedAuthApiKeySnapshot {
         provider_name: &str,
         provider_type: &str,
     ) -> bool {
+        if self
+            .api_key_denied_providers
+            .as_ref()
+            .is_some_and(|denied| {
+                denied.iter().any(|value| {
+                    provider_policy_value_matches(value, provider_id, provider_name, provider_type)
+                })
+            })
+        {
+            return false;
+        }
         for layer in self.provider_allowlist_layers() {
             if !provider_allowlist_layer_allows(layer, provider_id, provider_name, provider_type) {
                 return false;
@@ -272,6 +336,38 @@ impl ResolvedAuthApiKeySnapshot {
         self.api_key_allowed_models
             .as_deref()
             .or(self.user_allowed_models.as_deref())
+    }
+
+    pub fn allows_api_format(&self, api_format: &str) -> bool {
+        let matches =
+            |value: &String| aether_ai_formats::api_format_permission_covers(value, api_format);
+        !self
+            .api_key_denied_api_formats
+            .as_ref()
+            .is_some_and(|values| values.iter().any(matches))
+            && self
+                .effective_allowed_api_formats()
+                .is_none_or(|values| values.iter().any(matches))
+    }
+
+    pub fn allows_model(
+        &self,
+        requested_model: &str,
+        resolved_model: &str,
+        base_model: Option<&str>,
+    ) -> bool {
+        let matches = |value: &String| {
+            value == requested_model
+                || value == resolved_model
+                || base_model.is_some_and(|base| value == base)
+        };
+        !self
+            .api_key_denied_models
+            .as_ref()
+            .is_some_and(|values| values.iter().any(matches))
+            && self
+                .effective_allowed_models()
+                .is_none_or(|values| values.iter().any(matches))
     }
 
     pub fn apply_user_policy(
@@ -452,6 +548,12 @@ pub struct StoredAuthApiKeyExportRecord {
     pub created_at_unix_secs: Option<u64>,
     pub updated_at_unix_secs: Option<u64>,
     pub is_standalone: bool,
+    #[serde(default)]
+    pub denied_providers: Option<Vec<String>>,
+    #[serde(default)]
+    pub denied_api_formats: Option<Vec<String>>,
+    #[serde(default)]
+    pub denied_models: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for StoredAuthApiKeyExportRecord {
@@ -471,6 +573,18 @@ impl std::fmt::Debug for StoredAuthApiKeyExportRecord {
 }
 
 impl StoredAuthApiKeyExportRecord {
+    pub fn with_denied_lists(
+        mut self,
+        providers: Option<serde_json::Value>,
+        api_formats: Option<serde_json::Value>,
+        models: Option<serde_json::Value>,
+    ) -> Result<Self, crate::DataLayerError> {
+        self.denied_providers = parse_string_list(providers, "api_keys.denied_providers")?;
+        self.denied_api_formats = parse_string_list(api_formats, "api_keys.denied_api_formats")?;
+        self.denied_models = parse_string_list(models, "api_keys.denied_models")?;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_id: String,
@@ -526,6 +640,9 @@ impl StoredAuthApiKeyExportRecord {
             )?,
             allowed_models: parse_string_list(allowed_models, "api_keys.allowed_models")?,
             ip_rules: None,
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             rate_limit,
             concurrent_limit,
             force_capabilities,
@@ -611,6 +728,9 @@ pub struct CreateUserApiKeyRecord {
     pub total_requests: u64,
     pub total_tokens: u64,
     pub total_cost_usd: f64,
+    pub denied_providers: Option<Vec<String>>,
+    pub denied_api_formats: Option<Vec<String>>,
+    pub denied_models: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for CreateUserApiKeyRecord {
@@ -654,6 +774,9 @@ pub struct UpdateUserApiKeyBasicRecord {
     pub allowed_models: Option<Option<Vec<String>>>,
     /// `None` = leave unchanged; `Some(None)` = clear; `Some(Some(value))` = set.
     pub feature_settings: Option<Option<serde_json::Value>>,
+    pub denied_providers: Option<Option<Vec<String>>>,
+    pub denied_api_formats: Option<Option<Vec<String>>>,
+    pub denied_models: Option<Option<Vec<String>>>,
 }
 
 impl std::fmt::Debug for UpdateUserApiKeyBasicRecord {
@@ -691,6 +814,9 @@ pub struct CreateStandaloneApiKeyRecord {
     pub total_requests: u64,
     pub total_tokens: u64,
     pub total_cost_usd: f64,
+    pub denied_providers: Option<Vec<String>>,
+    pub denied_api_formats: Option<Vec<String>>,
+    pub denied_models: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for CreateStandaloneApiKeyRecord {
@@ -734,6 +860,9 @@ pub struct UpdateStandaloneApiKeyBasicRecord {
     pub expires_at_unix_secs: Option<u64>,
     pub auto_delete_on_expiry_present: bool,
     pub auto_delete_on_expiry: bool,
+    pub denied_providers: Option<Option<Vec<String>>>,
+    pub denied_api_formats: Option<Option<Vec<String>>>,
+    pub denied_models: Option<Option<Vec<String>>>,
 }
 
 impl std::fmt::Debug for UpdateStandaloneApiKeyBasicRecord {
@@ -790,6 +919,13 @@ pub enum AuthApiKeyLookupKey<'a> {
 
 #[async_trait]
 pub trait AuthApiKeyReadRepository: Send + Sync {
+    /// User keys with explicit lists, used to remove references to deleted catalog entries.
+    async fn list_user_api_keys_with_access_restrictions(
+        &self,
+    ) -> Result<Vec<StoredAuthApiKeyExportRecord>, crate::DataLayerError> {
+        Ok(Vec::new())
+    }
+
     /// Clears any local read-through cache maintained by a repository wrapper.
     /// Concrete database readers normally use the default no-op implementation.
     fn clear_cache(&self) {}
@@ -857,6 +993,17 @@ pub trait AuthApiKeyReadRepository: Send + Sync {
 
 #[async_trait]
 pub trait AuthApiKeyWriteRepository: Send + Sync {
+    /// Replace only the access lists if they still match the snapshot read before catalog lookup.
+    /// This keeps catalog cleanup from overwriting a concurrent key edit.
+    async fn compare_and_swap_user_api_key_access_lists(
+        &self,
+        expected: &StoredAuthApiKeyExportRecord,
+        replacement: &StoredAuthApiKeyExportRecord,
+    ) -> Result<bool, crate::DataLayerError> {
+        let _ = (expected, replacement);
+        Ok(false)
+    }
+
     async fn touch_last_used_at(&self, api_key_id: &str) -> Result<bool, crate::DataLayerError>;
 
     /// Synchronize an authoritative user snapshot for repositories used by gateway tests.
@@ -1824,6 +1971,85 @@ mod tests {
             snapshot.effective_allowed_models(),
             Some(&["gpt-4.1".to_string()][..])
         );
+    }
+
+    #[test]
+    fn switching_access_modes_clears_opposite_rules_and_preserves_omitted_patches() {
+        use super::normalize_api_key_access_list_patch;
+        assert_eq!(
+            normalize_api_key_access_list_patch(None, None, "models").unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            normalize_api_key_access_list_patch(None, Some(Some(vec!["old".into()])), "models")
+                .unwrap(),
+            (Some(None), Some(Some(vec!["old".into()])))
+        );
+        assert_eq!(
+            normalize_api_key_access_list_patch(Some(Some(Vec::new())), None, "models").unwrap(),
+            (Some(Some(Vec::new())), Some(None))
+        );
+        assert_eq!(
+            normalize_api_key_access_list_patch(Some(None), None, "models").unwrap(),
+            (Some(None), None)
+        );
+        assert!(normalize_api_key_access_list_patch(
+            Some(Some(Vec::new())),
+            Some(Some(Vec::new())),
+            "models"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn key_denylists_exclude_matches_and_admit_new_resources_within_user_policy() {
+        let mut stored = sample_auth_snapshot("key-deny", "user");
+        stored.api_key_allowed_providers = None;
+        stored.api_key_allowed_api_formats = None;
+        stored.api_key_allowed_models = None;
+        stored.user_allowed_api_formats = None;
+        stored.user_allowed_models = None;
+        stored.api_key_denied_providers = Some(vec!["provider-old".into()]);
+        stored.api_key_denied_api_formats = Some(vec!["openai:responses".into()]);
+        stored.api_key_denied_models = Some(vec!["gpt-old".into()]);
+        let mut resolved = ResolvedAuthApiKeySnapshot::from_stored(stored, 100);
+        assert!(!resolved.allows_provider("provider-old", "Old", "openai"));
+        assert!(resolved.allows_provider("provider-new", "New", "openai"));
+        assert!(!resolved.allows_provider("provider-new", "New", "anthropic"));
+        assert!(!resolved.allows_api_format("openai:responses"));
+        assert!(!resolved.allows_api_format("openai:search"));
+        assert!(resolved.allows_api_format("openai:chat"));
+        assert!(!resolved.allows_model("deployment", "gpt-old", None));
+        assert!(!resolved.allows_model("gpt-old-high", "gpt-old-high", Some("gpt-old")));
+        assert!(resolved.allows_model("gpt-new", "gpt-new", None));
+        resolved.apply_user_policy(
+            None,
+            Some(vec!["claude:messages".into()]),
+            Some(vec!["gpt-old".into()]),
+            None,
+        );
+        assert!(!resolved.allows_api_format("openai:chat"));
+        assert!(!resolved.allows_model("gpt-new", "gpt-new", None));
+        assert!(!resolved.allows_model("gpt-old", "gpt-old", None));
+    }
+
+    #[test]
+    fn empty_denylists_do_not_turn_empty_allowlists_into_unrestricted_access() {
+        let mut stored = sample_auth_snapshot("key-empty", "user");
+        stored.api_key_denied_providers = Some(Vec::new());
+        stored.api_key_denied_api_formats = Some(Vec::new());
+        stored.api_key_denied_models = Some(Vec::new());
+        let resolved = ResolvedAuthApiKeySnapshot::from_stored(stored.clone(), 100);
+        assert!(resolved.allows_provider("provider", "OpenAI", "openai"));
+        assert!(resolved.allows_api_format("openai:chat"));
+        assert!(resolved.allows_model("gpt-4.1", "gpt-4.1", None));
+        stored.api_key_allowed_providers = Some(Vec::new());
+        stored.api_key_allowed_api_formats = Some(Vec::new());
+        stored.api_key_allowed_models = Some(Vec::new());
+        let resolved = ResolvedAuthApiKeySnapshot::from_stored(stored, 100);
+        assert!(!resolved.allows_provider("provider", "OpenAI", "openai"));
+        assert!(!resolved.allows_api_format("openai:chat"));
+        assert!(!resolved.allows_model("gpt-4.1", "gpt-4.1", None));
     }
 
     fn sample_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {

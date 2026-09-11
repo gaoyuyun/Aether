@@ -279,13 +279,6 @@ VALUES (
     let auth_repository = SqlxAuthApiKeySnapshotReadRepository::new(pool.clone());
     let users_repository = SqlxUserReadRepository::new(pool.clone());
     let tokens_repository = SqlxManagementTokenRepository::new(pool.clone());
-    let api_key_error = auth_repository
-        .find_api_key_snapshot(AuthApiKeyLookupKey::ApiKeyId("legacy-policy-key"))
-        .await
-        .expect_err("legacy API key JSON null should reproduce the upgrade failure");
-    assert!(api_key_error
-        .to_string()
-        .contains("api_keys.allowed_providers contains JSON null"));
     assert!(users_repository
         .find_user_auth_by_id("legacy-policy-user")
         .await
@@ -325,6 +318,9 @@ VALUES (
     assert!(snapshot.api_key_allowed_providers.is_none());
     assert!(snapshot.api_key_allowed_api_formats.is_none());
     assert!(snapshot.api_key_allowed_models.is_none());
+    assert!(snapshot.api_key_denied_providers.is_none());
+    assert!(snapshot.api_key_denied_api_formats.is_none());
+    assert!(snapshot.api_key_denied_models.is_none());
     assert!(snapshot.api_key_ip_rules.is_none());
     let exported_keys = auth_repository
         .list_export_api_keys_by_ids(&["legacy-policy-key".to_string()])
@@ -382,5 +378,19 @@ VALUES (
         .await
         .expect("upgraded database should remain current")
         .is_empty());
+
+    // Current readers require the complete current schema. Reintroduce a legacy
+    // value after upgrading to verify decoding still rejects malformed policies.
+    query("UPDATE api_keys SET allowed_providers = 'null' WHERE id = 'legacy-policy-key'")
+        .execute(&pool)
+        .await
+        .expect("malformed API key policy fixture should update");
+    let api_key_error = auth_repository
+        .find_api_key_snapshot(AuthApiKeyLookupKey::ApiKeyId("legacy-policy-key"))
+        .await
+        .expect_err("legacy API key JSON null should fail strict policy decoding");
+    assert!(api_key_error
+        .to_string()
+        .contains("api_keys.allowed_providers contains JSON null"));
     pool.close().await;
 }

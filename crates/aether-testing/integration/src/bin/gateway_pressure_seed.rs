@@ -503,6 +503,9 @@ async fn seed_api_key(
     if existing.is_none() {
         auth_writer
             .create_standalone_api_key(CreateStandaloneApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: operator_user_id.to_string(),
                 api_key_id: api_key_id.clone(),
                 key_hash: sha256_hex(&api_key_value),
@@ -527,6 +530,9 @@ async fn seed_api_key(
         auth_writer
             .update_standalone_api_key_basic(
                 aether_data::repository::auth::UpdateStandaloneApiKeyBasicRecord {
+                    denied_providers: None,
+                    denied_api_formats: None,
+                    denied_models: None,
                     api_key_id: api_key_id.clone(),
                     key_encrypted: None,
                     key_encrypted_present: false,

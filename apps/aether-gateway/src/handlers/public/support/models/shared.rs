@@ -98,12 +98,8 @@ fn auth_snapshot_allows_model_for_models(
     auth_snapshot: Option<&crate::data::auth::GatewayAuthApiKeySnapshot>,
     global_model_name: &str,
 ) -> bool {
-    let Some(allowed) = auth_snapshot
-        .and_then(crate::data::auth::GatewayAuthApiKeySnapshot::effective_allowed_models)
-    else {
-        return true;
-    };
-    allowed.iter().any(|value| value == global_model_name)
+    auth_snapshot
+        .is_none_or(|snapshot| snapshot.allows_model(global_model_name, global_model_name, None))
 }
 
 fn mapping_scope_matches_for_models(
@@ -190,6 +186,7 @@ pub(crate) fn filter_eligible_model_rows(
     api_format: &str,
 ) -> Vec<StoredMinimalCandidateSelectionRow> {
     rows.into_iter()
+        .filter(|_| auth_snapshot.is_none_or(|snapshot| snapshot.allows_api_format(api_format)))
         .filter(|row| {
             auth_snapshot_allows_provider_for_models(
                 auth_snapshot,

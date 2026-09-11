@@ -29,7 +29,8 @@ pub(crate) async fn build_admin_list_user_api_keys_response(
 
     let active_filter = query_param_optional_bool(request_context.query_string(), "is_active");
     let mut export_records = state
-        .list_auth_api_key_export_records_by_user_ids(std::slice::from_ref(&user_id))
+        .app()
+        .list_user_api_keys_with_current_access(&user_id)
         .await?;
     if let Some(is_active) = active_filter {
         export_records.retain(|record| record.is_active == is_active);
@@ -66,6 +67,9 @@ pub(crate) async fn build_admin_list_user_api_keys_response(
                 "allowed_providers": record.allowed_providers,
                 "allowed_api_formats": record.allowed_api_formats,
                 "allowed_models": record.allowed_models,
+                "denied_providers": record.denied_providers,
+                "denied_api_formats": record.denied_api_formats,
+                "denied_models": record.denied_models,
                 "ip_rules": record.ip_rules,
                 "feature_settings": record.feature_settings,
                 "expires_at": format_optional_unix_secs_iso8601(record.expires_at_unix_secs),

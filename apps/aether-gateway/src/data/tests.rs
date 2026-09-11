@@ -894,6 +894,9 @@ async fn data_state_reads_minimal_candidate_selection_with_auth_filters() {
         .expect("minimal candidate selection rows should read");
     let layers = auth_snapshot.provider_allowlist_layers();
     let auth_constraints = SchedulerAuthConstraints {
+        denied_providers: auth_snapshot.api_key_denied_providers.clone(),
+        denied_api_formats: auth_snapshot.api_key_denied_api_formats.clone(),
+        denied_models: auth_snapshot.api_key_denied_models.clone(),
         allowed_providers: layers[0].map(|items| items.to_vec()),
         allowed_providers_and: layers[1].map(|items| items.to_vec()),
         allowed_api_formats: auth_snapshot

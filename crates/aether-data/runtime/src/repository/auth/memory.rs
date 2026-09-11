@@ -157,6 +157,22 @@ impl InMemoryAuthApiKeySnapshotRepository {
                             .map(|value| serde_json::json!(value)),
                     )
                 })
+                .and_then(|record| {
+                    record.with_denied_lists(
+                        snapshot
+                            .api_key_denied_providers
+                            .as_ref()
+                            .map(|value| serde_json::json!(value)),
+                        snapshot
+                            .api_key_denied_api_formats
+                            .as_ref()
+                            .map(|value| serde_json::json!(value)),
+                        snapshot
+                            .api_key_denied_models
+                            .as_ref()
+                            .map(|value| serde_json::json!(value)),
+                    )
+                })
                 .expect("derived auth api key export record should build"),
             );
             if let Some(key_hash) = key_hash {
@@ -360,6 +376,21 @@ fn apply_f64_delta(current: f64, delta: f64) -> f64 {
 
 #[async_trait]
 impl AuthApiKeyReadRepository for InMemoryAuthApiKeySnapshotRepository {
+    async fn list_user_api_keys_with_access_restrictions(
+        &self,
+    ) -> Result<Vec<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        let index = self
+            .index
+            .read()
+            .expect("auth api key snapshot repository lock");
+        Ok(index
+            .export_by_api_key_id
+            .values()
+            .filter(|record| !record.is_standalone)
+            .cloned()
+            .collect())
+    }
+
     async fn find_api_key_snapshot(
         &self,
         key: AuthApiKeyLookupKey<'_>,
@@ -635,6 +666,46 @@ impl AuthApiKeyReadRepository for InMemoryAuthApiKeySnapshotRepository {
 
 #[async_trait]
 impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
+    async fn compare_and_swap_user_api_key_access_lists(
+        &self,
+        expected: &StoredAuthApiKeyExportRecord,
+        replacement: &StoredAuthApiKeyExportRecord,
+    ) -> Result<bool, DataLayerError> {
+        let mut index = self
+            .index
+            .write()
+            .expect("auth api key snapshot repository lock");
+        let Some(current) = index.export_by_api_key_id.get_mut(&expected.api_key_id) else {
+            return Ok(false);
+        };
+        if current.is_standalone
+            || current.user_id != expected.user_id
+            || current.allowed_providers != expected.allowed_providers
+            || current.allowed_api_formats != expected.allowed_api_formats
+            || current.allowed_models != expected.allowed_models
+            || current.denied_providers != expected.denied_providers
+            || current.denied_api_formats != expected.denied_api_formats
+            || current.denied_models != expected.denied_models
+        {
+            return Ok(false);
+        }
+        current.allowed_providers = replacement.allowed_providers.clone();
+        current.allowed_api_formats = replacement.allowed_api_formats.clone();
+        current.allowed_models = replacement.allowed_models.clone();
+        current.denied_providers = replacement.denied_providers.clone();
+        current.denied_api_formats = replacement.denied_api_formats.clone();
+        current.denied_models = replacement.denied_models.clone();
+        if let Some(snapshot) = index.by_api_key_id.get_mut(&expected.api_key_id) {
+            snapshot.api_key_allowed_providers = replacement.allowed_providers.clone();
+            snapshot.api_key_allowed_api_formats = replacement.allowed_api_formats.clone();
+            snapshot.api_key_allowed_models = replacement.allowed_models.clone();
+            snapshot.api_key_denied_providers = replacement.denied_providers.clone();
+            snapshot.api_key_denied_api_formats = replacement.denied_api_formats.clone();
+            snapshot.api_key_denied_models = replacement.denied_models.clone();
+        }
+        Ok(true)
+    }
+
     async fn touch_last_used_at(&self, api_key_id: &str) -> Result<bool, DataLayerError> {
         let mut index = self
             .index
@@ -734,6 +805,9 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
             api_key_allowed_providers: record.allowed_providers.clone(),
             api_key_allowed_api_formats: record.allowed_api_formats.clone(),
             api_key_allowed_models: record.allowed_models.clone(),
+            api_key_denied_providers: record.denied_providers.clone(),
+            api_key_denied_api_formats: record.denied_api_formats.clone(),
+            api_key_denied_models: record.denied_models.clone(),
             api_key_ip_rules: record.ip_rules.clone(),
         };
 
@@ -769,6 +843,20 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
             i64_from_u64(record.total_tokens, "api_keys.total_tokens")?,
             record.total_cost_usd,
             false,
+        )?
+        .with_denied_lists(
+            record
+                .denied_providers
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
+            record
+                .denied_api_formats
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
+            record
+                .denied_models
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
         )?
         .with_ip_rules(
             record
@@ -830,6 +918,9 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                 api_key_allowed_providers: record.allowed_providers.clone(),
                 api_key_allowed_api_formats: record.allowed_api_formats.clone(),
                 api_key_allowed_models: record.allowed_models.clone(),
+                api_key_denied_providers: record.denied_providers.clone(),
+                api_key_denied_api_formats: record.denied_api_formats.clone(),
+                api_key_denied_models: record.denied_models.clone(),
                 api_key_ip_rules: record.ip_rules.clone(),
                 ..template
             }
@@ -869,6 +960,20 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                     .map(|value| serde_json::json!(value)),
                 record
                     .allowed_models
+                    .as_ref()
+                    .map(|value| serde_json::json!(value)),
+            )?
+            .with_denied_lists(
+                record
+                    .denied_providers
+                    .as_ref()
+                    .map(|value| serde_json::json!(value)),
+                record
+                    .denied_api_formats
+                    .as_ref()
+                    .map(|value| serde_json::json!(value)),
+                record
+                    .denied_models
                     .as_ref()
                     .map(|value| serde_json::json!(value)),
             )?
@@ -912,6 +1017,20 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
             i64_from_u64(record.total_tokens, "api_keys.total_tokens")?,
             record.total_cost_usd,
             true,
+        )?
+        .with_denied_lists(
+            record
+                .denied_providers
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
+            record
+                .denied_api_formats
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
+            record
+                .denied_models
+                .as_ref()
+                .map(|value| serde_json::json!(value)),
         )?
         .with_ip_rules(
             record
@@ -1030,6 +1149,30 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                 export.allowed_models = allowed_models;
             }
         }
+        if let Some(denied_providers) = record.denied_providers {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_providers = denied_providers.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_providers = denied_providers;
+            }
+        }
+        if let Some(denied_api_formats) = record.denied_api_formats {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_api_formats = denied_api_formats.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_api_formats = denied_api_formats;
+            }
+        }
+        if let Some(denied_models) = record.denied_models {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_models = denied_models.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_models = denied_models;
+            }
+        }
         if let Some(feature_settings) = record.feature_settings {
             if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
                 export.feature_settings = match feature_settings {
@@ -1119,6 +1262,30 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                 export.allowed_models = allowed_models;
             }
         }
+        if let Some(denied_providers) = record.denied_providers {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_providers = denied_providers.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_providers = denied_providers;
+            }
+        }
+        if let Some(denied_api_formats) = record.denied_api_formats {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_api_formats = denied_api_formats.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_api_formats = denied_api_formats;
+            }
+        }
+        if let Some(denied_models) = record.denied_models {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_models = denied_models.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_models = denied_models;
+            }
+        }
         if let Some(feature_settings) = record.feature_settings {
             if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
                 export.feature_settings = match feature_settings {
@@ -1202,6 +1369,30 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
                 export.allowed_models = allowed_models;
             }
         }
+        if let Some(denied_providers) = record.denied_providers {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_providers = denied_providers.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_providers = denied_providers;
+            }
+        }
+        if let Some(denied_api_formats) = record.denied_api_formats {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_api_formats = denied_api_formats.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_api_formats = denied_api_formats;
+            }
+        }
+        if let Some(denied_models) = record.denied_models {
+            if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
+                snapshot.api_key_denied_models = denied_models.clone();
+            }
+            if let Some(export) = index.export_by_api_key_id.get_mut(&record.api_key_id) {
+                export.denied_models = denied_models;
+            }
+        }
         if let Some(ip_rules) = record.ip_rules {
             if let Some(snapshot) = index.by_api_key_id.get_mut(&record.api_key_id) {
                 snapshot.api_key_ip_rules = ip_rules.clone();
@@ -1260,6 +1451,9 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
             snapshot.api_key_allowed_providers = restored.allowed_providers.clone();
             snapshot.api_key_allowed_api_formats = restored.allowed_api_formats.clone();
             snapshot.api_key_allowed_models = restored.allowed_models.clone();
+            snapshot.api_key_denied_providers = restored.denied_providers.clone();
+            snapshot.api_key_denied_api_formats = restored.denied_api_formats.clone();
+            snapshot.api_key_denied_models = restored.denied_models.clone();
             snapshot.api_key_ip_rules = restored.ip_rules.clone();
         }
         Ok(true)
@@ -1382,9 +1576,11 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
         }
         if let Some(snapshot) = index.by_api_key_id.get_mut(api_key_id) {
             snapshot.api_key_allowed_providers = allowed_providers.clone();
+            snapshot.api_key_denied_providers = None;
         }
         if let Some(export) = index.export_by_api_key_id.get_mut(api_key_id) {
             export.allowed_providers = allowed_providers;
+            export.denied_providers = None;
         }
         Ok(index.export_by_api_key_id.get(api_key_id).cloned())
     }
@@ -1410,9 +1606,11 @@ impl AuthApiKeyWriteRepository for InMemoryAuthApiKeySnapshotRepository {
         }
         if let Some(snapshot) = index.by_api_key_id.get_mut(api_key_id) {
             snapshot.api_key_allowed_providers = allowed_providers.clone();
+            snapshot.api_key_denied_providers = None;
         }
         if let Some(export) = index.export_by_api_key_id.get_mut(api_key_id) {
             export.allowed_providers = allowed_providers;
+            export.denied_providers = None;
         }
         Ok(index.export_by_api_key_id.get(api_key_id).cloned())
     }
@@ -1640,6 +1838,9 @@ mod tests {
         )]);
         let created = repository
             .create_user_api_key(CreateUserApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-created".to_string(),
                 key_hash: "hash-created".to_string(),
@@ -1674,6 +1875,9 @@ mod tests {
 
         let denied = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 key_encrypted: None,
                 key_encrypted_present: false,
                 name_present: false,
@@ -1701,6 +1905,9 @@ mod tests {
 
         let cleared = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 key_encrypted: None,
                 key_encrypted_present: false,
                 name_present: false,
@@ -1771,6 +1978,9 @@ mod tests {
         api_key_id: &str,
     ) -> CreateUserApiKeyRecord {
         CreateUserApiKeyRecord {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             user_id: user_id.to_string(),
             api_key_id: api_key_id.to_string(),
             key_hash: format!("hash-{api_key_id}"),
@@ -2152,6 +2362,9 @@ mod tests {
 
         assert!(repository
             .update_user_api_key_basic_if_unlocked(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
@@ -2222,6 +2435,9 @@ mod tests {
         // over locked keys; only the self-service variants enforce the fence.
         let admin_updated = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
@@ -2469,6 +2685,9 @@ mod tests {
 
         let updated = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-1".to_string(),
                 key_encrypted: None,
@@ -2507,6 +2726,9 @@ mod tests {
 
         let cleared = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
@@ -2532,6 +2754,9 @@ mod tests {
 
         let zero = repository
             .update_user_api_key_basic(UpdateUserApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 allowed_providers: None,
                 allowed_api_formats: None,
                 allowed_models: None,
@@ -2565,6 +2790,9 @@ mod tests {
 
         let updated = repository
             .update_standalone_api_key_basic(UpdateStandaloneApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 api_key_id: "key-standalone".to_string(),
                 key_encrypted: None,
                 key_encrypted_present: false,
@@ -2633,6 +2861,9 @@ mod tests {
 
         let after = repository
             .update_standalone_api_key_basic(UpdateStandaloneApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 api_key_id: "key-standalone".to_string(),
                 key_encrypted: Some("enc-after".to_string()),
                 key_encrypted_present: true,
@@ -2670,6 +2901,9 @@ mod tests {
         // A changed post-state must make the CAS fail without touching the newer value.
         let concurrent = repository
             .update_standalone_api_key_basic(UpdateStandaloneApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 api_key_id: "key-standalone".to_string(),
                 key_encrypted: None,
                 key_encrypted_present: false,

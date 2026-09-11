@@ -95,6 +95,7 @@ pub(crate) struct CandidatePageCacheKey {
     request_operation: String,
     client_api_format: String,
     auth_identity: CandidatePageAuthIdentity,
+    auth_policy_hash: String,
     require_streaming: bool,
     required_capabilities_hash: String,
     routing_policy_hash: String,
@@ -177,6 +178,17 @@ impl CandidatePageCacheKey {
             request_operation: normalize_text_key(request_operation.unwrap_or_default()),
             client_api_format: normalize_api_format(client_api_format),
             auth_identity: CandidatePageAuthIdentity::from_auth_snapshot(auth_snapshot),
+            auth_policy_hash: stable_json_hash(Some(&(
+                &auth_snapshot.user_allowed_providers,
+                &auth_snapshot.user_allowed_api_formats,
+                &auth_snapshot.user_allowed_models,
+                &auth_snapshot.api_key_allowed_providers,
+                &auth_snapshot.api_key_allowed_api_formats,
+                &auth_snapshot.api_key_allowed_models,
+                &auth_snapshot.api_key_denied_providers,
+                &auth_snapshot.api_key_denied_api_formats,
+                &auth_snapshot.api_key_denied_models,
+            ))),
             require_streaming,
             required_capabilities_hash: stable_json_hash(required_capabilities),
             routing_policy_hash: stable_json_hash(routing_policy),
@@ -537,6 +549,9 @@ mod tests {
 
     fn auth_snapshot(user_id: &str, api_key_id: &str) -> ResolvedAuthApiKeySnapshot {
         ResolvedAuthApiKeySnapshot {
+            api_key_denied_providers: None,
+            api_key_denied_api_formats: None,
+            api_key_denied_models: None,
             user_id: user_id.to_string(),
             username: "user".to_string(),
             email: None,
@@ -590,6 +605,41 @@ mod tests {
             Duration::from_secs(60)
         );
         std::env::remove_var(CANDIDATE_PAGE_CACHE_STALE_TTL_ENV);
+    }
+
+    #[test]
+    fn candidate_page_cache_cannot_reuse_candidates_after_access_rules_change() {
+        let original = auth_snapshot("user", "key");
+        let key = |auth: &ResolvedAuthApiKeySnapshot| {
+            CandidatePageCacheKey::new(
+                "gpt-5",
+                None,
+                "openai:chat",
+                false,
+                auth,
+                None,
+                None,
+                None,
+                0,
+                "provider_endpoint_key_model",
+                false,
+                None,
+                "",
+            )
+        };
+        let before = key(&original);
+        let mut changed = original.clone();
+        changed.api_key_denied_providers = Some(vec!["p1".into()]);
+        assert_ne!(before, key(&changed));
+        changed = original.clone();
+        changed.api_key_denied_models = Some(vec!["gpt-5".into()]);
+        assert_ne!(before, key(&changed));
+        changed = original.clone();
+        changed.api_key_denied_api_formats = Some(vec!["openai:chat".into()]);
+        assert_ne!(before, key(&changed));
+        changed = original.clone();
+        changed.user_allowed_providers = Some(Vec::new());
+        assert_ne!(before, key(&changed));
     }
 
     #[test]

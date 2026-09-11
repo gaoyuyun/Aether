@@ -42,6 +42,7 @@ pub(super) fn sample_persistence(provider_api_format: &str) -> LocalVideoTaskPer
 
 pub(super) fn sample_auth_context() -> GatewayControlAuthContext {
     GatewayControlAuthContext {
+        denied_models: None,
         user_id: "user-123".to_string(),
         api_key_id: "key-123".to_string(),
         username: None,

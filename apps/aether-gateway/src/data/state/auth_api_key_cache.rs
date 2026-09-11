@@ -336,6 +336,14 @@ impl Drop for AuthApiKeyInflightGuard<'_> {
 
 #[async_trait]
 impl AuthApiKeyReadRepository for CachedAuthApiKeyReadRepository {
+    async fn list_user_api_keys_with_access_restrictions(
+        &self,
+    ) -> Result<Vec<StoredAuthApiKeyExportRecord>, DataLayerError> {
+        self.inner
+            .list_user_api_keys_with_access_restrictions()
+            .await
+    }
+
     async fn find_api_key_snapshot(
         &self,
         key: AuthApiKeyLookupKey<'_>,

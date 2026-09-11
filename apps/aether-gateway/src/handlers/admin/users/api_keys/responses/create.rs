@@ -133,6 +133,27 @@ pub(crate) async fn build_admin_create_user_api_key_response(
                     .into_response());
             }
         };
+    let denied_providers = match {
+        let value = payload.denied_providers;
+        normalize_admin_user_string_list(value, "denied_providers")
+    } {
+        Ok(value) => value,
+        Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+    };
+    let denied_api_formats = match {
+        let value = payload.denied_api_formats;
+        normalize_admin_user_api_formats(value)
+    } {
+        Ok(value) => value,
+        Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+    };
+    let denied_models = match {
+        let value = payload.denied_models;
+        normalize_admin_user_string_list(value, "denied_models")
+    } {
+        Ok(value) => value,
+        Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+    };
     let ip_rules = match normalize_admin_user_ip_rules(payload.ip_rules) {
         Ok(value) => value,
         Err(detail) => {
@@ -163,6 +184,38 @@ pub(crate) async fn build_admin_create_user_api_key_response(
             }
         };
 
+    let (allowed_providers, denied_providers) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            Some(allowed_providers),
+            Some(denied_providers),
+            "providers",
+        ) {
+            Ok(value) => value,
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        };
+    let (allowed_providers, denied_providers) =
+        (allowed_providers.flatten(), denied_providers.flatten());
+    let (allowed_api_formats, denied_api_formats) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            Some(allowed_api_formats),
+            Some(denied_api_formats),
+            "api_formats",
+        ) {
+            Ok(value) => value,
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        };
+    let (allowed_api_formats, denied_api_formats) =
+        (allowed_api_formats.flatten(), denied_api_formats.flatten());
+    let (allowed_models, denied_models) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            Some(allowed_models),
+            Some(denied_models),
+            "models",
+        ) {
+            Ok(value) => value,
+            Err(detail) => return Ok(build_admin_users_bad_request_response(&detail)),
+        };
+    let (allowed_models, denied_models) = (allowed_models.flatten(), denied_models.flatten());
     let plaintext_key = generate_admin_user_api_key_plaintext();
     let api_key_id = uuid::Uuid::new_v4().to_string();
     let key_hash = hash_admin_user_api_key(&plaintext_key);
@@ -191,6 +244,9 @@ pub(crate) async fn build_admin_create_user_api_key_response(
             allowed_providers,
             allowed_api_formats,
             allowed_models,
+            denied_providers,
+            denied_api_formats,
+            denied_models,
             ip_rules,
             rate_limit,
             concurrent_limit,
@@ -221,6 +277,9 @@ pub(crate) async fn build_admin_create_user_api_key_response(
                 "allowed_providers": created.allowed_providers,
                 "allowed_api_formats": created.allowed_api_formats,
                 "allowed_models": created.allowed_models,
+                "denied_providers": created.denied_providers,
+                "denied_api_formats": created.denied_api_formats,
+                "denied_models": created.denied_models,
                 "expires_at": format_optional_unix_secs_iso8601(created.expires_at_unix_secs),
                 "last_used_at": format_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
                 "created_at": format_optional_unix_secs_iso8601(created.created_at_unix_secs),

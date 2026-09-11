@@ -20,6 +20,12 @@ pub(super) struct AdminCreateUserApiKeyRequest {
     pub(super) allowed_api_formats: Option<Vec<String>>,
     #[serde(default)]
     pub(super) allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub(super) denied_providers: Option<Vec<String>>,
+    #[serde(default)]
+    pub(super) denied_api_formats: Option<Vec<String>>,
+    #[serde(default)]
+    pub(super) denied_models: Option<Vec<String>>,
     #[serde(default, alias = "allowed_ips")]
     pub(super) ip_rules: Option<Vec<String>>,
     #[serde(default)]
@@ -64,6 +70,12 @@ pub(super) struct AdminUpdateUserApiKeyRequest {
     pub(super) allowed_api_formats: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
     pub(super) allowed_models: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    pub(super) denied_providers: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    pub(super) denied_api_formats: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    pub(super) denied_models: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, serde::Deserialize)]

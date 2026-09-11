@@ -1,3 +1,28 @@
+export type AccessRestrictionMode = 'allow' | 'deny'
+
+/** Null inherits; an explicit empty allowlist denies all; an empty denylist excludes nothing. */
+export function buildUserApiKeyListRestriction(unrestricted: boolean, mode: AccessRestrictionMode, values: string[]) {
+  return {
+    allowed: unrestricted || mode === 'deny' ? null : [...values],
+    denied: unrestricted || mode === 'allow' ? null : [...values],
+  }
+}
+
+export function readUserApiKeyListRestriction(allowed: unknown, denied: unknown) {
+  const allowedValues = normalizeUserApiKeyAllowedList(allowed)
+  const deniedValues = normalizeUserApiKeyAllowedList(denied)
+  return {
+    unrestricted: allowedValues == null && deniedValues == null,
+    mode: (deniedValues != null ? 'deny' : 'allow') as AccessRestrictionMode,
+    values: deniedValues ?? allowedValues ?? [],
+  }
+}
+
+export function retainAvailableAccessValues(values: string[], options: Array<{ value: string }>): string[] {
+  const available = new Set(options.map(option => option.value))
+  return values.filter(value => available.has(value))
+}
+
 export interface UserApiKeyMutationPayload {
   name: string
   rate_limit: number
@@ -5,6 +30,9 @@ export interface UserApiKeyMutationPayload {
   allowed_providers?: string[] | null
   allowed_api_formats?: string[] | null
   allowed_models?: string[] | null
+  denied_providers?: string[] | null
+  denied_api_formats?: string[] | null
+  denied_models?: string[] | null
 }
 
 interface BuildUserApiKeyMutationPayloadInput {
@@ -12,10 +40,13 @@ interface BuildUserApiKeyMutationPayloadInput {
   rate_limit?: number
   concurrent_limit?: number
   providerUnrestricted?: boolean
+  providerMode?: AccessRestrictionMode
   allowedProviders?: string[]
   apiFormatUnrestricted?: boolean
+  apiFormatMode?: AccessRestrictionMode
   allowedApiFormats?: string[]
   modelUnrestricted?: boolean
+  modelMode?: AccessRestrictionMode
   allowedModels?: string[]
 }
 
@@ -29,22 +60,19 @@ export function buildUserApiKeyMutationPayload(
   }
 
   if (input.providerUnrestricted !== undefined) {
-    payload.allowed_providers = buildUserApiKeyAllowedProviders(
-      input.providerUnrestricted,
-      input.allowedProviders ?? [],
-    )
+    const restriction = buildUserApiKeyListRestriction(input.providerUnrestricted, input.providerMode ?? 'allow', input.allowedProviders ?? [])
+    payload.allowed_providers = restriction.allowed
+    if (input.providerMode !== undefined) payload.denied_providers = restriction.denied
   }
   if (input.apiFormatUnrestricted !== undefined) {
-    payload.allowed_api_formats = buildUserApiKeyAllowedList(
-      input.apiFormatUnrestricted,
-      input.allowedApiFormats ?? [],
-    )
+    const restriction = buildUserApiKeyListRestriction(input.apiFormatUnrestricted, input.apiFormatMode ?? 'allow', input.allowedApiFormats ?? [])
+    payload.allowed_api_formats = restriction.allowed
+    if (input.apiFormatMode !== undefined) payload.denied_api_formats = restriction.denied
   }
   if (input.modelUnrestricted !== undefined) {
-    payload.allowed_models = buildUserApiKeyAllowedList(
-      input.modelUnrestricted,
-      input.allowedModels ?? [],
-    )
+    const restriction = buildUserApiKeyListRestriction(input.modelUnrestricted, input.modelMode ?? 'allow', input.allowedModels ?? [])
+    payload.allowed_models = restriction.allowed
+    if (input.modelMode !== undefined) payload.denied_models = restriction.denied
   }
 
   return payload

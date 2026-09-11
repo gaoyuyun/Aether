@@ -1444,18 +1444,11 @@ pub(crate) fn auth_snapshot_allows_cross_format_candidate(
         return false;
     }
 
-    if let Some(allowed_models) = auth_snapshot.effective_allowed_models() {
-        let model_allowed = allowed_models.iter().any(|value| {
-            value == requested_model
-                || value == &candidate.global_model_name
-                || requested_base_model.is_some_and(|base_model| value == base_model)
-        });
-        if !model_allowed {
-            return false;
-        }
-    }
-
-    true
+    auth_snapshot.allows_model(
+        requested_model,
+        &candidate.global_model_name,
+        requested_base_model,
+    )
 }
 
 fn routing_policy_allows_provider(
@@ -1671,6 +1664,9 @@ mod tests {
 
     fn unrestricted_auth_snapshot() -> GatewayAuthApiKeySnapshot {
         GatewayAuthApiKeySnapshot {
+            api_key_denied_providers: None,
+            api_key_denied_api_formats: None,
+            api_key_denied_models: None,
             user_id: "user-1".to_string(),
             username: "alice".to_string(),
             email: None,

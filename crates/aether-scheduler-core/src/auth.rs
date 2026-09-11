@@ -7,6 +7,9 @@ pub struct SchedulerAuthConstraints {
     pub allowed_providers_and: Option<Vec<String>>,
     pub allowed_api_formats: Option<Vec<String>>,
     pub allowed_models: Option<Vec<String>>,
+    pub denied_providers: Option<Vec<String>>,
+    pub denied_api_formats: Option<Vec<String>>,
+    pub denied_models: Option<Vec<String>>,
 }
 
 pub fn provider_matches_allowed_value(
@@ -46,7 +49,11 @@ pub fn auth_constraints_allow_provider(
     let Some(constraints) = constraints else {
         return true;
     };
-    provider_allowlist_layer_allows(
+    !constraints.denied_providers.as_ref().is_some_and(|values| {
+        values.iter().any(|value| {
+            provider_matches_allowed_value(value, provider_id, provider_name, provider_type)
+        })
+    }) && provider_allowlist_layer_allows(
         constraints.allowed_providers.as_deref(),
         provider_id,
         provider_name,
@@ -63,15 +70,18 @@ pub fn auth_constraints_allow_api_format(
     constraints: Option<&SchedulerAuthConstraints>,
     api_format: &str,
 ) -> bool {
-    let Some(allowed) =
-        constraints.and_then(|constraints| constraints.allowed_api_formats.as_deref())
-    else {
+    let Some(constraints) = constraints else {
         return true;
     };
-
-    allowed
-        .iter()
-        .any(|value| api_format_matches_allowed_value(value, api_format))
+    let matches = |value: &String| api_format_matches_allowed_value(value, api_format);
+    !constraints
+        .denied_api_formats
+        .as_ref()
+        .is_some_and(|values| values.iter().any(matches))
+        && constraints
+            .allowed_api_formats
+            .as_ref()
+            .is_none_or(|values| values.iter().any(matches))
 }
 
 pub fn api_format_matches_allowed_value(allowed_value: &str, api_format: &str) -> bool {
@@ -102,21 +112,25 @@ pub fn auth_constraints_allow_model_with_model_directives(
     resolved_global_model_name: &str,
     enable_model_directives: bool,
 ) -> bool {
-    let Some(allowed) = constraints.and_then(|constraints| constraints.allowed_models.as_deref())
-    else {
+    let Some(constraints) = constraints else {
         return true;
     };
-
     let base_model = enable_model_directives
         .then(|| aether_ai_formats::model_directive_base_model(requested_model_name))
         .flatten();
-    allowed.iter().any(|value| {
+    let matches = |value: &String| {
         value == requested_model_name
             || value == resolved_global_model_name
-            || base_model
-                .as_ref()
-                .is_some_and(|base_model| value == base_model)
-    })
+            || base_model.as_ref().is_some_and(|base| value == base)
+    };
+    !constraints
+        .denied_models
+        .as_ref()
+        .is_some_and(|values| values.iter().any(matches))
+        && constraints
+            .allowed_models
+            .as_ref()
+            .is_none_or(|values| values.iter().any(matches))
 }
 
 #[cfg(test)]
@@ -127,8 +141,63 @@ mod tests {
         auth_constraints_allow_provider, provider_matches_allowed_value, SchedulerAuthConstraints,
     };
 
+    #[test]
+    fn deny_rules_filter_candidates_and_model_directives_without_an_allowlist() {
+        let constraints = SchedulerAuthConstraints {
+            denied_providers: Some(vec!["blocked".into()]),
+            denied_api_formats: Some(vec!["openai:responses".into()]),
+            denied_models: Some(vec!["gpt-5".into()]),
+            ..Default::default()
+        };
+        assert!(!auth_constraints_allow_provider(
+            Some(&constraints),
+            "p1",
+            "Blocked",
+            "openai"
+        ));
+        assert!(auth_constraints_allow_provider(
+            Some(&constraints),
+            "p2",
+            "New",
+            "openai"
+        ));
+        assert!(!auth_constraints_allow_api_format(
+            Some(&constraints),
+            "openai:search"
+        ));
+        assert!(auth_constraints_allow_api_format(
+            Some(&constraints),
+            "openai:chat"
+        ));
+        assert!(!auth_constraints_allow_model(
+            Some(&constraints),
+            "alias",
+            "gpt-5"
+        ));
+        assert!(!auth_constraints_allow_model_with_model_directives(
+            Some(&constraints),
+            "gpt-5-high",
+            "gpt-5-high",
+            true
+        ));
+        assert!(auth_constraints_allow_model_with_model_directives(
+            Some(&constraints),
+            "gpt-5-high",
+            "gpt-5-high",
+            false
+        ));
+        assert!(auth_constraints_allow_model(
+            Some(&constraints),
+            "gpt-new",
+            "gpt-new"
+        ));
+    }
+
     fn sample_constraints() -> SchedulerAuthConstraints {
         SchedulerAuthConstraints {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             allowed_providers: Some(vec!["provider-1".to_string(), "OpenAI".to_string()]),
             allowed_providers_and: None,
             allowed_api_formats: Some(vec!["OPENAI:CHAT".to_string()]),
@@ -139,6 +208,9 @@ mod tests {
     #[test]
     fn constraints_and_second_provider_layer() {
         let constraints = SchedulerAuthConstraints {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             allowed_providers: Some(vec!["provider-openai-1".to_string()]),
             allowed_providers_and: Some(vec!["openai".to_string()]),
             allowed_api_formats: None,

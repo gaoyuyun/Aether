@@ -1,5 +1,12 @@
 // Complete UI messages only. Runtime names and user content must remain unchanged.
 export const legacyUiEnglishMessages: Record<string, string> = {
+  '允许': 'Allow',
+  '拒绝': 'Deny',
+  '限制方式': 'Restriction mode',
+  '未选择（不排除任何项目）': 'None selected (no exclusions)',
+  '不排除任何项目': 'No exclusions',
+  '密钥限制只能进一步收窄用户权限。允许列表为空时全部禁用，拒绝列表为空时不排除任何项目；已删除的项目会自动移除。': 'Key restrictions can only narrow user permissions. An empty allowlist disables all access; an empty denylist excludes nothing. Deleted entries are removed automatically.',
+
   '查看规则原值': 'View original rules',
   '查看已保存规则的原值': 'View the original values of saved rules',
   '查看原值': 'Reveal values',

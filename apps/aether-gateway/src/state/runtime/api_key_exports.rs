@@ -6,6 +6,25 @@ use crate::{AppState, GatewayError};
 const AUTH_API_KEY_RUNTIME_JSON_CACHE_TTL: Duration = Duration::from_secs(30);
 
 impl AppState {
+    pub(crate) async fn list_user_api_keys_with_current_access(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<aether_data::repository::auth::StoredAuthApiKeyExportRecord>, GatewayError>
+    {
+        let records = self
+            .list_auth_api_key_export_records_by_user_ids(&[user_id.to_string()])
+            .await?;
+        let cleaned = self
+            .data
+            .clean_user_api_key_access_records(records.clone())
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if cleaned != records {
+            self.invalidate_auth_context_cache();
+        }
+        Ok(cleaned)
+    }
+
     pub(crate) async fn read_auth_api_key_force_capabilities(
         &self,
         user_id: &str,
@@ -659,6 +678,9 @@ mod tests {
 
     fn create_record(user_id: &str, api_key_id: &str) -> CreateUserApiKeyRecord {
         CreateUserApiKeyRecord {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             user_id: user_id.to_string(),
             api_key_id: api_key_id.to_string(),
             key_hash: format!("hash-{api_key_id}"),

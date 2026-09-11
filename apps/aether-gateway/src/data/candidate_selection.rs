@@ -425,6 +425,9 @@ pub(crate) fn auth_snapshot_constraints(
 ) -> SchedulerAuthConstraints {
     let layers = snapshot.provider_allowlist_layers();
     SchedulerAuthConstraints {
+        denied_providers: snapshot.api_key_denied_providers.clone(),
+        denied_api_formats: snapshot.api_key_denied_api_formats.clone(),
+        denied_models: snapshot.api_key_denied_models.clone(),
         allowed_providers: layers[0].map(|items| items.to_vec()),
         allowed_providers_and: layers[1].map(|items| items.to_vec()),
         allowed_api_formats: snapshot

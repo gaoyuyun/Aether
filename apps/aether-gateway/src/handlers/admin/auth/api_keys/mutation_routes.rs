@@ -214,6 +214,9 @@ pub(super) async fn build_admin_create_api_key_response(
     let Some(created) = state
         .create_standalone_api_key(
             aether_data::repository::auth::CreateStandaloneApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: operator_id,
                 api_key_id,
                 key_hash,
@@ -489,6 +492,9 @@ pub(super) async fn build_admin_update_api_key_response(
     let Some(updated) = state
         .update_standalone_api_key_basic(
             aether_data::repository::auth::UpdateStandaloneApiKeyBasicRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 api_key_id: api_key_id.clone(),
                 key_encrypted: None,
                 key_encrypted_present: false,
@@ -649,6 +655,9 @@ mod tests {
     ) {
         repository
             .create_standalone_api_key(CreateStandaloneApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "admin-user".to_string(),
                 api_key_id: api_key_id.to_string(),
                 key_hash: format!("hash-{api_key_id}"),

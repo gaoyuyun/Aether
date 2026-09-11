@@ -527,6 +527,9 @@ mod tests {
 
     fn ordinary_user_api_key_snapshot() -> GatewayAuthApiKeySnapshot {
         GatewayAuthApiKeySnapshot {
+            api_key_denied_providers: None,
+            api_key_denied_api_formats: None,
+            api_key_denied_models: None,
             user_id: "user-1".to_string(),
             username: "ordinary-user".to_string(),
             email: Some("ordinary@example.com".to_string()),

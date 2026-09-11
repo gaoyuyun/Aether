@@ -388,6 +388,7 @@ impl fmt::Debug for GatewayDataState {
     }
 }
 
+mod access_restrictions;
 mod auth;
 mod auth_api_key_cache;
 mod candidate_cache;

@@ -522,6 +522,7 @@ mod tests {
     async fn limiter_uses_memory_fallback_for_explicit_user_rate_limit() {
         let limiter = FrontdoorUserRpmLimiter::new(FrontdoorUserRpmConfig::new(60, 120, false));
         let decision = sample_decision(GatewayControlAuthContext {
+            denied_models: None,
             user_id: "user-1".to_string(),
             api_key_id: "key-1".to_string(),
             username: None,
@@ -565,6 +566,7 @@ mod tests {
         let limiter = FrontdoorUserRpmLimiter::new(FrontdoorUserRpmConfig::new(60, 120, false))
             .with_system_default_limit_for_tests(1);
         let decision = sample_decision(GatewayControlAuthContext {
+            denied_models: None,
             user_id: "user-1".to_string(),
             api_key_id: "key-1".to_string(),
             username: None,
@@ -608,6 +610,7 @@ mod tests {
         let limiter = FrontdoorUserRpmLimiter::new(FrontdoorUserRpmConfig::new(60, 120, false))
             .with_system_default_limit_for_tests(1);
         let decision = sample_decision(GatewayControlAuthContext {
+            denied_models: None,
             user_id: "admin-1".to_string(),
             api_key_id: "key-1".to_string(),
             username: None,
@@ -662,6 +665,7 @@ mod tests {
             FrontdoorUserRpmConfig::new(60, 120, false).with_local_fallback(false),
         );
         let decision = sample_decision(GatewayControlAuthContext {
+            denied_models: None,
             user_id: "user-1".to_string(),
             api_key_id: "key-1".to_string(),
             username: None,

@@ -1014,6 +1014,7 @@ mod tests {
             Some("codex:live".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            denied_models: None,
             wallet_billing_enabled: true,
             billing_plans_enabled: true,
             user_id: "user-live-preflight".to_string(),
@@ -1197,6 +1198,7 @@ mod tests {
             Some("codex:live".to_string()),
         );
         decision.auth_context = Some(GatewayControlAuthContext {
+            denied_models: None,
             wallet_billing_enabled: true,
             billing_plans_enabled: true,
             user_id: "user-live-ws-preflight".to_string(),

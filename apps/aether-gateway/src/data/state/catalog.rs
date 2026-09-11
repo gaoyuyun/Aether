@@ -597,6 +597,7 @@ impl GatewayDataState {
         }?;
         if updated.is_some() {
             self.clear_provider_catalog_cache();
+            self.prune_user_api_key_access_restrictions().await?;
         }
         Ok(updated)
     }
@@ -635,6 +636,7 @@ impl GatewayDataState {
         }?;
         if deleted {
             self.clear_provider_catalog_cache();
+            self.prune_user_api_key_access_restrictions().await?;
         }
         Ok(deleted)
     }
@@ -689,6 +691,7 @@ impl GatewayDataState {
         }?;
         if updated.is_some() {
             self.clear_provider_catalog_cache();
+            self.prune_user_api_key_access_restrictions().await?;
         }
         Ok(updated)
     }
@@ -715,6 +718,7 @@ impl GatewayDataState {
         }?;
         if deleted {
             self.clear_provider_catalog_cache();
+            self.prune_user_api_key_access_restrictions().await?;
         }
         Ok(deleted)
     }

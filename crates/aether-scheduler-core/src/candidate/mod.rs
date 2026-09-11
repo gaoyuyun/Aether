@@ -192,6 +192,9 @@ mod tests {
         disallowed.provider_name = "Blocked".to_string();
 
         let constraints = SchedulerAuthConstraints {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             allowed_providers: Some(vec!["provider-1".to_string()]),
             allowed_providers_and: None,
             allowed_api_formats: Some(vec!["OPENAI:CHAT".to_string()]),
@@ -237,6 +240,9 @@ mod tests {
         }]);
 
         let constraints = SchedulerAuthConstraints {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             allowed_providers: Some(vec!["codex".to_string()]),
             allowed_providers_and: None,
             allowed_api_formats: Some(vec!["codex:live".to_string()]),
@@ -336,6 +342,9 @@ mod tests {
         disallowed.provider_name = "Blocked".to_string();
 
         let constraints = SchedulerAuthConstraints {
+            denied_providers: None,
+            denied_api_formats: None,
+            denied_models: None,
             allowed_providers: Some(vec!["provider-1".to_string()]),
             allowed_providers_and: None,
             allowed_api_formats: Some(vec!["openai:chat".to_string()]),

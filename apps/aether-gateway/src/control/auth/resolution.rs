@@ -99,6 +99,8 @@ pub(crate) struct GatewayControlAuthContext {
     #[serde(skip)]
     pub(crate) allowed_models: Option<Vec<String>>,
     #[serde(skip)]
+    pub(crate) denied_models: Option<Vec<String>>,
+    #[serde(skip)]
     pub(crate) ip_rules: Option<Vec<String>>,
     /// Credential verifier that established this API-key identity. Long-lived
     /// executions use it to prove that a later row with the same IDs is still
@@ -1047,6 +1049,7 @@ async fn resolve_data_backed_auth_context_with_trusted_auth(
             };
             let Some(snapshot) = snapshot else {
                 return Ok(Some(GatewayControlAuthContext {
+                    denied_models: None,
                     user_id: String::new(),
                     api_key_id: String::new(),
                     username: None,
@@ -1187,6 +1190,7 @@ async fn resolve_antigravity_bearer_bridge_auth_context(
     };
     let Some(snapshot) = snapshot else {
         return Ok(Some(GatewayControlAuthContext {
+            denied_models: None,
             user_id: user_id.to_string(),
             api_key_id: api_key_id.to_string(),
             username: None,
@@ -1269,6 +1273,7 @@ async fn resolve_trusted_auth_context(
     };
     let Some(snapshot) = snapshot else {
         return Ok(Some(GatewayControlAuthContext {
+            denied_models: None,
             user_id: trusted_headers.user_id,
             api_key_id: trusted_headers.api_key_id,
             username: None,
@@ -1363,14 +1368,7 @@ async fn build_data_backed_auth_context(
             provider: requested_provider.to_string(),
         })
     } else if !identity_only
-        && snapshot
-            .effective_allowed_api_formats()
-            .is_some_and(|allowed| {
-                !contains_api_format_or_alias(
-                    allowed,
-                    auth_gate_api_format(auth_endpoint_signature).as_str(),
-                )
-            })
+        && !snapshot.allows_api_format(auth_gate_api_format(auth_endpoint_signature).as_str())
     {
         Some(GatewayLocalAuthRejection::ApiFormatNotAllowed {
             api_format: auth_endpoint_signature.to_string(),
@@ -1395,6 +1393,7 @@ async fn build_data_backed_auth_context(
             && !snapshot.api_key_is_standalone,
         local_rejection,
         allowed_models,
+        denied_models: snapshot.api_key_denied_models,
         ip_rules: snapshot.api_key_ip_rules,
         verified_api_key_hash: None,
     })
@@ -1402,10 +1401,6 @@ async fn build_data_backed_auth_context(
 
 fn api_key_is_expired(expires_at_unix_secs: Option<u64>, now_unix_secs: u64) -> bool {
     expires_at_unix_secs.is_some_and(|expires_at| expires_at <= now_unix_secs)
-}
-
-fn contains_api_format_or_alias(items: &[String], target: &str) -> bool {
-    items.iter().any(|item| api_format_matches(item, target))
 }
 
 fn normalize_api_format_alias(value: &str) -> String {
@@ -1437,7 +1432,11 @@ async fn auth_snapshot_allows_requested_provider(
     auth_endpoint_signature: &str,
 ) -> bool {
     let layers = snapshot.provider_allowlist_layers();
-    if layers.iter().all(|layer| layer.is_none()) {
+    let has_denied_providers = snapshot
+        .api_key_denied_providers
+        .as_ref()
+        .is_some_and(|values| !values.is_empty());
+    if !has_denied_providers && layers.iter().all(|layer| layer.is_none()) {
         return true;
     }
     // Empty allowlist on any required layer is an explicit deny-all.
@@ -1465,7 +1464,7 @@ async fn auth_snapshot_allows_requested_provider(
             allowed_provider_value_matches_requested_provider(value, requested_provider)
         }),
     });
-    if direct_ok {
+    if direct_ok && !has_denied_providers {
         return true;
     }
     if !state.has_provider_catalog_data_reader() {
@@ -1642,6 +1641,9 @@ mod tests {
             .expect("old API key deletion should succeed"));
         repository
             .create_user_api_key(CreateUserApiKeyRecord {
+                denied_providers: None,
+                denied_api_formats: None,
+                denied_models: None,
                 user_id: "user-stable-id".to_string(),
                 api_key_id: "key-stable-id".to_string(),
                 key_hash: new_key_hash,

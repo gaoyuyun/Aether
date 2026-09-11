@@ -3064,6 +3064,7 @@ mod tests {
         )
         .with_execution_runtime_candidate(true);
         decision.auth_context = Some(crate::control::GatewayControlAuthContext {
+            denied_models: None,
             wallet_billing_enabled: true,
             billing_plans_enabled: true,
             user_id: subject_id.to_string(),

@@ -1959,6 +1959,41 @@ async fn gateway_handles_admin_user_api_key_routes_locally_with_trusted_admin_pr
     assert_eq!(update_payload["created_at"], "2024-03-21T05:48:20+00:00");
     assert_eq!(update_payload["message"], "API Key更新成功");
 
+    let deny_response = client
+        .post(format!("{gateway_url}/api/admin/users/user-1/api-keys"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({"name": "deny-key", "denied_providers": ["provider-blocked"], "denied_api_formats": ["openai:chat"], "denied_models": ["gpt-old"]}))
+        .send().await.unwrap();
+    assert_eq!(deny_response.status(), StatusCode::OK);
+    let denied: serde_json::Value = deny_response.json().await.unwrap();
+    assert_eq!(denied["allowed_providers"], serde_json::Value::Null);
+    assert_eq!(denied["denied_providers"], json!(["provider-blocked"]));
+    assert_eq!(denied["denied_api_formats"], json!(["openai:chat"]));
+    assert_eq!(denied["denied_models"], json!(["gpt-old"]));
+    let deny_id = denied["id"].as_str().unwrap();
+    let allow_response = client
+        .put(format!(
+            "{gateway_url}/api/admin/users/user-1/api-keys/{deny_id}"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({"allowed_providers": ["provider-openai"], "allowed_models": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allow_response.status(), StatusCode::OK);
+    let allowed: serde_json::Value = allow_response.json().await.unwrap();
+    assert_eq!(allowed["allowed_providers"], json!(["provider-openai"]));
+    assert_eq!(allowed["denied_providers"], serde_json::Value::Null);
+    assert_eq!(allowed["denied_api_formats"], json!(["openai:chat"]));
+    assert_eq!(allowed["allowed_models"], json!([]));
+    assert_eq!(allowed["denied_models"], serde_json::Value::Null);
+
     let lock_response = client
         .patch(format!(
             "{gateway_url}/api/admin/users/user-1/api-keys/key-1/lock"

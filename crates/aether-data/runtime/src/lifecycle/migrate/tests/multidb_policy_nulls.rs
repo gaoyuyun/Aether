@@ -43,6 +43,14 @@ INSERT INTO management_tokens (
 );
 "#;
 
+// Exercise strict policy decoding only after all columns required by the current
+// readers exist. A pre-upgrade schema may legitimately lack newer API-key fields.
+const MALFORMED_POLICY_READ_FIXTURES: &str = r#"
+UPDATE api_keys SET allowed_providers = 'null' WHERE id = 'legacy-policy-key';
+UPDATE users SET allowed_providers = 'null' WHERE id = 'legacy-policy-user';
+UPDATE user_groups SET allowed_providers = 'null' WHERE id = 'legacy-policy-group';
+"#;
+
 async fn assert_legacy_policy_reads_fail(
     auth: &dyn AuthApiKeyReadRepository,
     users: &dyn UserReadRepository,
@@ -80,6 +88,9 @@ async fn assert_upgraded_policy_reads(
     assert!(key.api_key_allowed_providers.is_none());
     assert!(key.api_key_allowed_api_formats.is_none());
     assert!(key.api_key_allowed_models.is_none());
+    assert!(key.api_key_denied_providers.is_none());
+    assert!(key.api_key_denied_api_formats.is_none());
+    assert!(key.api_key_denied_models.is_none());
     assert!(key.api_key_ip_rules.is_none());
     let user = users
         .find_user_auth_by_id("legacy-policy-user")
@@ -172,8 +183,6 @@ async fn mysql_full_legacy_schema_upgrades_without_rewriting_history() {
     let auth = aether_data_mysql::MysqlAuthApiKeyReadRepository::new(pool.clone());
     let users = aether_data_mysql::MysqlUserReadRepository::new(pool.clone());
     let tokens = aether_data_mysql::MysqlManagementTokenRepository::new(pool.clone());
-    assert_legacy_policy_reads_fail(&auth, &users).await;
-
     let pending = aether_data_mysql::prepare_database_for_startup(&pool)
         .await
         .unwrap();
@@ -182,7 +191,11 @@ async fn mysql_full_legacy_schema_upgrades_without_rewriting_history() {
             .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>(),
-        vec![POLICY_NULL_MIGRATION_VERSION]
+        aether_data_mysql::MIGRATOR
+            .iter()
+            .filter(|migration| migration.version >= POLICY_NULL_MIGRATION_VERSION)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>()
     );
     for _ in 0..2 {
         aether_data_mysql::run_migrations(&pool).await.unwrap();
@@ -203,6 +216,11 @@ async fn mysql_full_legacy_schema_upgrades_without_rewriting_history() {
         .collect::<Vec<_>>();
     assert_eq!(upgraded_checksums, previous_checksums);
     drop(connection);
+    sqlx::raw_sql(MALFORMED_POLICY_READ_FIXTURES)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_legacy_policy_reads_fail(&auth, &users).await;
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {database}"))
         .execute(&admin)
@@ -241,8 +259,6 @@ async fn sqlite_full_legacy_schema_upgrades_without_rewriting_history() {
     let auth = aether_data_sqlite::SqliteAuthApiKeyReadRepository::new(pool.clone());
     let users = aether_data_sqlite::SqliteUserReadRepository::new(pool.clone());
     let tokens = aether_data_sqlite::SqliteManagementTokenRepository::new(pool.clone());
-    assert_legacy_policy_reads_fail(&auth, &users).await;
-
     let pending = aether_data_sqlite::prepare_database_for_startup(&pool)
         .await
         .unwrap();
@@ -251,11 +267,11 @@ async fn sqlite_full_legacy_schema_upgrades_without_rewriting_history() {
             .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>(),
-        vec![
-            POLICY_NULL_MIGRATION_VERSION,
-            20260910000000,
-            20260911000000
-        ]
+        aether_data_sqlite::MIGRATOR
+            .iter()
+            .filter(|migration| migration.version >= POLICY_NULL_MIGRATION_VERSION)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>()
     );
     for _ in 0..2 {
         aether_data_sqlite::run_migrations(&pool).await.unwrap();
@@ -276,6 +292,11 @@ async fn sqlite_full_legacy_schema_upgrades_without_rewriting_history() {
         .collect::<Vec<_>>();
     assert_eq!(upgraded_checksums, previous_checksums);
     drop(connection);
+    sqlx::raw_sql(MALFORMED_POLICY_READ_FIXTURES)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_legacy_policy_reads_fail(&auth, &users).await;
     pool.close().await;
 }
 

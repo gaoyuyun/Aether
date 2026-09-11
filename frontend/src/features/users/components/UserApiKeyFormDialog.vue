@@ -114,37 +114,19 @@
         </CollapsibleTrigger>
         <CollapsibleContent>
           <div class="grid gap-4 border-t border-border px-4 py-4">
-            <div
+            <ApiKeyAccessRestrictionField
               v-for="restriction in accessRestrictions"
               :key="restriction.field"
-              class="space-y-2"
-            >
-              <Label class="text-sm font-medium">{{ legacyT(restriction.label) }}</Label>
-              <div class="flex items-center gap-3">
-                <MultiSelect
-                  class="min-w-0 flex-1"
-                  :model-value="form[restriction.field] as string[]"
-                  :options="restriction.options"
-                  :search-threshold="0"
-                  teleport
-                  :disabled="Boolean(form[restriction.unrestrictedField]) || loadingAccessOptions"
-                  :placeholder="form[restriction.unrestrictedField] ? legacyT('跟随用户权限') : legacyT('未选择（全部禁用）')"
-                  :empty-text="legacyT('暂无可用选项')"
-                  :no-results-text="legacyT('未找到匹配项')"
-                  :search-placeholder="legacyT('搜索...')"
-                  @update:model-value="updateField(restriction.field, $event)"
-                />
-                <div class="flex shrink-0 flex-col items-end gap-1">
-                  <Switch
-                    :model-value="Boolean(form[restriction.unrestrictedField])"
-                    @update:model-value="updateField(restriction.unrestrictedField, $event)"
-                  />
-                  <span class="whitespace-nowrap text-[10px] text-muted-foreground">
-                    {{ legacyT(form[restriction.unrestrictedField] ? '跟随用户' : '单独限制') }}
-                  </span>
-                </div>
-              </div>
-            </div>
+              :label="restriction.label"
+              :model-value="form[restriction.field]"
+              :mode="form[restriction.modeField]"
+              :unrestricted="form[restriction.unrestrictedField]"
+              :options="restriction.options"
+              :loading="loadingAccessOptions"
+              @update:model-value="updateField(restriction.field, $event)"
+              @update:mode="updateField(restriction.modeField, $event)"
+              @update:unrestricted="updateField(restriction.unrestrictedField, $event)"
+            />
             <p
               v-if="accessOptionsError"
               class="text-xs text-destructive"
@@ -152,7 +134,7 @@
               {{ accessOptionsError }}
             </p>
             <p class="text-xs text-muted-foreground">
-              {{ legacyT('密钥限制只能进一步收窄用户本身的权限；关闭跟随且不选择任何项目表示全部禁用。') }}
+              {{ legacyT('密钥限制只能进一步收窄用户权限。允许列表为空时全部禁用，拒绝列表为空时不排除任何项目；已删除的项目会自动移除。') }}
             </p>
           </div>
         </CollapsibleContent>
@@ -223,7 +205,7 @@
       </Button>
       <Button
         class="h-10 px-5"
-        :disabled="creating"
+        :disabled="creating || loadingAccessOptions || Boolean(accessOptionsError)"
         @click="$emit('submit')"
       >
         {{ submitLabel }}
@@ -245,7 +227,10 @@ import {
   Label,
   Switch,
 } from '@/components/ui'
-import { MultiSelect } from '@/components/common'
+import ApiKeyAccessRestrictionField from '@/features/api-keys/components/ApiKeyAccessRestrictionField.vue'
+import { retainAvailableAccessValues, type AccessRestrictionMode } from '@/features/api-keys/utils/userKeyPayload'
+import { getAccessControlCatalogRevision } from '@/utils/accessControlCatalog'
+import { useEventListener } from '@vueuse/core'
 import { useI18n } from '@/i18n'
 import { parseNumberInput } from '@/utils/form'
 import { parseApiError } from '@/utils/errorParser'
@@ -257,8 +242,11 @@ export interface UserApiKeyFormState {
   concurrent_limit?: number
   ip_rules_text: string
   provider_unrestricted: boolean
+  provider_mode: AccessRestrictionMode
   api_format_unrestricted: boolean
+  api_format_mode: AccessRestrictionMode
   model_unrestricted: boolean
+  model_mode: AccessRestrictionMode
   allowed_providers: string[]
   allowed_api_formats: string[]
   allowed_models: string[]
@@ -292,20 +280,23 @@ const {
 
 const accessRestrictions = computed(() => [
   {
-    label: '允许的提供商',
+    label: '提供商',
     field: 'allowed_providers' as const,
+    modeField: 'provider_mode' as const,
     unrestrictedField: 'provider_unrestricted' as const,
     options: providerOptions.value,
   },
   {
-    label: '允许的端点',
+    label: '端点',
     field: 'allowed_api_formats' as const,
+    modeField: 'api_format_mode' as const,
     unrestrictedField: 'api_format_unrestricted' as const,
     options: apiFormatOptions.value,
   },
   {
-    label: '允许的模型',
+    label: '模型',
     field: 'allowed_models' as const,
+    modeField: 'model_mode' as const,
     unrestrictedField: 'model_unrestricted' as const,
     options: modelOptions.value,
   },
@@ -325,16 +316,25 @@ function updateField<TKey extends keyof UserApiKeyFormState>(key: TKey, value: U
   })
 }
 
-watch(() => props.open, async (open) => {
-  if (!open) return
+async function refreshAccessOptions() {
+  if (!props.open) return
   loadingAccessOptions.value = true
   accessOptionsError.value = ''
   try {
-    await loadAccessControlOptions()
+    await loadAccessControlOptions({ force: true })
+    if (!props.open) return
+    const nextForm = { ...props.form }
+    for (const restriction of accessRestrictions.value) {
+      nextForm[restriction.field] = retainAvailableAccessValues(nextForm[restriction.field], restriction.options)
+    }
+    emit('update:form', nextForm)
   } catch (error) {
     accessOptionsError.value = parseApiError(error, legacyT('加载访问限制选项失败'))
   } finally {
     loadingAccessOptions.value = false
   }
-})
+}
+
+watch([() => props.open, getAccessControlCatalogRevision], () => { void refreshAccessOptions() }, { immediate: true })
+useEventListener('focus', () => { void refreshAccessOptions() })
 </script>

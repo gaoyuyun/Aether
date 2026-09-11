@@ -4520,6 +4520,7 @@ mod tests {
         state.auth_context_cache.insert(
             auth_cache_key.to_string(),
             GatewayControlAuthContext {
+                denied_models: None,
                 verified_api_key_hash: None,
                 user_id: "user-1".to_string(),
                 api_key_id: "key-1".to_string(),

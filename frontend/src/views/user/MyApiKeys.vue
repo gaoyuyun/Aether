@@ -497,111 +497,42 @@
           </p>
         </div>
 
-        <div class="space-y-2">
-          <Label class="text-sm font-semibold">
-            可用提供商
-          </Label>
-          <div class="flex items-center gap-3">
-            <div class="flex-1 min-w-0">
-              <MultiSelect
-                v-model="newKeyAllowedProviders"
-                :options="providerOptions"
-                :search-threshold="0"
-                teleport
-                :disabled="newKeyProviderUnrestricted || loadingProviders"
-                :placeholder="newKeyProviderUnrestricted ? '跟随账户可用提供商' : '未选择（全部禁用）'"
-                empty-text="暂无可用提供商"
-                no-results-text="未找到匹配的提供商"
-                search-placeholder="搜索提供商..."
-                data-testid="user-api-key-providers"
-              />
-            </div>
-            <div class="flex flex-col items-end gap-1 shrink-0">
-              <Switch
-                v-model="newKeyProviderUnrestricted"
-                data-testid="user-api-key-providers-unrestricted"
-              />
-              <span class="text-[10px] text-muted-foreground whitespace-nowrap">
-                {{ newKeyProviderUnrestricted ? '跟随账户' : '单独限制' }}
-              </span>
-            </div>
-          </div>
-          <p class="text-xs text-muted-foreground">
-            只能从你账户可用的提供商中再收窄；跟随账户表示继承全部可用提供商
-          </p>
-          <p
-            v-if="providersLoadError"
-            class="text-xs text-destructive"
-          >
-            {{ providersLoadError }}
-          </p>
-        </div>
-
-        <div class="space-y-2">
-          <Label class="text-sm font-semibold">
-            可用端点
-          </Label>
-          <div class="flex items-center gap-3">
-            <MultiSelect
-              v-model="newKeyAllowedApiFormats"
-              class="min-w-0 flex-1"
-              :options="apiFormatOptions"
-              :search-threshold="0"
-              teleport
-              :disabled="newKeyApiFormatUnrestricted || loadingProviders"
-              :placeholder="newKeyApiFormatUnrestricted ? '跟随账户可用端点' : '未选择（全部禁用）'"
-              empty-text="暂无可用端点"
-              no-results-text="未找到匹配的端点"
-              search-placeholder="搜索端点..."
-              data-testid="user-api-key-api-formats"
-            />
-            <div class="flex shrink-0 flex-col items-end gap-1">
-              <Switch
-                v-model="newKeyApiFormatUnrestricted"
-                data-testid="user-api-key-api-formats-unrestricted"
-              />
-              <span class="whitespace-nowrap text-[10px] text-muted-foreground">
-                {{ newKeyApiFormatUnrestricted ? '跟随账户' : '单独限制' }}
-              </span>
-            </div>
-          </div>
-          <p class="text-xs text-muted-foreground">
-            只能从你账户可用的端点中进一步收窄
-          </p>
-        </div>
-
-        <div class="space-y-2">
-          <Label class="text-sm font-semibold">
-            可用模型
-          </Label>
-          <div class="flex items-center gap-3">
-            <MultiSelect
-              v-model="newKeyAllowedModels"
-              class="min-w-0 flex-1"
-              :options="modelOptions"
-              :search-threshold="0"
-              teleport
-              :disabled="newKeyModelUnrestricted || loadingProviders"
-              :placeholder="newKeyModelUnrestricted ? '跟随账户可用模型' : '未选择（全部禁用）'"
-              empty-text="暂无可用模型"
-              no-results-text="未找到匹配的模型"
-              search-placeholder="搜索模型..."
-              data-testid="user-api-key-models"
-            />
-            <div class="flex shrink-0 flex-col items-end gap-1">
-              <Switch
-                v-model="newKeyModelUnrestricted"
-                data-testid="user-api-key-models-unrestricted"
-              />
-              <span class="whitespace-nowrap text-[10px] text-muted-foreground">
-                {{ newKeyModelUnrestricted ? '跟随账户' : '单独限制' }}
-              </span>
-            </div>
-          </div>
-          <p class="text-xs text-muted-foreground">
-            只能从你账户可用的模型中进一步收窄
-          </p>
-        </div>
+        <ApiKeyAccessRestrictionField
+          v-model="newKeyAllowedProviders"
+          v-model:mode="newKeyProviderMode"
+          v-model:unrestricted="newKeyProviderUnrestricted"
+          label="提供商"
+          :options="providerOptions"
+          :loading="loadingProviders"
+          test-id="user-api-key-providers"
+        />
+        <ApiKeyAccessRestrictionField
+          v-model="newKeyAllowedApiFormats"
+          v-model:mode="newKeyApiFormatMode"
+          v-model:unrestricted="newKeyApiFormatUnrestricted"
+          label="端点"
+          :options="apiFormatOptions"
+          :loading="loadingProviders"
+          test-id="user-api-key-api-formats"
+        />
+        <ApiKeyAccessRestrictionField
+          v-model="newKeyAllowedModels"
+          v-model:mode="newKeyModelMode"
+          v-model:unrestricted="newKeyModelUnrestricted"
+          label="模型"
+          :options="modelOptions"
+          :loading="loadingProviders"
+          test-id="user-api-key-models"
+        />
+        <p
+          v-if="providersLoadError"
+          class="text-xs text-destructive"
+        >
+          {{ providersLoadError }}
+        </p>
+        <p class="text-xs text-muted-foreground">
+          密钥限制只能进一步收窄用户权限。允许列表为空时全部禁用，拒绝列表为空时不排除任何项目；已删除的项目会自动移除。
+        </p>
 
         <div class="rounded-lg border border-border/60 bg-muted/30 p-4">
           <div class="flex items-center justify-between gap-4">
@@ -665,7 +596,7 @@
         </Button>
         <Button
           class="h-11 px-6 shadow-lg shadow-primary/20"
-          :disabled="creating"
+          :disabled="creating || loadingProviders || Boolean(providersLoadError)"
           @click="saveApiKey"
         >
           <Loader2
@@ -1026,7 +957,6 @@ import { ref, onMounted, onBeforeUnmount, computed, watch, reactive } from 'vue'
 import {
   meApi,
   type ApiKey,
-  type AvailableProvider,
   type InstallSessionTargetSystem,
   type InstallTargetCli,
   type ApiKeyInstallSession,
@@ -1046,7 +976,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui'
-import { LoadingState, AlertDialog, EmptyState, MultiSelect } from '@/components/common'
+import { LoadingState, AlertDialog, EmptyState } from '@/components/common'
 import {
   Table,
   TableBody,
@@ -1076,13 +1006,18 @@ import {
   type CcSwitchTargetApp,
 } from '@/features/api-keys/utils/ccswitchImport'
 import {
-  buildUserApiKeyAllowedList,
-  buildUserApiKeyAllowedProviders,
-  normalizeUserApiKeyAllowedList,
-  normalizeUserApiKeyAllowedProviders,
+  buildUserApiKeyListRestriction,
+  readUserApiKeyListRestriction,
+  retainAvailableAccessValues,
+  type AccessRestrictionMode,
   userApiKeyAllowedListsEqual,
   userApiKeyAllowedProvidersEqual,
 } from '@/features/api-keys/utils/userKeyPayload'
+
+import ApiKeyAccessRestrictionField from '@/features/api-keys/components/ApiKeyAccessRestrictionField.vue'
+import { useUserAccessControlOptions } from '@/features/users/composables/useUserAccessControlOptions'
+import { getAccessControlCatalogRevision } from '@/utils/accessControlCatalog'
+import { useEventListener } from '@vueuse/core'
 
 const { success, error: showError } = useToast()
 
@@ -1131,22 +1066,20 @@ const newKeyRateLimit = ref<number | undefined>(undefined)
 const newKeyConcurrentLimit = ref<number | undefined>(undefined)
 const newKeyIpRulesText = ref('')
 const newKeyProviderUnrestricted = ref(true)
+const newKeyProviderMode = ref<AccessRestrictionMode>('allow')
 const newKeyAllowedProviders = ref<string[]>([])
 const initialKeyAllowedProviders = ref<string[] | null>(null)
 const newKeyApiFormatUnrestricted = ref(true)
+const newKeyApiFormatMode = ref<AccessRestrictionMode>('allow')
 const newKeyAllowedApiFormats = ref<string[]>([])
 const initialKeyAllowedApiFormats = ref<string[] | null>(null)
 const newKeyModelUnrestricted = ref(true)
+const newKeyModelMode = ref<AccessRestrictionMode>('allow')
 const newKeyAllowedModels = ref<string[]>([])
 const initialKeyAllowedModels = ref<string[] | null>(null)
-const availableProviders = ref<AvailableProvider[]>([])
-const availableApiFormats = ref<string[]>([])
-const availableModels = ref<string[]>([])
-const accessOptionsLoadCount = ref(0)
-const loadingProviders = computed(() => accessOptionsLoadCount.value > 0)
+const loadingProviders = ref(false)
 const providersLoadError = ref('')
-const availableProvidersLoaded = ref(false)
-const accessRestrictionOptionsLoaded = ref(false)
+const { providerOptions, apiFormatOptions, modelOptions, loadAccessControlOptions } = useUserAccessControlOptions()
 const keyRedactionMode = ref<'inherit' | 'custom'>('inherit')
 const newKeyRedactionEnabled = ref(false)
 const newKeyRedactionInjectNotice = ref(true)
@@ -1154,19 +1087,6 @@ const newKeyValue = ref('')
 const createdApiKey = ref<ApiKey | null>(null)
 const keyToDelete = ref<ApiKey | null>(null)
 const editingApiKey = ref<ApiKey | null>(null)
-
-const providerOptions = computed(() =>
-  availableProviders.value.map((provider) => ({
-    value: provider.id,
-    label: (provider.name || '').trim() || provider.id,
-  })),
-)
-const apiFormatOptions = computed(() =>
-  availableApiFormats.value.map((value) => ({ value, label: value })),
-)
-const modelOptions = computed(() =>
-  availableModels.value.map((value) => ({ value, label: value })),
-)
 
 const selectedInstallApiKey = ref<ApiKey | null>(null)
 const pendingFirstInstallApiKey = ref<ApiKey | null>(null)
@@ -1246,7 +1166,6 @@ const ccSwitchModelHelpText = computed(() =>
 onMounted(() => {
   installSystem.value = detectCurrentSystem()
   void loadApiKeys()
-  void loadAvailableProviders({ force: false })
 })
 
 onBeforeUnmount(() => {
@@ -1284,83 +1203,25 @@ async function loadApiKeys() {
   }
 }
 
-let availableProvidersRequest: Promise<void> | null = null
-let accessRestrictionOptionsRequest: Promise<void> | null = null
-
-async function loadAvailableProviders(options: { force?: boolean } = {}) {
-  const force = options.force === true
-  if (!force && availableProvidersLoaded.value) {
-    return
-  }
-  if (!force && availableProvidersRequest) {
-    await availableProvidersRequest
-    return
-  }
-
-  accessOptionsLoadCount.value += 1
+async function loadAccessRestrictionOptions() {
+  if (!showCreateDialog.value) return
+  loadingProviders.value = true
   providersLoadError.value = ''
-  const request = (async () => {
-    try {
-      availableProviders.value = await meApi.getAvailableProviders({ view: 'options' })
-      // An empty list is a valid cached result (for example, a deny-all account policy).
-      availableProvidersLoaded.value = true
-    } catch (error: unknown) {
-      log.error('加载访问限制选项失败:', error)
-      providersLoadError.value = parseApiError(error, '加载访问限制选项失败')
-      availableProviders.value = []
-      availableProvidersLoaded.value = false
-    } finally {
-      accessOptionsLoadCount.value = Math.max(0, accessOptionsLoadCount.value - 1)
-      availableProvidersRequest = null
-    }
-  })()
-  availableProvidersRequest = request
-  await request
+  try {
+    await loadAccessControlOptions({ force: true })
+    if (!showCreateDialog.value) return
+    newKeyAllowedProviders.value = retainAvailableAccessValues(newKeyAllowedProviders.value, providerOptions.value)
+    newKeyAllowedApiFormats.value = retainAvailableAccessValues(newKeyAllowedApiFormats.value, apiFormatOptions.value)
+    newKeyAllowedModels.value = retainAvailableAccessValues(newKeyAllowedModels.value, modelOptions.value)
+  } catch (error: unknown) {
+    providersLoadError.value = parseApiError(error, '加载访问限制选项失败')
+  } finally {
+    loadingProviders.value = false
+  }
 }
 
-async function loadAccessRestrictionOptions(options: { force?: boolean } = {}) {
-  const force = options.force === true
-  if (!force && accessRestrictionOptionsLoaded.value) return
-  if (!force && accessRestrictionOptionsRequest) {
-    await accessRestrictionOptionsRequest
-    return
-  }
-
-  accessOptionsLoadCount.value += 1
-  providersLoadError.value = ''
-  const request = (async () => {
-    try {
-      await loadAvailableProviders({ force })
-      if (!availableProvidersLoaded.value) {
-        throw new Error(providersLoadError.value || '加载可用提供商失败')
-      }
-      const [providerAccessOptions, modelsData] = await Promise.all([
-        meApi.getAvailableProviders({ view: 'access-options' }),
-        meApi.getAvailableModels({ limit: 1000 }),
-      ])
-      availableApiFormats.value = Array.from(new Set(
-        providerAccessOptions.flatMap(provider => (provider.endpoints || []).map((endpoint) =>
-          String(endpoint.api_format || '').trim(),
-        )).filter(Boolean),
-      )).sort()
-      availableModels.value = Array.from(new Set(
-        (modelsData.models || []).map(model => model.name.trim()).filter(Boolean),
-      )).sort()
-      accessRestrictionOptionsLoaded.value = true
-    } catch (error: unknown) {
-      log.error('加载访问限制选项失败:', error)
-      providersLoadError.value = parseApiError(error, '加载访问限制选项失败')
-      availableApiFormats.value = []
-      availableModels.value = []
-      accessRestrictionOptionsLoaded.value = false
-    } finally {
-      accessOptionsLoadCount.value = Math.max(0, accessOptionsLoadCount.value - 1)
-      accessRestrictionOptionsRequest = null
-    }
-  })()
-  accessRestrictionOptionsRequest = request
-  await request
-}
+watch([showCreateDialog, getAccessControlCatalogRevision], () => { void loadAccessRestrictionOptions() })
+useEventListener('focus', () => { void loadAccessRestrictionOptions() })
 
 function clearInstallCopiedResetTimer() {
   if (installCopiedResetTimer) {
@@ -1377,28 +1238,30 @@ function resetInstallCopiedState() {
 function openEditApiKeyDialog(apiKey: ApiKey) {
   const hasRedactionFeature = hasChatPiiRedactionFeatureSettings(apiKey.feature_settings)
   const redactionFeature = readChatPiiRedactionFeatureSettings(apiKey.feature_settings)
-  const allowedProviders = normalizeUserApiKeyAllowedProviders(apiKey.allowed_providers)
-  const allowedApiFormats = normalizeUserApiKeyAllowedList(apiKey.allowed_api_formats)
-  const allowedModels = normalizeUserApiKeyAllowedList(apiKey.allowed_models)
+  const providerRestriction = readUserApiKeyListRestriction(apiKey.allowed_providers, apiKey.denied_providers)
+  const apiformatRestriction = readUserApiKeyListRestriction(apiKey.allowed_api_formats, apiKey.denied_api_formats)
+  const modelRestriction = readUserApiKeyListRestriction(apiKey.allowed_models, apiKey.denied_models)
   editingApiKey.value = apiKey
   newKeyName.value = apiKey.name || ''
   newKeyRateLimit.value = apiKey.rate_limit ?? undefined
   newKeyConcurrentLimit.value = apiKey.concurrent_limit ?? undefined
   newKeyIpRulesText.value = apiKey.ip_rules?.join(', ') ?? ''
-  newKeyProviderUnrestricted.value = allowedProviders == null
-  newKeyAllowedProviders.value = allowedProviders ? [...allowedProviders] : []
-  initialKeyAllowedProviders.value = allowedProviders ? [...allowedProviders] : null
-  newKeyApiFormatUnrestricted.value = allowedApiFormats == null
-  newKeyAllowedApiFormats.value = allowedApiFormats ? [...allowedApiFormats] : []
-  initialKeyAllowedApiFormats.value = allowedApiFormats ? [...allowedApiFormats] : null
-  newKeyModelUnrestricted.value = allowedModels == null
-  newKeyAllowedModels.value = allowedModels ? [...allowedModels] : []
-  initialKeyAllowedModels.value = allowedModels ? [...allowedModels] : null
+  newKeyProviderUnrestricted.value = providerRestriction.unrestricted
+  newKeyProviderMode.value = providerRestriction.mode
+  newKeyAllowedProviders.value = [...providerRestriction.values]
+  initialKeyAllowedProviders.value = apiKey.allowed_providers ?? null
+  newKeyApiFormatUnrestricted.value = apiformatRestriction.unrestricted
+  newKeyApiFormatMode.value = apiformatRestriction.mode
+  newKeyAllowedApiFormats.value = [...apiformatRestriction.values]
+  initialKeyAllowedApiFormats.value = apiKey.allowed_api_formats ?? null
+  newKeyModelUnrestricted.value = modelRestriction.unrestricted
+  newKeyModelMode.value = modelRestriction.mode
+  newKeyAllowedModels.value = [...modelRestriction.values]
+  initialKeyAllowedModels.value = apiKey.allowed_models ?? null
   keyRedactionMode.value = hasRedactionFeature ? 'custom' : 'inherit'
   newKeyRedactionEnabled.value = redactionFeature.enabled
   newKeyRedactionInjectNotice.value = redactionFeature.inject_model_instruction
   showCreateDialog.value = true
-  void loadAccessRestrictionOptions({ force: false })
 }
 
 function openCreateApiKeyDialog() {
@@ -1409,19 +1272,21 @@ function openCreateApiKeyDialog() {
   newKeyConcurrentLimit.value = undefined
   newKeyIpRulesText.value = ''
   newKeyProviderUnrestricted.value = true
+  newKeyProviderMode.value = 'allow'
   newKeyAllowedProviders.value = []
   initialKeyAllowedProviders.value = null
   newKeyApiFormatUnrestricted.value = true
+  newKeyApiFormatMode.value = 'allow'
   newKeyAllowedApiFormats.value = []
   initialKeyAllowedApiFormats.value = null
   newKeyModelUnrestricted.value = true
+  newKeyModelMode.value = 'allow'
   newKeyAllowedModels.value = []
   initialKeyAllowedModels.value = null
   keyRedactionMode.value = 'inherit'
   newKeyRedactionEnabled.value = false
   newKeyRedactionInjectNotice.value = true
   showCreateDialog.value = true
-  void loadAccessRestrictionOptions({ force: false })
 }
 
 function detectCurrentSystem(): InstallSessionTargetSystem {
@@ -1702,12 +1567,15 @@ function closeApiKeyDialog() {
   newKeyConcurrentLimit.value = undefined
   newKeyIpRulesText.value = ''
   newKeyProviderUnrestricted.value = true
+  newKeyProviderMode.value = 'allow'
   newKeyAllowedProviders.value = []
   initialKeyAllowedProviders.value = null
   newKeyApiFormatUnrestricted.value = true
+  newKeyApiFormatMode.value = 'allow'
   newKeyAllowedApiFormats.value = []
   initialKeyAllowedApiFormats.value = null
   newKeyModelUnrestricted.value = true
+  newKeyModelMode.value = 'allow'
   newKeyAllowedModels.value = []
   initialKeyAllowedModels.value = null
   keyRedactionMode.value = 'inherit'
@@ -1724,17 +1592,14 @@ async function saveApiKey() {
   creating.value = true
   try {
     const ipRules = parseIpRulesInput(newKeyIpRulesText.value)
-    const allowedProviders = buildUserApiKeyAllowedProviders(
-      newKeyProviderUnrestricted.value,
-      newKeyAllowedProviders.value,
+    const { allowed: allowedProviders, denied: deniedProviders } = buildUserApiKeyListRestriction(
+      newKeyProviderUnrestricted.value, newKeyProviderMode.value, newKeyAllowedProviders.value,
     )
-    const allowedApiFormats = buildUserApiKeyAllowedList(
-      newKeyApiFormatUnrestricted.value,
-      newKeyAllowedApiFormats.value,
+    const { allowed: allowedApiFormats, denied: deniedApiFormats } = buildUserApiKeyListRestriction(
+      newKeyApiFormatUnrestricted.value, newKeyApiFormatMode.value, newKeyAllowedApiFormats.value,
     )
-    const allowedModels = buildUserApiKeyAllowedList(
-      newKeyModelUnrestricted.value,
-      newKeyAllowedModels.value,
+    const { allowed: allowedModels, denied: deniedModels } = buildUserApiKeyListRestriction(
+      newKeyModelUnrestricted.value, newKeyModelMode.value, newKeyAllowedModels.value,
     )
     const isCreatingFirstApiKey = !editingApiKey.value && apiKeys.value.length === 0
     if (editingApiKey.value) {
@@ -1742,23 +1607,23 @@ async function saveApiKey() {
       const providersChanged = !userApiKeyAllowedProvidersEqual(
         initialKeyAllowedProviders.value,
         allowedProviders,
-      )
+      ) || !userApiKeyAllowedListsEqual(editingApiKey.value.denied_providers, deniedProviders)
       const apiFormatsChanged = !userApiKeyAllowedListsEqual(
         initialKeyAllowedApiFormats.value,
         allowedApiFormats,
-      )
+      ) || !userApiKeyAllowedListsEqual(editingApiKey.value.denied_api_formats, deniedApiFormats)
       const modelsChanged = !userApiKeyAllowedListsEqual(
         initialKeyAllowedModels.value,
         allowedModels,
-      )
+      ) || !userApiKeyAllowedListsEqual(editingApiKey.value.denied_models, deniedModels)
       await meApi.updateApiKey(keyId, {
         name: newKeyName.value,
         rate_limit: newKeyRateLimit.value ?? 0,
         concurrent_limit: newKeyConcurrentLimit.value,
         ip_rules: ipRules,
-        ...(providersChanged ? { allowed_providers: allowedProviders } : {}),
-        ...(apiFormatsChanged ? { allowed_api_formats: allowedApiFormats } : {}),
-        ...(modelsChanged ? { allowed_models: allowedModels } : {}),
+        ...(providersChanged ? { allowed_providers: allowedProviders, denied_providers: deniedProviders } : {}),
+        ...(apiFormatsChanged ? { allowed_api_formats: allowedApiFormats, denied_api_formats: deniedApiFormats } : {}),
+        ...(modelsChanged ? { allowed_models: allowedModels, denied_models: deniedModels } : {}),
         feature_settings: keyRedactionMode.value === 'custom'
           ? mergeChatPiiRedactionFeatureSettings(editingApiKey.value.feature_settings, {
                 enabled: newKeyRedactionEnabled.value,
@@ -1774,8 +1639,11 @@ async function saveApiKey() {
         concurrent_limit: newKeyConcurrentLimit.value,
         ip_rules: ipRules,
         allowed_providers: allowedProviders,
+        denied_providers: deniedProviders,
         allowed_api_formats: allowedApiFormats,
+        denied_api_formats: deniedApiFormats,
         allowed_models: allowedModels,
+        denied_models: deniedModels,
         ...(keyRedactionMode.value === 'custom'
           ? {
               feature_settings: mergeChatPiiRedactionFeatureSettings(null, {

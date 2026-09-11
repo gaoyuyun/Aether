@@ -87,21 +87,21 @@
                 <div class="mt-1 grid gap-0.5 text-xs text-muted-foreground sm:grid-cols-3">
                   <span
                     class="truncate"
-                    :title="formatRestriction(apiKey.allowed_providers, '跟随用户')"
+                    :title="formatRestriction(apiKey.allowed_providers, apiKey.denied_providers, '跟随用户')"
                   >
-                    {{ legacyT('提供商：') }}{{ formatRestriction(apiKey.allowed_providers, '跟随用户') }}
+                    {{ legacyT('提供商：') }}{{ formatRestriction(apiKey.allowed_providers, apiKey.denied_providers, '跟随用户') }}
                   </span>
                   <span
                     class="truncate"
-                    :title="formatRestriction(apiKey.allowed_api_formats, '跟随用户')"
+                    :title="formatRestriction(apiKey.allowed_api_formats, apiKey.denied_api_formats, '跟随用户')"
                   >
-                    {{ legacyT('端点：') }}{{ formatRestriction(apiKey.allowed_api_formats, '跟随用户') }}
+                    {{ legacyT('端点：') }}{{ formatRestriction(apiKey.allowed_api_formats, apiKey.denied_api_formats, '跟随用户') }}
                   </span>
                   <span
                     class="truncate"
-                    :title="formatRestriction(apiKey.allowed_models, '跟随用户')"
+                    :title="formatRestriction(apiKey.allowed_models, apiKey.denied_models, '跟随用户')"
                   >
-                    {{ legacyT('模型：') }}{{ formatRestriction(apiKey.allowed_models, '跟随用户') }}
+                    {{ legacyT('模型：') }}{{ formatRestriction(apiKey.allowed_models, apiKey.denied_models, '跟随用户') }}
                   </span>
                 </div>
               </div>
@@ -218,7 +218,11 @@ defineEmits<{
 
 const { legacyT } = useI18n()
 
-function formatRestriction(values: string[] | null | undefined, unrestrictedLabel: string): string {
+function formatRestriction(values: string[] | null | undefined, denied: string[] | null | undefined, unrestrictedLabel: string): string {
+  if (denied != null) {
+    if (denied.length === 0) return legacyT('不排除任何项目')
+    return `${legacyT('拒绝')} ${denied.length <= 2 ? denied.join('、') : legacyT(`${denied.length} 项`)}`
+  }
   if (values == null) return legacyT(unrestrictedLabel)
   if (values.length === 0) return legacyT('全部禁用')
   if (values.length <= 2) return values.join('、')

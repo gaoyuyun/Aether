@@ -556,6 +556,7 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if let Some(updated) = updated.as_ref() {
             self.invalidate_provider_routing_caches();
+            self.invalidate_auth_context_cache();
             self.update_public_model_metadata_cache(updated).await;
         }
         Ok(updated)
@@ -572,6 +573,7 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
             self.invalidate_provider_routing_caches();
+            self.invalidate_auth_context_cache();
             self.invalidate_public_model_metadata_cache().await;
         }
         Ok(deleted)
@@ -779,6 +781,7 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
             self.invalidate_provider_routing_caches();
+            self.invalidate_auth_context_cache();
         }
         match updated {
             Some(provider) => self
@@ -860,6 +863,7 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
             self.invalidate_provider_routing_caches();
+            self.invalidate_auth_context_cache();
         }
         Ok(deleted)
     }
@@ -939,6 +943,7 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated.is_some() {
             self.invalidate_provider_routing_caches();
+            self.invalidate_auth_context_cache();
         }
         match updated {
             Some(endpoint) => self
@@ -960,6 +965,7 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if deleted {
             self.invalidate_provider_routing_caches();
+            self.invalidate_auth_context_cache();
         }
         Ok(deleted)
     }
@@ -1533,6 +1539,9 @@ mod tests {
 
     fn sample_auth_snapshot() -> GatewayAuthApiKeySnapshot {
         GatewayAuthApiKeySnapshot {
+            api_key_denied_providers: None,
+            api_key_denied_api_formats: None,
+            api_key_denied_models: None,
             user_id: "user-1".to_string(),
             username: "alice".to_string(),
             email: None,

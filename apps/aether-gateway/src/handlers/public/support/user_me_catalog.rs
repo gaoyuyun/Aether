@@ -122,6 +122,7 @@ fn users_me_allowed_provider_names(
 async fn resolve_users_me_allowed_global_model_ids(
     state: &AppState,
     allowed_providers: Option<&[String]>,
+    include_inactive: bool,
 ) -> Result<Option<BTreeSet<String>>, Response<Body>> {
     let Some(allowed_providers) = allowed_providers else {
         return Ok(None);
@@ -143,7 +144,10 @@ async fn resolve_users_me_allowed_global_model_ids(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .collect::<BTreeSet<_>>();
-    let providers = match state.list_provider_catalog_providers(true).await {
+    let providers = match state
+        .list_provider_catalog_providers(!include_inactive)
+        .await
+    {
         Ok(value) => value,
         Err(err) => {
             return Err(build_auth_error_response(
@@ -164,6 +168,30 @@ async fn resolve_users_me_allowed_global_model_ids(
         .collect::<Vec<_>>();
     if provider_ids.is_empty() {
         return Ok(Some(BTreeSet::new()));
+    }
+
+    if include_inactive {
+        let mut model_ids = BTreeSet::new();
+        for provider_id in provider_ids {
+            let mut offset = 0;
+            loop {
+                let models = match state.data.list_admin_provider_models(
+                    &aether_data_contracts::repository::global_models::AdminProviderModelListQuery {
+                        provider_id: provider_id.clone(), is_active: None, offset, limit: 1000,
+                    },
+                ).await {
+                    Ok(models) => models,
+                    Err(err) => return Err(build_auth_error_response(http::StatusCode::INTERNAL_SERVER_ERROR, format!("user provider model lookup failed: {err:?}"), false)),
+                };
+                let count = models.len();
+                model_ids.extend(models.into_iter().map(|model| model.global_model_id));
+                offset += count;
+                if count < 1000 {
+                    break;
+                }
+            }
+        }
+        return Ok(Some(model_ids));
     }
 
     let refs = match state
@@ -207,6 +235,36 @@ pub(super) async fn handle_users_me_available_models(
         parse_users_me_available_models_query(request_context.request_query_string.as_deref());
     let options_view = query_param_value(request_context.request_query_string.as_deref(), "view")
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("options"));
+    let access_options_view =
+        query_param_value(request_context.request_query_string.as_deref(), "view")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("access-options"));
+    if access_options_view && auth.user.role.eq_ignore_ascii_case("admin") {
+        let page = match state
+            .data
+            .list_admin_global_models(
+                &aether_data_contracts::repository::global_models::AdminGlobalModelListQuery {
+                    offset: skip,
+                    limit,
+                    is_active: None,
+                    search,
+                },
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(err) => {
+                return build_auth_error_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("available model option lookup failed: {err:?}"),
+                    false,
+                )
+            }
+        };
+        return Json(json!({
+            "models": page.items.into_iter().map(|model| json!({"id": model.id, "name": model.name, "is_active": model.is_active})).collect::<Vec<_>>(),
+            "total": page.total,
+        })).into_response();
+    }
 
     if options_view && auth.user.role.eq_ignore_ascii_case("admin") {
         let identities = match state
@@ -274,6 +332,7 @@ pub(super) async fn handle_users_me_available_models(
             effective_policies
                 .as_ref()
                 .and_then(|policies| policies.allowed_providers.as_deref()),
+            access_options_view,
         )
         .await
         {
@@ -311,7 +370,11 @@ pub(super) async fn handle_users_me_available_models(
             .list_public_global_models(&PublicGlobalModelQuery {
                 offset: skip,
                 limit,
-                is_active: Some(true),
+                is_active: if access_options_view {
+                    None
+                } else {
+                    Some(true)
+                },
                 search,
             })
             .await
@@ -326,12 +389,16 @@ pub(super) async fn handle_users_me_available_models(
             }
         }
     } else {
-        let page = match state
+        let mut page = match state
             .list_public_global_models(&PublicGlobalModelQuery {
                 offset: 0,
                 limit: USERS_ME_AVAILABLE_MODELS_FETCH_LIMIT,
-                is_active: Some(true),
-                search,
+                is_active: if access_options_view {
+                    None
+                } else {
+                    Some(true)
+                },
+                search: search.clone(),
             })
             .await
         {
@@ -344,6 +411,36 @@ pub(super) async fn handle_users_me_available_models(
                 )
             }
         };
+
+        while access_options_view && page.items.len() < page.total {
+            let next = match state
+                .list_public_global_models(&PublicGlobalModelQuery {
+                    offset: page.items.len(),
+                    limit: 1000,
+                    is_active: None,
+                    search: search.clone(),
+                })
+                .await
+            {
+                Ok(next) => next,
+                Err(err) => {
+                    return build_auth_error_response(
+                        http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("available model lookup failed: {err:?}"),
+                        false,
+                    )
+                }
+            };
+            if next.items.is_empty() {
+                return build_auth_error_response(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "模型目录已变化，请重试",
+                    false,
+                );
+            }
+            page.items.extend(next.items);
+            page.total = next.total;
+        }
 
         let filtered = page
             .items
@@ -369,6 +466,12 @@ pub(super) async fn handle_users_me_available_models(
             .collect::<Vec<_>>();
         StoredPublicGlobalModelPage { items, total }
     };
+    if access_options_view {
+        return Json(json!({
+            "models": page.items.into_iter().map(|model| json!({"id": model.id, "name": model.name, "is_active": model.is_active})).collect::<Vec<_>>(),
+            "total": page.total,
+        })).into_response();
+    }
     let usage_counts = match resolve_users_me_model_usage_counts(state, &auth.user.id).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -460,7 +563,10 @@ pub(super) async fn handle_users_me_providers_get(
         view,
         UsersMeProvidersView::Options | UsersMeProvidersView::AccessOptions
     ) {
-        let mut providers = match state.list_provider_catalog_provider_identities(true).await {
+        let mut providers = match state
+            .list_provider_catalog_provider_identities(view != UsersMeProvidersView::AccessOptions)
+            .await
+        {
             Ok(value) => value,
             Err(err) => {
                 return build_auth_error_response(
@@ -502,9 +608,6 @@ pub(super) async fn handle_users_me_providers_get(
             };
             let mut formats_by_provider = BTreeMap::<String, BTreeSet<String>>::new();
             for endpoint in endpoints {
-                if !endpoint.is_active {
-                    continue;
-                }
                 if let Some(allowed_api_formats) = allowed_api_formats {
                     if !allowed_api_formats.iter().any(|allowed| {
                         crate::ai_serving::api::api_format_permission_covers(

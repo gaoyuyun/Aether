@@ -55,6 +55,12 @@ struct UsersMeCreateApiKeyRequest {
     allowed_api_formats: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
     allowed_models: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    denied_providers: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    denied_api_formats: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    denied_models: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +89,12 @@ struct UsersMeUpdateApiKeyRequest {
     allowed_api_formats: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
     allowed_models: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    denied_providers: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    denied_api_formats: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list_patch")]
+    denied_models: Option<Option<Vec<String>>>,
 }
 
 fn deserialize_optional_provider_list_patch<'de, D>(
@@ -216,6 +228,9 @@ fn build_users_me_api_key_list_payload(
         "allowed_providers": record.allowed_providers,
         "allowed_api_formats": record.allowed_api_formats,
         "allowed_models": record.allowed_models,
+        "denied_providers": record.denied_providers,
+        "denied_api_formats": record.denied_api_formats,
+        "denied_models": record.denied_models,
         "ip_rules": record.ip_rules,
         "force_capabilities": record.force_capabilities,
         "feature_settings": record.feature_settings,
@@ -236,6 +251,9 @@ fn build_users_me_api_key_detail_payload(
         "allowed_providers": record.allowed_providers,
         "allowed_api_formats": record.allowed_api_formats,
         "allowed_models": record.allowed_models,
+        "denied_providers": record.denied_providers,
+        "denied_api_formats": record.denied_api_formats,
+        "denied_models": record.denied_models,
         "ip_rules": record.ip_rules,
         "force_capabilities": record.force_capabilities,
         "feature_settings": record.feature_settings,
@@ -628,7 +646,7 @@ pub(super) async fn handle_users_me_api_keys_get(
         Err(response) => return response,
     };
     let mut records = match state
-        .list_auth_api_key_export_records_by_user_ids(std::slice::from_ref(&auth.user.id))
+        .list_user_api_keys_with_current_access(&auth.user.id)
         .await
     {
         Ok(value) => value,
@@ -700,7 +718,7 @@ pub(super) async fn handle_users_me_api_key_detail_get(
     .unwrap_or(false);
 
     let records = match state
-        .list_auth_api_key_export_records_by_user_ids(std::slice::from_ref(&auth.user.id))
+        .list_user_api_keys_with_current_access(&auth.user.id)
         .await
     {
         Ok(value) => value,
@@ -947,6 +965,69 @@ pub(super) async fn handle_users_me_api_key_create(
             false,
         );
     };
+    let denied_providers = match normalize_users_me_api_key_string_list(
+        payload.denied_providers.flatten(),
+        "denied_providers",
+    ) {
+        Ok(value) => value,
+        Err(detail) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+        }
+    };
+    let denied_api_formats =
+        match normalize_users_me_api_key_api_formats(payload.denied_api_formats.flatten()) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
+    let denied_models = match normalize_users_me_api_key_string_list(
+        payload.denied_models.flatten(),
+        "denied_models",
+    ) {
+        Ok(value) => value,
+        Err(detail) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+        }
+    };
+    let (allowed_providers, denied_providers) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            Some(allowed_providers),
+            Some(denied_providers),
+            "providers",
+        ) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
+    let (allowed_providers, denied_providers) =
+        (allowed_providers.flatten(), denied_providers.flatten());
+    let (allowed_api_formats, denied_api_formats) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            Some(allowed_api_formats),
+            Some(denied_api_formats),
+            "api_formats",
+        ) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
+    let (allowed_api_formats, denied_api_formats) =
+        (allowed_api_formats.flatten(), denied_api_formats.flatten());
+    let (allowed_models, denied_models) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            Some(allowed_models),
+            Some(denied_models),
+            "models",
+        ) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
+    let (allowed_models, denied_models) = (allowed_models.flatten(), denied_models.flatten());
     let record = aether_data::repository::auth::CreateUserApiKeyRecord {
         user_id: auth.user.id.clone(),
         api_key_id,
@@ -956,6 +1037,9 @@ pub(super) async fn handle_users_me_api_key_create(
         allowed_providers,
         allowed_api_formats,
         allowed_models,
+        denied_providers,
+        denied_api_formats,
+        denied_models,
         ip_rules,
         rate_limit,
         concurrent_limit,
@@ -995,6 +1079,9 @@ pub(super) async fn handle_users_me_api_key_create(
         "allowed_providers": created.allowed_providers,
         "allowed_api_formats": created.allowed_api_formats,
         "allowed_models": created.allowed_models,
+        "denied_providers": created.denied_providers,
+        "denied_api_formats": created.denied_api_formats,
+        "denied_models": created.denied_models,
         "feature_settings": created.feature_settings,
         "last_used_at": format_users_me_optional_unix_secs_iso8601(created.last_used_at_unix_secs),
         "created_at": format_users_me_optional_unix_secs_iso8601(created.created_at_unix_secs),
@@ -1140,6 +1227,70 @@ pub(super) async fn handle_users_me_api_key_update(
         };
     let allowed_api_formats = api_formats_patch_present.then_some(resolved_api_formats);
     let allowed_models = models_patch_present.then_some(resolved_models);
+    let denied_providers_present = payload.denied_providers.is_some();
+    let denied_providers = match normalize_users_me_api_key_string_list(
+        payload.denied_providers.flatten(),
+        "denied_providers",
+    ) {
+        Ok(value) => value,
+        Err(detail) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+        }
+    };
+    let denied_providers = denied_providers_present.then_some(denied_providers);
+    let denied_api_formats_present = payload.denied_api_formats.is_some();
+    let denied_api_formats =
+        match normalize_users_me_api_key_api_formats(payload.denied_api_formats.flatten()) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
+    let denied_api_formats = denied_api_formats_present.then_some(denied_api_formats);
+    let denied_models_present = payload.denied_models.is_some();
+    let denied_models = match normalize_users_me_api_key_string_list(
+        payload.denied_models.flatten(),
+        "denied_models",
+    ) {
+        Ok(value) => value,
+        Err(detail) => {
+            return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+        }
+    };
+    let denied_models = denied_models_present.then_some(denied_models);
+    let (allowed_providers, denied_providers) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            allowed_providers,
+            denied_providers,
+            "providers",
+        ) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
+    let (allowed_api_formats, denied_api_formats) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            allowed_api_formats,
+            denied_api_formats,
+            "api_formats",
+        ) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
+    let (allowed_models, denied_models) =
+        match aether_data_contracts::repository::auth::normalize_api_key_access_list_patch(
+            allowed_models,
+            denied_models,
+            "models",
+        ) {
+            Ok(value) => value,
+            Err(detail) => {
+                return build_auth_error_response(http::StatusCode::BAD_REQUEST, detail, false)
+            }
+        };
     let name_present = name.is_some();
     let rate_limit_present = rate_limit.is_some();
     let concurrent_limit_present = concurrent_limit.is_some();
@@ -1161,6 +1312,9 @@ pub(super) async fn handle_users_me_api_key_update(
                 allowed_providers,
                 allowed_api_formats,
                 allowed_models,
+                denied_providers,
+                denied_api_formats,
+                denied_models,
                 feature_settings,
             },
         )
