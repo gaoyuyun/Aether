@@ -18,6 +18,10 @@ pub struct ProviderQuotaDispatchSnapshot {
     pub pricing_rule_version_at_usage: Option<String>,
     pub provider_pricing_snapshot_at_usage: Option<serde_json::Value>,
     pub provider_quota_cost_usd: Option<f64>,
+    /// Admission estimate, independent of measured provider usage. Older dispatches
+    /// have no reservation and retain the legacy unresolved-accounting fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_cost_usd: Option<f64>,
     pub quota_accounting_status: String,
 }
 
@@ -36,9 +40,10 @@ impl ProviderQuotaDispatchSnapshot {
                 "provider quota dispatch snapshot identity is empty".to_string(),
             ));
         }
-        if self
-            .provider_quota_cost_usd
-            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        if [self.provider_quota_cost_usd, self.reserved_cost_usd]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite() || value < 0.0 || value > 1_000_000_000.0)
         {
             return Err(crate::DataLayerError::InvalidInput(
                 "provider quota dispatch snapshot cost is invalid".to_string(),

@@ -459,9 +459,14 @@ fn postgres_candidate_upsert_sql(template: &str) -> String {
         )
         .replace(
             "__AETHER_CANDIDATE_EXTRA_DATA__",
-            "CASE WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped') \
+            "CASE WHEN request_candidates.extra_data::jsonb ? 'provider_quota_dispatch_snapshot' THEN (\
+             COALESCE((CASE WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped') \
              AND (EXCLUDED.status <> request_candidates.status OR EXCLUDED.extra_data IS NULL) \
-             THEN request_candidates.extra_data ELSE EXCLUDED.extra_data END",
+             THEN request_candidates.extra_data ELSE EXCLUDED.extra_data END)::jsonb, '{}'::jsonb) \
+             || jsonb_build_object('provider_quota_dispatch_snapshot', request_candidates.extra_data -> 'provider_quota_dispatch_snapshot'))::json \
+             ELSE CASE WHEN request_candidates.status IN ('success', 'failed', 'cancelled', 'skipped') \
+             AND (EXCLUDED.status <> request_candidates.status OR EXCLUDED.extra_data IS NULL) \
+             THEN request_candidates.extra_data ELSE EXCLUDED.extra_data END END",
         )
 }
 
@@ -878,6 +883,7 @@ async fn upsert_provider_quota_attempt_delta(
     tx: &mut PostgresTransaction,
     candidate: &StoredRequestCandidate,
 ) -> Result<(), DataLayerError> {
+    crate::provider_quota_reservations::reserve(tx, candidate).await?;
     let Some(snapshot) = provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())? else {
         return Ok(());
     };
@@ -950,6 +956,19 @@ ON CONFLICT (id) DO UPDATE SET
         candidate.status,
         RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
     ) {
+        let provisional = candidate
+            .extra_data
+            .as_ref()
+            .and_then(|v| v.pointer("/provider_quota_attempt_accounting/status"))
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|s| matches!(s, "provisional_unknown" | "dispatch_minimum"));
+        let explicit_rejection = candidate
+            .status_code
+            .is_some_and(|status| matches!(status, 400..=499));
+        if snapshot.reserved_cost_usd.is_some() && provisional && !explicit_rejection {
+            crate::provider_quota_reservations::retain_uncertain(tx, &candidate.id).await?;
+            return Ok(());
+        }
         let actual = candidate
             .extra_data
             .as_ref()
@@ -1018,6 +1037,15 @@ WHERE delta.id = $1 AND delta.kind = 'provider_monthly'
     .execute(&mut **tx)
     .await
     .map_postgres_err()?;
+    crate::provider_quota_reservations::settle_if_ready(
+        tx,
+        &candidate.id,
+        (candidate
+            .finished_at_unix_ms
+            .unwrap_or(candidate.created_at_unix_ms)
+            / 1000) as i64,
+    )
+    .await?;
     Ok(())
 }
 

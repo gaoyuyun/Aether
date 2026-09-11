@@ -71,7 +71,7 @@ pub(super) async fn read_candidate_runtime_selection_snapshot(
     let key_oauth_invalid =
         read_key_oauth_invalid_map(candidates, &provider_key_rpm_states, now_unix_secs);
     let provider_quota_blocks_requests =
-        read_provider_quota_block_map(state, &providers, now_unix_secs).await?;
+        read_provider_quota_block_map(state, &providers, candidates, now_unix_secs).await?;
     let provider_key_rpm_reset_ats =
         read_provider_key_rpm_reset_at_map(state, candidates, now_unix_secs);
 
@@ -273,6 +273,7 @@ pub(super) async fn read_provider_key_rpm_states(
 async fn read_provider_quota_block_map(
     state: &(impl SchedulerRuntimeState + ?Sized),
     providers: &BTreeMap<String, StoredProviderCatalogProvider>,
+    candidates: &[SchedulerMinimalCandidateSelectionCandidate],
     now_unix_secs: u64,
 ) -> Result<BTreeMap<String, bool>, GatewayError> {
     let provider_ids = providers.keys().cloned().collect::<Vec<_>>();
@@ -286,6 +287,13 @@ async fn read_provider_quota_block_map(
     let mut invalid_window_configs = std::collections::BTreeSet::new();
     let mut window_requests = Vec::new();
     for provider_id in &provider_ids {
+        if candidates
+            .iter()
+            .filter(|c| &c.provider_id == provider_id)
+            .all(|c| c.endpoint_api_format.eq_ignore_ascii_case("openai:search"))
+        {
+            continue;
+        }
         let Some(quota) = quotas.get(provider_id) else {
             continue;
         };
@@ -344,6 +352,22 @@ async fn read_provider_quota_block_map(
 
     for provider_id in provider_ids {
         let quota = quotas.get(&provider_id);
+        if candidates
+            .iter()
+            .filter(|c| c.provider_id == provider_id)
+            .all(|c| c.endpoint_api_format.eq_ignore_ascii_case("openai:search"))
+        {
+            // Free Search obeys subscription dates and the actual enabled flag;
+            // token-spend accounting readiness cannot block a zero-cost route.
+            let blocked = quota.is_some_and(|quota| {
+                let mut subscription = quota.clone();
+                subscription.is_active = providers.get(&provider_id).is_some_and(|p| p.is_active);
+                subscription.monthly_quota_usd = None;
+                aether_scheduler_core::should_skip_provider_quota(&subscription, now_unix_secs)
+            });
+            quota_blocks.insert(provider_id, blocked);
+            continue;
+        }
         let mut blocks_requests = quota.as_ref().is_some_and(|quota| {
             aether_scheduler_core::should_skip_provider_quota(quota, now_unix_secs)
         }) || invalid_window_configs.contains(&provider_id);

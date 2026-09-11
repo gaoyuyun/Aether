@@ -282,3 +282,17 @@ CREATE TABLE IF NOT EXISTS usage_request_admissions (
 CREATE INDEX IF NOT EXISTS usage_request_admissions_subject_admitted_at_idx ON usage_request_admissions (subject_id, admitted_at);
 CREATE INDEX IF NOT EXISTS usage_request_admissions_retain_until_token_idx ON usage_request_admissions (retain_until, event_token);
 
+CREATE TABLE IF NOT EXISTS provider_quota_reservations (
+    candidate_id TEXT PRIMARY KEY NOT NULL,
+    provider_id TEXT NOT NULL,
+    quota_epoch_start INTEGER NOT NULL,
+    dispatch_at INTEGER NOT NULL,
+    reserved_cost_units INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'reserved',
+    created_at INTEGER NOT NULL,
+    finalized_at INTEGER,
+    CONSTRAINT provider_quota_reservations_provider_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS provider_quota_reservations_active_idx ON provider_quota_reservations (provider_id, quota_epoch_start, state, dispatch_at);
+CREATE INDEX IF NOT EXISTS provider_quota_reservations_finalized_idx ON provider_quota_reservations (finalized_at);
+

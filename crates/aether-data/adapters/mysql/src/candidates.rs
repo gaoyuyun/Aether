@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use sqlx::{mysql::MySqlRow, MySql, MySqlConnection, QueryBuilder, Row};
+use sqlx::{mysql::MySqlRow, Acquire, MySql, MySqlConnection, QueryBuilder, Row};
 
 use aether_data_contracts::repository::candidates::{
     provider_quota_dispatch_snapshot, request_candidate_lifecycle_would_regress,
@@ -221,7 +221,16 @@ impl RequestCandidateWriteRepository for MysqlRequestCandidateRepository {
     ) -> Result<StoredRequestCandidate, DataLayerError> {
         candidate.sanitize_for_persistence();
         candidate.validate()?;
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut connection = self.pool.acquire().await.map_sql_err()?;
+        if provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())?
+            .is_some_and(|s| s.reserved_cost_usd.is_some())
+        {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut *connection)
+                .await
+                .map_sql_err()?;
+        }
+        let mut tx = connection.begin().await.map_sql_err()?;
         match upsert_candidate_in_transaction(&mut tx, candidate).await {
             Ok(candidate) => {
                 tx.commit().await.map_sql_err()?;
@@ -246,7 +255,19 @@ impl RequestCandidateWriteRepository for MysqlRequestCandidateRepository {
             candidate.validate()?;
         }
 
-        let mut tx = self.pool.begin().await.map_sql_err()?;
+        let mut connection = self.pool.acquire().await.map_sql_err()?;
+        if candidates.iter().any(|c| {
+            c.extra_data
+                .as_ref()
+                .and_then(|v| v.pointer("/provider_quota_dispatch_snapshot/reserved_cost_usd"))
+                .is_some()
+        }) {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut *connection)
+                .await
+                .map_sql_err()?;
+        }
+        let mut tx = connection.begin().await.map_sql_err()?;
         let result: Result<usize, DataLayerError> = async {
             let mut persisted = 0usize;
             for candidate in candidates {
@@ -342,6 +363,7 @@ async fn upsert_provider_quota_attempt_delta(
     tx: &mut sqlx::Transaction<'_, MySql>,
     candidate: &StoredRequestCandidate,
 ) -> Result<(), DataLayerError> {
+    crate::provider_quota_reservations::reserve(tx, candidate).await?;
     let Some(snapshot) = provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())? else {
         return Ok(());
     };
@@ -420,6 +442,19 @@ ON DUPLICATE KEY UPDATE
         candidate.status,
         RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
     ) {
+        let provisional = candidate
+            .extra_data
+            .as_ref()
+            .and_then(|v| v.pointer("/provider_quota_attempt_accounting/status"))
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|s| matches!(s, "provisional_unknown" | "dispatch_minimum"));
+        let explicit_rejection = candidate
+            .status_code
+            .is_some_and(|status| matches!(status, 400..=499));
+        if snapshot.reserved_cost_usd.is_some() && provisional && !explicit_rejection {
+            crate::provider_quota_reservations::retain_uncertain(tx, &candidate.id).await?;
+            return Ok(());
+        }
         let actual = candidate
             .extra_data
             .as_ref()
@@ -491,6 +526,15 @@ WHERE delta.id = ? AND delta.kind = 'provider_monthly'
     .execute(&mut **tx)
     .await
     .map_sql_err()?;
+    crate::provider_quota_reservations::settle_if_ready(
+        tx,
+        &candidate.id,
+        (candidate
+            .finished_at_unix_ms
+            .unwrap_or(candidate.created_at_unix_ms)
+            / 1000) as i64,
+    )
+    .await?;
     Ok(())
 }
 
@@ -963,6 +1007,10 @@ fn merge_json_objects(
                 ] {
                     overlay_object.remove(key);
                 }
+            }
+            // A later status write cannot reprice or reassign an admitted attempt.
+            if existing_object.contains_key("provider_quota_dispatch_snapshot") {
+                overlay_object.remove("provider_quota_dispatch_snapshot");
             }
             existing_object.extend(overlay_object);
             Some(serde_json::Value::Object(existing_object))

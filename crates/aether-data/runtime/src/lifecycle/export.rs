@@ -169,6 +169,10 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
         primary_key: &["provider_id", "quota_epoch_start", "bucket_start"],
     },
     AuxiliaryTable {
+        name: "provider_quota_reservations",
+        primary_key: &["candidate_id"],
+    },
+    AuxiliaryTable {
         name: "provider_quota_maintenance_state",
         primary_key: &["provider_id", "quota_epoch_start", "task_kind"],
     },

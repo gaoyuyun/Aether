@@ -739,16 +739,12 @@ impl RequestCandidateRuntimeWriter for AppState {
             .unwrap_or_else(|| "pay_as_you_go".to_string());
         let quota_epoch = quota.as_ref().and_then(|q| q.quota_last_reset_at_unix_secs);
         if billing_type.eq_ignore_ascii_case("monthly_quota")
-            && (billing_context.is_none()
-                || quota_epoch.is_none()
-                || quota.as_ref().is_none_or(|value| {
-                    aether_scheduler_core::should_skip_provider_quota(value, current_unix_secs())
-                }))
+            && (billing_context.is_none() || quota_epoch.is_none())
         {
-            return Err(GatewayError::Internal(format!(
-                "monthly provider quota dispatch is unavailable or fail-closed for provider {}",
-                context.provider_id
-            )));
+            return Err(GatewayError::ProviderQuotaUnavailable {
+                provider_id: context.provider_id.clone(),
+                reason: "quota_dispatch_context_unavailable".to_owned(),
+            });
         }
 
         let is_monthly_quota = billing_type.eq_ignore_ascii_case("monthly_quota");
@@ -808,12 +804,31 @@ impl RequestCandidateRuntimeWriter for AppState {
                     .max(0.0)
                 })
         };
+        let reserved_cost_usd = if is_monthly_quota {
+            let providers = self
+                .read_provider_catalog_providers_by_ids(std::slice::from_ref(&context.provider_id))
+                .await?;
+            let config = providers.first().and_then(|p| p.config.as_ref());
+            Some(
+                aether_billing::estimate_provider_quota_reservation(
+                    pricing.as_ref().expect("monthly pricing checked above"),
+                    &context.provider_api_format,
+                    &context.reservation_input,
+                    config,
+                )
+                .map_err(GatewayError::Internal)?
+                .max(minimum_cost.unwrap_or(0.0)),
+            )
+        } else {
+            None
+        };
         let pricing_value = pricing
             .as_ref()
             .map(serde_json::to_value)
             .transpose()
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         let snapshot = ProviderQuotaDispatchSnapshot {
+            reserved_cost_usd,
             schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
             provider_billing_type_at_usage: billing_type,
             quota_epoch_start_at_usage: quota_epoch.map(|value| value / 60 * 60),
@@ -828,7 +843,7 @@ impl RequestCandidateRuntimeWriter for AppState {
             provider_quota_cost_usd: is_monthly_quota.then_some(minimum_cost).flatten(),
             quota_accounting_status: if !is_monthly_quota {
                 "not_applicable"
-            } else if minimum_cost.is_some() {
+            } else if is_known_free_provider_route {
                 "ready"
             } else {
                 "pending"

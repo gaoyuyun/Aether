@@ -12,6 +12,10 @@ use crate::insert_header_if_missing;
 
 #[derive(Debug, Clone)]
 pub(crate) enum GatewayError {
+    ProviderQuotaUnavailable {
+        provider_id: String,
+        reason: String,
+    },
     UpstreamUnavailable {
         trace_id: String,
         message: String,
@@ -41,8 +45,24 @@ pub(crate) enum GatewayError {
 }
 
 impl GatewayError {
+    pub(crate) fn from_data(error: aether_data_contracts::DataLayerError) -> Self {
+        match error {
+            aether_data_contracts::DataLayerError::ProviderQuotaUnavailable {
+                provider_id,
+                reason,
+            } => Self::ProviderQuotaUnavailable {
+                provider_id,
+                reason,
+            },
+            error => Self::Internal(error.to_string()),
+        }
+    }
     pub(crate) fn into_message(self) -> String {
         match self {
+            Self::ProviderQuotaUnavailable {
+                provider_id,
+                reason,
+            } => format!("provider quota temporarily unavailable: {provider_id}: {reason}"),
             Self::UpstreamUnavailable { message, .. }
             | Self::ControlUnavailable { message, .. }
             | Self::Client { message, .. }
@@ -72,6 +92,11 @@ impl GatewayError {
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response<Body> {
         match self {
+            Self::ProviderQuotaUnavailable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {"message": "provider quota temporarily unavailable"}})),
+            )
+                .into_response(),
             Self::UpstreamUnavailable { trace_id, message } => {
                 let error_fingerprint = gateway_error_fingerprint(&message);
                 warn!(

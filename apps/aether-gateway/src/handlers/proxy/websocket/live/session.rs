@@ -103,6 +103,7 @@ impl LiveRelayAdmissionError {
                 StatusCode::GATEWAY_TIMEOUT
             }
             Self::Gateway(GatewayError::UpstreamUnavailable { .. })
+            | Self::Gateway(GatewayError::ProviderQuotaUnavailable { .. })
             | Self::Gateway(GatewayError::ControlUnavailable { .. }) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -145,6 +146,9 @@ impl LiveRelayAdmissionError {
                 "admission_planning_timeout"
             }
             Self::Gateway(GatewayError::UpstreamUnavailable { .. }) => "upstream_unavailable",
+            Self::Gateway(GatewayError::ProviderQuotaUnavailable { .. }) => {
+                "provider_quota_blocked"
+            }
             Self::Gateway(GatewayError::ControlUnavailable { .. }) => "control_unavailable",
             Self::Gateway(GatewayError::Internal(_)) => "admission_failed",
         }
@@ -1243,6 +1247,7 @@ fn gateway_error_kind(error: &GatewayError) -> &'static str {
         GatewayError::LastActiveAdminUpdateDenied => "last_admin_update_denied",
         GatewayError::LastActiveAdminDeleteDenied => "last_admin_delete_denied",
         GatewayError::Client { .. } => "client_error",
+        GatewayError::ProviderQuotaUnavailable { .. } => "provider_quota_blocked",
         GatewayError::Internal(_) => "internal_error",
     }
 }
@@ -1259,6 +1264,7 @@ fn gateway_error_status(error: &GatewayError) -> StatusCode {
             StatusCode::BAD_REQUEST
         }
         GatewayError::Client { status, .. } => *status,
+        GatewayError::ProviderQuotaUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

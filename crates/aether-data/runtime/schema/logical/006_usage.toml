@@ -1344,3 +1344,60 @@ columns = ["subject_id"]
 references_table = "users"
 references_columns = ["id"]
 on_delete = "cascade"
+
+[table.provider_quota_reservations]
+domain = "usage"
+order = 80
+primary_key = ["candidate_id"]
+
+[[table.provider_quota_reservations.columns]]
+name = "candidate_id"
+type = "text_id"
+length = 64
+
+[[table.provider_quota_reservations.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.provider_quota_reservations.columns]]
+name = "quota_epoch_start"
+type = "int64"
+
+[[table.provider_quota_reservations.columns]]
+name = "dispatch_at"
+type = "int64"
+
+[[table.provider_quota_reservations.columns]]
+name = "reserved_cost_units"
+type = "int64"
+
+[[table.provider_quota_reservations.columns]]
+name = "state"
+type = "text"
+length = 16
+default = "reserved"
+
+[[table.provider_quota_reservations.columns]]
+name = "created_at"
+type = "int64"
+
+[[table.provider_quota_reservations.columns]]
+name = "finalized_at"
+type = "int64"
+nullable = true
+
+[[table.provider_quota_reservations.indexes]]
+name = "provider_quota_reservations_active_idx"
+columns = ["provider_id", "quota_epoch_start", "state", "dispatch_at"]
+
+[[table.provider_quota_reservations.indexes]]
+name = "provider_quota_reservations_finalized_idx"
+columns = ["finalized_at"]
+
+[[table.provider_quota_reservations.foreign_keys]]
+name = "provider_quota_reservations_provider_fkey"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "cascade"

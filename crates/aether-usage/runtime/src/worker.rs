@@ -633,7 +633,9 @@ fn usage_event_record_error_is_permanent(err: &DataLayerError) -> bool {
         DataLayerError::Postgres(message) | DataLayerError::Sql(message) => {
             database_error_is_known_permanent(message)
         }
-        DataLayerError::Redis(_) | DataLayerError::TimedOut(_) => false,
+        DataLayerError::Redis(_)
+        | DataLayerError::TimedOut(_)
+        | DataLayerError::ProviderQuotaUnavailable { .. } => false,
     }
 }
 

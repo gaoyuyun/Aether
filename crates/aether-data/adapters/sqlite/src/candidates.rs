@@ -343,6 +343,7 @@ async fn upsert_provider_quota_attempt_delta(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     candidate: &StoredRequestCandidate,
 ) -> Result<(), DataLayerError> {
+    crate::provider_quota_reservations::reserve(tx, candidate).await?;
     let Some(snapshot) = provider_quota_dispatch_snapshot(candidate.extra_data.as_ref())? else {
         return Ok(());
     };
@@ -426,6 +427,19 @@ ON CONFLICT (id) DO UPDATE SET
         candidate.status,
         RequestCandidateStatus::Failed | RequestCandidateStatus::Cancelled
     ) {
+        let provisional = candidate
+            .extra_data
+            .as_ref()
+            .and_then(|v| v.pointer("/provider_quota_attempt_accounting/status"))
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|s| matches!(s, "provisional_unknown" | "dispatch_minimum"));
+        let explicit_rejection = candidate
+            .status_code
+            .is_some_and(|status| matches!(status, 400..=499));
+        if snapshot.reserved_cost_usd.is_some() && provisional && !explicit_rejection {
+            crate::provider_quota_reservations::retain_uncertain(tx, &candidate.id).await?;
+            return Ok(());
+        }
         let actual = candidate
             .extra_data
             .as_ref()
@@ -547,6 +561,15 @@ WHERE delta.id = ? AND delta.kind = 'provider_monthly'
     .execute(&mut **tx)
     .await
     .map_sql_err()?;
+    crate::provider_quota_reservations::settle_if_ready(
+        tx,
+        &candidate.id,
+        (candidate
+            .finished_at_unix_ms
+            .unwrap_or(candidate.created_at_unix_ms)
+            / 1000) as i64,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1014,6 +1037,10 @@ fn merge_json_objects(
                     overlay_object.remove(key);
                 }
             }
+            // A later status write cannot reprice or reassign an admitted attempt.
+            if existing_object.contains_key("provider_quota_dispatch_snapshot") {
+                overlay_object.remove("provider_quota_dispatch_snapshot");
+            }
             existing_object.extend(overlay_object);
             Some(serde_json::Value::Object(existing_object))
         }
@@ -1095,6 +1122,7 @@ mod tests {
         let candidates = SqliteRequestCandidateRepository::new(pool.clone());
         let quotas = SqliteProviderQuotaRepository::new(pool.clone());
         let snapshot = ProviderQuotaDispatchSnapshot {
+            reserved_cost_usd: None,
             schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
             provider_billing_type_at_usage: "monthly_quota".to_string(),
             quota_epoch_start_at_usage: Some(960),
@@ -1206,6 +1234,7 @@ mod tests {
             (1, "active-long", RequestCandidateStatus::Pending),
         ] {
             let snapshot = ProviderQuotaDispatchSnapshot {
+                reserved_cost_usd: None,
                 schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
                 provider_billing_type_at_usage: "monthly_quota".to_string(),
                 quota_epoch_start_at_usage: Some(960),
@@ -1459,6 +1488,7 @@ mod tests {
         let pool = crate::test_support::migrated_pool().await;
         let repository = SqliteRequestCandidateRepository::new(pool.clone());
         let snapshot = ProviderQuotaDispatchSnapshot {
+            reserved_cost_usd: None,
             schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
             provider_billing_type_at_usage: "monthly_quota".to_string(),
             quota_epoch_start_at_usage: Some(1_699_999_980),
@@ -1522,6 +1552,7 @@ INSERT INTO usage_settlement_snapshots (
 
         let repository = SqliteRequestCandidateRepository::new(pool.clone());
         let snapshot = ProviderQuotaDispatchSnapshot {
+            reserved_cost_usd: None,
             schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
             provider_billing_type_at_usage: "monthly_quota".to_string(),
             quota_epoch_start_at_usage: Some(1_699_999_980),

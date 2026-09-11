@@ -409,6 +409,7 @@ fn gateway_error_kind(error: &GatewayError) -> &'static str {
         GatewayError::PlanUsageLimited(_) => "plan_usage_limited",
         GatewayError::LastActiveAdminUpdateDenied => "last_admin_update_denied",
         GatewayError::LastActiveAdminDeleteDenied => "last_admin_delete_denied",
+        GatewayError::ProviderQuotaUnavailable { .. } => "provider_quota_blocked",
         GatewayError::Internal(_) => "internal",
     }
 }

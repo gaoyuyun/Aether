@@ -572,6 +572,7 @@ fn gateway_error_kind(error: &GatewayError) -> &'static str {
         GatewayError::LastActiveAdminUpdateDenied => "last_admin_update_denied",
         GatewayError::LastActiveAdminDeleteDenied => "last_admin_delete_denied",
         GatewayError::Client { .. } => "client_error",
+        GatewayError::ProviderQuotaUnavailable { .. } => "provider_quota_blocked",
         GatewayError::Internal(_) => "internal_error",
     }
 }

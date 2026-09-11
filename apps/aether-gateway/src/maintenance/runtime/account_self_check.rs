@@ -592,6 +592,7 @@ fn gateway_error_category(err: &GatewayError) -> &'static str {
         GatewayError::LastActiveAdminUpdateDenied | GatewayError::LastActiveAdminDeleteDenied => {
             "operation_rejected"
         }
+        GatewayError::ProviderQuotaUnavailable { .. } => "provider_quota_blocked",
         GatewayError::Internal(_) => "internal_error",
     }
 }

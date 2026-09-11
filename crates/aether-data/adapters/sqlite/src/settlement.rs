@@ -382,6 +382,27 @@ pub(crate) async fn reconcile_provider_monthly_attempt_sqlite(
     cost_is_resolved: bool,
     updated_at: i64,
 ) -> Result<bool, DataLayerError> {
+    let reconciled = reconcile_provider_monthly_attempt_sqlite_inner(
+        tx,
+        candidate_id,
+        actual_cost_usd,
+        cost_is_resolved,
+        updated_at,
+    )
+    .await?;
+    if reconciled {
+        crate::provider_quota_reservations::settle_if_ready(tx, candidate_id, updated_at).await?;
+    }
+    Ok(reconciled)
+}
+
+async fn reconcile_provider_monthly_attempt_sqlite_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    candidate_id: &str,
+    actual_cost_usd: f64,
+    cost_is_resolved: bool,
+    updated_at: i64,
+) -> Result<bool, DataLayerError> {
     let delta_id = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_OID,
         format!("provider-quota-attempt:{}", candidate_id).as_bytes(),

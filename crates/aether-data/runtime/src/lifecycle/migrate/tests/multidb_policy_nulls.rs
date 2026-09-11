@@ -251,7 +251,11 @@ async fn sqlite_full_legacy_schema_upgrades_without_rewriting_history() {
             .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>(),
-        vec![POLICY_NULL_MIGRATION_VERSION, 20260910000000]
+        vec![
+            POLICY_NULL_MIGRATION_VERSION,
+            20260910000000,
+            20260911000000
+        ]
     );
     for _ in 0..2 {
         aether_data_sqlite::run_migrations(&pool).await.unwrap();

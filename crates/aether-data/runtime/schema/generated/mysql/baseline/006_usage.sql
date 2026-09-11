@@ -290,3 +290,18 @@ CREATE TABLE IF NOT EXISTS usage_request_admissions (
     CONSTRAINT usage_request_admissions_subject_id_fkey FOREIGN KEY (`subject_id`) REFERENCES users (`id`) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS provider_quota_reservations (
+    `candidate_id` VARCHAR(64) NOT NULL,
+    `provider_id` VARCHAR(64) NOT NULL,
+    `quota_epoch_start` BIGINT NOT NULL,
+    `dispatch_at` BIGINT NOT NULL,
+    `reserved_cost_units` BIGINT NOT NULL,
+    `state` VARCHAR(16) NOT NULL DEFAULT 'reserved',
+    `created_at` BIGINT NOT NULL,
+    `finalized_at` BIGINT,
+    PRIMARY KEY (`candidate_id`),
+    KEY provider_quota_reservations_active_idx (`provider_id`, `quota_epoch_start`, `state`, `dispatch_at`),
+    KEY provider_quota_reservations_finalized_idx (`finalized_at`),
+    CONSTRAINT provider_quota_reservations_provider_fkey FOREIGN KEY (`provider_id`) REFERENCES providers (`id`) ON DELETE CASCADE
+);
+

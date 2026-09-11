@@ -363,6 +363,7 @@ impl Drop for RoutingGroupInflightGuard<'_> {
 
 #[derive(Clone)]
 enum SharedDataLayerError {
+    ProviderQuotaUnavailable { provider_id: String, reason: String },
     InvalidConfiguration(String),
     InvalidInput(String),
     Postgres(String),
@@ -378,6 +379,13 @@ impl From<&DataLayerError> for SharedDataLayerError {
             DataLayerError::InvalidConfiguration(message) => {
                 Self::InvalidConfiguration(message.clone())
             }
+            DataLayerError::ProviderQuotaUnavailable {
+                provider_id,
+                reason,
+            } => Self::ProviderQuotaUnavailable {
+                provider_id: provider_id.clone(),
+                reason: reason.clone(),
+            },
             DataLayerError::InvalidInput(message) => Self::InvalidInput(message.clone()),
             DataLayerError::Postgres(message) => Self::Postgres(message.clone()),
             DataLayerError::Redis(message) => Self::Redis(message.clone()),
@@ -392,6 +400,13 @@ impl SharedDataLayerError {
     fn into_data_layer_error(self) -> DataLayerError {
         match self {
             Self::InvalidConfiguration(message) => DataLayerError::InvalidConfiguration(message),
+            Self::ProviderQuotaUnavailable {
+                provider_id,
+                reason,
+            } => DataLayerError::ProviderQuotaUnavailable {
+                provider_id,
+                reason,
+            },
             Self::InvalidInput(message) => DataLayerError::InvalidInput(message),
             Self::Postgres(message) => DataLayerError::Postgres(message),
             Self::Redis(message) => DataLayerError::Redis(message),

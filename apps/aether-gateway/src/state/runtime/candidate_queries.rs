@@ -364,7 +364,7 @@ impl AppState {
                 .data
                 .upsert_request_candidate(candidate)
                 .await
-                .map_err(|err| GatewayError::Internal(err.to_string()));
+                .map_err(GatewayError::from_data);
         }
         candidate.sanitize_for_persistence();
         if let Some(queue) = self.request_candidate_queue.as_ref() {

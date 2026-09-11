@@ -617,6 +617,7 @@ fn gateway_error_status(error: &GatewayError) -> StatusCode {
             StatusCode::BAD_REQUEST
         }
         GatewayError::Client { status, .. } => *status,
+        GatewayError::ProviderQuotaUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

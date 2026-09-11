@@ -17,6 +17,7 @@ mod oauth_providers;
 mod pool;
 mod pool_scores;
 mod provider_catalog;
+mod provider_quota_reservations;
 mod proxy_nodes;
 mod quota;
 mod routing_profiles;

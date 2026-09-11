@@ -46,6 +46,7 @@ pub(super) fn cleanup_data_layer_error_category(error: &DataLayerError) -> &'sta
         DataLayerError::Postgres(_) => CLEANUP_ERROR_POSTGRES,
         DataLayerError::Redis(_) => CLEANUP_ERROR_REDIS,
         DataLayerError::Sql(_) => CLEANUP_ERROR_SQL,
+        DataLayerError::ProviderQuotaUnavailable { .. } => "provider_quota_blocked",
         DataLayerError::TimedOut(_) => CLEANUP_ERROR_TIMED_OUT,
         DataLayerError::UnexpectedValue(_) => CLEANUP_ERROR_UNEXPECTED_VALUE,
     }
@@ -63,6 +64,7 @@ fn cleanup_gateway_error_category(error: &GatewayError) -> &'static str {
         GatewayError::LastActiveAdminUpdateDenied | GatewayError::LastActiveAdminDeleteDenied => {
             "operation_rejected"
         }
+        GatewayError::ProviderQuotaUnavailable { .. } => "provider_quota_blocked",
         GatewayError::Internal(_) => CLEANUP_ERROR_INTERNAL,
     }
 }

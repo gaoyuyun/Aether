@@ -45,8 +45,8 @@ fn quota_snapshot_select() -> SelectQuery<'static> {
         ))
         .alias("quota_expires_at_unix_secs"),
         SelectColumn::expr(DialectSql::dialect(
-            "CASE WHEN is_active AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.quota_epoch_start = (providers.quota_last_reset_at / 60) * 60 AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_epoch_start_at_usage = (providers.quota_last_reset_at / 60) * 60 AND delta.quota_accounting_status IN ('pending', 'failed')) THEN TRUE ELSE FALSE END",
-            "CASE WHEN is_active = 1 AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.quota_epoch_start = (providers.quota_last_reset_at / 60) * 60 AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_epoch_start_at_usage = (providers.quota_last_reset_at / 60) * 60 AND delta.quota_accounting_status IN ('pending', 'failed')) THEN 1 ELSE 0 END",
+            "CASE WHEN is_active AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.quota_epoch_start = (providers.quota_last_reset_at / 60) * 60 AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_epoch_start_at_usage = (providers.quota_last_reset_at / 60) * 60 AND delta.quota_accounting_status IN ('pending', 'failed') AND NOT EXISTS (SELECT 1 FROM provider_quota_reservations AS reservation WHERE reservation.candidate_id = delta.request_id AND reservation.provider_id = delta.target_id AND reservation.quota_epoch_start = delta.quota_epoch_start_at_usage AND reservation.state IN ('reserved', 'uncertain'))) THEN TRUE ELSE FALSE END",
+            "CASE WHEN is_active = 1 AND NOT EXISTS (SELECT 1 FROM provider_quota_maintenance_state AS task WHERE task.provider_id = providers.id AND task.quota_epoch_start = (providers.quota_last_reset_at / 60) * 60 AND task.status IN ('pending', 'running', 'failed')) AND NOT EXISTS (SELECT 1 FROM usage_counter_deltas AS delta WHERE delta.kind = 'provider_monthly' AND delta.target_id = providers.id AND delta.quota_epoch_start_at_usage = (providers.quota_last_reset_at / 60) * 60 AND delta.quota_accounting_status IN ('pending', 'failed') AND NOT EXISTS (SELECT 1 FROM provider_quota_reservations AS reservation WHERE reservation.candidate_id = delta.request_id AND reservation.provider_id = delta.target_id AND reservation.quota_epoch_start = delta.quota_epoch_start_at_usage AND reservation.state IN ('reserved', 'uncertain'))) THEN 1 ELSE 0 END",
         ))
         .alias("is_active"),
     ])
@@ -223,7 +223,7 @@ impl ProviderQuotaWriteRepository for SqliteProviderQuotaRepository {
   c.extra_data, c.status AS candidate_status,
   (SELECT CAST(json_extract(ss.settlement_snapshot, '$.provider_quota_cost_usd') AS REAL) FROM usage_settlement_snapshots ss
     JOIN usage_routing_snapshots routing ON routing.request_id = ss.request_id
-    WHERE routing.candidate_id = c.id AND ss.finalized_at IS NOT NULL LIMIT 1) AS settled_cost
+    WHERE routing.candidate_id = c.id AND ss.finalized_at IS NOT NULL AND json_extract(ss.settlement_snapshot, '$.status') = 'complete' LIMIT 1) AS settled_cost
 FROM usage_counter_deltas delta
 JOIN request_candidates c ON c.id = delta.request_id AND c.provider_id = delta.target_id
 JOIN providers p ON p.id = delta.target_id
@@ -233,6 +233,7 @@ WHERE delta.kind = 'provider_monthly' AND delta.quota_epoch_start_at_usage = (p.
   AND (c.status IN ('failed', 'cancelled') OR EXISTS (
     SELECT 1 FROM "usage" u WHERE u.request_id = c.request_id
       AND u.finalized_at IS NOT NULL AND u.finalized_at <= ?))
+  AND NOT EXISTS (SELECT 1 FROM provider_quota_reservations r WHERE r.candidate_id=c.id AND r.state='uncertain')
 ORDER BY delta.created_at, delta.id LIMIT ?"#)
             .bind(provider_id).bind(provider_id).bind(now_unix_secs.saturating_sub(300) as i64)
             .bind(limit.min(1000) as i64).fetch_all(&mut *tx).await.map_sql_err()?;
@@ -259,6 +260,18 @@ ORDER BY delta.created_at, delta.id LIMIT ?"#)
                 .and_then(|v| v.pointer("/provider_quota_attempt_accounting/cost_usd"))
                 .and_then(serde_json::Value::as_f64);
             let settled: Option<f64> = row.try_get("settled_cost").map_sql_err()?;
+            let provisional = extra
+                .as_ref()
+                .and_then(|v| v.pointer("/provider_quota_attempt_accounting/status"))
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|s| matches!(s, "provisional_unknown" | "dispatch_minimum"));
+            if snapshot.reserved_cost_usd.is_some() && settled.is_none() && provisional {
+                if !dry_run {
+                    crate::provider_quota_reservations::retain_uncertain(&mut tx, &candidate_id)
+                        .await?;
+                }
+                continue;
+            }
             let cost = row
                 .try_get::<Option<f64>, _>("cost")
                 .map_sql_err()?

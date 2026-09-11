@@ -454,6 +454,30 @@ pub(crate) async fn reconcile_provider_monthly_attempt_postgres(
     actual_cost_usd: f64,
     cost_is_resolved: bool,
 ) -> Result<bool, DataLayerError> {
+    let reconciled = reconcile_provider_monthly_attempt_postgres_inner(
+        tx,
+        candidate_id,
+        actual_cost_usd,
+        cost_is_resolved,
+    )
+    .await?;
+    if reconciled {
+        crate::provider_quota_reservations::settle_if_ready(
+            tx,
+            candidate_id,
+            chrono::Utc::now().timestamp(),
+        )
+        .await?;
+    }
+    Ok(reconciled)
+}
+
+async fn reconcile_provider_monthly_attempt_postgres_inner(
+    tx: &mut crate::PostgresTransaction,
+    candidate_id: &str,
+    actual_cost_usd: f64,
+    cost_is_resolved: bool,
+) -> Result<bool, DataLayerError> {
     let delta_id = uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_OID,
         format!("provider-quota-attempt:{}", candidate_id).as_bytes(),

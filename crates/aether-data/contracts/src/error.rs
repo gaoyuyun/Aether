@@ -1,5 +1,7 @@
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DataLayerError {
+    #[error("provider quota temporarily unavailable: {provider_id}: {reason}")]
+    ProviderQuotaUnavailable { provider_id: String, reason: String },
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
 

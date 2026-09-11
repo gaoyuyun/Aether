@@ -210,6 +210,7 @@ fn request_candidate_seed_write_timeout() -> Duration {
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalRequestCandidateStatusSnapshot {
+    reservation_input: aether_billing::ProviderQuotaReservationInput,
     candidate_id: String,
     request_id: String,
     user_id: Option<String>,
@@ -226,6 +227,7 @@ pub(crate) struct LocalRequestCandidateStatusSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderQuotaDispatchContext {
+    pub(crate) reservation_input: aether_billing::ProviderQuotaReservationInput,
     pub(crate) provider_id: String,
     pub(crate) key_id: String,
     pub(crate) model_id: Option<String>,
@@ -426,6 +428,9 @@ pub(crate) fn snapshot_local_request_candidate_status(
         .unwrap_or(0);
 
     Some(LocalRequestCandidateStatusSnapshot {
+        reservation_input: aether_billing::ProviderQuotaReservationInput::from_body(
+            plan.body.json_body.as_ref(),
+        ),
         candidate_id: candidate_id.to_string(),
         request_id: plan.request_id.clone(),
         user_id: metadata
@@ -462,6 +467,9 @@ fn plan_provider_quota_dispatch_context(
     report_context: Option<&Value>,
 ) -> ProviderQuotaDispatchContext {
     ProviderQuotaDispatchContext {
+        reservation_input: aether_billing::ProviderQuotaReservationInput::from_body(
+            plan.body.json_body.as_ref(),
+        ),
         provider_id: plan.provider_id.clone(),
         key_id: plan.key_id.clone(),
         model_id: report_context_string(report_context, "model_id"),
@@ -474,6 +482,7 @@ fn snapshot_provider_quota_dispatch_context(
     snapshot: &LocalRequestCandidateStatusSnapshot,
 ) -> ProviderQuotaDispatchContext {
     ProviderQuotaDispatchContext {
+        reservation_input: snapshot.reservation_input.clone(),
         provider_id: snapshot.provider_id.clone(),
         key_id: snapshot.key_id.clone(),
         model_id: snapshot.model_id.clone(),
@@ -740,7 +749,12 @@ fn local_request_candidate_skip_reason(
     (status == RequestCandidateStatus::Skipped)
         .then_some(error_type)
         .flatten()
-        .filter(|reason| *reason == "provider_key_concurrency_limit_reached")
+        .filter(|reason| {
+            matches!(
+                *reason,
+                "provider_key_concurrency_limit_reached" | "provider_quota_blocked"
+            )
+        })
         .map(ToOwned::to_owned)
 }
 
@@ -1418,6 +1432,7 @@ mod tests {
             attach_provider_quota_dispatch_snapshot(
                 &mut candidate.extra_data,
                 &ProviderQuotaDispatchSnapshot {
+                    reserved_cost_usd: None,
                     schema_version: PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
                     provider_billing_type_at_usage: "monthly_quota".to_string(),
                     quota_epoch_start_at_usage: Some(1_699_999_980),

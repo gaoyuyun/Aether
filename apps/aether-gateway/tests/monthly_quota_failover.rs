@@ -249,13 +249,14 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
 
     let quota = SqliteProviderQuotaRepository::new(pool.clone());
     for _ in 0..100 {
-        if quota
-            .find_by_provider_id(&a_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_active
-        {
+        let terminal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_candidates WHERE provider_id=? AND status='failed'",
+        )
+        .bind(&a_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if terminal == failed_attempts as i64 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -266,12 +267,22 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
         "failed attempt left monthly provider blocked"
     );
     assert_eq!(recovered.monthly_used_usd, 0.0);
-    let failed = sqlx::query("SELECT c.status, d.quota_accounting_status FROM request_candidates c JOIN usage_counter_deltas d ON d.request_id=c.id WHERE c.provider_id=? AND d.kind='provider_monthly'")
+    let failed = sqlx::query("SELECT c.status, d.quota_accounting_status, r.state AS reservation_state, r.reserved_cost_units FROM request_candidates c JOIN usage_counter_deltas d ON d.request_id=c.id JOIN provider_quota_reservations r ON r.candidate_id=c.id WHERE c.provider_id=? AND d.kind='provider_monthly'")
         .bind(&a_id).fetch_all(&pool).await.unwrap();
     assert_eq!(failed.len(), failed_attempts);
     for attempt in failed {
         assert_eq!(attempt.get::<String, _>("status"), "failed");
-        assert_eq!(attempt.get::<String, _>("quota_accounting_status"), "ready");
+        let accounting = attempt.get::<String, _>("quota_accounting_status");
+        if accounting == "ready" {
+            assert_eq!(attempt.get::<String, _>("reservation_state"), "settled");
+        } else {
+            assert!(matches!(accounting.as_str(), "pending" | "failed"));
+            assert_eq!(attempt.get::<String, _>("reservation_state"), "uncertain");
+            assert!(
+                attempt.get::<i64, _>("reserved_cost_units") > 0,
+                "unmeasurable usage must retain only that attempt's estimate"
+            );
+        }
     }
 
     // Restrict a new request to A so sticky affinity to the successful fallback cannot hide A.
@@ -299,7 +310,12 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        if finalized == 2 {
+        let successful_candidates: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_candidates WHERE status='success'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if finalized == 2 && successful_candidates == 1 + expected_b_hits as i64 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -345,7 +361,7 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
                 < 1e-12
         );
     }
-    let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_counter_deltas WHERE kind='provider_monthly' AND quota_accounting_status != 'ready'")
+    let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_counter_deltas d WHERE d.kind='provider_monthly' AND d.quota_accounting_status != 'ready' AND NOT EXISTS (SELECT 1 FROM provider_quota_reservations r WHERE r.candidate_id=d.request_id AND r.state='uncertain')")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(unresolved, 0);
     let writer = SqliteUsageWriteRepository::new(pool.clone());
@@ -413,4 +429,253 @@ fn monthly_quota_recovers_after_http_timeout_and_stream_failover() {
     if let Err(error) = handle.join() {
         std::panic::resume_unwind(error);
     }
+}
+
+async fn concurrent_reservation_case(stream: bool) {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let search_hits = Arc::new(AtomicUsize::new(0));
+    let permits = release.clone();
+    let hits = arrivals.clone();
+    let searches = search_hits.clone();
+    let a = serve(
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(payload): Json<Value>| {
+                    let permits = permits.clone();
+                    let hits = hits.clone();
+                    async move {
+                        let hit = hits.fetch_add(1, Ordering::SeqCst);
+                        if hit < 2 {
+                            permits.acquire().await.unwrap().forget();
+                        }
+                        completion("monthly-a", payload["stream"].as_bool().unwrap_or(false))
+                    }
+                }),
+            )
+            .route(
+                "/v1/alpha/search",
+                post(move || {
+                    searches.fetch_add(1, Ordering::SeqCst);
+                    async { Json(json!({"output":"local search result","encrypted_output":"local-search"})) }
+                }),
+            ),
+    )
+    .await;
+    let b = serve(Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(payload): Json<Value>| async move {
+            completion("fallback-b", payload["stream"].as_bool().unwrap_or(false))
+        }),
+    ))
+    .await;
+    let path = std::env::temp_dir().join(format!(
+        "aether-quota-concurrent-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let a_id = "monthly-concurrent-a";
+    let b_id = "fallback-concurrent-b";
+    seed(&pool, &a.url, &b.url, now, a_id, b_id).await;
+    sqlx::query("UPDATE providers SET monthly_quota_usd=0.5,request_timeout=30,stream_first_byte_timeout=30,config=? WHERE id=?")
+        .bind(json!({"quota_reservation":{"minimum_usd":0.25,"output_tokens":16,"safety_multiplier":1.0}}).to_string())
+        .bind(a_id).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO provider_endpoints (id,provider_id,name,base_url,api_format,api_family,endpoint_kind,max_retries,created_at,updated_at) VALUES ('search-endpoint',?,'search',?,'openai:search','openai','search',0,1,1)")
+        .bind(a_id).bind(format!("{}/v1",a.url)).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE provider_api_keys SET api_formats='[\"openai:chat\",\"openai:search\"]',global_priority_by_format='{\"openai:chat\":1,\"openai:search\":1}' WHERE provider_id=?")
+        .bind(a_id).execute(&pool).await.unwrap();
+    let state = AppState::new()
+        .unwrap()
+        .with_data_config_and_background_isolation(
+            GatewayDataConfig::from_database_config(
+                SqlDatabaseConfig::new(DatabaseDriver::Sqlite, url, SqlPoolConfig::default())
+                    .unwrap(),
+            )
+            .with_encryption_key(DEVELOPMENT_ENCRYPTION_KEY),
+            false,
+        )
+        .unwrap()
+        .with_usage_runtime_config(UsageRuntimeConfig {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+    state.ensure_system_default_routing_group().await.unwrap();
+    let gateway = serve(build_router_with_state(state)).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let body = json!({"model":"quota-test","messages":[{"role":"user","content":"concurrent probe"}],"stream":stream});
+    let mut running = Vec::new();
+    for index in 0..2 {
+        let client = client.clone();
+        let url = gateway.url.clone();
+        let body = body.clone();
+        running.push(tokio::spawn(async move {
+            let response = client
+                .post(format!("{url}/v1/chat/completions"))
+                .bearer_auth("sk-quota-only-a")
+                .header("x-trace-id", format!("concurrent-{stream}-{index}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert!(response.text().await.unwrap().contains("monthly-a"));
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while arrivals.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both requests must reach the monthly upstream before either completes");
+    let failover_id = format!("concurrent-failover-{stream}");
+    let start = std::time::Instant::now();
+    let fallback = client
+        .post(format!("{}/v1/chat/completions", gateway.url))
+        .bearer_auth("sk-quota-both")
+        .header("x-trace-id", &failover_id)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(fallback.status().is_success());
+    assert!(fallback.text().await.unwrap().contains("fallback-b"));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "quota rejection must transfer within the same HTTP request"
+    );
+    let denied_id = format!("concurrent-denied-{stream}");
+    let denied = client
+        .post(format!("{}/v1/chat/completions", gateway.url))
+        .bearer_auth("sk-quota-only-a")
+        .header("x-trace-id", &denied_id)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let search=client.post(format!("{}/v1/alpha/search",gateway.url)).bearer_auth("sk-quota-only-a")
+        .json(&json!({"id":"quota-search","model":"quota-test","commands":{"search_query":[{"q":"test"}]}})).send().await.unwrap();
+    let status = search.status();
+    let text = search.text().await.unwrap();
+    assert!(
+        status.is_success(),
+        "free Search must work with a fully reserved provider: {status} {text}"
+    );
+    assert_eq!(search_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        arrivals.load(Ordering::SeqCst),
+        2,
+        "insufficient reservations must never reach the upstream"
+    );
+    release.add_permits(2);
+    for task in running {
+        task.await.unwrap();
+    }
+    // HTTP delivery can finish before the background terminal writer. Wait for
+    // durable settlement, not provider.is_active (which now remains true in flight).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let reserved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_quota_reservations WHERE provider_id=? AND state='reserved' AND reserved_cost_units>0")
+                .bind(a_id).fetch_one(&pool).await.unwrap();
+            let active_candidates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_candidates WHERE status IN ('pending','streaming')")
+                .fetch_one(&pool).await.unwrap();
+            if reserved == 0 && active_candidates == 0 { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("successful requests must settle their reservations promptly");
+    for _ in 0..100 {
+        let pending:i64=sqlx::query_scalar("SELECT COUNT(*) FROM usage WHERE request_id IN (?,?) AND status NOT IN ('pending','streaming')")
+            .bind(&failover_id).bind(&denied_id).fetch_one(&pool).await.unwrap();
+        if pending == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for id in [&failover_id, &denied_id] {
+        let row=sqlx::query("SELECT COUNT(*) n,SUM(CASE WHEN status IN ('pending','streaming') THEN 1 ELSE 0 END) pending FROM usage WHERE request_id=?")
+            .bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            row.get::<i64, _>("n"),
+            1,
+            "a retry/skip must remain one usage request"
+        );
+        assert_eq!(
+            row.get::<i64, _>("pending"),
+            0,
+            "no orphan usage awaiting the ten-minute cleaner"
+        );
+    }
+    let rows=sqlx::query("SELECT provider_id,retry_index,status FROM request_candidates WHERE request_id=? ORDER BY candidate_index,retry_index")
+        .bind(&failover_id).fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.get::<String, _>("provider_id") == a_id)
+            .count(),
+        1,
+        "skip exhausted provider without same-key retries"
+    );
+    assert!(rows
+        .iter()
+        .any(|r| r.get::<String, _>("provider_id") == b_id
+            && r.get::<String, _>("status") == "success"));
+    let next = client
+        .post(format!("{}/v1/chat/completions", gateway.url))
+        .bearer_auth("sk-quota-only-a")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(next.status().is_success());
+    assert!(next.text().await.unwrap().contains("monthly-a"));
+    drop(gateway);
+    drop(pool);
+    let _ = std::fs::remove_file(path);
+}
+
+fn run_concurrent_reservation_case(stream: bool) {
+    std::env::set_var(
+        "AETHER_GATEWAY_OPENAI_CHAT_STREAM_TARGET_SELECT_WINDOW",
+        "1",
+    );
+    let thread = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(concurrent_reservation_case(stream));
+        })
+        .unwrap();
+    if let Err(error) = thread.join() {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
+fn monthly_quota_allows_concurrent_sync_and_free_search() {
+    run_concurrent_reservation_case(false);
+}
+
+#[test]
+fn monthly_quota_allows_concurrent_stream_and_free_search() {
+    run_concurrent_reservation_case(true);
 }

@@ -298,3 +298,19 @@ CREATE INDEX IF NOT EXISTS usage_request_admissions_subject_admitted_at_idx ON p
 CREATE INDEX IF NOT EXISTS usage_request_admissions_retain_until_token_idx ON public.usage_request_admissions USING btree (retain_until, event_token);
 ALTER TABLE ONLY public.usage_request_admissions ADD CONSTRAINT usage_request_admissions_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
+CREATE TABLE IF NOT EXISTS public.provider_quota_reservations (
+    candidate_id character varying(64) NOT NULL,
+    provider_id character varying(64) NOT NULL,
+    quota_epoch_start bigint NOT NULL,
+    dispatch_at bigint NOT NULL,
+    reserved_cost_units bigint NOT NULL,
+    state character varying(16) DEFAULT 'reserved' NOT NULL,
+    created_at bigint NOT NULL,
+    finalized_at bigint
+);
+
+ALTER TABLE ONLY public.provider_quota_reservations ADD CONSTRAINT provider_quota_reservations_pkey PRIMARY KEY (candidate_id);
+CREATE INDEX IF NOT EXISTS provider_quota_reservations_active_idx ON public.provider_quota_reservations USING btree (provider_id, quota_epoch_start, state, dispatch_at);
+CREATE INDEX IF NOT EXISTS provider_quota_reservations_finalized_idx ON public.provider_quota_reservations USING btree (finalized_at);
+ALTER TABLE ONLY public.provider_quota_reservations ADD CONSTRAINT provider_quota_reservations_provider_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
+

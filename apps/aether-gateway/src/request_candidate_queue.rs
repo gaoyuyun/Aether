@@ -1463,7 +1463,9 @@ fn request_candidate_write_error_disposition(
 
     match error {
         DataLayerError::InvalidConfiguration(_) => RequestCandidateWriteErrorDisposition::DropBatch,
-        DataLayerError::InvalidInput(_) | DataLayerError::UnexpectedValue(_) => {
+        DataLayerError::InvalidInput(_)
+        | DataLayerError::UnexpectedValue(_)
+        | DataLayerError::ProviderQuotaUnavailable { .. } => {
             RequestCandidateWriteErrorDisposition::IsolateRecord
         }
         DataLayerError::Postgres(message) | DataLayerError::Sql(message) => {
@@ -1523,6 +1525,7 @@ fn request_candidate_write_error_kind(
         DataLayerError::Postgres(_) => "postgres",
         DataLayerError::Sql(_) => "sql",
         DataLayerError::Redis(_) => "redis",
+        DataLayerError::ProviderQuotaUnavailable { .. } => "provider_quota_blocked",
         DataLayerError::TimedOut(_) => "timed_out",
     }
 }

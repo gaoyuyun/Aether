@@ -307,6 +307,7 @@ fn safe_codex_quota_refresh_error(error: &GatewayError) -> &'static str {
         | GatewayError::Client { message, .. }
         | GatewayError::Internal(message) => message.as_str(),
         GatewayError::PlanUsageLimited(_)
+        | GatewayError::ProviderQuotaUnavailable { .. }
         | GatewayError::LastActiveAdminUpdateDenied
         | GatewayError::LastActiveAdminDeleteDenied => return "Quota refresh failed",
         GatewayError::LocalExecutionPlanningTimeout { .. }

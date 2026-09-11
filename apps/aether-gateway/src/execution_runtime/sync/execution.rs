@@ -207,6 +207,9 @@ fn persisted_sync_abort_message(error: &GatewayError) -> &'static str {
         GatewayError::Internal(_) => {
             "local sync attempt aborted before terminal finalization: internal error"
         }
+        GatewayError::ProviderQuotaUnavailable { .. } => {
+            "local sync attempt aborted before terminal finalization: provider quota unavailable"
+        }
     }
 }
 
@@ -2127,13 +2130,7 @@ async fn execute_execution_runtime_sync_impl(
             return Ok(None);
         }
     };
-    let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
-    let usage_data = state.usage_lifecycle_data_state().as_ref().clone();
-    state
-        .usage_runtime
-        .record_pending_direct(&usage_data, lifecycle_seed)
-        .await;
-    record_local_request_candidate_dispatch(
+    let dispatch_result = record_local_request_candidate_dispatch(
         state,
         &plan,
         report_context.as_ref(),
@@ -2147,7 +2144,39 @@ async fn execute_execution_runtime_sync_impl(
             finished_at_unix_ms: None,
         },
     )
-    .await?;
+    .await;
+    if let Err(error) = dispatch_result {
+        if let GatewayError::ProviderQuotaUnavailable {
+            provider_id,
+            reason,
+        } = &error
+        {
+            tracing::info!(event_name = "provider_quota_reservation_rejected", log_type = "event",
+                    trace_id = %trace_id, request_id = %plan.request_id, provider_id = %provider_id, reason = %reason,
+                    "gateway skipped provider because quota could not be reserved");
+            record_local_runtime_candidate_skip_reason(state, trace_id, "provider_quota_blocked");
+            if let Some(scope) = retry_scope_out.as_deref_mut() {
+                *scope = AiAttemptRetryScope::Provider;
+            }
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Skipped,
+                    status_code: None,
+                    error_type: Some("provider_quota_blocked".to_owned()),
+                    error_message: Some(reason.clone()),
+                    latency_ms: Some(0),
+                    started_at_unix_ms: None,
+                    finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                },
+            )
+            .await;
+            return Ok(None);
+        }
+        return Err(error);
+    }
     let mut terminal_guard = SyncAttemptTerminalGuard::new(
         state,
         &plan,
@@ -2155,6 +2184,12 @@ async fn execute_execution_runtime_sync_impl(
         candidate_started_unix_secs,
         candidate_started_at,
     );
+    let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let usage_data = state.usage_lifecycle_data_state().as_ref().clone();
+    state
+        .usage_runtime
+        .record_pending_direct(&usage_data, lifecycle_seed)
+        .await;
     let result = (async {
     record_sync_execution_active(
         state,

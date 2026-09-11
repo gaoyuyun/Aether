@@ -4,6 +4,7 @@ mod formula_engine;
 mod models;
 mod precision;
 mod pricing;
+mod reservation;
 mod schema;
 mod service;
 mod token_normalization;
@@ -27,6 +28,7 @@ pub use pricing::{
     BillingPricingConfigurationError, BillingPricingResolution, BillingPricingSource,
     BillingUsageInput,
 };
+pub use reservation::{estimate_provider_quota_reservation, ProviderQuotaReservationInput};
 pub use schema::{
     BillingSnapshot, BillingSnapshotStatus, CostResult, BILLING_SNAPSHOT_SCHEMA_VERSION,
 };

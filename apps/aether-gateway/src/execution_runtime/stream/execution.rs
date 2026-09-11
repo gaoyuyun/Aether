@@ -3919,12 +3919,8 @@ async fn execute_execution_runtime_stream_inner(
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
     let candidate_started_at = Instant::now();
     let mut lifecycle_pending_recorded = false;
-    if let Some(seed) = lifecycle_seed.as_ref() {
-        record_stream_pending_lifecycle(state, seed, &mut stage_trace).await;
-        lifecycle_pending_recorded = true;
-    }
     if let Some(snapshot) = request_candidate_status_snapshot.clone() {
-        record_local_request_candidate_dispatch_snapshot(
+        let dispatch_result = record_local_request_candidate_dispatch_snapshot(
             state,
             &snapshot,
             SchedulerRequestCandidateStatusUpdate {
@@ -3937,7 +3933,42 @@ async fn execute_execution_runtime_stream_inner(
                 finished_at_unix_ms: None,
             },
         )
-        .await?;
+        .await;
+        if let Err(error) = dispatch_result {
+            if let GatewayError::ProviderQuotaUnavailable {
+                provider_id,
+                reason,
+            } = &error
+            {
+                tracing::info!(event_name = "provider_quota_reservation_rejected", log_type = "event",
+                    trace_id = %trace_id, request_id = %plan.request_id, provider_id = %provider_id, reason = %reason,
+                    "gateway skipped provider because quota could not be reserved");
+                record_local_runtime_candidate_skip_reason(
+                    state,
+                    trace_id,
+                    "provider_quota_blocked",
+                );
+                if let Some(scope) = retry_scope_out.as_deref_mut() {
+                    *scope = AiAttemptRetryScope::Provider;
+                }
+                record_local_request_candidate_status_snapshot(
+                    state,
+                    &snapshot,
+                    SchedulerRequestCandidateStatusUpdate {
+                        status: RequestCandidateStatus::Skipped,
+                        status_code: None,
+                        error_type: Some("provider_quota_blocked".to_owned()),
+                        error_message: Some(reason.clone()),
+                        latency_ms: Some(0),
+                        started_at_unix_ms: None,
+                        finished_at_unix_ms: Some(current_request_candidate_unix_ms()),
+                    },
+                )
+                .await;
+                return Ok(None);
+            }
+            return Err(error);
+        }
     }
     // From here the attempt owns non-terminal rows, and everything that could
     // settle them runs inside the downstream request future. Arm the guard so a
@@ -3949,6 +3980,10 @@ async fn execute_execution_runtime_stream_inner(
         candidate_started_unix_secs,
         stream_started_at,
     );
+    if let Some(seed) = lifecycle_seed.as_ref() {
+        record_stream_pending_lifecycle(state, seed, &mut stage_trace).await;
+        lifecycle_pending_recorded = true;
+    }
     let plan_request_id_for_log = short_request_id(plan.request_id.as_str());
     let provider_name = plan
         .provider_name
