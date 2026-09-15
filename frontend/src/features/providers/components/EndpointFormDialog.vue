@@ -117,6 +117,18 @@
                 >
                   <Radio class="w-3.5 h-3.5" />
                 </Button>
+                <!-- Claude count_tokens 支持开关 -->
+                <Button
+                  v-if="isClaudeCountTokensToggleVisible(endpoint)"
+                  variant="ghost"
+                  size="icon"
+                  :class="getClaudeCountTokensButtonClass(endpoint)"
+                  :title="getClaudeCountTokensTooltip(endpoint)"
+                  :disabled="savingEndpointId === endpoint.id"
+                  @click="handleToggleClaudeCountTokens(endpoint)"
+                >
+                  <Hash class="w-3.5 h-3.5" />
+                </Button>
                 <!-- 启用/停用 -->
                 <Button
                   variant="ghost"
@@ -1069,7 +1081,7 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from '@/components/ui'
-import { Settings, Trash2, Check, X, Power, ChevronRight, Plus, Shuffle, RotateCcw, Radio, CheckCircle, Save, Filter, HelpCircle, GripVertical, Globe, Code2, AlignLeft, Eye } from 'lucide-vue-next'
+import { Settings, Trash2, Check, X, Power, ChevronRight, Plus, Shuffle, RotateCcw, Radio, Hash, CheckCircle, Save, Filter, HelpCircle, GripVertical, Globe, Code2, AlignLeft, Eye } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { log } from '@/utils/logger'
@@ -1096,7 +1108,7 @@ import {
   type BodyRuleRegexReplace,
 } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
-import { formatApiFormat } from '@/api/endpoints/types/api-format'
+import { API_FORMATS, formatApiFormat, normalizeApiFormatAlias } from '@/api/endpoints/types/api-format'
 import {
   conditionEquals,
   conditionToEditable,
@@ -3515,6 +3527,78 @@ function getUpstreamStreamTooltip(endpoint: ProviderEndpoint): string {
   if (policy === 'force_stream') return legacyT('固定流式（点击切换为固定非流）')
   if (policy === 'force_non_stream') return legacyT('固定非流（点击切换为跟随请求）')
   return legacyT('跟随请求（点击切换为固定流式）')
+}
+
+// ---- Claude count_tokens 支持开关（endpoint.config.anthropic.supported_operations）----
+// 后端语义：未配置 supported_operations 时默认视为支持；配置了数组但不含 count_tokens 则跳过该端点。
+// Kiro / Grok 私有适配器在后端被固定为不支持，前端不展示开关。
+const CLAUDE_COUNT_TOKENS_OPERATION = 'count_tokens'
+const CLAUDE_MESSAGES_OPERATION = 'messages'
+const CLAUDE_COUNT_TOKENS_FIXED_UNSUPPORTED_PROVIDER_TYPES = new Set(['kiro', 'grok'])
+
+function isClaudeCountTokensToggleVisible(endpoint: ProviderEndpoint): boolean {
+  if (normalizeApiFormatAlias(endpoint.api_format) !== API_FORMATS.CLAUDE_MESSAGES) return false
+  const providerType = (props.provider?.provider_type || '').trim().toLowerCase()
+  return !CLAUDE_COUNT_TOKENS_FIXED_UNSUPPORTED_PROVIDER_TYPES.has(providerType)
+}
+
+function readAnthropicConfig(config: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  const raw = config?.anthropic
+  return raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? { ...(raw as Record<string, unknown>) }
+    : {}
+}
+
+function isClaudeCountTokensSupported(endpoint: ProviderEndpoint): boolean {
+  const operations = readAnthropicConfig(endpoint.config).supported_operations
+  if (!Array.isArray(operations)) return true
+  return operations.some(op => typeof op === 'string' && op.trim().toLowerCase() === CLAUDE_COUNT_TOKENS_OPERATION)
+}
+
+function getClaudeCountTokensButtonClass(endpoint: ProviderEndpoint): string {
+  return isClaudeCountTokensSupported(endpoint) ? 'h-7 w-7 text-primary' : 'h-7 w-7 text-destructive'
+}
+
+function getClaudeCountTokensTooltip(endpoint: ProviderEndpoint): string {
+  return isClaudeCountTokensSupported(endpoint)
+    ? legacyT('上游支持 count_tokens（点击标记为不支持）')
+    : legacyT('上游不支持 count_tokens，该端点不会接收 token 计数请求（点击标记为支持）')
+}
+
+async function handleToggleClaudeCountTokens(endpoint: ProviderEndpoint) {
+  const nextSupported = !isClaudeCountTokensSupported(endpoint)
+
+  savingEndpointId.value = endpoint.id
+  try {
+    const merged: Record<string, unknown> = { ...(endpoint.config || {}) }
+    const anthropic = readAnthropicConfig(merged)
+    const existing = Array.isArray(anthropic.supported_operations)
+      ? (anthropic.supported_operations as unknown[])
+        .filter((op): op is string => typeof op === 'string')
+        .map(op => op.trim().toLowerCase())
+        .filter(op => op && op !== CLAUDE_COUNT_TOKENS_OPERATION)
+      : [CLAUDE_MESSAGES_OPERATION]
+    const operations = Array.from(new Set([
+      ...(existing.length > 0 ? existing : [CLAUDE_MESSAGES_OPERATION]),
+      ...(nextSupported ? [CLAUDE_COUNT_TOKENS_OPERATION] : []),
+    ]))
+    anthropic.supported_operations = operations
+    merged.anthropic = anthropic
+
+    const updated = await updateEndpoint(endpoint.id, {
+      config: merged,
+    })
+    replaceLocalEndpoint({ ...endpoint, ...updated, config: merged })
+
+    success(nextSupported
+      ? legacyT('已标记为支持 count_tokens')
+      : legacyT('已标记为不支持 count_tokens'))
+    emit('endpointUpdated')
+  } catch (error: unknown) {
+    showError(localizedApiError(error, '操作失败'), legacyT('错误'))
+  } finally {
+    savingEndpointId.value = null
+  }
 }
 
 // 循环切换上游流式策略并直接保存

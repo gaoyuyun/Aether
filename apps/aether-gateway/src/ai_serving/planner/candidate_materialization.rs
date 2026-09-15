@@ -48,6 +48,7 @@ use crate::clock::current_unix_ms;
 use crate::dispatch::refs::dispatch_ref_for_local_candidate;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::orchestration::{ExecutionAttemptIdentity, POOL_KEY_RETRY_INDEX_STRIDE};
+use crate::scheduler::affinity::request_operation_writes_session_affinity;
 use crate::scheduler::candidate::is_auth_api_key_concurrency_limit_skip_reason;
 use crate::scheduler::config::SchedulerSchedulingMode;
 use crate::stage_metrics::observe_gateway_stage_ms;
@@ -602,6 +603,7 @@ pub(crate) async fn materialize_local_execution_candidates_with_serving<F, G>(
     routing_policy: Option<&ResolvedRoutingPolicy>,
     sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
+    request_operation: Option<&str>,
     persistence_policy: LocalCandidatePersistencePolicy<'_>,
     candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
@@ -613,8 +615,9 @@ where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync,
 {
-    let scheduler_cache_affinity_enabled =
-        scheduler_cache_affinity_enabled(state, routing_policy).await;
+    let scheduler_cache_affinity_enabled = scheduler_cache_affinity_enabled(state, routing_policy)
+        .await
+        && request_operation_writes_session_affinity(request_operation);
     let port = GatewayLocalCandidateMaterializationPort {
         state,
         trace_id,
@@ -651,6 +654,7 @@ pub(crate) async fn build_local_execution_candidate_attempt_source_with_serving<
     routing_policy: Option<&ResolvedRoutingPolicy>,
     sticky_session_token: Option<&str>,
     request_auth_channel: Option<&str>,
+    request_operation: Option<&str>,
     persistence_policy: LocalCandidatePersistencePolicy<'_>,
     candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
     preselection_skipped: Vec<SkippedLocalExecutionCandidate>,
@@ -662,8 +666,9 @@ where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync,
 {
-    let scheduler_cache_affinity_enabled =
-        scheduler_cache_affinity_enabled(state, routing_policy).await;
+    let scheduler_cache_affinity_enabled = scheduler_cache_affinity_enabled(state, routing_policy)
+        .await
+        && request_operation_writes_session_affinity(request_operation);
     let _ = build_available_extra_data;
     let (candidates, resolved_skipped) = resolve_and_rank_logical_local_execution_candidates(
         state,
@@ -827,8 +832,9 @@ where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync + 'a,
     G: Fn(SkippedLocalExecutionCandidate) -> SkippedLocalExecutionCandidate + Send + Sync + 'a,
 {
-    let scheduler_cache_affinity_enabled =
-        scheduler_cache_affinity_enabled(state, routing_policy).await;
+    let scheduler_cache_affinity_enabled = scheduler_cache_affinity_enabled(state, routing_policy)
+        .await
+        && request_operation_writes_session_affinity(request_operation);
     let _ = build_available_extra_data;
     let decorate_skipped_candidate = Arc::new(decorate_skipped_candidate);
     let record_runtime_miss_diagnostic = persistence_policy.skipped.record_runtime_miss_diagnostic;

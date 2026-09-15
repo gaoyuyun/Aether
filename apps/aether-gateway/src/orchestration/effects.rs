@@ -50,6 +50,7 @@ use crate::orchestration::{
     ROUTING_POOL_POLICY_OVERRIDE_REPORT_FIELD,
 };
 use crate::scheduler::affinity::{
+    request_operation_writes_session_affinity,
     scheduler_affinity_policy_context_from_report_context, SCHEDULER_AFFINITY_POLICY_REPORT_FIELD,
     SCHEDULER_AFFINITY_TTL,
 };
@@ -762,6 +763,12 @@ async fn local_scheduler_affinity_matches_failed_target(
     local_execution_plan_uses_pool(state, plan).await
 }
 
+fn local_request_operation(report_context: Option<&Value>) -> Option<&str> {
+    report_context
+        .and_then(|context| context.get("api_operation"))
+        .and_then(Value::as_str)
+}
+
 fn scheduler_cache_affinity_enabled(report_context: Option<&Value>) -> bool {
     report_context
         .and_then(|context| context.get(SCHEDULER_AFFINITY_POLICY_REPORT_FIELD))
@@ -775,6 +782,9 @@ async fn remember_successful_local_scheduler_affinity(
     context: LocalExecutionEffectContext<'_>,
 ) {
     if !scheduler_cache_affinity_enabled(context.report_context) {
+        return;
+    }
+    if !request_operation_writes_session_affinity(local_request_operation(context.report_context)) {
         return;
     }
     let Some(cache_key) = local_scheduler_affinity_cache_key(context.report_context) else {
@@ -3178,6 +3188,54 @@ mod tests {
                 endpoint_id: "ep-1".to_string(),
                 key_id: "key-1".to_string(),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_count_tokens_success_does_not_remember_scheduler_affinity() {
+        let state = AppState::new().expect("gateway state should build");
+        let plan = sample_claude_plan();
+        let mut report_context = cache_affinity_report_context();
+        report_context["client_api_format"] = json!("claude:messages");
+        report_context["api_operation"] = json!("count_tokens");
+        let cache_key = build_scheduler_affinity_cache_key_for_api_key_id(
+            "api-key-1",
+            "claude:messages",
+            "gpt-5",
+        )
+        .expect("scheduler affinity cache key should build");
+
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
+        )
+        .await;
+
+        assert_eq!(
+            state.read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL),
+            None,
+            "count_tokens must not become the session's remembered upstream"
+        );
+
+        report_context["api_operation"] = json!("messages");
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::HealthSuccess(LocalHealthSuccessEffect),
+        )
+        .await;
+        assert!(
+            state
+                .read_scheduler_affinity_target(cache_key.as_str(), SCHEDULER_AFFINITY_TTL)
+                .is_some(),
+            "message creation on the same plan still remembers affinity"
         );
     }
 

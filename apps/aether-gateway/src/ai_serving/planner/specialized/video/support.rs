@@ -229,6 +229,7 @@ pub(super) async fn build_local_video_create_candidate_attempt_source<'a>(
         input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
+        None,
         persistence_policy,
         candidates,
         preselection_skipped
@@ -295,6 +296,7 @@ async fn materialize_local_video_create_candidate_attempts(
         input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
+        None,
         persistence_policy,
         candidates,
         preselection_skipped,

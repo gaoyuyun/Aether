@@ -227,6 +227,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
         input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
+        request_operation,
         persistence_policy,
         preselection.candidates,
         preselection.skipped_candidates,
@@ -394,6 +395,7 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
     let sticky_session_token = extract_pool_sticky_session_token(body_json);
+    let request_operation = openai_responses_request_operation(spec_metadata.api_format, body_json);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
     let persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
@@ -428,6 +430,7 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
         input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
+        request_operation,
         persistence_policy,
         preselection.candidates,
         preselection.skipped_candidates,

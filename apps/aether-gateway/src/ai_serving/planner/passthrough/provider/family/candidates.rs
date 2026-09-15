@@ -156,6 +156,7 @@ pub(crate) async fn materialize_local_same_format_provider_candidate_attempts(
         input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
+        spec.operation.map(|operation| operation.as_str()),
         persistence_policy,
         candidates,
         preselection_skipped
@@ -266,6 +267,7 @@ pub(crate) async fn build_local_same_format_provider_candidate_attempt_source<'a
         input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
+        spec.operation.map(|operation| operation.as_str()),
         persistence_policy,
         candidates,
         preselection_skipped

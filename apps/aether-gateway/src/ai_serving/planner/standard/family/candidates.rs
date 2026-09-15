@@ -156,6 +156,7 @@ pub(super) async fn materialize_local_standard_candidate_attempts(
         input.routing_policy.as_ref(),
         sticky_session_token.as_deref(),
         input.request_auth_channel.as_deref(),
+        None,
         persistence_policy,
         candidates,
         skipped_candidates,

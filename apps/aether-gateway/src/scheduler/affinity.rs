@@ -14,6 +14,18 @@ use super::state::SchedulerRuntimeState;
 pub(crate) const SCHEDULER_AFFINITY_TTL: Duration = Duration::from_secs(300);
 pub(crate) const SCHEDULER_AFFINITY_POLICY_REPORT_FIELD: &str = "scheduler_affinity_policy";
 
+/// Claude `count_tokens` is a stateless helper call. It may follow the
+/// session's remembered upstream, but it must never *become* the remembered
+/// upstream: a token-count request that falls over to another provider would
+/// otherwise drag the session's subsequent `/v1/messages` traffic with it.
+pub(crate) fn request_operation_writes_session_affinity(request_operation: Option<&str>) -> bool {
+    !request_operation.is_some_and(|operation| {
+        operation
+            .trim()
+            .eq_ignore_ascii_case(crate::ai_serving::ApiOperation::ClaudeCountTokens.as_str())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SchedulerAffinityPolicyContext {
     pub(crate) scheduling_mode: RoutingSchedulingMode,
@@ -97,4 +109,22 @@ pub(crate) fn read_cached_scheduler_affinity_target_with_policy_context(
             policy_context.scope.as_ref(),
         )?;
     state.read_cached_scheduler_affinity_target(&cache_key, SCHEDULER_AFFINITY_TTL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_operation_writes_session_affinity;
+
+    #[test]
+    fn count_tokens_operation_never_writes_session_affinity() {
+        assert!(request_operation_writes_session_affinity(None));
+        assert!(request_operation_writes_session_affinity(Some("messages")));
+        assert!(request_operation_writes_session_affinity(Some("compact")));
+        assert!(!request_operation_writes_session_affinity(Some(
+            "count_tokens"
+        )));
+        assert!(!request_operation_writes_session_affinity(Some(
+            " COUNT_TOKENS "
+        )));
+    }
 }
