@@ -41,7 +41,7 @@ pub(super) async fn handle_admin_provider_ops_verify(
     };
     let (effective_provider, mut credentials, saved_binding, reused_saved_secret) =
         match existing_provider.as_ref() {
-            Some(provider) if admin_provider_ops_config_object(provider).is_some() => {
+            Some(provider) => {
                 match admin_provider_ops_merge_credentials(
                     state,
                     &payload.architecture_id,
@@ -53,7 +53,7 @@ pub(super) async fn handle_admin_provider_ops_verify(
                     Ok(snapshot) => (
                         Some(snapshot.provider),
                         snapshot.credentials,
-                        Some(snapshot.saved_binding),
+                        snapshot.saved_binding,
                         snapshot.reused_saved_secret,
                     ),
                     Err(detail) => {
@@ -61,12 +61,6 @@ pub(super) async fn handle_admin_provider_ops_verify(
                     }
                 }
             }
-            Some(provider) => (
-                Some(provider.clone()),
-                payload.connector.credentials.clone(),
-                None,
-                false,
-            ),
             None => (None, payload.connector.credentials.clone(), None, false),
         };
     let fallback_base_url = saved_binding

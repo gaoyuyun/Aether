@@ -499,6 +499,164 @@ async fn gateway_handles_admin_provider_ops_config_locally_with_trusted_admin_pr
 }
 
 #[test]
+fn gateway_creates_and_recreates_admin_provider_ops_config() {
+    run_provider_ops_test(
+        "gateway_creates_and_recreates_admin_provider_ops_config",
+        gateway_creates_and_recreates_admin_provider_ops_config_impl,
+    );
+}
+
+async fn gateway_creates_and_recreates_admin_provider_ops_config_impl() {
+    for initial_config in [
+        None,
+        Some(json!({"feature_flag": true})),
+        Some(json!({"feature_flag": true, "provider_ops": null})),
+    ] {
+        let mut provider = sample_provider("provider-openai", "openai", 10);
+        provider.website = None;
+        provider.config = initial_config.clone();
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![],
+            vec![],
+        ));
+        let gateway = build_router_with_state(
+            AppState::new()
+                .expect("gateway should build")
+                .with_data_state_for_tests(
+                    GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                        &repository,
+                    ))
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+                ),
+        );
+        let (gateway_url, gateway_handle) = start_server(gateway).await;
+        let client = reqwest::Client::new();
+        let config_url =
+            format!("{gateway_url}/api/admin/provider-ops/providers/provider-openai/config");
+        let request = |method| {
+            client
+                .request(method, &config_url)
+                .header(GATEWAY_HEADER, "rust-phase3b")
+                .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+                .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+                .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        };
+
+        for api_key in ["first-save-api-key", "recreated-api-key"] {
+            let response = request(reqwest::Method::GET)
+                .send()
+                .await
+                .expect("config request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            let config: serde_json::Value = response.json().await.expect("config should parse");
+            assert_eq!(config["is_configured"], false);
+
+            let mut payload = json!({
+                "architecture_id": "new_api",
+                "base_url": " https://OPS.example.com:443/ ",
+                "connector": {
+                    "auth_type": "api_key",
+                    "config": {},
+                    "credentials": {
+                        "api_key": api_key,
+                        "cookie": "session=first-save-cookie",
+                        "user_id": "42",
+                    },
+                },
+            });
+            let response = request(reqwest::Method::PUT)
+                .json(&payload)
+                .send()
+                .await
+                .expect("save request should succeed");
+            let status = response.status();
+            let saved: serde_json::Value =
+                response.json().await.expect("save response should parse");
+            assert_eq!(status, StatusCode::OK, "response={saved}");
+            assert_eq!(saved["success"], true);
+
+            // An update that keeps the destination must preserve masked or empty secrets.
+            payload["base_url"] = serde_json::Value::Null;
+            payload["connector"]["credentials"]["api_key"] = json!("");
+            payload["connector"]["credentials"]["cookie"] = json!("********");
+            payload["quota_alert"] = json!({"enabled": true, "threshold_amount": 10});
+            let response = request(reqwest::Method::PUT)
+                .json(&payload)
+                .send()
+                .await
+                .expect("update request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let stored = repository
+                .list_providers_by_ids(&["provider-openai".to_string()])
+                .await
+                .expect("provider should read")
+                .remove(0);
+            let config = stored.config.as_ref().expect("config should be stored");
+            assert_eq!(
+                config.get("feature_flag"),
+                initial_config
+                    .as_ref()
+                    .and_then(|value| value.get("feature_flag"))
+            );
+            let ops = &config["provider_ops"];
+            assert_eq!(ops["base_url"], "https://ops.example.com");
+            assert_eq!(ops["connector"]["credentials"]["user_id"], "42");
+            assert_eq!(ops["quota_alert"]["enabled"], true);
+            for (field, plaintext) in [
+                ("api_key", api_key),
+                ("cookie", "session=first-save-cookie"),
+            ] {
+                let ciphertext = ops["connector"]["credentials"][field]
+                    .as_str()
+                    .expect("credential should be stored");
+                assert!(ciphertext.starts_with("aether-provider-ops-credential-v2:"));
+                assert_eq!(
+                    open_stored_provider_ops_credential(&stored, field, ciphertext),
+                    plaintext
+                );
+            }
+
+            let response = request(reqwest::Method::GET)
+                .send()
+                .await
+                .expect("config request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            let visible: serde_json::Value = response.json().await.expect("config should parse");
+            assert_eq!(visible["is_configured"], true);
+            assert!(!visible.to_string().contains(api_key));
+            assert!(!visible.to_string().contains("session=first-save-cookie"));
+            assert!(!visible
+                .to_string()
+                .contains("aether-provider-ops-credential-v2:"));
+
+            // Reusing a saved secret at another destination must still be rejected.
+            payload["base_url"] = json!("https://other.example.com");
+            let response = request(reqwest::Method::PUT)
+                .json(&payload)
+                .send()
+                .await
+                .expect("binding change request should complete");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let unchanged = repository
+                .list_providers_by_ids(&["provider-openai".to_string()])
+                .await
+                .expect("provider should read")
+                .remove(0);
+            assert_eq!(unchanged.config, stored.config);
+
+            let response = request(reqwest::Method::DELETE)
+                .send()
+                .await
+                .expect("clear request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        gateway_handle.abort();
+    }
+}
+
+#[test]
 fn gateway_saves_admin_provider_ops_config_locally_with_trusted_admin_principal() {
     run_provider_ops_test(
         "gateway_saves_admin_provider_ops_config_locally_with_trusted_admin_principal",
