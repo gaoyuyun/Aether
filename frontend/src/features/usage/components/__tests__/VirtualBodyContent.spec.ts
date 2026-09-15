@@ -12,7 +12,7 @@ afterEach(() => {
 
 function mountChunks(loadChunk: (index: number) => Chunk | Promise<Chunk>) {
   const errors: unknown[] = []
-  const viewer = ref<{ refresh: (index: number, resetTail?: boolean) => void } | null>(null)
+  const viewer = ref<{ refresh: (index: number, resetTail?: boolean) => void, reload: () => void } | null>(null)
   const root = document.createElement('div')
   document.body.appendChild(root)
   const app = createApp(defineComponent({ setup: () => () => h(VirtualBodyContent<Chunk>, {
@@ -69,6 +69,40 @@ describe('virtual body scrolling', () => {
     scroll(viewport, 5000)
     await nextTick()
     expect(loadChunk).toHaveBeenCalledTimes(2)
+  })
+
+  it('reloads visible chunks in place, keeping the scroll extent and position', async () => {
+    let version = 1
+    const loadChunk = vi.fn((index: number) => ({ text: `chunk-${index}-v${version}`, hasNext: index < 20 }))
+    const { root, viewport, viewer } = mountChunks(loadChunk)
+    await vi.waitFor(() => expect(root.textContent).toContain('chunk-0-v1'))
+    scroll(viewport, 5000)
+    await vi.waitFor(() => expect(root.textContent).toContain('chunk-5-v1'))
+    const spacerHeightBefore = root.querySelector<HTMLElement>('[aria-hidden="true"]')!.style.height
+    const callsBefore = loadChunk.mock.calls.length
+
+    version = 2
+    viewer.value!.reload()
+    await vi.waitFor(() => expect(root.textContent).toContain('chunk-5-v2'))
+
+    expect(root.textContent).not.toContain('v1')
+    expect(viewport.scrollTop).toBe(5000)
+    expect(root.querySelector<HTMLElement>('[aria-hidden="true"]')!.style.height).toBe(spacerHeightBefore)
+    expect(loadChunk.mock.calls.slice(callsBefore).every(([index]) => index >= 3 && index <= 9)).toBe(true)
+    expect(loadChunk.mock.calls.slice(callsBefore).some(([index]) => index === 0)).toBe(false)
+  })
+
+  it('discards an in-flight chunk that resolves after reload and loads the fresh one', async () => {
+    const pending: Array<(value: Chunk) => void> = []
+    const loadChunk = vi.fn(() => new Promise<Chunk>(resolve => pending.push(resolve)))
+    const { root, viewer } = mountChunks(loadChunk)
+    await vi.waitFor(() => expect(loadChunk).toHaveBeenCalledTimes(1))
+    viewer.value!.reload()
+    pending[0]({ text: 'stale', hasNext: false })
+    await vi.waitFor(() => expect(loadChunk).toHaveBeenCalledTimes(2))
+    expect(root.textContent).not.toContain('stale')
+    pending[1]({ text: 'fresh', hasNext: false })
+    await vi.waitFor(() => expect(root.textContent).toContain('fresh'))
   })
 
   it('ignores errors after unmount and disconnects its resize observer', async () => {

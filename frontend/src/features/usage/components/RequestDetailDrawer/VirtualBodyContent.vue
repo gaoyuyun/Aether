@@ -175,6 +175,15 @@ function refresh(index: number, resetTail = false) {
   void loadVisibleChunks()
 }
 
+// 数据源内容变化时原地重载：保留已测量的分块高度和滚动位置，只重新拉取可见分块。
+// 与重新挂载不同，用户正在阅读的位置不会跳回顶部；分块数量变化会在加载时自动收敛。
+function reload() {
+  generation += 1
+  failed.value = false
+  chunks.value = new Map()
+  void loadVisibleChunks()
+}
+
 watch([visibleStart, visibleEnd], () => {
   evictDistantChunks()
   void loadVisibleChunks()
@@ -198,7 +207,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', measureChunks)
 })
 
-defineExpose({ refresh })
+defineExpose({ refresh, reload })
 </script>
 
 <style scoped>

@@ -1257,8 +1257,11 @@ function clearAuthenticatedVideoUrls() {
 }
 
 async function loadAuthenticatedVideo(task: AsyncTaskDetail) {
+  // 详情自动刷新每 5 秒调用一次；已经拿到 Blob URL 的地址不再重复下载，
+  // 否则 <video> 的 src 会被换成新的 Blob URL，正在播放的视频会被打断，旧 URL 也无法释放。
   const candidates = [task.video_url, ...(task.video_urls || [])]
     .filter((value): value is string => Boolean(value && requiresAuthenticatedVideoProxy(value)))
+    .filter(value => !authenticatedVideoUrls.value[authenticatedVideoKey(task.id, value)])
   if (candidates.length === 0) return
 
   const generation = ++authenticatedVideoLoadGeneration

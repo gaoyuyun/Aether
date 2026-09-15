@@ -100,6 +100,7 @@ import { ref, watch } from 'vue'
 import { ChevronRight, ChevronDown } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import VirtualBodyContent from './VirtualBodyContent.vue'
+import { deepEqual } from '@/utils/deepEqual'
 import { getRawTextChunk, JsonPageReader, JSON_SCROLL_CHUNK_SIZE, JSON_TEXT_CHUNK_SIZE, type JsonDisplayLine } from '../../utils/json-viewer'
 import type { BodyDocument } from '../../utils/body-document'
 import type { BodyJsonPage } from '../../utils/body-document-protocol'
@@ -114,7 +115,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{ 'load-error': [error: unknown] }>()
-const viewer = ref<{ refresh: (index: number, resetTail?: boolean) => void } | null>(null)
+const viewer = ref<{ refresh: (index: number, resetTail?: boolean) => void, reload: () => void } | null>(null)
 const viewRevision = ref(0)
 const foldOverrides = ref(new Map<string, boolean>())
 let localReader: JsonPageReader | undefined
@@ -175,11 +176,23 @@ function toggleFold(line: JsonDisplayLine, index: number) {
   viewer.value?.refresh(index, true)
 }
 
-watch([() => props.data, () => props.bodyDocument, () => props.expandDepth], () => {
-  viewRevision.value += 1
-  localReader = undefined
-  foldOverrides.value = new Map()
-})
+watch(
+  [() => props.data, () => props.bodyDocument, () => props.expandDepth],
+  ([data, bodyDocument, expandDepth], [previousData, previousDocument, previousDepth]) => {
+    if (bodyDocument !== previousDocument || expandDepth !== previousDepth) {
+      // 换了正文文档或展开层级：整体重建并回到顶部
+      viewRevision.value += 1
+      localReader = undefined
+      foldOverrides.value = new Map()
+      return
+    }
+    // 轮询刷新会返回内容相同、引用不同的对象：内容没变就什么都不做，
+    // 内容真的变了则原地重载，保留滚动位置和用户的折叠状态。
+    if (deepEqual(data, previousData)) return
+    localReader = undefined
+    viewer.value?.reload()
+  },
+)
 </script>
 
 <style scoped>
