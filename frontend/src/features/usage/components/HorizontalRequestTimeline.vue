@@ -1,6 +1,4 @@
-  const requestId = props.requestId
-  if (!requestId || props.traceData) return
-  if (traceLoadInFlight) return traceLoadInFlight<template>
+<template>
   <div class="minimal-request-timeline">
     <!-- Loading State -->
     <div
@@ -48,7 +46,7 @@
           <div class="minimal-track">
             <div
               v-for="(group, groupIndex) in groupedTimeline"
-              :key="group.id"
+              :key="`${group.id}:${group.startIndex}`"
               class="minimal-node-group"
               :class="{
                 selected: isGroupSelected(group),
@@ -65,33 +63,31 @@
                   {{ group.providerName }}
                 </div>
 
-                <!-- 主节点（代表首次请求） -->
+                <!-- 主节点（代表该渠道的最终状态） -->
                 <div
                   class="node-dot"
-                  :class="[
-                    getStatusColorClass(group.primaryStatus),
-                    { 'is-first-selected': isGroupSelected(group) && selectedAttemptIndex === 0 }
-                  ]"
-                  @click.stop="selectFirstAttempt(group)"
+                  :class="getStatusColorClass(group.finalStatus)"
+                  :title="formatGroupDotTitle(group)"
+                  @click.stop="selectGroup(group)"
                 />
 
-                <!-- 子节点（同提供商的其他尝试，不包含首次） -->
+                <!-- 子节点（该渠道下的每一次尝试，含首次） -->
                 <div
                   v-if="group.retryCount > 0"
                   class="sub-dots"
                 >
                   <button
-                    v-for="(attempt, idx) in group.allAttempts.slice(1)"
+                    v-for="(attempt, idx) in group.allAttempts"
                     :key="attempt.id"
                     type="button"
                     class="sub-dot"
                     :class="[
                       getStatusColorClass(getDisplayStatus(attempt)),
-                      { active: isAttemptSelected(group, idx + 1) }
+                      { active: isAttemptSelected(group, idx) }
                     ]"
                     :title="formatAttemptDotTitle(attempt)"
                     :aria-label="formatAttemptDotTitle(attempt)"
-                    @click.stop="selectAttemptInGroup(group, idx + 1)"
+                    @click.stop="selectAttemptInGroup(group, idx)"
                   />
                 </div>
               </div>
@@ -600,9 +596,9 @@ import {
 interface NodeGroup {
   id: string
   providerName: string
-  primary: CandidateRecord
-  primaryStatus: string
-  allAttempts: CandidateRecord[]  // 当前展示的尝试（含主节点）
+  primary: CandidateRecord  // 该渠道的首次尝试（用于名称等元信息）
+  finalStatus: string  // 该渠道的最终状态：成功优先，其次进行中，否则取最后一次执行结果
+  allAttempts: CandidateRecord[]  // 当前展示的尝试（含首次）
   retryCount: number
   totalLatency: number  // 所有尝试的总延迟
   startIndex: number
@@ -800,18 +796,6 @@ const proxyTimingBreakdown = (proxy: CandidateProxyInfo): string => {
   return parts.join(' / ')
 }
 
-const STATUS_PRIORITY: Record<string, number> = {
-  available: 0,
-  unused: 0,
-  skipped: 1,
-  failed: 2,
-  cancelled: 2,
-  stream_interrupted: 2,
-  pending: 3,
-  streaming: 3,
-  success: 4,
-}
-
 const isParticipatedCandidate = (candidate: CandidateRecord): boolean => {
   return TIMELINE_STATUS.includes(candidate.status)
 }
@@ -923,9 +907,20 @@ const getProviderDisplayName = (
   return '未知'
 }
 
-const normalizeProviderIdentity = (value: unknown): string => {
-  if (typeof value !== 'string') return ''
-  return value.trim().toLowerCase()
+const GROUP_FAILURE_STATUSES = ['failed', 'cancelled', 'stream_interrupted']
+
+// 渠道（组）的最终状态：任一尝试成功即成功；有进行中的尝试则进行中；
+// 否则取最后一次真正执行过的尝试结果；全部跳过则为跳过。
+const resolveGroupFinalStatus = (attempts: CandidateRecord[]): string => {
+  const statuses = attempts.map(getDisplayStatus)
+  if (statuses.includes('success')) return 'success'
+  const live = statuses.find(status => status === 'pending' || status === 'streaming')
+  if (live) return live
+  for (let i = statuses.length - 1; i >= 0; i--) {
+    if (GROUP_FAILURE_STATUSES.includes(statuses[i])) return statuses[i]
+  }
+  if (statuses.includes('skipped')) return 'skipped'
+  return statuses[statuses.length - 1] ?? 'available'
 }
 
 const buildProviderGroups = (items: CandidateRecord[]): NodeGroup[] => {
@@ -933,20 +928,16 @@ const buildProviderGroups = (items: CandidateRecord[]): NodeGroup[] => {
   let currentGroup: NodeGroup | null = null
 
   items.forEach((candidate) => {
-    const providerKey = candidate.provider_name || '未知'
+    const providerKey = candidate.provider_id || candidate.provider_name || '未知'
 
     if (currentGroup && currentGroup.id === providerKey) {
       currentGroup.allAttempts.push(candidate)
+      currentGroup.finalStatus = resolveGroupFinalStatus(currentGroup.allAttempts)
       currentGroup.retryCount++
       currentGroup.endIndex = candidate.candidate_index
       currentGroup.totalLatency += candidate.latency_ms || 0
       if (candidate.extra_data?.needs_conversion) {
         currentGroup.hasConversion = true
-      }
-      const currentPriority = STATUS_PRIORITY[currentGroup.primaryStatus] ?? 0
-      const newPriority = STATUS_PRIORITY[getDisplayStatus(candidate)] ?? 0
-      if (newPriority > currentPriority) {
-        currentGroup.primaryStatus = getDisplayStatus(candidate)
       }
       return
     }
@@ -955,7 +946,7 @@ const buildProviderGroups = (items: CandidateRecord[]): NodeGroup[] => {
       id: providerKey,
       providerName: getProviderDisplayName(candidate),
       primary: candidate,
-      primaryStatus: getDisplayStatus(candidate),
+      finalStatus: getDisplayStatus(candidate),
       allAttempts: [candidate],
       retryCount: 0,
       totalLatency: candidate.latency_ms || 0,
@@ -979,8 +970,6 @@ const groupedTimeline = computed<NodeGroup[]>(() => {
     return providerGroups
   }
 
-  const poolProviderIds = new Set<string>()
-  const poolProviderNames = new Set<string>()
   const poolGroups: NodeGroup[] = []
 
   for (const [groupId, attemptsRaw] of poolAttemptsByGroup.value.entries()) {
@@ -990,16 +979,7 @@ const groupedTimeline = computed<NodeGroup[]>(() => {
     const visibleAttempts = buildPoolGroupVisibleAttempts(attempts)
     if (visibleAttempts.length === 0) continue
 
-    const poolPrimaryStatus = visibleAttempts.reduce((best, current) => {
-      const bestPriority = STATUS_PRIORITY[best] ?? 0
-      const currentStatus = getDisplayStatus(current)
-      const currentPriority = STATUS_PRIORITY[currentStatus] ?? 0
-      return currentPriority > bestPriority ? currentStatus : best
-    }, getDisplayStatus(visibleAttempts[0]))
-
-    const successAttempt = visibleAttempts.find((item) => item.status === 'success')
-    const poolPrimary =
-      successAttempt || visibleAttempts[visibleAttempts.length - 1] || visibleAttempts[0]
+    const poolPrimary = visibleAttempts[0]
     const startIndex = Math.min(...attempts.map(item => item.candidate_index))
     const endIndex = Math.max(...attempts.map(item => item.candidate_index))
 
@@ -1007,7 +987,7 @@ const groupedTimeline = computed<NodeGroup[]>(() => {
       id: `pool:${groupId}`,
       providerName: getProviderDisplayName(poolPrimary, { allowAuthTypeFallback: false }),
       primary: poolPrimary,
-      primaryStatus: poolPrimaryStatus,
+      finalStatus: resolveGroupFinalStatus(visibleAttempts),
       allAttempts: visibleAttempts,
       retryCount: Math.max(0, visibleAttempts.length - 1),
       totalLatency: visibleAttempts.reduce((sum, item) => sum + (item.latency_ms || 0), 0),
@@ -1017,29 +997,11 @@ const groupedTimeline = computed<NodeGroup[]>(() => {
       providerApiFormat: null,
       isPoolGroup: true,
     })
-
-    for (const attempt of attempts) {
-      const providerId = String(attempt.provider_id || '').trim()
-      if (providerId) poolProviderIds.add(providerId)
-      const providerName = normalizeProviderIdentity(attempt.provider_name)
-      if (providerName) poolProviderNames.add(providerName)
-    }
   }
 
-  const dedupedProviderGroups = providerGroups.filter((group) => {
-    const sameProviderById = group.allAttempts.some((attempt) => {
-      const providerId = String(attempt.provider_id || '').trim()
-      return providerId !== '' && poolProviderIds.has(providerId)
-    })
-    if (sameProviderById) return false
-
-    const groupName = normalizeProviderIdentity(group.primary.provider_name || group.providerName)
-    if (groupName && poolProviderNames.has(groupName)) return false
-
-    return true
-  })
-
-  const allGroups = [...poolGroups, ...dedupedProviderGroups]
+  // timeline already excludes the exact attempts represented by pool groups.
+  // Dropping a whole provider here would hide attempts with partial pool metadata.
+  const allGroups = [...poolGroups, ...providerGroups]
   allGroups.sort((a, b) => a.startIndex - b.startIndex)
   return allGroups
 })
@@ -2108,7 +2070,7 @@ const selectMostRelevantGroup = (newGroups: NodeGroup[]) => {
   // 从后往前找第一个有效状态的组
   for (let i = newGroups.length - 1; i >= 0; i--) {
     const group = newGroups[i]
-    if (TERMINAL_ATTEMPT_STATUSES.includes(group.primaryStatus)) {
+    if (group.allAttempts.some(isTerminalResultAttempt)) {
       selectedGroupIndex.value = i
       // 选中最后一个有效状态的尝试（从后往前遍历）
       let targetIdx = -1
@@ -2140,16 +2102,6 @@ const selectGroup = (group: NodeGroup) => {
   }
 }
 
-// 选中一个组的首次请求
-const selectFirstAttempt = (group: NodeGroup) => {
-  const index = findGroupIndex(groupedTimeline.value, group)
-  if (index >= 0) {
-    selectionPinnedByUser.value = true
-    selectedGroupIndex.value = index
-    selectedAttemptIndex.value = 0
-  }
-}
-
 const selectAttemptInGroup = (group: NodeGroup, attemptIndex: number) => {
   const groupIndex = findGroupIndex(groupedTimeline.value, group)
   if (groupIndex < 0) return
@@ -2173,6 +2125,15 @@ const formatAttemptDotTitle = (attempt: CandidateRecord): string => {
     formatCandidateAttemptIndex(attempt),
     attempt.key_name || attempt.key_account_label || attempt.key_preview || '未知 Key',
     getStatusLabel(getDisplayStatus(attempt)),
+  ]
+  return parts.filter(Boolean).join(' · ')
+}
+
+const formatGroupDotTitle = (group: NodeGroup): string => {
+  const parts = [
+    group.providerName,
+    getStatusLabel(group.finalStatus),
+    group.allAttempts.length > 1 ? `${group.allAttempts.length} 次尝试` : '',
   ]
   return parts.filter(Boolean).join(' · ')
 }
@@ -2309,6 +2270,7 @@ watch(
       internalTrace.value = null
       loading.value = false
       error.value = null
+      selectMostRelevantGroup(groupedTimeline.value)
       return
     }
 
@@ -2580,11 +2542,6 @@ function getDisplayStatus(attempt: CandidateRecord | null | undefined): string {
   border-radius: 50%;
   background: currentColor;
   transform: translate(-50%, -50%);
-}
-
-/* 选中首次时的样式 */
-.node-dot.is-first-selected {
-  transform: scale(1.1);
 }
 
 /* 子节点容器 - 绝对定位在主节点下方 */

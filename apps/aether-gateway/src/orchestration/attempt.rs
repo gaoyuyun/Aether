@@ -8,6 +8,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExecutionAttemptIdentity {
     pub(crate) candidate_index: u32,
+    pub(crate) scheduling_candidate_index: u32,
     pub(crate) retry_index: u32,
     pub(crate) pool_key_index: Option<u32>,
 }
@@ -16,6 +17,7 @@ impl ExecutionAttemptIdentity {
     pub(crate) const fn new(candidate_index: u32, retry_index: u32) -> Self {
         Self {
             candidate_index,
+            scheduling_candidate_index: candidate_index,
             retry_index,
             pool_key_index: None,
         }
@@ -23,6 +25,11 @@ impl ExecutionAttemptIdentity {
 
     pub(crate) const fn with_pool_key_index(mut self, pool_key_index: Option<u32>) -> Self {
         self.pool_key_index = pool_key_index;
+        self
+    }
+
+    pub(crate) const fn with_scheduling_candidate_index(mut self, index: u32) -> Self {
+        self.scheduling_candidate_index = index;
         self
     }
 }
@@ -57,8 +64,14 @@ pub(crate) fn attempt_identity_from_report_context(
     let metadata = parse_request_candidate_report_context(report_context)?;
     let candidate_metadata = local_execution_candidate_metadata_from_report_context(report_context);
 
+    let candidate_index = metadata.candidate_index?;
     Some(ExecutionAttemptIdentity {
-        candidate_index: metadata.candidate_index?,
+        candidate_index,
+        scheduling_candidate_index: report_context
+            .and_then(|context| context.get("scheduling_candidate_index"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(candidate_index),
         retry_index: metadata.retry_index,
         pool_key_index: candidate_metadata.pool_key_index,
     })
@@ -156,7 +169,7 @@ fn pool_key_lease_from_report_context(report_context: Option<&Value>) -> Option<
 /// Retry index of the next same-key attempt, or `None` when the sticky-key
 /// budget for this candidate is used up.
 ///
-/// Only the first-ranked candidate (index `0`, the cache-affinity sticky key)
+/// Only the first-ranked candidate (path-local index `0`, the cache-affinity sticky key)
 /// is retried on the same key; every later candidate gets exactly one attempt
 /// so that once failover has started it keeps advancing. `sticky_key_attempts`
 /// is the *total* attempt count on that key: `2` means one retry, `0` and `1`
@@ -170,7 +183,7 @@ pub(crate) fn next_same_key_retry_index(
     identity: ExecutionAttemptIdentity,
     sticky_key_attempts: Option<u32>,
 ) -> Option<u32> {
-    if identity.candidate_index != 0 {
+    if identity.scheduling_candidate_index != 0 {
         return None;
     }
     let pool_limit = match identity.pool_key_index {
@@ -347,6 +360,31 @@ mod tests {
     }
 
     #[test]
+    fn request_wide_trace_indices_preserve_same_key_retry_budgets() {
+        let identity = attempt_identity_from_report_context(Some(&json!({
+            "candidate_index": 7, "scheduling_candidate_index": 0,
+            "retry_index": 0, "pool_key_index": 0,
+        })))
+        .expect("attempt identity should parse");
+        assert_eq!(identity.candidate_index, 7);
+        assert_eq!(next_same_key_retry_index(identity, Some(2)), Some(1));
+        assert_eq!(
+            next_same_key_retry_index(
+                ExecutionAttemptIdentity {
+                    retry_index: 1,
+                    ..identity
+                },
+                Some(2),
+            ),
+            None
+        );
+        assert_eq!(
+            next_same_key_retry_index(identity.with_scheduling_candidate_index(1), Some(2),),
+            None
+        );
+    }
+
+    #[test]
     fn parse_attempt_identity_from_report_context_reads_candidate_and_retry_indices() {
         let identity = attempt_identity_from_report_context(Some(&json!({
             "candidate_index": 4,
@@ -359,6 +397,7 @@ mod tests {
             identity,
             ExecutionAttemptIdentity {
                 candidate_index: 4,
+                scheduling_candidate_index: 4,
                 retry_index: 1,
                 pool_key_index: Some(7),
             }

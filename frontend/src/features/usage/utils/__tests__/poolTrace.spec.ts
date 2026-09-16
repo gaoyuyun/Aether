@@ -203,6 +203,49 @@ describe('poolTrace', () => {
     expect(attempts.map(item => item.key_id)).toEqual(['pool-group', 'key-success'])
   })
 
+  it('recovers attempts with missing pool metadata without changing their results', () => {
+    const rawTimeline = [
+      buildCandidate({
+        id: 'failed', provider_id: 'provider-1', extra_data: { pool_key_index: 0 },
+      }),
+      buildCandidate({
+        id: 'success', candidate_index: 1, provider_id: 'provider-1',
+        status: 'success', status_code: 200,
+      }),
+    ]
+    const attempts = buildPoolParticipatedCandidates(rawTimeline, null, 'req-1')
+
+    expect(attempts.map(item => item.id)).toEqual(['failed', 'success'])
+    expect(attempts[1]).toMatchObject({
+      status: 'success', status_code: 200, extra_data: { pool_group_id: 'provider-1' },
+    })
+    expect(rawTimeline[1].extra_data).toBeUndefined()
+  })
+
+  it('does not infer membership when a provider has multiple pool groups', () => {
+    const attempts = buildPoolParticipatedCandidates([
+      buildCandidate({
+        id: 'pool-a', provider_id: 'provider-1', extra_data: { pool_group_id: 'a' },
+      }),
+      buildCandidate({
+        id: 'pool-b', candidate_index: 1, provider_id: 'provider-1', extra_data: { pool_group_id: 'b' },
+      }),
+      buildCandidate({ id: 'unassigned', candidate_index: 2, provider_id: 'provider-1' }),
+    ], null, 'req-1')
+
+    expect(attempts.map(item => item.id)).toEqual(['pool-a', 'pool-b'])
+  })
+
+  it('preserves an explicit stream failure even when the audit says HTTP 200 succeeded', () => {
+    const attempts = buildPoolAttemptCandidatesFromAudit([
+      buildCandidate({ status: 'failed', status_code: 200, error_type: 'stream_terminal_error' }),
+    ], [{ candidate_index: 0, retry_index: 0, status: 'success', status_code: 200 }], 'req-1')
+
+    expect(attempts[0]).toMatchObject({
+      status: 'failed', status_code: 200, error_type: 'stream_terminal_error',
+    })
+  })
+
   it('treats only real execution statuses as attempted', () => {
     expect(isAttemptedCandidate(buildCandidate({ status: 'success' }))).toBe(true)
     expect(isAttemptedCandidate(buildCandidate({ status: 'failed' }))).toBe(true)

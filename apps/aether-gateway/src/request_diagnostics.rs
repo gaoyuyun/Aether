@@ -18,6 +18,7 @@ pub(crate) struct RequestDiagnostics {
 #[derive(Debug, Default)]
 struct RequestDiagnosticsInner {
     request_accepted_at: Option<Instant>,
+    next_candidate_indices: BTreeMap<String, u32>,
     db_operations: BTreeMap<&'static str, DbOperationTiming>,
     db_pool: Option<DbPoolObservation>,
 }
@@ -183,6 +184,25 @@ where
 
 pub(crate) fn current_request_diagnostics() -> Option<Arc<RequestDiagnostics>> {
     REQUEST_DIAGNOSTICS.try_with(Arc::clone).ok()
+}
+
+/// Candidate indices are request-wide, while each execution path ranks its
+/// own candidates from zero. Keep trace slots distinct across those paths.
+pub(crate) fn allocate_request_candidate_index(request_id: &str, fallback: u32) -> u32 {
+    let Some(diagnostics) = current_request_diagnostics() else {
+        return fallback;
+    };
+    let mut inner = diagnostics
+        .inner
+        .lock()
+        .expect("request candidate indices lock");
+    let next = inner
+        .next_candidate_indices
+        .entry(request_id.to_string())
+        .or_default();
+    let index = (*next).max(fallback);
+    *next = index.saturating_add(1);
+    index
 }
 
 pub(crate) fn record_request_accepted_at(accepted_at: Instant) {

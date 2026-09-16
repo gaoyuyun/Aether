@@ -120,9 +120,6 @@ export function buildPoolParticipatedCandidates(
   )
   const fromAudit = buildPoolAttemptCandidatesFromAudit(rawTimeline, attempts, requestId)
 
-  if (fromTrace.length === 0) return fromAudit
-  if (fromAudit.length === 0) return fromTrace
-
   const traceKeys = new Set(
     fromTrace.map(candidate => makeAttemptKey(candidate.candidate_index, candidate.retry_index)),
   )
@@ -131,7 +128,31 @@ export function buildPoolParticipatedCandidates(
     const key = makeAttemptKey(candidate.candidate_index, candidate.retry_index)
     if (!traceKeys.has(key)) {
       merged.push(candidate)
+      traceKeys.add(key)
     }
+  }
+
+  // Some runtime and historical usage snapshots omit pool metadata. Attach
+  // them only when the provider has a single unambiguous pool group.
+  const groupsByProvider = new Map<string, Set<string>>()
+  for (const candidate of merged) {
+    const providerId = candidate.provider_id?.trim()
+    const groupId = extractPoolGroupId(candidate)
+    if (!providerId || !groupId) continue
+    const groups = groupsByProvider.get(providerId) ?? new Set<string>()
+    groups.add(groupId)
+    groupsByProvider.set(providerId, groups)
+  }
+  for (const candidate of rawTimeline) {
+    const key = makeAttemptKey(candidate.candidate_index, candidate.retry_index)
+    if (traceKeys.has(key)) continue
+    const groups = groupsByProvider.get(candidate.provider_id?.trim() ?? '')
+    if (groups?.size !== 1) continue
+    merged.push({
+      ...candidate,
+      extra_data: { ...candidate.extra_data, pool_group_id: [...groups][0] },
+    })
+    traceKeys.add(key)
   }
 
   return merged.sort((a, b) => {
@@ -195,19 +216,20 @@ export function buildPoolAttemptCandidatesFromAudit(
             created_at: new Date(0).toISOString(),
           }
 
-      if (parsedStatus !== null) {
+      // The execution trace owns the attempt result; the scheduling audit is
+      // a fallback for missing attempts and may predate completion.
+      if (!fromTrace && parsedStatus !== null) {
         merged.status = parsedStatus
       }
-      if (typeof raw.provider_id === 'string') merged.provider_id = raw.provider_id
-      if (typeof raw.provider_name === 'string') merged.provider_name = raw.provider_name
-      if (typeof raw.endpoint_id === 'string') merged.endpoint_id = raw.endpoint_id
-      if (typeof raw.key_id === 'string') merged.key_id = raw.key_id
-      if (typeof raw.key_name === 'string') merged.key_name = raw.key_name
-      if (typeof raw.status_code === 'number') merged.status_code = raw.status_code
-      if (typeof raw.error_type === 'string') merged.error_type = raw.error_type
+      if (!merged.provider_id && typeof raw.provider_id === 'string') merged.provider_id = raw.provider_id
+      if (!merged.provider_name && typeof raw.provider_name === 'string') merged.provider_name = raw.provider_name
+      if (!merged.endpoint_id && typeof raw.endpoint_id === 'string') merged.endpoint_id = raw.endpoint_id
+      if (!merged.key_id && typeof raw.key_id === 'string') merged.key_id = raw.key_id
+      if (!merged.key_name && typeof raw.key_name === 'string') merged.key_name = raw.key_name
+      if (!fromTrace && typeof raw.status_code === 'number') merged.status_code = raw.status_code
+      if (!fromTrace && typeof raw.error_type === 'string') merged.error_type = raw.error_type
       const rawPoolGroupId = typeof raw.pool_group_id === 'string' ? raw.pool_group_id.trim() : ''
-      const fallbackPoolGroupId = typeof raw.provider_id === 'string' ? raw.provider_id.trim() : ''
-      const finalPoolGroupId = rawPoolGroupId || fallbackPoolGroupId
+      const finalPoolGroupId = extractPoolGroupId(merged) || rawPoolGroupId || merged.provider_id?.trim()
       if (finalPoolGroupId) {
         merged.extra_data = {
           ...(merged.extra_data || {}),

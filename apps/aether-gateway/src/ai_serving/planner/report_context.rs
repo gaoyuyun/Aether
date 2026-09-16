@@ -87,6 +87,10 @@ pub(crate) fn build_local_execution_report_context(
         parts.original_request_body_base64,
     );
     let mut extra_fields = parts.extra_fields;
+    extra_fields.insert(
+        "scheduling_candidate_index".to_string(),
+        Value::from(parts.attempt_identity.scheduling_candidate_index),
+    );
     if let Some(value) = parts
         .client_session_affinity
         .and_then(client_session_affinity_report_context_value)
@@ -349,7 +353,8 @@ mod tests {
                 auth_context: &auth_context,
                 request_id: "trace-1",
                 candidate_id: "candidate-1",
-                attempt_identity: ExecutionAttemptIdentity::new(0, 0),
+                attempt_identity: ExecutionAttemptIdentity::new(7, 0)
+                    .with_scheduling_candidate_index(0),
                 model: "gpt-5",
                 provider_name: "OpenAI",
                 provider_id: "provider-1",
@@ -391,6 +396,8 @@ mod tests {
                 extra_fields: Map::new(),
             });
 
+        assert_eq!(report_context["candidate_index"], 7);
+        assert_eq!(report_context["scheduling_candidate_index"], 0);
         assert_eq!(
             report_context["client_ip"],
             Value::String("203.0.113.8".to_string())

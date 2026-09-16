@@ -511,6 +511,7 @@ mod tests {
                 ranking: None,
             },
             candidate_index,
+            scheduling_candidate_index: candidate_index,
             retry_index: 0,
             candidate_id: format!("candidate-{candidate_index}"),
         }
@@ -551,6 +552,7 @@ mod tests {
                 ranking: None,
             },
             candidate_index,
+            scheduling_candidate_index: candidate_index,
             retry_index: 0,
             candidate_id: format!("candidate-{candidate_index}"),
         }

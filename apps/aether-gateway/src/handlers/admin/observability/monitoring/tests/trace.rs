@@ -322,6 +322,99 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
 }
 
 #[tokio::test]
+async fn admin_monitoring_trace_recovers_only_a_missing_successful_terminal_attempt() {
+    for (status, final_candidate_id, expected_count) in [
+        ("completed", "final-candidate", 4),
+        ("completed", "failed-1", 3),
+        ("failed", "final-candidate", 3),
+        ("streaming", "final-candidate", 3),
+    ] {
+        let failed = [0, 1, 100]
+            .into_iter()
+            .enumerate()
+            .map(|(index, retry_index)| {
+                let mut candidate = sample_candidate(
+                    &format!("failed-{index}"),
+                    "request-missing-final",
+                    0,
+                    RequestCandidateStatus::Failed,
+                    Some(100 + index as i64),
+                    Some(61_000),
+                    None,
+                );
+                candidate.retry_index = retry_index;
+                candidate.error_type = Some("local_stream_candidate_watchdog_timeout".to_string());
+                candidate.extra_data = Some(json!({"pool_key_index": retry_index / 100}));
+                candidate
+            })
+            .collect::<Vec<_>>();
+        let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(failed));
+        let mut usage = sample_usage(
+            "request-missing-final",
+            "provider-1",
+            "OpenAI",
+            6000,
+            1.15,
+            status,
+            Some(200),
+            100,
+        );
+        usage.candidate_id = Some(final_candidate_id.to_string());
+        usage.candidate_index = None;
+        usage.response_time_ms = Some(78_000);
+        usage.finalized_at_unix_secs = Some(422);
+        usage.request_metadata = Some(json!({"end_to_end_time_ms": 322_000}));
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![usage]));
+        let data_state = GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+            Arc::clone(&request_candidates),
+            usage_repository,
+        );
+        let state = AppState::new()
+            .unwrap()
+            .with_data_state_for_tests(data_state);
+        let context = request_context(
+            http::Method::GET,
+            "/api/admin/monitoring/trace/request-missing-final?attempted_only=true",
+        );
+        let response = local_monitoring_response(&state, &context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["total_candidates"], expected_count);
+        for candidate in payload["candidates"].as_array().unwrap().iter().take(3) {
+            assert_eq!(candidate["status"], "failed");
+            assert!(candidate["status_code"].is_null());
+        }
+        if expected_count == 4 {
+            assert_eq!(payload["final_status"], "success");
+            assert_eq!(payload["total_latency_ms"], 322_000);
+            let final_attempt = &payload["candidates"][3];
+            assert_eq!(final_attempt["id"], final_candidate_id);
+            assert_eq!(final_attempt["status"], "success");
+            assert_eq!(final_attempt["status_code"], 200);
+            assert_eq!(final_attempt["candidate_index"], 1);
+            assert_eq!(final_attempt["latency_ms"], 78_000);
+            assert_eq!(
+                final_attempt["extra_data"]["source"],
+                "usage_routing_snapshot"
+            );
+        }
+        use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+        assert_eq!(
+            request_candidates
+                .list_by_request_id("request-missing-final")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+}
+
+#[tokio::test]
 async fn admin_monitoring_trace_request_returns_oauth_account_label_from_auth_config() {
     let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
         sample_candidate(

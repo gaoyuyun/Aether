@@ -61,6 +61,7 @@ const AUTH_API_KEY_CONCURRENCY_RETRY_DELAY: Duration = Duration::from_millis(10)
 pub(crate) struct LocalExecutionCandidateAttempt {
     pub(crate) eligible: EligibleLocalExecutionCandidate,
     pub(crate) candidate_index: u32,
+    pub(crate) scheduling_candidate_index: u32,
     pub(crate) retry_index: u32,
     pub(crate) candidate_id: String,
 }
@@ -103,6 +104,7 @@ enum LocalExecutionCandidateAttemptSourceItem<'a> {
     Pool {
         cursor: PoolKeyCursor<'a>,
         candidate_index: u32,
+        scheduling_candidate_index: u32,
         pending_attempts: DispatchSequence<LocalExecutionCandidateAttempt>,
         pool_exhaustion_persistence: Option<PoolGroupExhaustionPersistenceContext>,
     },
@@ -158,6 +160,7 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                 LocalExecutionCandidateAttemptSourceItem::Pool {
                     cursor,
                     candidate_index,
+                    scheduling_candidate_index,
                     pending_attempts,
                     pool_exhaustion_persistence,
                 } => {
@@ -204,6 +207,7 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                         build_unpersisted_local_execution_candidate_attempts(
                             candidate,
                             *candidate_index,
+                            *scheduling_candidate_index,
                         )
                         .into(),
                     );
@@ -276,6 +280,7 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
 impl LocalExecutionCandidateAttempt {
     pub(crate) fn attempt_identity(&self) -> ExecutionAttemptIdentity {
         ExecutionAttemptIdentity::new(self.candidate_index, self.retry_index)
+            .with_scheduling_candidate_index(self.scheduling_candidate_index)
             .with_pool_key_index(self.eligible.orchestration.pool_key_index)
     }
 }
@@ -368,6 +373,7 @@ struct GatewayAvailableCandidatePersistencePort<'a, F> {
     required_capabilities: Option<&'a Value>,
     error_context: &'static str,
     created_at_unix_ms: u64,
+    candidate_indices: Vec<u32>,
     build_extra_data: F,
 }
 
@@ -515,7 +521,7 @@ where
                 self.user_id,
                 self.api_key_id,
                 &candidate.candidate,
-                candidate_index,
+                self.candidate_indices[candidate_index as usize],
                 effective_retry_index(retry_index, candidate.orchestration.pool_key_index),
                 generated_candidate_id,
                 self.required_capabilities,
@@ -537,7 +543,8 @@ where
             effective_retry_index(retry_index, candidate.orchestration.pool_key_index);
         LocalExecutionCandidateAttempt {
             eligible: candidate,
-            candidate_index,
+            candidate_index: self.candidate_indices[candidate_index as usize],
+            scheduling_candidate_index: candidate_index,
             retry_index,
             candidate_id,
         }
@@ -578,7 +585,10 @@ impl AiSkippedCandidatePersistencePort for GatewaySkippedCandidatePersistencePor
             self.user_id,
             self.api_key_id,
             &candidate.candidate,
-            candidate_index,
+            crate::request_diagnostics::allocate_request_candidate_index(
+                self.trace_id,
+                candidate_index,
+            ),
             generated_candidate_id,
             self.required_capabilities,
             candidate.skip_reason,
@@ -703,21 +713,7 @@ where
             &candidates,
         );
     }
-    persist_skipped_local_execution_candidates_with_context(
-        state.app(),
-        trace_id,
-        persistence_policy.skipped,
-        u32::try_from(candidates.len()).unwrap_or(u32::MAX),
-        attach_routing_trace_to_skipped_candidates(
-            routing_policy,
-            client_api_format,
-            u32::try_from(candidates.len()).unwrap_or(u32::MAX),
-            skipped_candidates,
-        ),
-    )
-    .await;
-
-    let (items, _) = build_logical_candidate_items(
+    let (items, next_candidate_index) = build_logical_candidate_items(
         state,
         candidates,
         0,
@@ -735,6 +731,19 @@ where
             routing_policy,
         )),
     );
+    persist_skipped_local_execution_candidates_with_context(
+        state.app(),
+        trace_id,
+        persistence_policy.skipped,
+        next_candidate_index,
+        attach_routing_trace_to_skipped_candidates(
+            routing_policy,
+            client_api_format,
+            next_candidate_index,
+            skipped_candidates,
+        ),
+    )
+    .await;
 
     (
         LocalExecutionCandidateAttemptSource {
@@ -762,13 +771,20 @@ fn build_logical_candidate_items<'a>(
     let mut items = VecDeque::new();
     let mut next_candidate_index = starting_candidate_index;
     for candidate in candidates {
-        let candidate_index = next_candidate_index;
+        let scheduling_candidate_index = next_candidate_index;
+        let candidate_index = trace_id.map_or(scheduling_candidate_index, |request_id| {
+            crate::request_diagnostics::allocate_request_candidate_index(
+                request_id,
+                scheduling_candidate_index,
+            )
+        });
         next_candidate_index = next_candidate_index.saturating_add(1);
         match candidate.kind {
             LocalExecutionCandidateKind::SingleKey => {
                 let attempts = build_unpersisted_local_execution_candidate_attempts(
                     candidate,
                     candidate_index,
+                    scheduling_candidate_index,
                 );
                 if !attempts.is_empty() {
                     items.push_back(LocalExecutionCandidateAttemptSourceItem::Static {
@@ -793,6 +809,7 @@ fn build_logical_candidate_items<'a>(
                 items.push_back(LocalExecutionCandidateAttemptSourceItem::Pool {
                     cursor,
                     candidate_index,
+                    scheduling_candidate_index,
                     pending_attempts: DispatchSequence::new(Vec::new()),
                     pool_exhaustion_persistence: pool_exhaustion_persistence.clone(),
                 });
@@ -1189,6 +1206,7 @@ async fn pop_attempt_from_items(
             LocalExecutionCandidateAttemptSourceItem::Pool {
                 cursor,
                 candidate_index,
+                scheduling_candidate_index,
                 pending_attempts,
                 pool_exhaustion_persistence,
             } => {
@@ -1235,6 +1253,7 @@ async fn pop_attempt_from_items(
                     build_unpersisted_local_execution_candidate_attempts(
                         candidate,
                         *candidate_index,
+                        *scheduling_candidate_index,
                     )
                     .into(),
                 );
@@ -1477,6 +1496,14 @@ pub(crate) async fn persist_available_local_execution_candidates<F>(
 where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
 {
+    let candidate_indices = (0..candidates.len())
+        .map(|index| {
+            crate::request_diagnostics::allocate_request_candidate_index(
+                trace_id,
+                u32::try_from(index).unwrap_or(u32::MAX),
+            )
+        })
+        .collect();
     let port = GatewayAvailableCandidatePersistencePort {
         state,
         trace_id,
@@ -1485,6 +1512,7 @@ where
         required_capabilities,
         error_context,
         created_at_unix_ms: current_unix_ms(),
+        candidate_indices,
         build_extra_data,
     };
 
@@ -1536,8 +1564,13 @@ where
 {
     let mut attempts = Vec::new();
 
-    for (candidate_index, candidate) in candidates.into_iter().enumerate() {
-        let candidate_index = u32::try_from(candidate_index).unwrap_or(u32::MAX);
+    for (scheduling_candidate_index, candidate) in candidates.into_iter().enumerate() {
+        let scheduling_candidate_index =
+            u32::try_from(scheduling_candidate_index).unwrap_or(u32::MAX);
+        let candidate_index = crate::request_diagnostics::allocate_request_candidate_index(
+            trace_id,
+            scheduling_candidate_index,
+        );
         match candidate.kind {
             LocalExecutionCandidateKind::SingleKey => {
                 attempts.extend(
@@ -1547,6 +1580,7 @@ where
                         context,
                         candidate,
                         candidate_index,
+                        scheduling_candidate_index,
                         routing_policy,
                         client_api_format,
                         build_extra_data,
@@ -1569,6 +1603,7 @@ where
                     attempts.extend(build_unpersisted_local_execution_candidate_attempts(
                         candidate,
                         candidate_index,
+                        scheduling_candidate_index,
                     ));
                 }
                 let _ = cursor.take_skipped_candidates();
@@ -1610,6 +1645,7 @@ async fn persist_available_local_execution_candidate_at_index<F>(
     context: LocalAvailableCandidatePersistenceContext<'_>,
     candidate: EligibleLocalExecutionCandidate,
     candidate_index: u32,
+    scheduling_candidate_index: u32,
     routing_policy: Option<&ResolvedRoutingPolicy>,
     client_api_format: &str,
     build_extra_data: &F,
@@ -1658,6 +1694,7 @@ where
     vec![LocalExecutionCandidateAttempt {
         eligible: candidate,
         candidate_index,
+        scheduling_candidate_index,
         retry_index,
         candidate_id,
     }]
@@ -1912,6 +1949,7 @@ fn dispatch_sequence_exhausted(
 fn build_unpersisted_local_execution_candidate_attempts(
     candidate: EligibleLocalExecutionCandidate,
     candidate_index: u32,
+    scheduling_candidate_index: u32,
 ) -> VecDeque<LocalExecutionCandidateAttempt> {
     // One attempt per candidate; same-key retries are derived lazily by the
     // attempt loop after a failure.
@@ -1919,6 +1957,7 @@ fn build_unpersisted_local_execution_candidate_attempts(
     VecDeque::from([LocalExecutionCandidateAttempt {
         eligible: candidate,
         candidate_index,
+        scheduling_candidate_index,
         retry_index,
         candidate_id: Uuid::new_v4().to_string(),
     }])
@@ -2638,11 +2677,13 @@ mod tests {
         let first = build_unpersisted_local_execution_candidate_attempts(
             sample_eligible("pool-key-1", Some(0)),
             0,
+            0,
         )
         .pop_front()
         .expect("first pool key attempt");
         let second = build_unpersisted_local_execution_candidate_attempts(
             sample_eligible("pool-key-2", Some(1)),
+            0,
             0,
         )
         .pop_front()
@@ -2654,6 +2695,96 @@ mod tests {
         assert_eq!(second.attempt_identity().retry_index, 100);
         assert_eq!(first.attempt_identity().pool_key_index, Some(0));
         assert_eq!(second.attempt_identity().pool_key_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn execution_paths_keep_distinct_request_candidate_slots() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_repository_for_tests(repository),
+            )
+            .without_request_candidate_queue_for_tests();
+        crate::request_diagnostics::scope_request_diagnostics(async {
+            for (index, status) in [RequestCandidateStatus::Failed, RequestCandidateStatus::Success]
+                .into_iter().enumerate()
+            {
+                // Both the standard path and the same-format fallback rank
+                // their first key at zero within the same request.
+                let (items, _) = build_logical_candidate_items(
+                    PlannerAppState::new(&app), vec![sample_eligible("same-key", Some(0))],
+                    0, Some("trace-cross-path"), false, None, None, None, None, None,
+                );
+                let mut source = LocalExecutionCandidateAttemptSource {
+                    items,
+                    skipped_provider_ids: BTreeSet::new(),
+                    skipped_endpoint_ids: BTreeSet::new(),
+                    skipped_credential_ids: BTreeSet::new(),
+                };
+                let attempt = source.next_attempt().await.unwrap().unwrap();
+                assert_eq!(attempt.candidate_index, index as u32);
+                assert_eq!(attempt.attempt_identity().scheduling_candidate_index, 0);
+                crate::request_candidate_runtime::record_report_request_candidate_status(
+                    &app,
+                    Some(&json!({
+                        "request_id": "trace-cross-path", "candidate_id": attempt.candidate_id,
+                        "candidate_index": attempt.candidate_index, "retry_index": 1,
+                        "provider_id": "provider-1", "endpoint_id": "endpoint-1", "key_id": "same-key",
+                    })),
+                    aether_scheduler_core::SchedulerRequestCandidateStatusUpdate {
+                        status,
+                        status_code: Some(if status == RequestCandidateStatus::Success { 200 } else { 503 }),
+                        error_type: None, error_message: None, latency_ms: Some(10),
+                        started_at_unix_ms: Some(100_000), finished_at_unix_ms: Some(100_010),
+                    },
+                ).await;
+            }
+            let stored = app.read_request_candidates_by_request_id("trace-cross-path").await.unwrap();
+            assert_eq!(stored.len(), 2);
+            assert_eq!(stored[0].status, RequestCandidateStatus::Failed);
+            assert_eq!(stored[1].status, RequestCandidateStatus::Success);
+            assert_ne!(stored[0].id, stored[1].id);
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn available_candidates_from_separate_paths_keep_distinct_slots() {
+        let repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_repository_for_tests(repository),
+            )
+            .without_request_candidate_queue_for_tests();
+        crate::request_diagnostics::scope_request_diagnostics(async {
+            let mut ids = Vec::new();
+            for index in 0..2 {
+                let attempts = persist_available_local_execution_candidates(
+                    PlannerAppState::new(&app),
+                    "trace-materialized-paths",
+                    "user-1",
+                    "api-key-1",
+                    None,
+                    vec![sample_eligible("same-key", None)],
+                    "test persistence",
+                    |_| None,
+                )
+                .await;
+                assert_eq!(attempts[0].candidate_index, index);
+                assert_eq!(attempts[0].scheduling_candidate_index, 0);
+                ids.push(attempts[0].candidate_id.clone());
+            }
+            assert_ne!(ids[0], ids[1]);
+            assert_eq!(
+                app.read_request_candidates_by_request_id("trace-materialized-paths")
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2724,6 +2855,7 @@ mod tests {
                     build_unpersisted_local_execution_candidate_attempts(
                         sample_eligible("normal-key", None),
                         0,
+                        0,
                     )
                     .into(),
                 ),
@@ -2762,6 +2894,7 @@ mod tests {
                 attempts: dispatch_sequence_from_attempts(
                     build_unpersisted_local_execution_candidate_attempts(
                         candidate,
+                        candidate_index,
                         candidate_index,
                     )
                     .into(),
@@ -2816,6 +2949,7 @@ mod tests {
             build_unpersisted_local_execution_candidate_attempts(
                 sample_eligible("pool-key-a", None),
                 0,
+                0,
             )
             .into(),
         );
@@ -2824,13 +2958,14 @@ mod tests {
         Arc::make_mut(&mut fallback.transport).provider.id = "provider-b".to_string();
         Arc::make_mut(&mut fallback.transport).key.provider_id = "provider-b".to_string();
         let fallback_attempts = dispatch_sequence_from_attempts(
-            build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
+            build_unpersisted_local_execution_candidate_attempts(fallback, 1, 1).into(),
         );
         let mut source = LocalExecutionCandidateAttemptSource {
             items: VecDeque::from([
                 LocalExecutionCandidateAttemptSourceItem::Pool {
                     cursor: pool_cursor,
                     candidate_index: 0,
+                    scheduling_candidate_index: 0,
                     pending_attempts: pool_key_attempts,
                     pool_exhaustion_persistence: None,
                 },
@@ -2873,13 +3008,14 @@ mod tests {
         Arc::make_mut(&mut fallback.transport).provider.id = "provider-b".to_string();
         Arc::make_mut(&mut fallback.transport).key.provider_id = "provider-b".to_string();
         let fallback_attempts = dispatch_sequence_from_attempts(
-            build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
+            build_unpersisted_local_execution_candidate_attempts(fallback, 1, 1).into(),
         );
         let mut source = LocalExecutionCandidateAttemptSource {
             items: VecDeque::from([
                 LocalExecutionCandidateAttemptSourceItem::Pool {
                     cursor: pool_cursor,
                     candidate_index: 0,
+                    scheduling_candidate_index: 0,
                     pending_attempts: DispatchSequence::new(Vec::new()),
                     pool_exhaustion_persistence: None,
                 },
@@ -2952,6 +3088,7 @@ mod tests {
             items: VecDeque::from([LocalExecutionCandidateAttemptSourceItem::Pool {
                 cursor,
                 candidate_index: 0,
+                scheduling_candidate_index: 0,
                 pending_attempts: DispatchSequence::new(Vec::new()),
                 pool_exhaustion_persistence: Some(pool_exhaustion_persistence),
             }]),

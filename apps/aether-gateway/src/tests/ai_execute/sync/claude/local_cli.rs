@@ -778,7 +778,13 @@ async fn gateway_returns_claude_cli_error_for_local_sync_failure_impl() {
         .list_by_request_id("trace-claude-cli-local-error-123")
         .await
         .expect("request candidate trace should read");
-    assert_eq!(stored_candidates.len(), 1);
+    // Standard and same-format paths retain their own candidate evaluations.
+    assert_eq!(stored_candidates.len(), 2);
+    assert_ne!(stored_candidates[0].id, stored_candidates[1].id);
+    assert_ne!(
+        stored_candidates[0].candidate_index,
+        stored_candidates[1].candidate_index
+    );
     assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Failed);
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1035,12 +1041,19 @@ async fn gateway_marks_claude_cli_cross_format_runtime_miss_when_format_conversi
         .list_by_request_id("trace-claude-cli-openai-local-miss-123")
         .await
         .expect("request candidate trace should read");
-    assert_eq!(stored_candidates.len(), 1);
-    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Skipped);
-    assert_eq!(
-        stored_candidates[0].skip_reason.as_deref(),
-        Some("format_conversion_disabled")
+    assert_eq!(stored_candidates.len(), 2);
+    assert_ne!(stored_candidates[0].id, stored_candidates[1].id);
+    assert_ne!(
+        stored_candidates[0].candidate_index,
+        stored_candidates[1].candidate_index
     );
+    for candidate in &stored_candidates {
+        assert_eq!(candidate.status, RequestCandidateStatus::Skipped);
+        assert_eq!(
+            candidate.skip_reason.as_deref(),
+            Some("format_conversion_disabled")
+        );
+    }
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

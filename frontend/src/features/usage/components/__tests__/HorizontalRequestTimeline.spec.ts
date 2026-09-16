@@ -340,12 +340,133 @@ describe('HorizontalRequestTimeline', () => {
     const root = mountTimeline(trace)
     await nextTick()
 
+    const nodeDots = [...root.querySelectorAll<HTMLElement>('.node-dot')]
+    expect(nodeDots.map(dot => dot.getAttribute('title'))).toEqual([
+      'Provider A · 失败 · 2 次尝试',
+      'Provider B · 成功 · 2 次尝试',
+    ])
+    expect(nodeDots[0].classList.contains('status-failed')).toBe(true)
+    expect(nodeDots[1].classList.contains('status-success')).toBe(true)
+
     const subDots = [...root.querySelectorAll<HTMLButtonElement>('.sub-dot')]
-    expect(subDots).toHaveLength(2)
+    expect(subDots).toHaveLength(4)
     expect(subDots.map(dot => dot.getAttribute('title'))).toEqual([
+      '#0 · Key A1 · 失败',
       '#1 · Key A2 · 失败',
+      '#2 · Key B1 · 失败',
       '#3 · Key B2 · 成功',
     ])
+  })
+
+  it.each([false, true])('shows the provider final status on the main node and every attempt below it (pool: %s)', async (isPool) => {
+    const extraData = isPool ? { pool_key_index: 0 } : undefined
+    const root = mountTimeline(buildTrace([
+      buildCandidate({ id: 'first-failed', status_code: 503, extra_data: extraData }),
+      buildCandidate({
+        id: 'retry-success',
+        retry_index: 1,
+        status: 'success',
+        status_code: 200,
+        extra_data: extraData,
+      }),
+    ]), { requestStatus: 'completed', overrideStatusCode: 200 })
+    await nextTick()
+
+    const mainDot = root.querySelector<HTMLElement>('.node-dot')!
+    expect(mainDot.classList.contains('status-success')).toBe(true)
+    expect(mainDot.getAttribute('title')).toBe('Provider 1 · 成功 · 2 次尝试')
+
+    const subDots = [...root.querySelectorAll<HTMLButtonElement>('.sub-dot')]
+    expect(subDots).toHaveLength(2)
+    expect(subDots[0].classList.contains('status-failed')).toBe(true)
+    expect(subDots[1].classList.contains('status-success')).toBe(true)
+
+    subDots[0].click()
+    await nextTick()
+    expect(root.querySelector('.status-tag')?.textContent?.trim()).toBe('503')
+    expect(root.querySelector('.title-dot')?.classList.contains('status-failed')).toBe(true)
+    expect(subDots[0].classList.contains('active')).toBe(true)
+
+    mainDot.click()
+    await nextTick()
+    expect(root.querySelector('.status-tag')?.textContent?.trim()).toBe('200')
+    expect(subDots[1].classList.contains('active')).toBe(true)
+  })
+
+  it('keeps the main node red when every attempt of the provider failed', async () => {
+    const root = mountTimeline(buildTrace([
+      buildCandidate({ id: 'first-failed', status_code: 503 }),
+      buildCandidate({ id: 'retry-failed', retry_index: 1, status_code: 502 }),
+      buildCandidate({
+        id: 'other-success',
+        candidate_index: 1,
+        provider_id: 'provider-2',
+        provider_name: 'Provider 2',
+        status: 'success',
+        status_code: 200,
+      }),
+    ]), { requestStatus: 'completed', overrideStatusCode: 200 })
+    await nextTick()
+
+    const nodeDots = [...root.querySelectorAll<HTMLElement>('.node-dot')]
+    expect(nodeDots).toHaveLength(2)
+    expect(nodeDots[0].classList.contains('status-failed')).toBe(true)
+    expect(nodeDots[1].classList.contains('status-success')).toBe(true)
+    expect([...root.querySelectorAll<HTMLButtonElement>('.sub-dot')]).toHaveLength(2)
+  })
+
+  it('keeps the final successful attempt when earlier attempts have pool metadata', async () => {
+    const onSelectAttempt = vi.fn()
+    const root = mountTimeline(buildTrace([
+      buildCandidate({ id: 'pool-failed', extra_data: { pool_key_index: 0 } }),
+      buildCandidate({ id: 'pool-retry-failed', retry_index: 1, extra_data: { pool_key_index: 0 } }),
+      buildCandidate({ id: 'pool-next-key-failed', retry_index: 100, extra_data: { pool_key_index: 1 } }),
+      buildCandidate({
+        id: 'final-success', candidate_index: 1, status: 'success', status_code: 200,
+        extra_data: { source: 'usage_routing_snapshot' },
+      }),
+    ]), { requestStatus: 'completed', overrideStatusCode: 200, onSelectAttempt })
+    await nextTick()
+
+    expect(root.querySelector('.node-dot')?.classList.contains('status-success')).toBe(true)
+    const subDots = [...root.querySelectorAll('.sub-dot')]
+    expect(subDots).toHaveLength(4)
+    expect(subDots.slice(0, 3).every(dot => dot.classList.contains('status-failed'))).toBe(true)
+    expect(subDots[3].classList.contains('status-success')).toBe(true)
+    expect(onSelectAttempt.mock.lastCall?.[0]?.id).toBe('final-success')
+  })
+
+  it('keeps the trace result when an older scheduling audit reports failure', async () => {
+    const root = mountTimeline(buildTrace([
+      buildCandidate({ id: 'final-success', status: 'success', status_code: 200 }),
+    ]), {
+      requestStatus: 'completed',
+      overrideStatusCode: 200,
+      requestMetadata: {
+        scheduling_audit: { attempts: [{
+          candidate_index: 0, retry_index: 0, provider_id: 'provider-1',
+          status: 'failed', status_code: 503,
+        }] },
+      },
+    })
+    await nextTick()
+
+    expect(root.querySelector('.node-dot')?.classList.contains('status-success')).toBe(true)
+    expect(root.querySelector('.status-tag')?.textContent?.trim()).toBe('200')
+  })
+
+  it('does not drop unmatched attempts when a provider has multiple pool groups', async () => {
+    const root = mountTimeline(buildTrace([
+      buildCandidate({ id: 'pool-a', extra_data: { pool_group_id: 'a' } }),
+      buildCandidate({ id: 'pool-b', candidate_index: 1, extra_data: { pool_group_id: 'b' } }),
+      buildCandidate({ id: 'success', candidate_index: 2, status: 'success', status_code: 200 }),
+    ]))
+    await nextTick()
+
+    const dots = [...root.querySelectorAll('.node-dot')]
+    expect(dots).toHaveLength(3)
+    expect(dots[2].classList.contains('status-success')).toBe(true)
+    expect(root.querySelector('.status-tag')?.textContent?.trim()).toBe('200')
   })
 
   it('orders visible candidates by scheduling index and includes unattempted candidates', async () => {
@@ -461,6 +582,7 @@ describe('HorizontalRequestTimeline', () => {
       .toBe(true)
     expect([...root.querySelectorAll<HTMLButtonElement>('.sub-dot')]
       .map(dot => dot.getAttribute('title'))).toEqual([
+      '#0 · CodexFree2 · 跳过',
       '#1 · Success Key · 成功',
     ])
   })

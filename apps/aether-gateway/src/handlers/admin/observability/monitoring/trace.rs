@@ -48,7 +48,7 @@ pub(super) async fn build_admin_monitoring_trace_request_response(
         Err(detail) => return Ok(admin_monitoring_bad_request_response(detail)),
     };
 
-    let Some(resolved) =
+    let Some(mut resolved) =
         resolve_admin_monitoring_trace(admin_state, &request_id, attempted_only).await?
     else {
         debug!(
@@ -64,6 +64,7 @@ pub(super) async fn build_admin_monitoring_trace_request_response(
             attempted_only,
         ));
     };
+    append_missing_terminal_usage_candidate(&mut resolved);
     let key_accounts =
         build_admin_monitoring_key_account_display_map(admin_state, &resolved.trace).await?;
 
@@ -80,6 +81,83 @@ pub(super) async fn build_admin_monitoring_trace_request_response(
             .insert("x-aether-build-version", version);
     }
     Ok(response)
+}
+
+/// Older execution paths could reuse a previous path's candidate slot. The
+/// final usage snapshot still identifies the successful attempt in that case.
+/// Recover only that missing attempt, without relabeling any recorded failure.
+fn append_missing_terminal_usage_candidate(resolved: &mut ResolvedAdminMonitoringTrace) {
+    let Some(usage) = resolved.usage.as_ref() else {
+        return;
+    };
+    if !matches!(
+        usage.status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "success"
+    ) || admin_monitoring_usage_candidate_status(usage) != RequestCandidateStatus::Success
+        || !admin_monitoring_usage_trace_request_ids(usage).contains(&resolved.trace.request_id)
+    {
+        return;
+    }
+    let Some(candidate_id) = usage
+        .routing_candidate_id()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    if resolved.trace.candidates.iter().any(|item| {
+        item.candidate.id == candidate_id
+            || item.candidate.status == RequestCandidateStatus::Success
+    }) {
+        return;
+    }
+    let Some(mut snapshot) = build_admin_monitoring_usage_routing_snapshot_trace(usage) else {
+        return;
+    };
+    let Some(mut recovered) = snapshot.candidates.pop() else {
+        return;
+    };
+    if let Some(existing) = resolved.trace.candidates.iter().find(|item| {
+        item.candidate.provider_id == recovered.candidate.provider_id
+            && item.candidate.endpoint_id == recovered.candidate.endpoint_id
+            && item.candidate.key_id == recovered.candidate.key_id
+    }) {
+        recovered = DecisionTraceCandidate {
+            candidate: recovered.candidate,
+            ..existing.clone()
+        };
+    }
+    recovered.candidate.request_id = resolved.trace.request_id.clone();
+    recovered.candidate.candidate_index = resolved
+        .trace
+        .candidates
+        .iter()
+        .map(|item| item.candidate.candidate_index)
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1);
+    if let (Some(end), Some(latency)) = (
+        recovered.candidate.finished_at_unix_ms,
+        recovered.candidate.latency_ms,
+    ) {
+        recovered.candidate.started_at_unix_ms =
+            Some(end.saturating_sub(latency).max(usage.created_at_unix_ms));
+    }
+    resolved.trace.total_latency_ms = resolved
+        .trace
+        .total_latency_ms
+        .saturating_add(snapshot.total_latency_ms);
+    if let Some(elapsed) = usage
+        .request_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("end_to_end_time_ms"))
+        .and_then(Value::as_u64)
+    {
+        resolved.trace.total_latency_ms = resolved.trace.total_latency_ms.max(elapsed);
+    }
+    resolved.trace.candidates.push(recovered);
+    resolved.trace.total_candidates = resolved.trace.candidates.len();
+    resolved.trace.final_status = RequestCandidateFinalStatus::Success;
 }
 
 async fn resolve_admin_monitoring_trace(
@@ -258,10 +336,12 @@ fn admin_monitoring_usage_has_routing_snapshot_trace_data(usage: &StoredRequestU
 fn admin_monitoring_usage_candidate_status(
     usage: &StoredRequestUsageAudit,
 ) -> RequestCandidateStatus {
-    if usage.status.trim().eq_ignore_ascii_case("cancelled")
-        || usage.status.trim().eq_ignore_ascii_case("canceled")
-    {
-        return RequestCandidateStatus::Cancelled;
+    match usage.status.trim().to_ascii_lowercase().as_str() {
+        "failed" | "error" => return RequestCandidateStatus::Failed,
+        "cancelled" | "canceled" => return RequestCandidateStatus::Cancelled,
+        "pending" => return RequestCandidateStatus::Pending,
+        "streaming" => return RequestCandidateStatus::Streaming,
+        _ => {}
     }
 
     match usage.status_code {
