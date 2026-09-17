@@ -12,9 +12,10 @@ use super::{
     PROVIDER_ACTUAL_SERVICE_TIER_METADATA_KEY, PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY,
     PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_SERVICE_TIER_METADATA_KEY,
     REALTIME_SESSION_METADATA_KEY, REQUESTED_REASONING_EFFORT_METADATA_KEY,
-    ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY, ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY,
-    USAGE_AVAILABLE_METADATA_KEY, USAGE_PRICING_AVAILABLE_METADATA_KEY,
-    WEBSOCKET_MODE_METADATA_KEY, WEBSOCKET_TRANSPORT_METADATA_KEY,
+    REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY, ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY,
+    ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
+    USAGE_PRICING_AVAILABLE_METADATA_KEY, WEBSOCKET_MODE_METADATA_KEY,
+    WEBSOCKET_TRANSPORT_METADATA_KEY,
 };
 
 const UPSTREAM_IS_STREAM_KEY: &str = "upstream_is_stream";
@@ -108,6 +109,7 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
         "client_response_body_base64_bytes",
         "end_to_end_time_ms",
         "end_to_end_first_byte_time_ms",
+        REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY,
     ] {
         insert_u64(source, &mut target, key);
     }
@@ -1283,6 +1285,23 @@ mod tests {
         ] {
             assert!(metadata.get(key).is_none(), "{key} must not be persisted");
         }
+    }
+
+    #[test]
+    fn persistence_projection_keeps_request_level_timing_facts() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "request_accepted_at_unix_ms": 1_757_000_000_123_u64,
+            "end_to_end_time_ms": 10_626,
+            "end_to_end_first_byte_time_ms": 10_120,
+        })))
+        .expect("timing metadata should remain");
+
+        assert_eq!(
+            metadata["request_accepted_at_unix_ms"],
+            1_757_000_000_123_u64
+        );
+        assert_eq!(metadata["end_to_end_time_ms"], 10_626);
+        assert_eq!(metadata["end_to_end_first_byte_time_ms"], 10_120);
     }
 
     #[test]

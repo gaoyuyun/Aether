@@ -613,8 +613,10 @@ fn build_users_me_usage_record_payload(
         "request_path": users_me_usage_metadata_string(item, "request_path"),
         "request_path_and_query": users_me_usage_metadata_string(item, "request_path_and_query"),
         "status": item.status,
+        "lifecycle_finalized": item.lifecycle_is_terminal(),
         "has_fallback": item.has_fallback(),
         "created_at": unix_secs_to_rfc3339(item.created_at_unix_ms),
+        "request_accepted_at_unix_ms": item.request_accepted_at_unix_ms(),
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "cache_creation_ephemeral_5m_input_tokens": item.cache_creation_ephemeral_5m_input_tokens,
         "cache_creation_ephemeral_1h_input_tokens": item.cache_creation_ephemeral_1h_input_tokens,
@@ -673,6 +675,8 @@ fn build_users_me_usage_active_payload(
     let mut payload = json!({
         "id": item.id,
         "status": item.status,
+        "lifecycle_finalized": item.lifecycle_is_terminal(),
+        "request_accepted_at_unix_ms": item.request_accepted_at_unix_ms(),
         "request_type": item.request_type,
         "input_tokens": item.input_tokens,
         "effective_input_tokens": users_me_usage_effective_input_tokens(item),
@@ -768,19 +772,20 @@ async fn resolve_users_me_usage_active_state_overrides_by_request_id(
         return Ok(BTreeMap::new());
     }
 
-    let active_request_ids = items
+    let active_usage_by_request_id = items
         .iter()
         .filter(|item| matches!(item.status.as_str(), "pending" | "streaming"))
-        .map(|item| item.request_id.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|item| (item.request_id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
     let mut overrides = BTreeMap::new();
-    for request_id in active_request_ids {
+    for (request_id, item) in active_usage_by_request_id {
         let candidates = state
             .read_request_candidates_by_request_id(&request_id)
             .await?;
-        if let Some(override_payload) =
-            resolve_request_terminal_candidate_state_override(&candidates)
-        {
+        if let Some(override_payload) = resolve_request_terminal_candidate_state_override(
+            &candidates,
+            item.request_accepted_at_unix_ms(),
+        ) {
             overrides.insert(request_id, override_payload);
         }
     }
@@ -1964,6 +1969,79 @@ mod tests {
     }
 
     #[test]
+    fn user_usage_payloads_expose_request_clock_origin_and_lifecycle_finalization() {
+        let active_item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "request_accepted_at_unix_ms": 1_757_000_000_123_u64,
+            })),
+            ..sample_usage("streaming")
+        };
+        let record = build_users_me_usage_record_payload(
+            &active_item,
+            false,
+            false,
+            &BTreeMap::new(),
+            false,
+        );
+        let active = build_users_me_usage_active_payload(&active_item, false);
+        for payload in [&record, &active] {
+            assert_eq!(
+                payload["request_accepted_at_unix_ms"],
+                1_757_000_000_123_u64
+            );
+            assert_eq!(payload["lifecycle_finalized"], false);
+        }
+
+        let legacy_item = sample_usage("completed");
+        let record = build_users_me_usage_record_payload(
+            &legacy_item,
+            false,
+            false,
+            &BTreeMap::new(),
+            false,
+        );
+        let active = build_users_me_usage_active_payload(&legacy_item, false);
+        for payload in [&record, &active] {
+            assert_eq!(payload["request_accepted_at_unix_ms"], Value::Null);
+            assert_eq!(payload["lifecycle_finalized"], true);
+        }
+    }
+
+    #[test]
+    fn user_usage_active_override_keeps_row_unfinalized_with_request_level_total() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "request_accepted_at_unix_ms": 200_u64,
+            })),
+            ..sample_usage("streaming")
+        };
+        let candidate = sample_candidate(
+            RequestCandidateStatus::Success,
+            Some(200),
+            Some(9_210),
+            None,
+        );
+        let overrides = resolve_request_terminal_candidate_state_override(
+            &[candidate],
+            item.request_accepted_at_unix_ms(),
+        )
+        .expect("override");
+
+        let mut payload = build_users_me_usage_active_payload(&item, false);
+        let object = payload.as_object_mut().expect("object");
+        apply_users_me_usage_state_override(
+            object,
+            overrides.as_object().expect("override object"),
+        );
+
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["response_time_ms"], 9_210);
+        assert_eq!(payload["end_to_end_time_ms"], 10_010);
+        assert_eq!(payload["lifecycle_finalized"], false);
+        assert_eq!(payload["request_accepted_at_unix_ms"], 200);
+    }
+
+    #[test]
     fn user_usage_payloads_only_expose_provider_when_enabled() {
         let item = sample_usage("completed");
 
@@ -2080,8 +2158,8 @@ mod tests {
             "upstream_response": {"body": {"error": {"message": "private upstream diagnostic"}}}
         }));
 
-        let payload =
-            resolve_request_terminal_candidate_state_override(&[candidate]).expect("override");
+        let payload = resolve_request_terminal_candidate_state_override(&[candidate], None)
+            .expect("override");
 
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["response_time_ms"], 9_210);
@@ -2129,7 +2207,7 @@ mod tests {
         streaming.started_at_unix_ms = Some(10_500);
         streaming.finished_at_unix_ms = None;
 
-        let payload = resolve_request_terminal_candidate_state_override(&[failed, streaming]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed, streaming], None);
 
         assert!(payload.is_none());
     }
@@ -2151,7 +2229,7 @@ mod tests {
             }
         }));
 
-        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed], None);
 
         assert!(payload.is_none());
     }
@@ -2167,7 +2245,7 @@ mod tests {
             Some("upstream connection reset"),
         );
 
-        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed], None);
 
         assert!(payload.is_none());
     }
@@ -2183,7 +2261,7 @@ mod tests {
         failed.extra_data = Some(json!({ "request_lifecycle": "request_terminal" }));
 
         let payload =
-            resolve_request_terminal_candidate_state_override(&[failed]).expect("override");
+            resolve_request_terminal_candidate_state_override(&[failed], None).expect("override");
 
         assert_eq!(payload["status"], "failed");
         assert_eq!(payload["status_code"], 502);

@@ -96,6 +96,7 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
             "trace_id"
                 | "client_ip"
                 | "client_family"
+                | "request_accepted_at_unix_ms"
                 | "client_requested_stream"
                 | "upstream_is_stream"
                 | "api_key_is_standalone"
@@ -462,6 +463,7 @@ mod tests {
         let metadata = retain_first_byte_request_metadata(Some(json!({
             "trace_id": "trace-first-byte",
             "client_ip": "203.0.113.8",
+            "request_accepted_at_unix_ms": 1_757_000_000_123_u64,
             "request_path": "/v1/chat/completions",
             "upstream_is_stream": true,
             "proxy": {"mode": "manual", "node_id": "proxy-1"},
@@ -476,6 +478,7 @@ mod tests {
             json!({
                 "trace_id": "trace-first-byte",
                 "client_ip": "203.0.113.8",
+                "request_accepted_at_unix_ms": 1_757_000_000_123_u64,
                 "request_path": "/v1/chat/completions",
                 "request_path_and_query": "/v1/chat/completions",
                 "upstream_is_stream": true

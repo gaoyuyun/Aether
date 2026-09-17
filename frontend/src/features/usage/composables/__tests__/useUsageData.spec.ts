@@ -413,11 +413,89 @@ describe('useUsageData', () => {
     })
     await loadRecords({ page: 1, pageSize: 20 }, undefined, dateRange)
 
+    // The terminal snapshot is authoritative for both candidate-level timings: it carries the
+    // successful candidate's own first byte, which may be smaller than the value an earlier
+    // attempt left on the active row.
     expect(currentRecords.value[0]).toMatchObject({
       status: 'completed',
       response_time_ms: 5200,
       response_time_updated_at: '2026-07-17T12:00:07Z',
-      first_byte_time_ms: 2000,
+      first_byte_time_ms: 1800,
+    })
+  })
+
+  it('keeps request-level timing facts across a stale list snapshot and adopts the terminal refinement', async () => {
+    const isAdminPage = ref(true)
+    const { loadRecords, currentRecords } = useUsageData({ isAdminPage })
+    const dateRange = { preset: 'today', tz_offset_minutes: 0 }
+
+    // The active poll already concluded the request from its candidate: request-level total known,
+    // the usage row itself still catching up.
+    getAllUsageRecordsMock.mockResolvedValueOnce({
+      records: [buildUsageRecord({
+        status: 'completed',
+        lifecycle_finalized: false,
+        request_accepted_at_unix_ms: 1_757_000_000_123,
+        response_time_ms: 9_210,
+        first_byte_time_ms: 2_000,
+        end_to_end_time_ms: 10_010,
+        updated_at: '2026-09-17T00:00:05Z',
+      })],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    })
+    await loadRecords({ page: 1, pageSize: 20 }, undefined, dateRange)
+
+    // A lagging replica still reports the streaming row without any request-level facts.
+    getAllUsageRecordsMock.mockResolvedValueOnce({
+      records: [buildUsageRecord({
+        status: 'streaming',
+        lifecycle_finalized: false,
+        request_accepted_at_unix_ms: null,
+        response_time_ms: 2_000,
+        first_byte_time_ms: 2_000,
+        end_to_end_time_ms: null,
+        updated_at: '2026-09-17T00:00:04Z',
+      })],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    })
+    await loadRecords({ page: 1, pageSize: 20 }, undefined, dateRange)
+
+    expect(currentRecords.value[0]).toMatchObject({
+      status: 'completed',
+      lifecycle_finalized: false,
+      request_accepted_at_unix_ms: 1_757_000_000_123,
+      end_to_end_time_ms: 10_010,
+    })
+
+    // The terminal usage write lands: the successful candidate's own first byte replaces the
+    // earlier attempt's value, end-to-end timing is refined, and polling may stop.
+    getAllUsageRecordsMock.mockResolvedValueOnce({
+      records: [buildUsageRecord({
+        status: 'completed',
+        lifecycle_finalized: true,
+        request_accepted_at_unix_ms: 1_757_000_000_123,
+        response_time_ms: 9_210,
+        first_byte_time_ms: 1_500,
+        end_to_end_time_ms: 10_026,
+        end_to_end_first_byte_time_ms: 2_316,
+        updated_at: '2026-09-17T00:00:06Z',
+      })],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    })
+    await loadRecords({ page: 1, pageSize: 20 }, undefined, dateRange)
+
+    expect(currentRecords.value[0]).toMatchObject({
+      status: 'completed',
+      lifecycle_finalized: true,
+      first_byte_time_ms: 1_500,
+      end_to_end_time_ms: 10_026,
+      end_to_end_first_byte_time_ms: 2_316,
     })
   })
 

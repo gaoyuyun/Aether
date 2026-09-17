@@ -48,6 +48,7 @@ const INTERNAL_REPORT_OBSERVATION_FIELDS: &[&str] = &[
     "db_timings_ms",
     "end_to_end_time_ms",
     "end_to_end_first_byte_time_ms",
+    "request_accepted_at_unix_ms",
     "windsurf_native_runtime",
     "windsurf_language_server_port",
 ];

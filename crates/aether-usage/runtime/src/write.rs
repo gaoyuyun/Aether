@@ -7,8 +7,9 @@ use aether_data_contracts::repository::settlement::{
 };
 use aether_data_contracts::repository::usage::{
     UpsertUsageRecord, UsageBodyCaptureState, LIVE_SESSION_METADATA_KEY,
-    USAGE_AVAILABLE_METADATA_KEY, USAGE_PRICING_AVAILABLE_METADATA_KEY,
-    WEBSOCKET_MODE_METADATA_KEY, WEBSOCKET_TRANSPORT_METADATA_KEY,
+    REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
+    USAGE_PRICING_AVAILABLE_METADATA_KEY, WEBSOCKET_MODE_METADATA_KEY,
+    WEBSOCKET_TRANSPORT_METADATA_KEY,
 };
 use aether_data_contracts::DataLayerError;
 use serde_json::{json, Map, Value};
@@ -2168,6 +2169,17 @@ fn build_runtime_request_metadata_seed_from_parts(
     if let Some(user_agent) = context_string(context, "user_agent") {
         metadata.insert("user_agent".to_string(), Value::String(user_agent));
     }
+    // The request-level clock origin travels with every attempt so the pending row (and any
+    // first-byte row inserted ahead of it) anchors live elapsed time exactly where the
+    // terminal `end_to_end_time_ms` starts.
+    if let Some(request_accepted_at_unix_ms) =
+        context_u64(context, REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY)
+    {
+        metadata.insert(
+            REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY.to_string(),
+            Value::from(request_accepted_at_unix_ms),
+        );
+    }
     if let Some(client_requested_stream) = context_bool(context, "client_requested_stream") {
         metadata.insert(
             "client_requested_stream".to_string(),
@@ -3809,6 +3821,7 @@ mod tests {
                 Some(&json!({
                     "candidate_id": "cand-pending-event-1",
                     "candidate_index": 3,
+                    "request_accepted_at_unix_ms": 1_757_000_000_123_u64,
                     "websocket_mode": true,
                     "websocket_transport": "responses",
                     "original_request_body": {"messages": [{"content": "omit me"}]},
@@ -3828,6 +3841,14 @@ mod tests {
         assert_eq!(record.billing_status, "pending");
         assert_eq!(record.request_type.as_deref(), Some("compact"));
         assert_eq!(record.finalized_at_unix_secs, None);
+        assert_eq!(
+            record
+                .request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("request_accepted_at_unix_ms"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1_757_000_000_123)
+        );
         assert_eq!(record.updated_at_unix_secs, 1_700_000_020);
         assert!(record.request_body.is_none());
         assert!(record.provider_request_body.is_none());

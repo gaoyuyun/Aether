@@ -278,6 +278,23 @@ describe('usage status helpers', () => {
     expect(isUsageRecordPollable(buildUsageRecord({ status: undefined }))).toBe(false)
   })
 
+  it('keeps polling a terminal status that the usage row has not finalized yet', () => {
+    // A candidate-level conclusion overlaid on an active usage row: the terminal usage write
+    // (tokens, cost, end-to-end timing) is still catching up.
+    expect(isUsageRecordPollable(buildUsageRecord({
+      status: 'completed',
+      lifecycle_finalized: false,
+    }))).toBe(true)
+    expect(isUsageRecordPollable(buildUsageRecord({
+      status: 'completed',
+      lifecycle_finalized: true,
+    }))).toBe(false)
+    expect(isUsageRecordPollable(buildUsageRecord({
+      status: 'streaming',
+      lifecycle_finalized: false,
+    }))).toBe(true)
+  })
+
   it('uses status code only as a last fallback for timeline status', () => {
     expect(resolveTimelineFinalStatus({
       statusCode: 200,

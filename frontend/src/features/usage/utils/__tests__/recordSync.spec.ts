@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest'
 
 import type { UsageRecord } from '../../types'
 import {
+  mergeUsageRecordEndToEndTimeMs,
   mergeUsageRecordErrorMessage,
   mergeUsageRecordFirstByteTimeMs,
+  mergeUsageRecordLifecycleFinalized,
   mergeUsageRecordLifecycleSnapshot,
+  mergeUsageRecordRequestAcceptedAtUnixMs,
   mergeUsageRecordResponseTiming,
   syncUsageRecordStreamResolution,
 } from '../recordSync'
@@ -76,6 +79,47 @@ describe('mergeUsageRecordFirstByteTimeMs', () => {
     expect(mergeUsageRecordFirstByteTimeMs(0, null)).toBe(0)
     expect(mergeUsageRecordFirstByteTimeMs(null, -1)).toBeNull()
     expect(mergeUsageRecordFirstByteTimeMs(-1, null)).toBeUndefined()
+  })
+
+  it('lets a terminal snapshot replace the first byte kept from an earlier attempt', () => {
+    expect(mergeUsageRecordFirstByteTimeMs(2000, 1500, { preferNext: true })).toBe(1500)
+    expect(mergeUsageRecordFirstByteTimeMs(2000, null, { preferNext: true })).toBe(2000)
+    expect(mergeUsageRecordFirstByteTimeMs(2000, 1500)).toBe(2000)
+  })
+})
+
+describe('mergeUsageRecordEndToEndTimeMs', () => {
+  it('never lets a snapshot without end-to-end timing clear a known value', () => {
+    expect(mergeUsageRecordEndToEndTimeMs(10_626, null)).toBe(10_626)
+    expect(mergeUsageRecordEndToEndTimeMs(10_626, undefined)).toBe(10_626)
+    expect(mergeUsageRecordEndToEndTimeMs(null, 10_626)).toBe(10_626)
+    expect(mergeUsageRecordEndToEndTimeMs(undefined, null)).toBeUndefined()
+    expect(mergeUsageRecordEndToEndTimeMs(null, undefined)).toBeNull()
+  })
+
+  it('lets the terminal usage write refine the candidate-level projection', () => {
+    expect(mergeUsageRecordEndToEndTimeMs(10_010, 10_026)).toBe(10_026)
+    expect(mergeUsageRecordEndToEndTimeMs(10_026, 10_010)).toBe(10_010)
+  })
+})
+
+describe('mergeUsageRecordRequestAcceptedAtUnixMs', () => {
+  it('keeps the first known accepted clock origin', () => {
+    expect(mergeUsageRecordRequestAcceptedAtUnixMs(undefined, 1_757_000_000_123)).toBe(1_757_000_000_123)
+    expect(mergeUsageRecordRequestAcceptedAtUnixMs(1_757_000_000_123, 1_757_000_000_999)).toBe(1_757_000_000_123)
+    expect(mergeUsageRecordRequestAcceptedAtUnixMs(1_757_000_000_123, null)).toBe(1_757_000_000_123)
+    expect(mergeUsageRecordRequestAcceptedAtUnixMs(null, 0)).toBeNull()
+    expect(mergeUsageRecordRequestAcceptedAtUnixMs(undefined, undefined)).toBeUndefined()
+  })
+})
+
+describe('mergeUsageRecordLifecycleFinalized', () => {
+  it('only moves towards finalized', () => {
+    expect(mergeUsageRecordLifecycleFinalized(undefined, false)).toBe(false)
+    expect(mergeUsageRecordLifecycleFinalized(false, true)).toBe(true)
+    expect(mergeUsageRecordLifecycleFinalized(true, false)).toBe(true)
+    expect(mergeUsageRecordLifecycleFinalized(false, undefined)).toBe(false)
+    expect(mergeUsageRecordLifecycleFinalized(undefined, undefined)).toBeUndefined()
   })
 })
 

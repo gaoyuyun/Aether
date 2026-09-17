@@ -12,6 +12,12 @@ pub const ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY: &str = "routing_failure_diagn
 pub const WEBSOCKET_MODE_METADATA_KEY: &str = "websocket_mode";
 pub const WEBSOCKET_TRANSPORT_METADATA_KEY: &str = "websocket_transport";
 pub const PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY: &str = "plan_usage_reservation_deferred";
+/// Wall-clock instant (unix milliseconds) at which the gateway accepted the client request.
+///
+/// The first lifecycle usage write stamps it so the live "end-to-end elapsed" clock shown for
+/// an active request and the terminal `end_to_end_time_ms` share one origin. Candidate-level
+/// `response_time_ms`/`first_byte_time_ms` restart with every attempt and must not anchor it.
+pub const REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY: &str = "request_accepted_at_unix_ms";
 /// Whether token/cost usage is authoritative for this audit row.
 ///
 /// The field is absent for legacy and normally-metered requests. An explicit
@@ -842,6 +848,23 @@ impl StoredRequestUsageAudit {
     pub fn has_fallback(&self) -> bool {
         self.routing_candidate_index()
             .is_some_and(|index| index > 0)
+    }
+
+    /// Unix milliseconds at which the gateway accepted the request, when the lifecycle
+    /// writes stamped it. Absent for rows written before the field existed and for paths
+    /// without request diagnostics.
+    pub fn request_accepted_at_unix_ms(&self) -> Option<u64> {
+        self.request_metadata_u64(REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY)
+    }
+
+    /// Whether the usage row itself reached a terminal lifecycle status. Request candidates can
+    /// conclude earlier than the usage row; readers that overlay candidate state keep polling
+    /// until this becomes true so late terminal facts (tokens, end-to-end timing) still land.
+    pub fn lifecycle_is_terminal(&self) -> bool {
+        matches!(
+            self.status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "cancelled"
+        )
     }
 
     pub fn routing_key_name(&self) -> Option<&str> {

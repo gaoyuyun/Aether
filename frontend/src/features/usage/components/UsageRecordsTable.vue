@@ -406,6 +406,7 @@
                 :response-time-updated-at="record.response_time_updated_at ?? null"
                 :status="getDisplayStatus(record)"
                 :response-time-ms="record.response_time_ms ?? null"
+                :request-accepted-at-unix-ms="record.request_accepted_at_unix_ms ?? null"
               />
               <span class="text-muted-foreground"> / </span>
               <span>{{ formatOutputRate(getRecordDisplayOutputRate(record)) }}</span>
@@ -999,6 +1000,7 @@
                   :response-time-updated-at="record.response_time_updated_at ?? null"
                   :status="getDisplayStatus(record)"
                   :response-time-ms="record.response_time_ms ?? null"
+                  :request-accepted-at-unix-ms="record.request_accepted_at_unix_ms ?? null"
                 />
               </span>
             </div>

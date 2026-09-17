@@ -1298,6 +1298,8 @@ fn admin_usage_active_request_json(
     let mut value = json!({
         "id": item.id,
         "status": item.status,
+        "lifecycle_finalized": item.lifecycle_is_terminal(),
+        "request_accepted_at_unix_ms": item.request_accepted_at_unix_ms(),
         "request_type": item.request_type,
         "input_tokens": item.input_tokens,
         "effective_input_tokens": admin_usage_effective_input_tokens(item),
@@ -1455,6 +1457,14 @@ pub fn admin_usage_record_json(
             item,
             "end_to_end_first_byte_time_ms"
         )),
+    );
+    object.insert(
+        "lifecycle_finalized".to_string(),
+        json!(item.lifecycle_is_terminal()),
+    );
+    object.insert(
+        "request_accepted_at_unix_ms".to_string(),
+        json!(item.request_accepted_at_unix_ms()),
     );
     object.insert("is_websocket".to_string(), json!(item.is_websocket()));
     object.insert(
@@ -2869,6 +2879,50 @@ mod tests {
             assert_eq!(payload["first_byte_time_ms"], 120);
             assert_eq!(payload["end_to_end_time_ms"], 10_626);
             assert_eq!(payload["end_to_end_first_byte_time_ms"], 10_120);
+        }
+    }
+
+    #[test]
+    fn admin_usage_payloads_expose_request_clock_origin_and_lifecycle_finalization() {
+        let active_item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "request_accepted_at_unix_ms": 1_757_000_000_123_u64,
+            })),
+            ..sample_usage("streaming", None, None)
+        };
+        let record = admin_usage_record_json(
+            &active_item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&active_item, None, None, None);
+        for payload in [&record, &active] {
+            assert_eq!(
+                payload["request_accepted_at_unix_ms"],
+                1_757_000_000_123_u64
+            );
+            assert_eq!(payload["lifecycle_finalized"], false);
+        }
+
+        let legacy_item = sample_usage("completed", Some(200), None);
+        let record = admin_usage_record_json(
+            &legacy_item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&legacy_item, None, None, None);
+        for payload in [&record, &active] {
+            assert_eq!(
+                payload["request_accepted_at_unix_ms"],
+                serde_json::Value::Null
+            );
+            assert_eq!(payload["lifecycle_finalized"], true);
         }
     }
 

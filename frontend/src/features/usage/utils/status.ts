@@ -259,10 +259,18 @@ export function resolveDisplayRequestStatus(record: UsageDisplayStatusRecord): R
  * candidates can still carry an error code from a candidate the gateway already abandoned, and
  * deriving pollability from the display status would drop such a request from the polling set
  * before its next candidate answers — leaving the row stuck on an intermediate failure forever.
+ *
+ * A terminal status can also be a candidate-level conclusion overlaid on a usage row that is
+ * still catching up (`lifecycle_finalized === false`). Such a row keeps polling so the terminal
+ * usage write (tokens, cost, end-to-end timing) still reaches the table instead of leaving the
+ * candidate-level snapshot on screen until the next full refresh.
  */
 export function isUsageRecordPollable(
-  record: Pick<UsageRecord, 'status'>
+  record: Pick<UsageRecord, 'status' | 'lifecycle_finalized'>
 ): boolean {
+  if (record.lifecycle_finalized === false) {
+    return true
+  }
   const status = normalizeRequestStatus(record.status)
   return status === 'pending' || status === 'streaming'
 }

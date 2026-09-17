@@ -66,4 +66,18 @@ describe('admin usage initial loading', () => {
       "if (typeof update.requested_reasoning_effort === 'string' && update.requested_reasoning_effort.trim())",
     )
   })
+
+  it('merges request-level timing from active snapshots so completion never falls back to candidate numbers', () => {
+    const pollBlock = source
+      .split('async function pollActiveRequests()')[1]
+      ?.split('async function discoverActiveRequests()')[0]
+
+    expect(pollBlock).toBeTruthy()
+    expect(pollBlock).toContain('record.request_accepted_at_unix_ms = mergeUsageRecordRequestAcceptedAtUnixMs(')
+    expect(pollBlock).toContain('record.end_to_end_time_ms = mergeUsageRecordEndToEndTimeMs(')
+    expect(pollBlock).toContain('record.end_to_end_first_byte_time_ms = mergeUsageRecordEndToEndTimeMs(')
+    expect(pollBlock).toContain('record.lifecycle_finalized = mergeUsageRecordLifecycleFinalized(')
+    // A terminal snapshot owns the successful candidate's first byte.
+    expect(pollBlock).toContain('{ preferNext: updateIsTerminal }')
+  })
 })

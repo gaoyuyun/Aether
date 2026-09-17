@@ -60,7 +60,8 @@ export function mergeUsageRecordResponseTiming(
 
 export function mergeUsageRecordFirstByteTimeMs(
   existingValue: number | null | undefined,
-  nextValue: number | null | undefined
+  nextValue: number | null | undefined,
+  options: { preferNext?: boolean } = {},
 ): number | null | undefined {
   // Millisecond timing is floored, so 0 still means the first byte was observed.
   const existingIsResolved = typeof existingValue === 'number' &&
@@ -71,7 +72,9 @@ export function mergeUsageRecordFirstByteTimeMs(
     nextValue >= 0
 
   if (existingIsResolved && nextIsResolved) {
-    return Math.max(existingValue, nextValue)
+    // A terminal snapshot carries the successful candidate's own first byte, which may be
+    // smaller than the earlier attempt's value the active row kept while streaming.
+    return options.preferNext ? nextValue : Math.max(existingValue, nextValue)
   }
   if (existingIsResolved) {
     return existingValue
@@ -80,6 +83,52 @@ export function mergeUsageRecordFirstByteTimeMs(
     return nextValue
   }
   return existingValue == null ? existingValue : undefined
+}
+
+/**
+ * Merge a request-level end-to-end timing fact (`end_to_end_time_ms` /
+ * `end_to_end_first_byte_time_ms`).
+ *
+ * These only ever appear once the request concluded and are never legitimately withdrawn, so a
+ * snapshot that lacks them (an active row, a candidate override without a first byte, a stale
+ * replica) must not clear a value another snapshot already delivered. A newer snapshot that
+ * carries the fact replaces it: the terminal usage write refines the candidate-level projection
+ * by a few milliseconds at most.
+ */
+export function mergeUsageRecordEndToEndTimeMs(
+  existingValue: number | null | undefined,
+  nextValue: number | null | undefined,
+): number | null | undefined {
+  const nextIsResolved = typeof nextValue === 'number' && Number.isFinite(nextValue) && nextValue >= 0
+  return nextIsResolved ? nextValue : existingValue
+}
+
+/**
+ * The request's accepted clock origin is a single immutable fact: keep the first valid value and
+ * only adopt a snapshot's value while none is known yet.
+ */
+export function mergeUsageRecordRequestAcceptedAtUnixMs(
+  existingValue: number | null | undefined,
+  nextValue: number | null | undefined,
+): number | null | undefined {
+  const existingIsValid = typeof existingValue === 'number' && Number.isFinite(existingValue) && existingValue > 0
+  if (existingIsValid) return existingValue
+  const nextIsValid = typeof nextValue === 'number' && Number.isFinite(nextValue) && nextValue > 0
+  return nextIsValid ? nextValue : existingValue
+}
+
+/**
+ * `lifecycle_finalized` only moves one way: once the usage row is terminal it never becomes
+ * active again, so a stale snapshot that still says `false` must not reopen polling.
+ */
+export function mergeUsageRecordLifecycleFinalized(
+  existingValue: boolean | null | undefined,
+  nextValue: boolean | null | undefined,
+): boolean | undefined {
+  if (existingValue === true || nextValue === true) return true
+  if (typeof nextValue === 'boolean') return nextValue
+  if (typeof existingValue === 'boolean') return existingValue
+  return undefined
 }
 
 export function mergeUsageRecordErrorMessage(

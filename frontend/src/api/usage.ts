@@ -43,6 +43,8 @@ export interface UsageRecord {
   created_at: string
   updated_at?: string | null
   response_time_updated_at?: string | null
+  request_accepted_at_unix_ms?: number | null
+  lifecycle_finalized?: boolean | null
   has_fallback?: boolean // 🆕 是否发生了 fallback
   client_family?: string | null
   client_ip?: string | null
@@ -610,6 +612,8 @@ export const usageApi = {
       first_byte_time_ms: number | null
       end_to_end_time_ms?: number | null
       end_to_end_first_byte_time_ms?: number | null
+      request_accepted_at_unix_ms?: number | null
+      lifecycle_finalized?: boolean | null
       updated_at?: string | null
       response_time_updated_at?: string | null
       status_code?: number | null
@@ -678,6 +682,8 @@ export const usageApi = {
       first_byte_time_ms: number | null
       end_to_end_time_ms?: number | null
       end_to_end_first_byte_time_ms?: number | null
+      request_accepted_at_unix_ms?: number | null
+      lifecycle_finalized?: boolean | null
       updated_at?: string | null
       response_time_updated_at?: string | null
       status_code?: number | null

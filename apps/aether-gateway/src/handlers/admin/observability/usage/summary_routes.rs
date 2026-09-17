@@ -239,10 +239,11 @@ async fn resolve_admin_usage_active_candidate_state(
                 .image_progress_by_request_id
                 .insert(request_id.clone(), progress);
         }
-        if active_usage_by_request_id.contains_key(&request_id) {
-            if let Some(override_payload) =
-                resolve_request_terminal_candidate_state_override(&candidates)
-            {
+        if let Some(item) = active_usage_by_request_id.get(&request_id) {
+            if let Some(override_payload) = resolve_request_terminal_candidate_state_override(
+                &candidates,
+                item.request_accepted_at_unix_ms(),
+            ) {
                 candidate_state
                     .state_overrides_by_request_id
                     .insert(request_id, override_payload);
@@ -290,6 +291,38 @@ pub(super) fn clear_admin_usage_active_failure_signal(item: &mut StoredRequestUs
         item.status_code = None;
     }
     item.error_message = None;
+}
+
+/// Request-level facts a candidate override contributes to the JSON payload only.
+///
+/// `apply_admin_usage_state_override` already moved status, status code, error and the
+/// candidate-level latency onto the usage row with their nuances (a null status code may not
+/// erase a valid 2xx). The remaining keys have no column on the row: the end-to-end total the
+/// candidate finish projects from the request's accepted clock, and the flag telling readers the
+/// usage row itself has not been finalized yet.
+pub(super) fn admin_usage_state_override_projection(
+    override_payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let object = override_payload.as_object()?;
+    let mut projection = serde_json::Map::new();
+    for key in ["lifecycle_finalized", "end_to_end_time_ms"] {
+        if let Some(value) = object.get(key) {
+            projection.insert(key.to_string(), value.clone());
+        }
+    }
+    (!projection.is_empty()).then_some(serde_json::Value::Object(projection))
+}
+
+fn admin_usage_state_override_projections(
+    state_overrides_by_request_id: &BTreeMap<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    state_overrides_by_request_id
+        .iter()
+        .filter_map(|(request_id, override_payload)| {
+            admin_usage_state_override_projection(override_payload)
+                .map(|projection| (request_id.clone(), projection))
+        })
+        .collect()
 }
 
 pub(super) fn apply_admin_usage_state_override(
@@ -401,6 +434,7 @@ fn build_admin_usage_records_response_with_attempt_flags(
     provider_key_names: &BTreeMap<String, String>,
     attempt_flags_by_usage_id: &BTreeMap<String, AdminUsageAttemptFlags>,
     request_candidate_reader_available: bool,
+    state_override_projections_by_request_id: &BTreeMap<String, serde_json::Value>,
     total: usize,
     limit: usize,
     offset: usize,
@@ -425,6 +459,20 @@ fn build_admin_usage_records_response_with_attempt_flags(
             );
             record["has_fallback"] = json!(flags.has_fallback);
             record["has_retry"] = json!(flags.has_retry);
+            // A row still active in the usage table but concluded by its candidate carries the
+            // candidate's request-level projection (end-to-end timing, `lifecycle_finalized`) the
+            // same way the active endpoint does, so both readers agree while the terminal usage
+            // write catches up.
+            if let (Some(record), Some(projection)) = (
+                record.as_object_mut(),
+                state_override_projections_by_request_id
+                    .get(&item.request_id)
+                    .and_then(serde_json::Value::as_object),
+            ) {
+                for (key, value) in projection {
+                    record.insert(key.clone(), value.clone());
+                }
+            }
             record
         })
         .collect();
@@ -725,6 +773,9 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             };
             let api_key_names = admin_usage_api_key_names(state, &items).await?;
             let provider_key_names = admin_usage_provider_key_names(state, &items).await?;
+            let state_override_projections = admin_usage_state_override_projections(
+                &active_candidate_state.state_overrides_by_request_id,
+            );
 
             return Ok(Some(build_admin_usage_active_requests_response(
                 &items,
@@ -732,7 +783,7 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                 state.has_auth_api_key_data_reader(),
                 &provider_key_names,
                 &image_progress_by_request_id,
-                &BTreeMap::new(),
+                &state_override_projections,
             )));
         }
         Some("records")
@@ -922,6 +973,9 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
 
             let active_candidate_state =
                 resolve_admin_usage_active_candidate_state(state, &usage).await?;
+            let state_override_projections = admin_usage_state_override_projections(
+                &active_candidate_state.state_overrides_by_request_id,
+            );
             let usage = usage
                 .into_iter()
                 .map(|mut item| {
@@ -957,6 +1011,7 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                 &provider_key_names,
                 &attempt_flags_by_usage_id,
                 state.has_request_candidate_data_reader(),
+                &state_override_projections,
                 total,
                 limit,
                 offset,
@@ -1116,8 +1171,8 @@ mod tests {
             None,
         );
 
-        let payload =
-            resolve_request_terminal_candidate_state_override(&[candidate]).expect("override");
+        let payload = resolve_request_terminal_candidate_state_override(&[candidate], None)
+            .expect("override");
 
         assert_eq!(payload["status"], "completed");
         assert_eq!(payload["status_code"], 200);
@@ -1126,6 +1181,44 @@ mod tests {
         assert_eq!(
             payload["response_time_updated_at"],
             "1970-01-01T00:00:10.210+00:00"
+        );
+        // Without the request's accepted clock only the candidate-level latency is known.
+        assert_eq!(payload.get("end_to_end_time_ms"), None);
+        assert_eq!(payload["lifecycle_finalized"], false);
+    }
+
+    #[test]
+    fn admin_usage_active_override_projects_request_level_total_from_accepted_clock() {
+        let candidate = sample_candidate(
+            1,
+            RequestCandidateStatus::Success,
+            Some(200),
+            Some(9_210),
+            None,
+        );
+
+        // Accepted 800ms before the successful candidate's own clock started: the request-level
+        // total covers the earlier failed attempt while the candidate latency stays as it was.
+        let payload = resolve_request_terminal_candidate_state_override(&[candidate], Some(200))
+            .expect("override");
+
+        assert_eq!(payload["response_time_ms"], 9_210);
+        assert_eq!(payload["end_to_end_time_ms"], 10_010);
+        assert_eq!(payload["lifecycle_finalized"], false);
+
+        let candidate = sample_candidate(
+            0,
+            RequestCandidateStatus::Success,
+            Some(200),
+            Some(9_210),
+            None,
+        );
+        let payload = resolve_request_terminal_candidate_state_override(&[candidate], Some(20_000))
+            .expect("override");
+        assert_eq!(
+            payload.get("end_to_end_time_ms"),
+            None,
+            "a clock that starts after the candidate finished is not a usable origin"
         );
     }
 
@@ -1143,7 +1236,7 @@ mod tests {
         streaming.started_at_unix_ms = Some(10_500);
         streaming.finished_at_unix_ms = None;
 
-        let payload = resolve_request_terminal_candidate_state_override(&[failed, streaming]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed, streaming], None);
 
         assert!(payload.is_none());
     }
@@ -1166,7 +1259,7 @@ mod tests {
             }
         }));
 
-        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed], None);
 
         assert!(payload.is_none());
     }
@@ -1183,7 +1276,7 @@ mod tests {
             Some("upstream connection reset"),
         );
 
-        let payload = resolve_request_terminal_candidate_state_override(&[failed]);
+        let payload = resolve_request_terminal_candidate_state_override(&[failed], None);
 
         assert!(payload.is_none());
     }
@@ -1200,11 +1293,40 @@ mod tests {
         failed.extra_data = Some(json!({ "request_lifecycle": "request_terminal" }));
 
         let payload =
-            resolve_request_terminal_candidate_state_override(&[failed]).expect("override");
+            resolve_request_terminal_candidate_state_override(&[failed], None).expect("override");
 
         assert_eq!(payload["status"], "failed");
         assert_eq!(payload["status_code"], 502);
         assert_eq!(payload["error_message"], "upstream refused the request");
+    }
+
+    #[test]
+    fn admin_usage_state_override_projection_keeps_only_payload_level_facts() {
+        let candidate = sample_candidate(
+            1,
+            RequestCandidateStatus::Success,
+            Some(200),
+            Some(9_210),
+            None,
+        );
+        let override_payload =
+            resolve_request_terminal_candidate_state_override(&[candidate], Some(200))
+                .expect("override");
+
+        let projection =
+            super::admin_usage_state_override_projection(&override_payload).expect("projection");
+
+        assert_eq!(
+            projection,
+            json!({
+                "lifecycle_finalized": false,
+                "end_to_end_time_ms": 10_010,
+            })
+        );
+        assert_eq!(
+            super::admin_usage_state_override_projection(&json!({"status": "completed"})),
+            None
+        );
     }
 
     #[test]

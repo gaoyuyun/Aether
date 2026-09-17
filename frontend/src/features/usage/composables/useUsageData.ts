@@ -15,7 +15,10 @@ import { log } from '@/utils/logger'
 import { getErrorStatus } from '@/types/api-error'
 import { isUsageProviderVisible, normalizeUsageProviderStats } from '../utils/providerStats'
 import {
+  mergeUsageRecordEndToEndTimeMs,
   mergeUsageRecordErrorMessage,
+  mergeUsageRecordLifecycleFinalized,
+  mergeUsageRecordRequestAcceptedAtUnixMs,
   mergeUsageRecordFirstByteTimeMs,
   mergeUsageRecordResponseTiming,
   parseUsageTimestampMs,
@@ -626,7 +629,27 @@ export function useUsageData(options: UseUsageDataOptions) {
         first_byte_time_ms: mergeUsageRecordFirstByteTimeMs(
           existing.first_byte_time_ms,
           record.first_byte_time_ms,
+          { preferNext: nextTimingIsAuthoritative },
         ),
+        // Request-level timing facts: the accepted clock origin never changes, and end-to-end
+        // values only appear once the request concluded, so a stale list snapshot that lacks
+        // them must not clear what the active poll already delivered.
+        request_accepted_at_unix_ms: mergeUsageRecordRequestAcceptedAtUnixMs(
+          existing.request_accepted_at_unix_ms,
+          record.request_accepted_at_unix_ms,
+        ),
+        end_to_end_time_ms: statusProgressed
+          ? mergeUsageRecordEndToEndTimeMs(existing.end_to_end_time_ms, record.end_to_end_time_ms)
+          : existing.end_to_end_time_ms,
+        end_to_end_first_byte_time_ms: statusProgressed
+          ? mergeUsageRecordEndToEndTimeMs(
+            existing.end_to_end_first_byte_time_ms,
+            record.end_to_end_first_byte_time_ms,
+          )
+          : existing.end_to_end_first_byte_time_ms,
+        lifecycle_finalized: statusProgressed
+          ? mergeUsageRecordLifecycleFinalized(existing.lifecycle_finalized, record.lifecycle_finalized)
+          : mergeUsageRecordLifecycleFinalized(existing.lifecycle_finalized, undefined),
         updated_at: statusProgressed
           ? (record.updated_at ?? existing.updated_at)
           : existing.updated_at,

@@ -153,9 +153,12 @@ import {
 } from '@/features/usage/composables'
 import { reconcileActiveRequestDiscovery } from '@/features/usage/utils/activeRequestDiscovery'
 import {
+  mergeUsageRecordEndToEndTimeMs,
   mergeUsageRecordErrorMessage,
   mergeUsageRecordFirstByteTimeMs,
+  mergeUsageRecordLifecycleFinalized,
   mergeUsageRecordLifecycleSnapshot,
+  mergeUsageRecordRequestAcceptedAtUnixMs,
   mergeUsageRecordResponseTiming,
   parseUsageTimestampMs,
 } from '@/features/usage/utils/recordSync'
@@ -616,6 +619,9 @@ async function pollActiveRequests() {
         record.cost = update.cost
         record.actual_cost = update.actual_cost ?? undefined
         record.rate_multiplier = update.rate_multiplier ?? undefined
+        const updateIsTerminal = update.status === 'completed' ||
+          update.status === 'failed' ||
+          update.status === 'cancelled'
         const responseTiming = mergeUsageRecordResponseTiming(
           {
             response_time_ms: record.response_time_ms,
@@ -625,17 +631,34 @@ async function pollActiveRequests() {
             response_time_ms: update.response_time_ms,
             response_time_updated_at: update.response_time_updated_at,
           },
-          {
-            preferNext: update.status === 'completed' ||
-              update.status === 'failed' ||
-              update.status === 'cancelled',
-          },
+          { preferNext: updateIsTerminal },
         )
         record.response_time_ms = responseTiming.response_time_ms
         record.response_time_updated_at = responseTiming.response_time_updated_at
         record.first_byte_time_ms = mergeUsageRecordFirstByteTimeMs(
           record.first_byte_time_ms,
-          update.first_byte_time_ms
+          update.first_byte_time_ms,
+          { preferNext: updateIsTerminal },
+        )
+        // Request-level timing: the accepted clock origin drives the live total while active,
+        // and the end-to-end values are what the completed row shows. Without merging them here
+        // a request that completes under polling keeps candidate-level numbers until the next
+        // full refresh and then visibly jumps.
+        record.request_accepted_at_unix_ms = mergeUsageRecordRequestAcceptedAtUnixMs(
+          record.request_accepted_at_unix_ms,
+          update.request_accepted_at_unix_ms,
+        )
+        record.end_to_end_time_ms = mergeUsageRecordEndToEndTimeMs(
+          record.end_to_end_time_ms,
+          update.end_to_end_time_ms,
+        )
+        record.end_to_end_first_byte_time_ms = mergeUsageRecordEndToEndTimeMs(
+          record.end_to_end_first_byte_time_ms,
+          update.end_to_end_first_byte_time_ms,
+        )
+        record.lifecycle_finalized = mergeUsageRecordLifecycleFinalized(
+          record.lifecycle_finalized,
+          update.lifecycle_finalized,
         )
         if ('updated_at' in update) {
           if (typeof update.updated_at === 'string') {

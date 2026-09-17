@@ -81,6 +81,8 @@ export interface UsageRecordDetail {
   first_byte_time_ms?: number | null
   end_to_end_time_ms?: number | null
   end_to_end_first_byte_time_ms?: number | null
+  request_accepted_at_unix_ms?: number | null
+  lifecycle_finalized?: boolean | null
   updated_at?: string | null
   response_time_updated_at?: string | null
   is_stream: boolean
@@ -424,6 +426,8 @@ export const meApi = {
       first_byte_time_ms: number | null
       end_to_end_time_ms?: number | null
       end_to_end_first_byte_time_ms?: number | null
+      request_accepted_at_unix_ms?: number | null
+      lifecycle_finalized?: boolean | null
       updated_at?: string | null
       response_time_updated_at?: string | null
       status_code?: number | null
@@ -472,6 +476,8 @@ export const meApi = {
       first_byte_time_ms: number | null
       end_to_end_time_ms?: number | null
       end_to_end_first_byte_time_ms?: number | null
+      request_accepted_at_unix_ms?: number | null
+      lifecycle_finalized?: boolean | null
       updated_at?: string | null
       response_time_updated_at?: string | null
       status_code?: number | null

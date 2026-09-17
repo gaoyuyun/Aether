@@ -10,12 +10,21 @@ const props = withDefaults(defineProps<{
   responseTimeUpdatedAt?: string | null
   status?: string | null
   responseTimeMs?: number | null
+  /**
+   * Millisecond wall-clock instant at which the gateway accepted the request. When present it is
+   * the only anchor of the live total: it is the same origin the completed row's
+   * `end_to_end_time_ms` is measured from, so the clock never restarts on a failover and never
+   * has to be corrected when the request finishes. `createdAt`/`responseTimeUpdatedAt` are only
+   * fallbacks for rows written before this field existed.
+   */
+  requestAcceptedAtUnixMs?: number | null
   precision?: number
 }>(), {
   createdAt: null,
   responseTimeUpdatedAt: null,
   status: null,
   responseTimeMs: null,
+  requestAcceptedAtUnixMs: null,
   precision: 2,
 })
 
@@ -73,6 +82,14 @@ const displayText = computed(() => {
     const responseTimeMs = finiteNonNegativeMs(props.responseTimeMs)
     if (responseTimeMs == null) return '-'
     return `${(responseTimeMs / 1000).toFixed(precision.value)}s`
+  }
+
+  const requestAcceptedAtUnixMs = props.requestAcceptedAtUnixMs
+  if (typeof requestAcceptedAtUnixMs === 'number' &&
+    Number.isFinite(requestAcceptedAtUnixMs) &&
+    requestAcceptedAtUnixMs > 0) {
+    const acceptedElapsedMs = Math.max(0, now.value - requestAcceptedAtUnixMs)
+    return `${(acceptedElapsedMs / 1000).toFixed(precision.value)}s`
   }
 
   const createdAtMs = parseCreatedAtMs(props.createdAt)

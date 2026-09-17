@@ -138,8 +138,16 @@ fn request_candidate_unix_millis_to_rfc3339(unix_ms: u64) -> Option<String> {
 /// downstream client received, and cancellation is a client-side event. A failed candidate is only
 /// conclusive when the commit point stamped it as request terminal; otherwise the candidate loop
 /// is still allowed to continue with the next candidate and the request stays active.
+///
+/// The override is a stop-gap read while the terminal usage write is still catching up, so it is
+/// marked `lifecycle_finalized: false` and readers keep polling until the usage row itself is
+/// terminal. `response_time_ms` stays candidate-level (the successful attempt's own latency); the
+/// request-level total is projected as `end_to_end_time_ms` from the candidate's finish instant and
+/// the request's accepted clock so the UI never has to fall back to a candidate-level number for
+/// the request-level column.
 pub(crate) fn resolve_request_terminal_candidate_state_override(
     candidates: &[StoredRequestCandidate],
+    request_accepted_at_unix_ms: Option<u64>,
 ) -> Option<Value> {
     let candidate = request_candidate_current(candidates)?;
     let status = match candidate.status {
@@ -158,19 +166,28 @@ pub(crate) fn resolve_request_terminal_candidate_state_override(
                 .saturating_sub(candidate.started_at_unix_ms?),
         )
     });
-    let mut payload = serde_json::json!({ "status": status });
+    let mut payload = serde_json::json!({
+        "status": status,
+        "lifecycle_finalized": false,
+    });
     if let Some(latency_ms) = latency_ms {
         payload["response_time_ms"] = serde_json::json!(latency_ms);
-        if let Some(response_time_updated_at) = candidate
-            .finished_at_unix_ms
-            .or_else(|| {
-                candidate
-                    .started_at_unix_ms
-                    .map(|started_at| started_at.saturating_add(latency_ms))
-            })
-            .and_then(request_candidate_unix_millis_to_rfc3339)
+        let finished_at_unix_ms = candidate.finished_at_unix_ms.or_else(|| {
+            candidate
+                .started_at_unix_ms
+                .map(|started_at| started_at.saturating_add(latency_ms))
+        });
+        if let Some(response_time_updated_at) =
+            finished_at_unix_ms.and_then(request_candidate_unix_millis_to_rfc3339)
         {
             payload["response_time_updated_at"] = serde_json::json!(response_time_updated_at);
+        }
+        if let Some(end_to_end_time_ms) = finished_at_unix_ms
+            .zip(request_accepted_at_unix_ms)
+            .filter(|(finished_at, accepted_at)| finished_at >= accepted_at)
+            .map(|(finished_at, accepted_at)| finished_at - accepted_at)
+        {
+            payload["end_to_end_time_ms"] = serde_json::json!(end_to_end_time_ms);
         }
     }
     if candidate.status == RequestCandidateStatus::Success {
@@ -913,6 +930,12 @@ pub(crate) async fn ensure_execution_request_candidate_slot(
     plan: &mut ExecutionPlan,
     report_context: &mut Option<Value>,
 ) {
+    // Every attempt passes through here before its pending usage row is written, which makes it
+    // the one place to hand the attempt the request-level clock origin. Stamp it before any early
+    // return: the usage row must carry it even when no candidate writer is configured.
+    crate::request_diagnostics::attach_current_request_accepted_at_to_report_context(
+        report_context,
+    );
     if !state.has_request_candidate_data_writer() {
         warn!(
             event_name = "request_candidate_writer_unavailable",

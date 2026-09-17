@@ -60,9 +60,14 @@ export interface UsageRecord {
   status_code?: number
   error_message?: string
   status?: RequestStatus  // 请求状态: pending, streaming, completed, failed
+  // usage 行本身是否已到终态。候选终态覆盖会把 status 提前改成 completed，此时为 false，
+  // 前端据此继续轮询，直到终态写入（tokens、end_to_end_* 等）真正落库。
+  lifecycle_finalized?: boolean | null
   created_at: string
   updated_at?: string | null
   response_time_updated_at?: string | null
+  // 网关受理该请求的墙钟毫秒时间戳，是进行中记录实时"总耗时"与终态 end_to_end_time_ms 的共同起点
+  request_accepted_at_unix_ms?: number | null
   has_fallback?: boolean
   has_retry?: boolean
   image_progress?: ImageProgress | null

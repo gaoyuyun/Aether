@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use aether_data::DatabasePoolSummary;
+use aether_data_contracts::repository::usage::REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY;
 use serde_json::{Map, Value};
 
 tokio::task_local! {
@@ -18,6 +19,9 @@ pub(crate) struct RequestDiagnostics {
 #[derive(Debug, Default)]
 struct RequestDiagnosticsInner {
     request_accepted_at: Option<Instant>,
+    /// Wall-clock twin of `request_accepted_at`, so the same origin can be persisted on the usage
+    /// row and compared against `Date.now()` by readers that never see the monotonic instant.
+    request_accepted_at_unix_ms: Option<u64>,
     next_candidate_indices: BTreeMap<String, u32>,
     db_operations: BTreeMap<&'static str, DbOperationTiming>,
     db_pool: Option<DbPoolObservation>,
@@ -41,10 +45,20 @@ struct DbPoolObservation {
 
 impl RequestDiagnostics {
     fn record_request_accepted_at(&self, accepted_at: Instant) {
+        let accepted_at_unix_ms = crate::clock::current_unix_ms()
+            .saturating_sub(accepted_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
         inner.request_accepted_at = Some(accepted_at);
+        inner.request_accepted_at_unix_ms = Some(accepted_at_unix_ms);
+    }
+
+    pub(crate) fn request_accepted_at_unix_ms(&self) -> Option<u64> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        inner.request_accepted_at_unix_ms
     }
 
     pub(crate) fn request_accepted_at(&self) -> Option<Instant> {
@@ -211,6 +225,33 @@ pub(crate) fn record_request_accepted_at(accepted_at: Instant) {
     }
 }
 
+/// Stamps the request-level clock origin onto an attempt's report context.
+///
+/// Every lifecycle usage write (pending, first byte, terminal) derives its metadata from the
+/// attempt's report context, so stamping it once per attempt is what lets the usage row carry
+/// `request_accepted_at_unix_ms` from its very first write. The value is identical for every
+/// attempt of the request, so a later attempt rewriting the row keeps the same origin.
+pub(crate) fn attach_current_request_accepted_at_to_report_context(
+    report_context: &mut Option<Value>,
+) {
+    let Some(accepted_at_unix_ms) = current_request_diagnostics()
+        .and_then(|diagnostics| diagnostics.request_accepted_at_unix_ms())
+    else {
+        return;
+    };
+    let object = match report_context.take() {
+        Some(Value::Object(object)) => object,
+        Some(other) => Map::from_iter([("seed".to_string(), other)]),
+        None => Map::new(),
+    };
+    let mut object = object;
+    object.insert(
+        REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY.to_string(),
+        Value::from(accepted_at_unix_ms),
+    );
+    *report_context = Some(Value::Object(object));
+}
+
 pub(crate) async fn observe_db_operation<F>(
     operation: &'static str,
     pool_summary: Option<DatabasePoolSummary>,
@@ -247,6 +288,8 @@ pub(crate) fn attach_request_diagnostics_to_report_context(
     let db_timings_ms = diagnostics.and_then(|diagnostics| diagnostics.db_timings_metadata());
     let end_to_end_time_ms =
         diagnostics.and_then(|diagnostics| diagnostics.request_accepted_elapsed_ms());
+    let request_accepted_at_unix_ms =
+        diagnostics.and_then(|diagnostics| diagnostics.request_accepted_at_unix_ms());
     if db_timings_ms.is_none() && end_to_end_time_ms.is_none() {
         return report_context;
     }
@@ -263,6 +306,12 @@ pub(crate) fn attach_request_diagnostics_to_report_context(
         object.insert(
             "end_to_end_time_ms".to_string(),
             Value::from(end_to_end_time_ms),
+        );
+    }
+    if let Some(request_accepted_at_unix_ms) = request_accepted_at_unix_ms {
+        object.insert(
+            REQUEST_ACCEPTED_AT_UNIX_MS_METADATA_KEY.to_string(),
+            Value::from(request_accepted_at_unix_ms),
         );
     }
     Some(Value::Object(object))
@@ -414,9 +463,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        attach_current_request_accepted_at_to_report_context,
         attach_request_diagnostics_and_candidate_start_timing_to_report_context,
         calibrate_candidate_first_byte_elapsed_ms,
-        end_to_end_first_byte_time_ms_from_candidate_start, RequestDiagnostics,
+        end_to_end_first_byte_time_ms_from_candidate_start, record_request_accepted_at,
+        scope_request_diagnostics, RequestDiagnostics,
     };
 
     #[test]
@@ -470,5 +521,59 @@ mod tests {
             .expect("first-byte timing should exist");
         assert!(end_to_end >= 1_000);
         assert_eq!(first_byte, 850);
+
+        // The wall-clock origin lands next to the elapsed values so the persisted row can anchor
+        // a live clock on the same instant the terminal end-to-end timing starts from.
+        let accepted_unix_ms = context["request_accepted_at_unix_ms"]
+            .as_u64()
+            .expect("request accepted wall clock should exist");
+        let now_unix_ms = crate::clock::current_unix_ms();
+        assert!(now_unix_ms.saturating_sub(accepted_unix_ms) >= 1_000);
+        assert!(now_unix_ms.saturating_sub(accepted_unix_ms) < 60_000);
+    }
+
+    #[tokio::test]
+    async fn scoped_request_accepted_clock_is_stamped_onto_attempt_report_context() {
+        scope_request_diagnostics(async {
+            let mut report_context = Some(json!({"candidate_index": 0}));
+            attach_current_request_accepted_at_to_report_context(&mut report_context);
+            assert_eq!(
+                report_context,
+                Some(json!({"candidate_index": 0})),
+                "nothing to stamp before the request is accepted"
+            );
+
+            let accepted_at = Instant::now() - Duration::from_millis(250);
+            record_request_accepted_at(accepted_at);
+
+            attach_current_request_accepted_at_to_report_context(&mut report_context);
+            let stamped = report_context
+                .as_ref()
+                .and_then(|context| context.get("request_accepted_at_unix_ms"))
+                .and_then(serde_json::Value::as_u64)
+                .expect("accepted clock should be stamped");
+            let now_unix_ms = crate::clock::current_unix_ms();
+            assert!(now_unix_ms.saturating_sub(stamped) >= 250);
+            assert!(now_unix_ms.saturating_sub(stamped) < 60_000);
+            assert_eq!(report_context.as_ref().unwrap()["candidate_index"], 0);
+
+            let mut empty_context = None;
+            attach_current_request_accepted_at_to_report_context(&mut empty_context);
+            assert_eq!(
+                empty_context
+                    .as_ref()
+                    .and_then(|context| context.get("request_accepted_at_unix_ms"))
+                    .and_then(serde_json::Value::as_u64),
+                Some(stamped)
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn unscoped_attempt_report_context_is_left_untouched() {
+        let mut report_context = Some(json!({"candidate_index": 1}));
+        attach_current_request_accepted_at_to_report_context(&mut report_context);
+        assert_eq!(report_context, Some(json!({"candidate_index": 1})));
     }
 }

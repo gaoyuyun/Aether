@@ -8,7 +8,8 @@ use super::replay::{
     build_admin_usage_detail_payload, build_admin_usage_replay_response,
 };
 use super::summary_routes::{
-    apply_admin_usage_state_override, clear_admin_usage_active_failure_signal,
+    admin_usage_state_override_projection, apply_admin_usage_state_override,
+    clear_admin_usage_active_failure_signal,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::{attach_admin_audit_response, query_param_bool};
@@ -451,6 +452,7 @@ pub(super) async fn maybe_build_local_admin_usage_detail_response(
             let provider_key_name = admin_usage_provider_key_name(&item, &provider_key_names);
 
             let mut detail_item = item.clone();
+            let mut state_override_projection = None;
             if matches!(detail_item.status.as_str(), "pending" | "streaming")
                 && state.has_request_candidate_data_reader()
             {
@@ -461,9 +463,12 @@ pub(super) async fn maybe_build_local_admin_usage_detail_response(
                 if let Some(override_payload) =
                     crate::request_candidate_runtime::resolve_request_terminal_candidate_state_override(
                         &candidates,
+                        detail_item.request_accepted_at_unix_ms(),
                     )
                 {
                     apply_admin_usage_state_override(&mut detail_item, &override_payload);
+                    state_override_projection =
+                        admin_usage_state_override_projection(&override_payload);
                 }
                 clear_admin_usage_active_failure_signal(&mut detail_item);
             }
@@ -545,6 +550,16 @@ pub(super) async fn maybe_build_local_admin_usage_detail_response(
                     UsageBodyField::ClientResponseBody => detail_item.client_response_body.take(),
                 }
                 .unwrap_or(Value::Null);
+            }
+            if let (Some(payload), Some(projection)) = (
+                payload.as_object_mut(),
+                state_override_projection
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object),
+            ) {
+                for (key, value) in projection {
+                    payload.insert(key.clone(), value.clone());
+                }
             }
             payload["body_load_errors"] = if include_bodies && !body_load_errors.is_empty() {
                 Value::Object(body_load_errors)
