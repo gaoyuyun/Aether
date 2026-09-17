@@ -1,5 +1,6 @@
-use aether_ai_serving::{AiExecutionAttempt, STICKY_KEY_ATTEMPTS_REPORT_FIELD};
-use aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS;
+use super::policy::LOCAL_FAILOVER_POLICY_REPORT_FIELD;
+use aether_ai_serving::{AiExecutionAttempt, SAME_KEY_RETRIES_REPORT_FIELD};
+use aether_routing_core::DEFAULT_SAME_KEY_RETRIES;
 use aether_runtime_state::RuntimeLockLease;
 use aether_scheduler_core::parse_request_candidate_report_context;
 use serde_json::Value;
@@ -40,9 +41,9 @@ pub(crate) struct LocalExecutionCandidateMetadata {
     pub(crate) pool_key_index: Option<u32>,
     pub(crate) pool_key_lease: Option<RuntimeLockLease>,
     pub(crate) scheduler_affinity_epoch: Option<u64>,
-    /// Routing-policy `sticky_key_attempts` in effect for this request. `None`
-    /// means the policy default applies.
-    pub(crate) sticky_key_attempts: Option<u32>,
+    /// Routing-policy default `same_key_retries` in effect for this request.
+    /// `None` means the built-in default (no retry) applies.
+    pub(crate) same_key_retries: Option<u32>,
 }
 
 pub(crate) const SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD: &str = "scheduler_affinity_epoch";
@@ -94,8 +95,8 @@ pub(crate) fn local_execution_candidate_metadata_from_report_context(
         scheduler_affinity_epoch: report_context
             .and_then(|value| value.get(SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD))
             .and_then(Value::as_u64),
-        sticky_key_attempts: report_context
-            .and_then(|value| value.get(STICKY_KEY_ATTEMPTS_REPORT_FIELD))
+        same_key_retries: report_context
+            .and_then(|value| value.get(SAME_KEY_RETRIES_REPORT_FIELD))
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok()),
     }
@@ -166,41 +167,80 @@ fn pool_key_lease_from_report_context(report_context: Option<&Value>) -> Option<
     })
 }
 
-/// Retry index of the next same-key attempt, or `None` when the sticky-key
-/// budget for this candidate is used up.
+/// Same-key retry budget for one attempt, read from its report context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SameKeyRetryBudget {
+    /// Routing-policy default `same_key_retries`: retries after the first
+    /// attempt on every key without a provider override. `None` means the
+    /// built-in default (no retry) applies.
+    pub(crate) policy_same_key_retries: Option<u32>,
+    /// Provider-level override carried as `local_failover_policy.max_retries`:
+    /// retries after the first attempt on every key of that provider. `None`
+    /// inherits the routing-policy default.
+    pub(crate) provider_same_key_retries: Option<u32>,
+}
+
+impl SameKeyRetryBudget {
+    /// Retries allowed after the first attempt on the key: the provider
+    /// override wins, then the routing-policy default, then no retry.
+    pub(crate) fn allowed_retries(self) -> u32 {
+        self.provider_same_key_retries
+            .or(self.policy_same_key_retries)
+            .unwrap_or(DEFAULT_SAME_KEY_RETRIES)
+    }
+}
+
+/// Provider-level same-key retry override carried in the report context as
+/// `local_failover_policy.max_retries`. The provider's own `max_retries`
+/// column, its endpoint column and `failover_rules.max_retries` are folded
+/// into that field when the attempt is planned; `None` means the provider
+/// inherits the routing policy.
+pub(crate) fn provider_same_key_retries_from_report_context(
+    report_context: Option<&Value>,
+) -> Option<u32> {
+    let value = report_context?
+        .get(LOCAL_FAILOVER_POLICY_REPORT_FIELD)?
+        .get("max_retries")?;
+    let retries = value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))?;
+    Some(u32::try_from(retries).unwrap_or(u32::MAX))
+}
+
+/// Retry index of the next same-key attempt, or `None` when the same-key
+/// budget for this key is used up.
 ///
-/// Only the first-ranked candidate (path-local index `0`, the cache-affinity sticky key)
-/// is retried on the same key; every later candidate gets exactly one attempt
-/// so that once failover has started it keeps advancing. `sticky_key_attempts`
-/// is the *total* attempt count on that key: `2` means one retry, `0` and `1`
-/// mean none. There is no upper bound: attempts are derived one at a time
-/// after each failure, never materialized ahead of time.
+/// Every candidate key is treated alike, whatever its rank: after a
+/// candidate-scoped failure it is retried on the same key up to the budget's
+/// retry count (`0` fails over immediately, `1` allows one retry, i.e. two
+/// attempts). The provider's own setting overrides the routing policy default.
 ///
-/// Inside a pool group only the first key (`pool_key_index == 0`) is treated
-/// as sticky, and its retries stay below `POOL_KEY_RETRY_INDEX_STRIDE` so the
-/// encoded retry index never collides with the next pool key.
+/// There is no upper bound: attempts are derived one at a time after each
+/// failure, never materialized ahead of time. Inside a pool group the encoded
+/// retry index is `pool_key_index * POOL_KEY_RETRY_INDEX_STRIDE + retry`, so
+/// each pool key counts its own retries and stays below the stride to avoid
+/// colliding with the next pool key.
 pub(crate) fn next_same_key_retry_index(
     identity: ExecutionAttemptIdentity,
-    sticky_key_attempts: Option<u32>,
+    budget: SameKeyRetryBudget,
 ) -> Option<u32> {
-    if identity.scheduling_candidate_index != 0 {
-        return None;
-    }
-    let pool_limit = match identity.pool_key_index {
-        None => u32::MAX,
-        Some(0) => POOL_KEY_RETRY_INDEX_STRIDE,
-        Some(_) => return None,
+    let (retry_base, pool_limit) = match identity.pool_key_index {
+        None => (0, u32::MAX),
+        Some(pool_key_index) => (
+            pool_key_index.checked_mul(POOL_KEY_RETRY_INDEX_STRIDE)?,
+            POOL_KEY_RETRY_INDEX_STRIDE,
+        ),
     };
-    let budget = sticky_key_attempts.unwrap_or(DEFAULT_STICKY_KEY_ATTEMPTS);
-    let attempts_so_far = identity.retry_index.checked_add(1)?;
-    if attempts_so_far >= budget || attempts_so_far >= pool_limit {
+    let retries_so_far = identity.retry_index.checked_sub(retry_base)?;
+    let next_retry = retries_so_far.checked_add(1)?;
+    if next_retry > budget.allowed_retries() || next_retry >= pool_limit {
         return None;
     }
-    Some(attempts_so_far)
+    identity.retry_index.checked_add(1)
 }
 
 /// Derive the next same-key attempt for `attempt` after a candidate-scoped
-/// failure, reading the attempt identity and sticky budget from its report
+/// failure, reading the attempt identity and retry budget from its report
 /// context. Returns `None` when no further same-key retry is allowed.
 pub(crate) fn next_same_key_retry_attempt<A: AiExecutionAttempt>(attempt: &A) -> Option<A> {
     let owned_report_context = attempt
@@ -213,7 +253,11 @@ pub(crate) fn next_same_key_retry_attempt<A: AiExecutionAttempt>(attempt: &A) ->
         .or(owned_report_context.as_ref());
     let identity = attempt_identity_from_report_context(report_context)?;
     let metadata = local_execution_candidate_metadata_from_report_context(report_context);
-    let retry_index = next_same_key_retry_index(identity, metadata.sticky_key_attempts)?;
+    let budget = SameKeyRetryBudget {
+        policy_same_key_retries: metadata.same_key_retries,
+        provider_same_key_retries: provider_same_key_retries_from_report_context(report_context),
+    };
+    let retry_index = next_same_key_retry_index(identity, budget)?;
     attempt.with_same_key_retry(retry_index, Uuid::new_v4().to_string())
 }
 
@@ -224,63 +268,43 @@ mod tests {
     use super::{
         attempt_identity_from_report_context,
         local_execution_candidate_metadata_from_report_context, next_same_key_retry_attempt,
-        next_same_key_retry_index, ExecutionAttemptIdentity, LocalExecutionCandidateMetadata,
+        next_same_key_retry_index, provider_same_key_retries_from_report_context,
+        ExecutionAttemptIdentity, LocalExecutionCandidateMetadata, SameKeyRetryBudget,
         POOL_KEY_RETRY_INDEX_STRIDE,
     };
     use aether_ai_serving::{AiExecutionAttempt, AiSyncAttempt};
     use aether_runtime_state::RuntimeLockLease;
 
-    #[test]
-    fn first_candidate_defaults_to_one_same_key_retry() {
-        assert_eq!(
-            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 0), None),
-            Some(1)
-        );
-        assert_eq!(
-            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 1), None),
-            None
-        );
+    fn policy_budget(same_key_retries: Option<u32>) -> SameKeyRetryBudget {
+        SameKeyRetryBudget {
+            policy_same_key_retries: same_key_retries,
+            provider_same_key_retries: None,
+        }
+    }
+
+    /// A provider override next to a generous policy default, so tests prove
+    /// the override wins rather than the policy.
+    fn provider_budget(retries: u32) -> SameKeyRetryBudget {
+        SameKeyRetryBudget {
+            policy_same_key_retries: Some(5),
+            provider_same_key_retries: Some(retries),
+        }
     }
 
     #[test]
-    fn first_candidate_uses_policy_sticky_key_attempts_without_upper_bound() {
-        assert_eq!(
-            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 2), Some(3)),
-            None
-        );
-        assert_eq!(
-            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 1), Some(3)),
-            Some(2)
-        );
-        assert_eq!(
-            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 4_999), Some(10_000)),
-            Some(5_000)
-        );
-    }
-
-    #[test]
-    fn zero_and_one_mean_single_attempt() {
-        assert_eq!(
-            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 0), Some(0)),
-            None
-        );
-        assert_eq!(
-            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 0), Some(1)),
-            None
-        );
-    }
-
-    #[test]
-    fn failover_candidates_never_retry_on_the_same_key() {
-        for candidate_index in 1..5 {
+    fn default_budget_never_retries_on_the_same_key() {
+        for candidate_index in 0..3 {
             assert_eq!(
-                next_same_key_retry_index(ExecutionAttemptIdentity::new(candidate_index, 0), None),
+                next_same_key_retry_index(
+                    ExecutionAttemptIdentity::new(candidate_index, 0),
+                    policy_budget(None)
+                ),
                 None
             );
             assert_eq!(
                 next_same_key_retry_index(
                     ExecutionAttemptIdentity::new(candidate_index, 0),
-                    Some(50)
+                    policy_budget(Some(0))
                 ),
                 None
             );
@@ -288,31 +312,174 @@ mod tests {
     }
 
     #[test]
-    fn pool_groups_only_retry_their_first_key_within_the_stride() {
-        let first_pool_key = ExecutionAttemptIdentity::new(0, 0).with_pool_key_index(Some(0));
-        assert_eq!(next_same_key_retry_index(first_pool_key, Some(3)), Some(1));
+    fn policy_default_applies_to_every_candidate() {
+        for candidate_index in 0..5 {
+            assert_eq!(
+                next_same_key_retry_index(
+                    ExecutionAttemptIdentity::new(candidate_index, 0),
+                    policy_budget(Some(1))
+                ),
+                Some(1)
+            );
+            assert_eq!(
+                next_same_key_retry_index(
+                    ExecutionAttemptIdentity::new(candidate_index, 1),
+                    policy_budget(Some(1))
+                ),
+                None,
+                "one retry exhausts a policy default of 1"
+            );
+        }
+    }
 
-        let at_stride_limit = ExecutionAttemptIdentity::new(0, POOL_KEY_RETRY_INDEX_STRIDE - 1)
-            .with_pool_key_index(Some(0));
+    #[test]
+    fn policy_default_has_no_upper_bound() {
         assert_eq!(
-            next_same_key_retry_index(at_stride_limit, Some(10_000)),
-            None
+            next_same_key_retry_index(
+                ExecutionAttemptIdentity::new(0, 4_999),
+                policy_budget(Some(10_000))
+            ),
+            Some(5_000)
         );
-
-        let second_pool_key = ExecutionAttemptIdentity::new(0, POOL_KEY_RETRY_INDEX_STRIDE)
-            .with_pool_key_index(Some(1));
         assert_eq!(
-            next_same_key_retry_index(second_pool_key, Some(10_000)),
+            next_same_key_retry_index(
+                ExecutionAttemptIdentity::new(0, 10_000),
+                policy_budget(Some(10_000))
+            ),
             None
         );
     }
 
     #[test]
-    fn next_same_key_retry_attempt_rewrites_candidate_id_and_retry_index() {
-        let attempt = AiSyncAttempt {
+    fn provider_override_applies_to_every_candidate() {
+        for candidate_index in 0..5 {
+            assert_eq!(
+                next_same_key_retry_index(
+                    ExecutionAttemptIdentity::new(candidate_index, 0),
+                    provider_budget(2)
+                ),
+                Some(1)
+            );
+            assert_eq!(
+                next_same_key_retry_index(
+                    ExecutionAttemptIdentity::new(candidate_index, 1),
+                    provider_budget(2)
+                ),
+                Some(2)
+            );
+            assert_eq!(
+                next_same_key_retry_index(
+                    ExecutionAttemptIdentity::new(candidate_index, 2),
+                    provider_budget(2)
+                ),
+                None,
+                "two retries exhaust a provider budget of 2"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_override_replaces_the_policy_default_in_both_directions() {
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(0, 0), provider_budget(0)),
+            None,
+            "a provider override of 0 disables the policy's five retries"
+        );
+        let generous_provider = SameKeyRetryBudget {
+            policy_same_key_retries: Some(0),
+            provider_same_key_retries: Some(3),
+        };
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(1, 2), generous_provider),
+            Some(3),
+            "a provider override of 3 retries even when the policy default is 0"
+        );
+        assert_eq!(
+            next_same_key_retry_index(ExecutionAttemptIdentity::new(1, 3), generous_provider),
+            None
+        );
+    }
+
+    #[test]
+    fn every_pool_key_retries_within_its_stride() {
+        let first_pool_key = ExecutionAttemptIdentity::new(0, 0).with_pool_key_index(Some(0));
+        assert_eq!(
+            next_same_key_retry_index(first_pool_key, policy_budget(Some(3))),
+            Some(1)
+        );
+
+        let second_pool_key = ExecutionAttemptIdentity::new(0, POOL_KEY_RETRY_INDEX_STRIDE)
+            .with_pool_key_index(Some(1));
+        assert_eq!(
+            next_same_key_retry_index(second_pool_key, provider_budget(2)),
+            Some(POOL_KEY_RETRY_INDEX_STRIDE + 1)
+        );
+        let after_two_retries = ExecutionAttemptIdentity::new(0, POOL_KEY_RETRY_INDEX_STRIDE + 2)
+            .with_pool_key_index(Some(1));
+        assert_eq!(
+            next_same_key_retry_index(after_two_retries, provider_budget(2)),
+            None,
+            "the second pool key counts its own retries from its stride base"
+        );
+
+        let at_stride_limit = ExecutionAttemptIdentity::new(0, 2 * POOL_KEY_RETRY_INDEX_STRIDE - 1)
+            .with_pool_key_index(Some(1));
+        assert_eq!(
+            next_same_key_retry_index(at_stride_limit, provider_budget(10_000)),
+            None,
+            "retries never spill into the next pool key's index range"
+        );
+        assert_eq!(
+            next_same_key_retry_index(
+                ExecutionAttemptIdentity::new(0, 0).with_pool_key_index(Some(0)),
+                policy_budget(None)
+            ),
+            None,
+            "pool keys do not retry without a configured budget"
+        );
+    }
+
+    #[test]
+    fn provider_same_key_retries_read_local_failover_policy_max_retries() {
+        assert_eq!(provider_same_key_retries_from_report_context(None), None);
+        assert_eq!(
+            provider_same_key_retries_from_report_context(Some(&json!({}))),
+            None
+        );
+        assert_eq!(
+            provider_same_key_retries_from_report_context(Some(&json!({
+                "local_failover_policy": {}
+            }))),
+            None
+        );
+        assert_eq!(
+            provider_same_key_retries_from_report_context(Some(&json!({
+                "local_failover_policy": {"max_retries": null}
+            }))),
+            None
+        );
+        assert_eq!(
+            provider_same_key_retries_from_report_context(Some(&json!({
+                "local_failover_policy": {"max_retries": 3}
+            }))),
+            Some(3)
+        );
+        assert_eq!(
+            provider_same_key_retries_from_report_context(Some(&json!({
+                "local_failover_policy": {"max_retries": -1}
+            }))),
+            None
+        );
+    }
+
+    fn sample_attempt(report_context: serde_json::Value) -> AiSyncAttempt {
+        AiSyncAttempt {
             plan: aether_contracts::ExecutionPlan {
                 request_id: "trace-1".to_string(),
-                candidate_id: Some("candidate-a".to_string()),
+                candidate_id: report_context
+                    .get("candidate_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
                 provider_name: None,
                 provider_id: "provider-1".to_string(),
                 endpoint_id: "endpoint-1".to_string(),
@@ -336,13 +503,18 @@ mod tests {
                 timeouts: None,
             },
             report_kind: None,
-            report_context: Some(json!({
-                "candidate_id": "candidate-a",
-                "candidate_index": 0,
-                "retry_index": 0,
-                "sticky_key_attempts": 2,
-            })),
-        };
+            report_context: Some(report_context),
+        }
+    }
+
+    #[test]
+    fn next_same_key_retry_attempt_rewrites_candidate_id_and_retry_index() {
+        let attempt = sample_attempt(json!({
+            "candidate_id": "candidate-a",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "same_key_retries": 1,
+        }));
 
         let retry = next_same_key_retry_attempt(&attempt).expect("one same-key retry remains");
         let retry_candidate_id = retry.plan.candidate_id.clone().expect("fresh candidate id");
@@ -355,31 +527,86 @@ mod tests {
 
         assert!(
             next_same_key_retry_attempt(&retry).is_none(),
-            "budget of 2 attempts is exhausted after one retry"
+            "a budget of one retry is exhausted after one retry"
+        );
+        assert!(
+            next_same_key_retry_attempt(&sample_attempt(json!({
+                "candidate_id": "candidate-a",
+                "candidate_index": 0,
+                "retry_index": 0,
+            })))
+            .is_none(),
+            "without any configured budget a failure fails over immediately"
         );
     }
 
     #[test]
-    fn request_wide_trace_indices_preserve_same_key_retry_budgets() {
+    fn next_same_key_retry_attempt_honours_the_provider_override() {
+        let failover_attempt = sample_attempt(json!({
+            "candidate_id": "candidate-b",
+            "candidate_index": 3,
+            "scheduling_candidate_index": 1,
+            "retry_index": 0,
+            "same_key_retries": 0,
+            "local_failover_policy": {"max_retries": 1},
+        }));
+        let retry = next_same_key_retry_attempt(&failover_attempt)
+            .expect("a provider override retries failover candidates too");
+        let context = retry.report_context_ref().expect("context retained");
+        assert_eq!(context["retry_index"], json!(1));
+        assert_eq!(context["candidate_index"], json!(3));
+        assert_eq!(context["scheduling_candidate_index"], json!(1));
+        assert!(
+            next_same_key_retry_attempt(&retry).is_none(),
+            "one provider retry is exhausted after one retry"
+        );
+
+        let disabled_by_provider = sample_attempt(json!({
+            "candidate_id": "candidate-a",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "same_key_retries": 2,
+            "local_failover_policy": {"max_retries": 0},
+        }));
+        assert!(
+            next_same_key_retry_attempt(&disabled_by_provider).is_none(),
+            "a provider override of 0 disables the policy default"
+        );
+
+        let inheriting_attempt = sample_attempt(json!({
+            "candidate_id": "candidate-a",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "same_key_retries": 1,
+            "local_failover_policy": {"max_retries": null},
+        }));
+        assert!(
+            next_same_key_retry_attempt(&inheriting_attempt).is_some(),
+            "a null override inherits the routing policy default"
+        );
+    }
+
+    #[test]
+    fn request_wide_trace_indices_do_not_affect_same_key_retry_budgets() {
         let identity = attempt_identity_from_report_context(Some(&json!({
-            "candidate_index": 7, "scheduling_candidate_index": 0,
+            "candidate_index": 7, "scheduling_candidate_index": 2,
             "retry_index": 0, "pool_key_index": 0,
         })))
         .expect("attempt identity should parse");
         assert_eq!(identity.candidate_index, 7);
-        assert_eq!(next_same_key_retry_index(identity, Some(2)), Some(1));
+        assert_eq!(identity.scheduling_candidate_index, 2);
+        assert_eq!(
+            next_same_key_retry_index(identity, policy_budget(Some(1))),
+            Some(1)
+        );
         assert_eq!(
             next_same_key_retry_index(
                 ExecutionAttemptIdentity {
                     retry_index: 1,
                     ..identity
                 },
-                Some(2),
+                policy_budget(Some(1)),
             ),
-            None
-        );
-        assert_eq!(
-            next_same_key_retry_index(identity.with_scheduling_candidate_index(1), Some(2),),
             None
         );
     }
@@ -414,7 +641,7 @@ mod tests {
             "pool_key_lease_token": "gateway-1:token-1",
             "pool_key_lease_fencing_token": 7,
             "pool_key_lease_ttl_ms": 900000,
-            "sticky_key_attempts": 3,
+            "same_key_retries": 3,
         })));
 
         assert_eq!(
@@ -430,7 +657,7 @@ mod tests {
                     ttl_ms: 900000,
                 }),
                 scheduler_affinity_epoch: None,
-                sticky_key_attempts: Some(3),
+                same_key_retries: Some(3),
             }
         );
     }

@@ -128,7 +128,7 @@ export async function updateProvider(
     quota_windows: Array<{ duration_secs: number; limit_usd: number }>
     rpm_limit: number | null
     // 请求配置（从 Endpoint 迁移）
-    max_retries: number
+    max_retries: number | null  // 同 Key 重试次数；null 表示继承调度策略
     max_transfer_count: number
     max_transfer_timeout_seconds: number
     proxy: ProxyConfig | null
@@ -169,7 +169,7 @@ export async function createProvider(
     keep_priority_on_conversion?: boolean
     responses_websocket_enabled?: boolean
     is_active?: boolean
-    max_retries?: number
+    max_retries?: number | null  // null 清除覆盖，继承调度策略
     max_transfer_count?: number
     max_transfer_timeout_seconds?: number
     stream_first_byte_timeout?: number | null

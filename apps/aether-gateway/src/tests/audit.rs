@@ -129,17 +129,7 @@ fn sample_local_openai_provider() -> StoredProviderCatalogProvider {
         "custom".to_string(),
     )
     .expect("provider should build")
-    .with_transport_fields(
-        true,
-        false,
-        false,
-        None,
-        Some(2),
-        None,
-        Some(20.0),
-        None,
-        None,
-    )
+    .with_transport_fields(true, false, false, None, None, None, Some(20.0), None, None)
 }
 
 fn sample_local_openai_endpoint(base_url: String) -> StoredProviderCatalogEndpoint {
@@ -152,7 +142,7 @@ fn sample_local_openai_endpoint(base_url: String) -> StoredProviderCatalogEndpoi
         true,
     )
     .expect("endpoint should build")
-    .with_transport_fields(base_url, None, None, Some(2), None, None, None, None)
+    .with_transport_fields(base_url, None, None, None, None, None, None, None)
     .expect("endpoint transport should build")
 }
 

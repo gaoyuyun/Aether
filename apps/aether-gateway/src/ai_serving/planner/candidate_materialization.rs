@@ -2289,7 +2289,7 @@ mod tests {
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
                 // These tests cover persistence shape, not same-key retries.
-                sticky_key_attempts: Some(1),
+                same_key_retries: Some(0),
             },
             ranking: None,
         }
@@ -2533,7 +2533,7 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
             keep_priority_on_conversion: false,
-            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            same_key_retries: aether_routing_core::DEFAULT_SAME_KEY_RETRIES,
             execution_policy: Default::default(),
             ranking_overlay: Default::default(),
             mutation_plan: Default::default(),

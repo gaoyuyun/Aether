@@ -1077,6 +1077,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260908010000,
             20260911000000,
             20260911010000,
+            20260917000000,
         ]
     );
     assert_eq!(
@@ -1133,6 +1134,7 @@ fn mysql_and_sqlite_migrations_include_enabled_incrementals() {
             20260910000000,
             20260911000000,
             20260911010000,
+            20260917000000,
         ]
     );
 }
@@ -2408,6 +2410,7 @@ fn pending_migrations_from_applied_skips_versions_already_applied() {
             20260908010000,
             20260911000000,
             20260911010000,
+            20260917000000,
         ]
     );
 }

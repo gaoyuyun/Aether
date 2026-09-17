@@ -302,7 +302,7 @@ export interface EndpointExport {
   base_url: string
   header_rules?: Record<string, unknown>[] | null
   body_rules?: Record<string, unknown>[] | null
-  max_retries?: number
+  max_retries?: number | null
   is_active: boolean
   custom_path?: string | null
   config?: Record<string, unknown>

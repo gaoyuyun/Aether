@@ -8,13 +8,14 @@ import {
   getModelScheduling,
   modelSchedulingRuleId,
   normalizeRoutingGroupConfig,
-  normalizeStickyKeyAttempts,
+  normalizeSameKeyRetries,
   resolveModelKeyPriorityOverride,
   setDefaultPoolPriorityOverrides,
   setDefaultProviderPriorityOverrides,
   setModelKeyPriorityOverridesForFormat,
   upsertModelSchedulingRule,
   upsertModelPolicy,
+  type RoutingDefaultPolicy,
 } from '../utils/routingPolicy'
 import { sortCandidateTraces, summarizeRoutingTrace, type RoutingDecisionTrace } from '../utils/routingTrace'
 
@@ -87,17 +88,25 @@ describe('routingPolicy', () => {
     expect(policy.key_priority_overrides).toEqual({})
   })
 
-  it('defaults sticky key attempts to 2 and normalizes invalid values', () => {
-    expect(createEmptyRoutingGroupConfig().default_policy.sticky_key_attempts).toBe(2)
-    expect(normalizeRoutingGroupConfig({}).default_policy.sticky_key_attempts).toBe(2)
+  it('defaults same-key retries to 0 and normalizes invalid values', () => {
+    expect(createEmptyRoutingGroupConfig().default_policy.same_key_retries).toBe(0)
+    expect(normalizeRoutingGroupConfig({}).default_policy.same_key_retries).toBe(0)
     expect(normalizeRoutingGroupConfig({
-      default_policy: { ...createEmptyRoutingGroupConfig().default_policy, priority_mode: 'provider', scheduling_mode: 'cache_affinity', keep_priority_on_conversion: false, sticky_key_attempts: 3, enable_cf_heartbeat: false, cyber_continue_failover: false, cancel_on_client_disconnect: false },
-    }).default_policy.sticky_key_attempts).toBe(3)
-    expect(normalizeStickyKeyAttempts('5')).toBe(5)
-    expect(normalizeStickyKeyAttempts(-1)).toBe(2)
-    expect(normalizeStickyKeyAttempts('abc')).toBe(2)
-    expect(normalizeStickyKeyAttempts(500)).toBe(99)
-    expect(getModelScheduling(createEmptyRoutingGroupConfig(), 'gpt-5').sticky_key_attempts).toBe(2)
+      default_policy: { ...createEmptyRoutingGroupConfig().default_policy, priority_mode: 'provider', scheduling_mode: 'cache_affinity', keep_priority_on_conversion: false, same_key_retries: 3, enable_cf_heartbeat: false, cyber_continue_failover: false, cancel_on_client_disconnect: false },
+    }).default_policy.same_key_retries).toBe(3)
+    expect(normalizeSameKeyRetries('5')).toBe(5)
+    expect(normalizeSameKeyRetries(-1)).toBe(0)
+    expect(normalizeSameKeyRetries('abc')).toBe(0)
+    expect(normalizeSameKeyRetries(500)).toBe(99)
+    expect(getModelScheduling(createEmptyRoutingGroupConfig(), 'gpt-5').same_key_retries).toBe(0)
+  })
+
+  it('drops the legacy sticky_key_attempts field instead of carrying it forward', () => {
+    const normalized = normalizeRoutingGroupConfig({
+      default_policy: { sticky_key_attempts: 2 } as unknown as RoutingDefaultPolicy,
+    })
+    expect(normalized.default_policy.same_key_retries).toBe(0)
+    expect(normalized.default_policy).not.toHaveProperty('sticky_key_attempts')
   })
 
   it('keeps key priority overrides independent per api format', () => {

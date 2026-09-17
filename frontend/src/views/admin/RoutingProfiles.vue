@@ -423,24 +423,24 @@
               </div>
               <div
                 class="order-4 flex min-h-12 items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2 text-sm"
-                data-testid="sticky-key-attempts"
+                data-testid="same-key-retries"
               >
                 <div class="flex min-w-0 items-center gap-1.5">
-                  <span class="font-medium">错误重试次数</span>
+                  <span class="font-medium">同 Key 重试次数</span>
                   <HelpHint
-                    label="错误重试次数"
-                    text="首个候选（缓存亲和命中的 Key）的总尝试次数。2 表示失败后同 Key 重试 1 次再转移；0 或 1 表示不重试。"
+                    label="同 Key 重试次数"
+                    text="所有渠道的默认值：候选 Key 失败后在同一 Key 上再试几次，0 表示失败后直接转移，1 表示再试一次（共两次请求）。渠道单独配置了同 Key 重试次数时以渠道的为准。"
                   />
                 </div>
                 <Input
-                  :model-value="stickyKeyAttempts"
+                  :model-value="sameKeyRetries"
                   type="number"
                   min="0"
                   max="99"
                   class="w-20 shrink-0"
                   :disabled="saving"
-                  aria-label="错误重试次数"
-                  @update:model-value="updateStickyKeyAttempts"
+                  aria-label="同 Key 重试次数"
+                  @update:model-value="updateSameKeyRetries"
                 />
               </div>
               <div
@@ -873,7 +873,7 @@ import { AlertDialog } from '@/components/common'
 import HelpHint from '@/components/common/HelpHint.vue'
 import {
   DEFAULT_ROUTING_POLICY_MODEL,
-  DEFAULT_STICKY_KEY_ATTEMPTS,
+  DEFAULT_SAME_KEY_RETRIES,
   copyPerModelRoutingConfig,
   createEmptyModelPolicy,
   createEmptyRoutingGroupConfig,
@@ -881,7 +881,7 @@ import {
   isGeneratedModelSchedulingRule,
   modelSchedulingRuleId,
   normalizeRoutingGroupConfig,
-  normalizeStickyKeyAttempts,
+  normalizeSameKeyRetries,
   removePerModelRoutingConfig,
   savePerModelRoutingConfig,
   setRoutingSortingScope,
@@ -1002,8 +1002,8 @@ const firstStepSchedulingMode = computed<RoutingSchedulingMode>(() => {
 const keepPriorityOnConversion = computed<boolean>(() => (
   draft.value?.config_json.default_policy.keep_priority_on_conversion ?? false
 ))
-const stickyKeyAttempts = computed<number>(() => (
-  draft.value?.config_json.default_policy.sticky_key_attempts ?? DEFAULT_STICKY_KEY_ATTEMPTS
+const sameKeyRetries = computed<number>(() => (
+  draft.value?.config_json.default_policy.same_key_retries ?? DEFAULT_SAME_KEY_RETRIES
 ))
 const cfHeartbeat = computed<boolean>(() => (
   draft.value?.config_json.default_policy.enable_cf_heartbeat ?? false
@@ -1341,8 +1341,8 @@ function updateDefaultPolicy(patch: Partial<RoutingDefaultPolicy>): void {
   }
 }
 
-function updateStickyKeyAttempts(value: string | number): void {
-  updateDefaultPolicy({ sticky_key_attempts: normalizeStickyKeyAttempts(value) })
+function updateSameKeyRetries(value: string | number): void {
+  updateDefaultPolicy({ same_key_retries: normalizeSameKeyRetries(value) })
 }
 
 function updateKeepPriorityOnConversion(value: boolean): void {

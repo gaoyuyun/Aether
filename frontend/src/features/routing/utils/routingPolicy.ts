@@ -5,8 +5,8 @@ export type RoutingSchedulingMode = 'fixed_order' | 'cache_affinity' | 'load_bal
 export type RoutingRulePhase = 'client_request' | 'provider_request'
 export type RoutingSortingScope = 'unified' | 'per_model'
 
-/** 首个候选（粘性 Key）的总尝试次数默认值：失败后同 Key 重试 1 次 */
-export const DEFAULT_STICKY_KEY_ATTEMPTS = 2
+/** 同 Key 重试次数默认值：失败后直接转移，不在同一 Key 上重试；供应商可单独覆盖 */
+export const DEFAULT_SAME_KEY_RETRIES = 0
 
 export interface RoutingDefaultPolicy extends RoutingFailoverPolicy {
   priority_mode: RoutingPriorityMode
@@ -15,8 +15,8 @@ export interface RoutingDefaultPolicy extends RoutingFailoverPolicy {
   enable_cf_heartbeat: boolean
   cyber_continue_failover: boolean
   cancel_on_client_disconnect: boolean
-  /** 首个候选的总尝试次数；后续候选始终只尝试 1 次。0 或 1 表示不重试 */
-  sticky_key_attempts: number
+  /** 所有候选 Key 的默认同 Key 重试次数，0 表示失败后直接转移；供应商单独配置的值优先 */
+  same_key_retries: number
 }
 
 export interface RoutingPoolSchedulingPreset {
@@ -61,7 +61,7 @@ export interface RoutingSetSchedulingAction {
   type: 'set_scheduling'
   priority_mode: RoutingPriorityMode
   scheduling_mode: RoutingSchedulingMode
-  sticky_key_attempts?: number
+  same_key_retries?: number
 }
 
 export interface RoutingGroupConfig {
@@ -83,16 +83,16 @@ export function createEmptyRoutingGroupConfig(): RoutingGroupConfig {
       enable_cf_heartbeat: false,
       cyber_continue_failover: false,
       cancel_on_client_disconnect: false,
-      sticky_key_attempts: DEFAULT_STICKY_KEY_ATTEMPTS,
+      same_key_retries: DEFAULT_SAME_KEY_RETRIES,
     },
     model_policies: [],
     rules: [],
   }
 }
 
-export function normalizeStickyKeyAttempts(value: unknown): number {
+export function normalizeSameKeyRetries(value: unknown): number {
   const parsed = Math.trunc(Number(value))
-  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_STICKY_KEY_ATTEMPTS
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_SAME_KEY_RETRIES
   return Math.min(parsed, 99)
 }
 
@@ -114,10 +114,13 @@ export function normalizeRoutingGroupConfig(value: Partial<RoutingGroupConfig> |
   const rawDefaultPolicy = (value?.default_policy ?? {}) as Partial<RoutingDefaultPolicy> & {
     enable_openai_image_sync_heartbeat?: boolean
     enable_standard_text_sync_heartbeat?: boolean
+    /** 旧字段：首个候选的总尝试次数，已由 same_key_retries 取代，读取时丢弃 */
+    sticky_key_attempts?: number
   }
   const {
     enable_openai_image_sync_heartbeat: legacyImageHeartbeat,
     enable_standard_text_sync_heartbeat: legacyTextHeartbeat,
+    sticky_key_attempts: _legacyStickyKeyAttempts,
     ...defaultPolicyWithoutLegacyHeartbeat
   } = rawDefaultPolicy
 
@@ -129,8 +132,8 @@ export function normalizeRoutingGroupConfig(value: Partial<RoutingGroupConfig> |
       enable_cf_heartbeat: Boolean(
         rawDefaultPolicy.enable_cf_heartbeat || legacyImageHeartbeat || legacyTextHeartbeat,
       ),
-      sticky_key_attempts: normalizeStickyKeyAttempts(
-        rawDefaultPolicy.sticky_key_attempts ?? DEFAULT_STICKY_KEY_ATTEMPTS,
+      same_key_retries: normalizeSameKeyRetries(
+        rawDefaultPolicy.same_key_retries ?? DEFAULT_SAME_KEY_RETRIES,
       ),
     },
     model_policies: Array.isArray(value?.model_policies)
@@ -382,7 +385,7 @@ export function getModelScheduling(
     enable_cf_heartbeat: normalized.default_policy.enable_cf_heartbeat,
     cyber_continue_failover: normalized.default_policy.cyber_continue_failover,
     cancel_on_client_disconnect: normalized.default_policy.cancel_on_client_disconnect,
-    sticky_key_attempts: action?.sticky_key_attempts ?? normalized.default_policy.sticky_key_attempts,
+    same_key_retries: action?.same_key_retries ?? normalized.default_policy.same_key_retries,
   }
 }
 

@@ -152,7 +152,7 @@ async fn gateway_executes_codex_image_stream_via_local_decision_gate_after_oauth
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,
@@ -174,7 +174,7 @@ async fn gateway_executes_codex_image_stream_via_local_decision_gate_after_oauth
             "https://chatgpt.com/backend-api/codex".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -539,7 +539,7 @@ async fn gateway_bridges_codex_image_sync_json_to_streaming_image_sse_impl() {
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,
@@ -561,7 +561,7 @@ async fn gateway_bridges_codex_image_sync_json_to_streaming_image_sse_impl() {
             "https://chatgpt.com/backend-api/codex".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -863,17 +863,7 @@ fn image_bridge_provider_catalog_provider(
         provider_type.to_string(),
     )
     .expect("provider should build")
-    .with_transport_fields(
-        true,
-        false,
-        false,
-        None,
-        Some(2),
-        None,
-        Some(20.0),
-        None,
-        None,
-    )
+    .with_transport_fields(true, false, false, None, None, None, Some(20.0), None, None)
 }
 
 fn image_bridge_provider_catalog_endpoint(
@@ -893,7 +883,7 @@ fn image_bridge_provider_catalog_endpoint(
         base_url.to_string(),
         None,
         None,
-        Some(2),
+        None,
         None,
         None,
         None,

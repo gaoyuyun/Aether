@@ -218,7 +218,7 @@ export interface ProviderEndpoint {
   header_rules?: HeaderRule[]  // 请求头规则列表，支持 set/drop/rename 操作
   // 请求体配置
   body_rules?: BodyRule[]  // 请求体规则列表，支持 set/drop/rename 操作
-  max_retries: number
+  max_retries: number | null  // 同 Key 重试次数；null 表示继承提供商/调度策略
   is_active: boolean
   config?: Record<string, unknown>
   proxy?: ProxyConfig | null
@@ -903,7 +903,7 @@ export interface ProviderWithEndpointsSummary {
   quota_expires_at?: string
   quota_windows?: ProviderQuotaWindow[]
   // 请求配置（从 Endpoint 迁移）
-  max_retries?: number  // 最大重试次数
+  max_retries?: number | null  // 同 Key 重试次数；null 表示沿用调度策略
   max_transfer_count?: number  // 提供商内最大转移次数，0 表示不限制
   max_transfer_timeout_seconds?: number  // 提供商内最大转移时长，0 表示不限制
   proxy?: ProxyConfig | null  // 代理配置

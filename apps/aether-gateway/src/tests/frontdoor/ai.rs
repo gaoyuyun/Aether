@@ -436,17 +436,7 @@ fn gemini_video_catalog_repository() -> Arc<InMemoryProviderCatalogReadRepositor
         "gemini".to_string(),
     )
     .expect("Gemini video provider should build")
-    .with_transport_fields(
-        true,
-        false,
-        false,
-        None,
-        Some(2),
-        None,
-        Some(20.0),
-        None,
-        None,
-    );
+    .with_transport_fields(true, false, false, None, None, None, Some(20.0), None, None);
     let endpoint = StoredProviderCatalogEndpoint::new(
         ENDPOINT_ID.to_string(),
         PROVIDER_ID.to_string(),
@@ -460,7 +450,7 @@ fn gemini_video_catalog_repository() -> Arc<InMemoryProviderCatalogReadRepositor
         "https://generativelanguage.googleapis.com".to_string(),
         None,
         None,
-        Some(2),
+        None,
         None,
         None,
         None,

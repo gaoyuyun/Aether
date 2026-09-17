@@ -147,17 +147,7 @@ async fn gateway_executes_openai_chat_stream_via_local_decision_gate_without_exe
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -174,7 +164,7 @@ async fn gateway_executes_openai_chat_stream_via_local_decision_gate_without_exe
             "https://api.openai.example".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -584,17 +574,7 @@ async fn gateway_executes_openai_chat_stream_via_local_openai_responses_cross_fo
             "codex".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -611,7 +591,7 @@ async fn gateway_executes_openai_chat_stream_via_local_openai_responses_cross_fo
             "https://chatgpt.com/backend-api/codex".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -1070,17 +1050,7 @@ async fn gateway_executes_openai_chat_stream_via_local_cross_format_gemini_candi
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -2013,6 +1983,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
     fn sample_provider_catalog_provider(
         provider_id: &str,
         provider_name: &str,
+        same_key_retries: Option<i32>,
     ) -> StoredProviderCatalogProvider {
         StoredProviderCatalogProvider::new(
             provider_id.to_string(),
@@ -2026,7 +1997,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
             false,
             false,
             None,
-            Some(2),
+            same_key_retries,
             None,
             Some(20.0),
             None,
@@ -2052,7 +2023,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
             base_url.to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -2225,8 +2196,8 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
                             .to_string(),
                     });
 
-                // The primary key gets two attempts under the default
-                // sticky_key_attempts; both must fail to reach the backup.
+                // The primary provider allows one same-key retry, so its two
+                // attempts must both fail before failover reaches the backup.
                 let frames = if attempt <= 2 {
                     concat!(
                         "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":429,\"headers\":{\"content-type\":\"application/json\"}}}\n",
@@ -2284,8 +2255,14 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![
-            sample_provider_catalog_provider("provider-openai-local-stream-primary", "openai"),
-            sample_provider_catalog_provider("provider-openai-local-stream-backup", "openai"),
+            // The primary provider allows one same-key retry; the backup
+            // provider inherits the routing policy default of none.
+            sample_provider_catalog_provider(
+                "provider-openai-local-stream-primary",
+                "openai",
+                Some(1),
+            ),
+            sample_provider_catalog_provider("provider-openai-local-stream-backup", "openai", None),
         ],
         vec![
             sample_provider_catalog_endpoint(
@@ -2376,8 +2353,8 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
         .lock()
         .expect("mutex should lock")
         .clone();
-    // Default sticky_key_attempts is 2: the primary key is retried once on
-    // the same key, then failover moves to the backup with a single attempt.
+    // The primary provider's one same-key retry is used up first, then
+    // failover moves to the backup, which succeeds on its single attempt.
     assert_eq!(seen_execution_runtime_requests.len(), 3);
     assert_eq!(
         seen_execution_runtime_requests
@@ -2429,7 +2406,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
             .filter(|candidate| candidate.status == RequestCandidateStatus::Failed)
             .count(),
         2,
-        "both sticky-key attempts on the primary should be recorded as failed"
+        "both attempts on the primary key should be recorded as failed"
     );
     let failed_candidate = stored_candidates
         .iter()

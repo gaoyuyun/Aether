@@ -154,17 +154,7 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint(base_url: &str) -> StoredProviderCatalogEndpoint {
@@ -181,7 +171,7 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
             base_url.to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -654,17 +644,7 @@ async fn gateway_executes_openai_chat_cross_format_upstream_stream_via_local_fin
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -1100,17 +1080,7 @@ async fn gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -1583,17 +1553,7 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
             "antigravity".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -1610,7 +1570,7 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
             "https://antigravity.googleapis.com".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -2095,17 +2055,7 @@ async fn gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_loca
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -2455,17 +2405,7 @@ async fn gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_loca
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {

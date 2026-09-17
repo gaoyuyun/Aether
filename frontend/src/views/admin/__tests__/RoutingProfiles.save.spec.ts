@@ -181,7 +181,7 @@ function routingGroup(
         keep_priority_on_conversion: false,
         enable_cf_heartbeat: false,
         cyber_continue_failover: false,
-        sticky_key_attempts: 2,
+        same_key_retries: 0,
         cancel_on_client_disconnect: false,
         max_transfer_count: 0,
         max_transfer_timeout_seconds: 0,

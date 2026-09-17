@@ -59,9 +59,9 @@ pub struct ResolvedRoutingPolicy {
     pub priority_mode: RoutingSetPriorityMode,
     pub scheduling_mode: RoutingSchedulingMode,
     pub keep_priority_on_conversion: bool,
-    /// See `RoutingDefaultPolicy::sticky_key_attempts`.
-    #[serde(default = "default_sticky_key_attempts")]
-    pub sticky_key_attempts: u32,
+    /// See `RoutingDefaultPolicy::same_key_retries`.
+    #[serde(default = "default_same_key_retries")]
+    pub same_key_retries: u32,
     #[serde(flatten)]
     pub execution_policy: RoutingExecutionPolicy,
     pub ranking_overlay: RankingOverlay,
@@ -88,7 +88,7 @@ pub fn resolve_routing_policy(
         priority_mode: config.default_policy.priority_mode,
         scheduling_mode: config.default_policy.scheduling_mode,
         keep_priority_on_conversion: config.default_policy.keep_priority_on_conversion,
-        sticky_key_attempts: config.default_policy.sticky_key_attempts,
+        same_key_retries: config.default_policy.same_key_retries,
         execution_policy: config.default_policy.execution_policy.clone(),
         ranking_overlay: RankingOverlay::default(),
         mutation_plan: MutationPlan::default(),
@@ -206,7 +206,7 @@ fn apply_action(
             priority_mode,
             scheduling_mode,
             keep_priority_on_conversion,
-            sticky_key_attempts,
+            same_key_retries,
         } => {
             if let Some(priority_mode) = priority_mode {
                 policy.priority_mode = *priority_mode;
@@ -217,8 +217,8 @@ fn apply_action(
             if let Some(keep_priority_on_conversion) = keep_priority_on_conversion {
                 policy.keep_priority_on_conversion = *keep_priority_on_conversion;
             }
-            if let Some(sticky_key_attempts) = sticky_key_attempts {
-                policy.sticky_key_attempts = *sticky_key_attempts;
+            if let Some(same_key_retries) = same_key_retries {
+                policy.same_key_retries = *same_key_retries;
             }
         }
         RoutingAction::SetProviderPriority {
@@ -287,8 +287,8 @@ fn model_allowed(patterns: &[String], requested_model: &str) -> bool {
             .any(|pattern| model_pattern_matches(pattern, requested_model))
 }
 
-fn default_sticky_key_attempts() -> u32 {
-    crate::model::DEFAULT_STICKY_KEY_ATTEMPTS
+fn default_same_key_retries() -> u32 {
+    crate::model::DEFAULT_SAME_KEY_RETRIES
 }
 
 fn model_pattern_matches(pattern: &str, value: &str) -> bool {
@@ -391,7 +391,7 @@ mod tests {
                 priority_mode: RoutingSetPriorityMode::GlobalKey,
                 scheduling_mode: RoutingSchedulingMode::LoadBalance,
                 keep_priority_on_conversion: true,
-                sticky_key_attempts: 3,
+                same_key_retries: 3,
                 execution_policy: Default::default(),
             },
             model_policies: vec![RoutingModelPolicy {
@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(special.priority_mode, RoutingSetPriorityMode::GlobalKey);
         assert_eq!(special.scheduling_mode, RoutingSchedulingMode::LoadBalance);
         assert!(special.keep_priority_on_conversion);
-        assert_eq!(special.sticky_key_attempts, 3);
+        assert_eq!(special.same_key_retries, 3);
         assert_eq!(
             special.ranking_overlay.allowed_providers,
             vec!["provider-special"]
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(ordinary.priority_mode, RoutingSetPriorityMode::GlobalKey);
         assert_eq!(ordinary.scheduling_mode, RoutingSchedulingMode::LoadBalance);
         assert!(ordinary.keep_priority_on_conversion);
-        assert_eq!(ordinary.sticky_key_attempts, 3);
+        assert_eq!(ordinary.same_key_retries, 3);
         assert!(ordinary.ranking_overlay.allowed_providers.is_empty());
         assert!(ordinary.ranking_overlay.allowed_keys.is_empty());
         assert!(ordinary
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_key_attempts_defaults_to_two_and_can_be_overridden_by_rule() {
+    fn same_key_retries_defaults_to_zero_and_can_be_overridden_by_rule() {
         let default_config = RoutingGroupConfig::default();
         let default_policy = resolve_routing_policy(
             &default_config,
@@ -520,21 +520,21 @@ mod tests {
         )
         .expect("default config should resolve");
         assert_eq!(
-            default_policy.sticky_key_attempts,
-            crate::DEFAULT_STICKY_KEY_ATTEMPTS
+            default_policy.same_key_retries,
+            crate::DEFAULT_SAME_KEY_RETRIES
         );
 
         let parsed: RoutingGroupConfig =
             serde_json::from_value(json!({ "default_policy": { "priority_mode": "provider" } }))
-                .expect("legacy config without sticky_key_attempts should deserialize");
+                .expect("config without same_key_retries should deserialize");
         assert_eq!(
-            parsed.default_policy.sticky_key_attempts,
-            crate::DEFAULT_STICKY_KEY_ATTEMPTS
+            parsed.default_policy.same_key_retries,
+            crate::DEFAULT_SAME_KEY_RETRIES
         );
 
         let config = RoutingGroupConfig {
             rules: vec![RoutingRule {
-                id: "no-sticky-retry".to_string(),
+                id: "one-same-key-retry".to_string(),
                 priority: 1,
                 enabled: true,
                 phase: RoutingRulePhase::ClientRequest,
@@ -543,7 +543,7 @@ mod tests {
                     priority_mode: None,
                     scheduling_mode: None,
                     keep_priority_on_conversion: None,
-                    sticky_key_attempts: Some(1),
+                    same_key_retries: Some(1),
                 }],
                 stop_processing: false,
             }],
@@ -566,7 +566,7 @@ mod tests {
             },
         )
         .expect("rule config should resolve");
-        assert_eq!(policy.sticky_key_attempts, 1);
+        assert_eq!(policy.same_key_retries, 1);
     }
 
     #[test]

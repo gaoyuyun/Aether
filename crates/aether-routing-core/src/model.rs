@@ -24,9 +24,10 @@ pub struct RoutingPoolPolicyOverride {
     pub scheduling_presets: Vec<RoutingSchedulingPreset>,
 }
 
-/// Default number of attempts on the first-ranked (sticky) candidate before
-/// failing over: one retry on the same key.
-pub const DEFAULT_STICKY_KEY_ATTEMPTS: u32 = 2;
+/// Default number of same-key retries after a failed attempt: none, so a
+/// failure fails over to the next candidate unless the routing policy or the
+/// provider configures retries.
+pub const DEFAULT_SAME_KEY_RETRIES: u32 = 0;
 
 /// Request-independent execution behaviours selected by a routing strategy.
 ///
@@ -97,11 +98,11 @@ pub struct RoutingDefaultPolicy {
     pub scheduling_mode: RoutingSchedulingMode,
     #[serde(default)]
     pub keep_priority_on_conversion: bool,
-    /// Total attempts on the first-ranked candidate before moving on. Later
-    /// candidates always get a single attempt so failover keeps advancing.
-    /// `0` and `1` both mean no same-key retry.
-    #[serde(default = "default_sticky_key_attempts")]
-    pub sticky_key_attempts: u32,
+    /// Default number of same-key retries after a failed attempt, applied to
+    /// every candidate key that has no provider-level override. `0` means a
+    /// failure fails over immediately; `1` means one retry, i.e. two attempts.
+    #[serde(default = "default_same_key_retries")]
+    pub same_key_retries: u32,
     /// Strategy-scoped execution behaviour. Flattened for a stable JSON
     /// shape and backwards-compatible migration from system settings.
     #[serde(flatten)]
@@ -114,14 +115,14 @@ impl Default for RoutingDefaultPolicy {
             priority_mode: RoutingSetPriorityMode::default(),
             scheduling_mode: RoutingSchedulingMode::default(),
             keep_priority_on_conversion: false,
-            sticky_key_attempts: DEFAULT_STICKY_KEY_ATTEMPTS,
+            same_key_retries: DEFAULT_SAME_KEY_RETRIES,
             execution_policy: RoutingExecutionPolicy::default(),
         }
     }
 }
 
-fn default_sticky_key_attempts() -> u32 {
-    DEFAULT_STICKY_KEY_ATTEMPTS
+fn default_same_key_retries() -> u32 {
+    DEFAULT_SAME_KEY_RETRIES
 }
 
 fn is_false(value: &bool) -> bool {

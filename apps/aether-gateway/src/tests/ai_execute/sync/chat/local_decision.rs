@@ -189,7 +189,7 @@ async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restore
             true,
         )
         .expect("endpoint should build")
-        .with_transport_fields(base_url, None, None, Some(2), None, None, None, None)
+        .with_transport_fields(base_url, None, None, None, None, None, None, None)
         .expect("endpoint transport should build")
     }
 
@@ -471,17 +471,7 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -498,7 +488,7 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
             "https://api.openai.example/v1".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -860,17 +850,7 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -887,7 +867,7 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
             "https://api.openai.example/v1".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -1173,17 +1153,7 @@ async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candida
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_disabled_conversion_provider_catalog_provider() -> StoredProviderCatalogProvider {
@@ -1199,7 +1169,7 @@ async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candida
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,

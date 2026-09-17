@@ -43,10 +43,6 @@ pub(super) fn build_admin_provider_endpoint_response(
     )
 }
 
-fn default_admin_endpoint_max_retries() -> i32 {
-    2
-}
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct AdminProviderEndpointCreateRequest {
     pub(crate) provider_id: String,
@@ -58,8 +54,9 @@ pub(crate) struct AdminProviderEndpointCreateRequest {
     pub(crate) header_rules: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) body_rules: Option<serde_json::Value>,
-    #[serde(default = "default_admin_endpoint_max_retries")]
-    pub(crate) max_retries: i32,
+    /// `None` inherits the provider's same-key retry setting.
+    #[serde(default)]
+    pub(crate) max_retries: Option<i32>,
     #[serde(default)]
     pub(crate) config: Option<serde_json::Value>,
     #[serde(default)]

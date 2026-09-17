@@ -47,7 +47,7 @@ pub(crate) fn build_admin_fixed_provider_endpoint_defaults(
         base_url: normalize_admin_base_url(template.base_url)?,
         header_rules: None,
         body_rules,
-        max_retries: Some(provider.max_retries.unwrap_or(2)),
+        max_retries: provider.max_retries,
         custom_path: endpoint_template.custom_path.map(ToOwned::to_owned),
         config: fixed_provider_endpoint_default_config(endpoint_template),
         format_acceptance_config: None,

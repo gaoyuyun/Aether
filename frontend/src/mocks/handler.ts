@@ -981,7 +981,7 @@ const MOCK_ROUTING_GROUPS: MockRoutingGroup[] = [
         priority_mode: 'provider',
         scheduling_mode: 'cache_affinity',
         keep_priority_on_conversion: false,
-        sticky_key_attempts: 2,
+        same_key_retries: 0,
       },
       model_policies: [
         {

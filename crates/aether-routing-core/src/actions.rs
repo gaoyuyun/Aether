@@ -74,7 +74,7 @@ pub enum RoutingAction {
         scheduling_mode: Option<RoutingSchedulingMode>,
         keep_priority_on_conversion: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        sticky_key_attempts: Option<u32>,
+        same_key_retries: Option<u32>,
     },
     SetProviderPriority {
         provider_id: String,

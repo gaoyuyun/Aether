@@ -166,7 +166,7 @@ describe('RoutingProfiles failover persistence', () => {
     await nextTick()
     button(root, 'CF保持心跳').click()
     await nextTick()
-    await input(root, '错误重试次数', '4')
+    await input(root, '同 Key 重试次数', '3')
     await input(root, '全局最大转移次数', '5')
     button(root, '添加错误终止规则').click()
     await nextTick()
@@ -180,7 +180,7 @@ describe('RoutingProfiles failover persistence', () => {
     expect(routingApi.updateRoutingGroup).toHaveBeenCalledTimes(1)
     const saved = routingApi.updateRoutingGroup.mock.calls[0][1].config_json
     expect(saved.default_policy.enable_cf_heartbeat).toBe(true)
-    expect(saved.default_policy.sticky_key_attempts).toBe(4)
+    expect(saved.default_policy.same_key_retries).toBe(3)
     expect(saved.default_policy.max_transfer_count).toBe(5)
     expect(saved.default_policy.max_transfer_timeout_seconds).toBe(60)
     expect(saved.default_policy.failover_rules.error_stop_patterns).toEqual([{ pattern: '', status_codes: [429] }])
@@ -195,7 +195,7 @@ describe.each(['unified', 'per_model'] as const)('RoutingProfiles global setting
     { label: 'Cyber继续转移', field: 'cyber_continue_failover', value: true },
     { label: 'CF保持心跳', field: 'enable_cf_heartbeat', value: true },
     { label: '取消请求立即打断', field: 'cancel_on_client_disconnect', value: true },
-    { label: '错误重试次数', field: 'sticky_key_attempts', value: 4 },
+    { label: '同 Key 重试次数', field: 'same_key_retries', value: 3 },
     { label: '全局最大转移次数', field: 'max_transfer_count', value: 5 },
     { label: '全局最大转移时间', field: 'max_transfer_timeout_seconds', value: 60 },
   ] as const)('saves $label without requiring a model save', async ({ label, field, value }) => {

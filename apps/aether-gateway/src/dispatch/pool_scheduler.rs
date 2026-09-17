@@ -1996,13 +1996,13 @@ fn apply_pool_orchestration(
     orchestration: PoolCandidateOrchestration,
 ) -> EligibleLocalExecutionCandidate {
     let scheduler_affinity_epoch = candidate.orchestration.scheduler_affinity_epoch;
-    let sticky_key_attempts = candidate.orchestration.sticky_key_attempts;
+    let same_key_retries = candidate.orchestration.same_key_retries;
     candidate.orchestration = LocalExecutionCandidateMetadata {
         candidate_group_id: orchestration.candidate_group_id,
         pool_key_index: orchestration.pool_key_index,
         pool_key_lease: None,
         scheduler_affinity_epoch,
-        sticky_key_attempts,
+        same_key_retries,
     };
     candidate
 }
@@ -2255,7 +2255,7 @@ mod tests {
                 pool_key_index: Some(0),
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
-                sticky_key_attempts: None,
+                same_key_retries: None,
             }
         );
         assert_eq!(reordered[1].orchestration.pool_key_index, Some(1));
@@ -2273,7 +2273,7 @@ mod tests {
                 pool_key_index: None,
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
-                sticky_key_attempts: None,
+                same_key_retries: None,
             }
         );
     }
@@ -5190,7 +5190,7 @@ mod tests {
             priority_mode: RoutingSetPriorityMode::Provider,
             scheduling_mode: RoutingSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
-            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            same_key_retries: aether_routing_core::DEFAULT_SAME_KEY_RETRIES,
             execution_policy: Default::default(),
             ranking_overlay: RankingOverlay {
                 allowed_keys: key_ids.into_iter().map(str::to_string).collect(),

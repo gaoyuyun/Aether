@@ -25,10 +25,10 @@ pub trait AiExecutionAttempt {
     }
 }
 
-/// Report-context field carrying the routing policy's sticky-key attempt
-/// budget for the request, so the attempt loop can derive same-key retries
+/// Report-context field carrying the routing policy's default same-key retry
+/// count for the request, so the attempt loop can derive same-key retries
 /// lazily instead of pre-materializing them.
-pub const STICKY_KEY_ATTEMPTS_REPORT_FIELD: &str = "sticky_key_attempts";
+pub const SAME_KEY_RETRIES_REPORT_FIELD: &str = "same_key_retries";
 
 #[derive(Debug)]
 pub enum AiAttemptLoopOutcome<Response, Exhaustion> {
@@ -103,7 +103,7 @@ where
     }
 
     /// After `attempt` failed with candidate scope, return the next attempt on
-    /// the same key, or `None` once the sticky-key budget is used up. Retries
+    /// the same key, or `None` once the same-key budget is used up. Retries
     /// are derived here on demand so no attempt is materialized before it is
     /// actually needed.
     async fn next_same_key_retry(

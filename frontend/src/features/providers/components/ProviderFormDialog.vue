@@ -150,17 +150,6 @@
               </SelectContent>
             </Select>
           </div>
-          <div class="space-y-1.5">
-            <Label>{{ legacyT('最大重试次数') }}</Label>
-            <Input
-              :model-value="form.max_retries ?? ''"
-              type="number"
-              min="0"
-              max="999"
-              :placeholder="legacyT('默认 2')"
-              @update:model-value="(v) => form.max_retries = parseNumberInput(v)"
-            />
-          </div>
         </div>
 
         <!-- 超时配置 -->
@@ -197,8 +186,29 @@
           </div>
         </div>
 
-        <!-- 提供商内转移限制 -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <!-- 同 Key 重试与提供商内转移限制 -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div class="min-w-0 space-y-1.5">
+            <Label
+              for="same-key-retries"
+              class="text-xs sm:text-sm"
+            >
+              {{ legacyT('同 Key 重试次数') }}
+            </Label>
+            <Input
+              id="same-key-retries"
+              :model-value="form.max_retries ?? ''"
+              type="number"
+              min="0"
+              max="99"
+              step="1"
+              :placeholder="legacyT('留空则沿用调度策略')"
+              @update:model-value="(v) => form.max_retries = parseNumberInput(v, { min: 0 })"
+            />
+            <p class="text-xs text-muted-foreground">
+              {{ legacyT('0 表示失败后直接转移，1 表示再试一次（共两次）；设置后对本供应商的每个 Key 生效') }}
+            </p>
+          </div>
           <div class="min-w-0 space-y-1.5">
             <Label
               for="max-transfer-count"
@@ -708,8 +718,8 @@ const handleSubmit = async () => {
         : undefined,
       responses_websocket_enabled: form.value.responses_websocket_enabled,
       is_active: form.value.is_active,
-      // 请求配置
-      max_retries: form.value.max_retries ?? undefined,
+      // 请求配置：编辑时清空需显式发送 null，后端才会清除覆盖并回到继承调度策略
+      max_retries: form.value.max_retries ?? (isEditMode.value ? null : undefined),
       max_transfer_count: form.value.max_transfer_count,
       max_transfer_timeout_seconds: form.value.max_transfer_timeout_seconds,
       // 超时配置（null 表示清除，使用全局配置）

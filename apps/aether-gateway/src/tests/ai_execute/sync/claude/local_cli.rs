@@ -894,7 +894,7 @@ async fn gateway_marks_claude_cli_cross_format_runtime_miss_when_format_conversi
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,

@@ -570,8 +570,8 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .filter(|plan| plan["request_id"] == "trace-search-failover-1")
         .map(|plan| plan["provider_id"].clone())
         .collect::<Vec<_>>();
-    // Default sticky_key_attempts is 2: the first provider is retried once on
-    // the same key before failover advances to the second provider.
+    // The provider fixture allows one same-key retry: the first provider is
+    // retried once on the same key before failover advances to the second.
     assert_eq!(
         failover_plans,
         vec![

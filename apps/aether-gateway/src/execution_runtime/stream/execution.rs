@@ -8631,7 +8631,7 @@ mod tests {
             "https://provider.example".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,
@@ -8701,16 +8701,7 @@ mod tests {
             true,
         )
         .expect("endpoint should build")
-        .with_transport_fields(
-            plan.url.clone(),
-            None,
-            None,
-            Some(2),
-            None,
-            None,
-            None,
-            None,
-        )
+        .with_transport_fields(plan.url.clone(), None, None, None, None, None, None, None)
         .expect("endpoint transport should build");
         let encrypted_auth_config = auth_config.map(|config| {
             encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, &config.to_string())

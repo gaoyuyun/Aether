@@ -152,7 +152,7 @@ fn endpoint(test_id: &str, base_url: String) -> StoredProviderCatalogEndpoint {
         true,
     )
     .expect("endpoint should build")
-    .with_transport_fields(base_url, None, None, Some(2), None, None, None, None)
+    .with_transport_fields(base_url, None, None, None, None, None, None, None)
     .expect("endpoint transport should build")
 }
 

@@ -66,7 +66,7 @@ export async function updateEndpoint(
     custom_path: string | null
     header_rules: HeaderRule[] | null
     body_rules: BodyRule[] | null
-    max_retries: number
+    max_retries: number | null
     is_active: boolean
     config: Record<string, unknown> | null
     proxy: ProxyConfig | null

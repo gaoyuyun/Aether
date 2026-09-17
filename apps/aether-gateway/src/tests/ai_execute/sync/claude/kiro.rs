@@ -863,7 +863,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,

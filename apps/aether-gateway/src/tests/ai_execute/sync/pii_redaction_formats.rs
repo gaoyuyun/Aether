@@ -629,7 +629,7 @@ fn provider(case: &RedactionFormatCase) -> StoredProviderCatalogProvider {
         false,
         case.client_format != case.provider_format,
         None,
-        Some(2),
+        None,
         None,
         Some(20.0),
         None,

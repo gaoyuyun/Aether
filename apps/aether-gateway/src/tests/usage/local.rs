@@ -968,8 +968,8 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
         .list_by_request_id("trace-openai-chat-local-report-sync-failure-123")
         .await
         .expect("request candidate trace should read");
-    // The only candidate is the sticky first key: the default policy retries
-    // it once on the same key before the request is exhausted.
+    // The only candidate belongs to a provider configured with one same-key
+    // retry, so it is tried twice before the request is exhausted.
     assert_eq!(stored_candidates.len(), 2);
     for candidate in &stored_candidates {
         assert_eq!(candidate.status, RequestCandidateStatus::Failed);
@@ -1050,7 +1050,7 @@ async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable
     let response = send_request(gateway, request).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    // The sticky first key is retried once on the same key before exhaustion.
+    // The provider allows one same-key retry, so the key is tried twice.
     assert_eq!(*execution_hits.lock().expect("mutex should lock"), 2);
 
     let stored_usage = wait_for_usage_status(
@@ -1924,7 +1924,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
             false,
             false,
             None,
-            Some(1),
+            None,
             None,
             Some(20.0),
             None,
@@ -2251,7 +2251,7 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
             false,
             false,
             None,
-            Some(1),
+            None,
             None,
             Some(20.0),
             None,
@@ -2715,7 +2715,7 @@ async fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_req
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,
@@ -2734,7 +2734,7 @@ async fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_req
             "https://api.anthropic.example/v1".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,

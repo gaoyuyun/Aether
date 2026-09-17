@@ -157,7 +157,7 @@ async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finali
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,

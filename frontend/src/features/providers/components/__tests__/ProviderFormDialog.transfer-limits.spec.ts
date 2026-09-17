@@ -257,6 +257,56 @@ describe('ProviderFormDialog transfer limits', () => {
   })
 })
 
+describe('ProviderFormDialog same-key retries', () => {
+  it('loads the configured override and clears it back to inherit with null', async () => {
+    mountDialog(makeProvider({ max_retries: 1 }))
+    await settle()
+
+    const input = document.body.querySelector<HTMLInputElement>('#same-key-retries')
+    expect(input?.value).toBe('1')
+    expect(input?.placeholder).toBe('留空则沿用调度策略')
+
+    await setInput('#same-key-retries', '')
+    clickButton('保存')
+    await settle()
+
+    // 编辑时清空必须显式发送 null，后端才会清除覆盖并回到继承调度策略
+    expect(endpointMocks.updateProvider).toHaveBeenCalledWith(
+      'provider-1',
+      expect.objectContaining({ max_retries: null }),
+    )
+  })
+
+  it('submits an explicit zero so the provider fails over without a same-key retry', async () => {
+    mountDialog(makeProvider({ max_retries: null }))
+    await settle()
+
+    expect(document.body.querySelector<HTMLInputElement>('#same-key-retries')?.value).toBe('')
+
+    await setInput('#same-key-retries', '0')
+    clickButton('保存')
+    await settle()
+
+    expect(endpointMocks.updateProvider).toHaveBeenCalledWith(
+      'provider-1',
+      expect.objectContaining({ max_retries: 0 }),
+    )
+  })
+
+  it('omits the override when creating a provider without one', async () => {
+    mountDialog(null)
+    await settle()
+
+    await setInput('#name', 'New Provider')
+    clickButton('创建')
+    await settle()
+
+    const payload = endpointMocks.createProvider.mock.calls[0]?.[0]
+    expect(payload).toEqual(expect.any(Object))
+    expect(payload?.max_retries).toBeUndefined()
+  })
+})
+
 describe('ProviderFormDialog quota cycle updates', () => {
   it('does not overwrite a concurrently reset cycle when the field was not edited', async () => {
     mountDialog(makeProvider({

@@ -68,7 +68,7 @@ import { BookOpen } from 'lucide-vue-next'
       <div class="space-y-4 mt-4 text-[#666663] dark:text-[#a3a094] text-sm">
         <ul class="list-decimal pl-5 space-y-2">
           <li><strong class="text-[#262624] dark:text-[#f1ead8] font-medium">提供商类型：</strong>自定义或反代；一般自定义即可，反代请进入反代章节。</li>
-          <li><strong class="text-[#262624] dark:text-[#f1ead8] font-medium">最大重试次数：</strong>在缓存亲和调度模式下，首次请求失败后的重试次数。</li>
+          <li><strong class="text-[#262624] dark:text-[#f1ead8] font-medium">同 Key 重试次数：</strong>留空则沿用调度策略的默认值（默认 0，失败后直接转移）；设置后对该提供商的每个 Key 生效，1 表示失败后再试一次，共请求两次。</li>
           <li>
             <strong class="text-[#262624] dark:text-[#f1ead8] font-medium">超时时间：</strong>
             <ul class="list-disc pl-5 mt-1 space-y-1">

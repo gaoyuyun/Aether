@@ -1,7 +1,7 @@
 use aether_routing_core::{
     resolve_routing_policy, MutationPlan, RankingOverlay, ResolvedRoutingPolicy,
     RoutingDefaultPolicy, RoutingGroupConfig, RoutingPolicyError, RoutingPolicyInput,
-    RoutingRulePhase, RoutingSchedulingMode, RoutingSetPriorityMode, DEFAULT_STICKY_KEY_ATTEMPTS,
+    RoutingRulePhase, RoutingSchedulingMode, RoutingSetPriorityMode, DEFAULT_SAME_KEY_RETRIES,
 };
 use http::StatusCode;
 use serde_json::Value;
@@ -95,7 +95,7 @@ pub(crate) fn resolve_gateway_static_default_routing_policy(
         priority_mode: default_policy.priority_mode,
         scheduling_mode: default_policy.scheduling_mode,
         keep_priority_on_conversion: default_policy.keep_priority_on_conversion,
-        sticky_key_attempts: default_policy.sticky_key_attempts,
+        same_key_retries: default_policy.same_key_retries,
         execution_policy: default_policy.execution_policy,
         ranking_overlay: RankingOverlay::default(),
         mutation_plan: MutationPlan::default(),
@@ -138,12 +138,12 @@ fn static_default_policy_fields(
         Some(value) => value.as_bool().ok_or_else(invalid_routing_group_config)?,
         None => false,
     };
-    let sticky_key_attempts = match default_policy.get("sticky_key_attempts") {
+    let same_key_retries = match default_policy.get("same_key_retries") {
         Some(value) => value
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
             .ok_or_else(invalid_routing_group_config)?,
-        None => DEFAULT_STICKY_KEY_ATTEMPTS,
+        None => DEFAULT_SAME_KEY_RETRIES,
     };
     let execution_policy: aether_routing_core::RoutingExecutionPolicy =
         serde_json::from_value(Value::Object(default_policy.clone()))
@@ -155,7 +155,7 @@ fn static_default_policy_fields(
         priority_mode,
         scheduling_mode,
         keep_priority_on_conversion,
-        sticky_key_attempts,
+        same_key_retries,
         execution_policy,
     }))
 }

@@ -135,7 +135,7 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
             false,
             false,
             None,
-            Some(2),
+            None,
             None,
             Some(20.0),
             None,

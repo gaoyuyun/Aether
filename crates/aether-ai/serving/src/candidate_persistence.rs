@@ -42,7 +42,7 @@ where
 {
     // One attempt per candidate. Same-key retries are derived lazily by the
     // attempt loop (`AiAttemptLoopPort::next_same_key_retry`) after a failure,
-    // so the sticky-key budget never inflates up-front materialization.
+    // so the same-key retry budget never inflates up-front materialization.
     let mut materialized = Vec::with_capacity(candidates.len());
 
     for (candidate_index, candidate) in candidates.into_iter().enumerate() {

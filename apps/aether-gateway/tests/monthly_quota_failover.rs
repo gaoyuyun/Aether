@@ -83,16 +83,19 @@ async fn seed(pool: &SqlitePool, a_url: &str, b_url: &str, now: u64, a_id: &str,
         sqlx::query("INSERT INTO api_keys (id, user_id, key_hash, allowed_providers, created_at, updated_at) VALUES (?, 'quota-user', ?, ?, 1, 1)")
             .bind(id).bind(hash).bind(allowed).execute(pool).await.unwrap();
     }
-    for (id, url, priority, billing) in [
-        (a_id, a_url, 1, "monthly_quota"),
-        (b_id, b_url, 100, "pay_as_you_go"),
+    // Provider A allows one same-key retry; provider B fails over immediately.
+    for (id, url, priority, billing, same_key_retries) in [
+        (a_id, a_url, 1, "monthly_quota", 1),
+        (b_id, b_url, 100, "pay_as_you_go", 0),
     ] {
-        sqlx::query("INSERT INTO providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, quota_subscription_started_at, quota_cycle_start_at, provider_priority, max_retries, request_timeout, stream_first_byte_timeout, config, created_at, updated_at) VALUES (?, ?, 'custom', ?, 100, 0, 7, ?, ?, ?, ?, 0, 1, 1, ?, 1, 1)")
+        sqlx::query("INSERT INTO providers (id, name, provider_type, billing_type, monthly_quota_usd, monthly_used_usd, quota_reset_day, quota_last_reset_at, quota_subscription_started_at, quota_cycle_start_at, provider_priority, max_retries, request_timeout, stream_first_byte_timeout, config, created_at, updated_at) VALUES (?, ?, 'custom', ?, 100, 0, 7, ?, ?, ?, ?, ?, 1, 1, ?, 1, 1)")
             .bind(id).bind(id).bind(billing).bind((now / 60 * 60 - 3600) as i64)
             .bind((now / 60 * 60 - 3600) as i64).bind((now / 60 * 60 - 3600) as i64).bind(priority)
+            .bind(same_key_retries)
             .bind("{}")
             .execute(pool).await.unwrap();
-        sqlx::query("INSERT INTO provider_endpoints (id, provider_id, name, base_url, api_format, api_family, endpoint_kind, max_retries, created_at, updated_at) VALUES (?, ?, ?, ?, 'openai:chat', 'openai', 'chat', 0, 1, 1)")
+        // Endpoints inherit the provider's same-key retries.
+        sqlx::query("INSERT INTO provider_endpoints (id, provider_id, name, base_url, api_format, api_family, endpoint_kind, max_retries, created_at, updated_at) VALUES (?, ?, ?, ?, 'openai:chat', 'openai', 'chat', NULL, 1, 1)")
             .bind(format!("endpoint-{id}")).bind(id).bind(id).bind(format!("{url}/v1")).execute(pool).await.unwrap();
         let encrypted =
             encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "sk-local-fixture")
@@ -236,7 +239,7 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
             assert!(body.contains("fallback-b"), "expected fallback: {body}");
         }
     }
-    // The first key gets one same-key retry by default. A committed stream
+    // Provider A is configured with one same-key retry. A committed stream
     // cannot retry, while refused connections never reach the HTTP handler.
     let failed_attempts = if committed_stream_error { 1 } else { 2 };
     assert_eq!(

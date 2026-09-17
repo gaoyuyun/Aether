@@ -4,7 +4,7 @@ use aether_ai_serving::{
     build_ai_execution_report_context,
     insert_provider_stream_event_api_format as insert_ai_provider_stream_event_api_format,
     provider_stream_event_api_format_for_provider_type as ai_provider_stream_event_api_format_for_provider_type,
-    AiExecutionReportContextParts, AiRequestOrigin, STICKY_KEY_ATTEMPTS_REPORT_FIELD,
+    AiExecutionReportContextParts, AiRequestOrigin, SAME_KEY_RETRIES_REPORT_FIELD,
 };
 use aether_routing_core::ResolvedRoutingPolicy;
 use aether_runtime_state::RuntimeLockLease;
@@ -60,9 +60,9 @@ pub(crate) struct LocalExecutionReportContextParts<'a> {
     pub(crate) client_session_affinity: Option<&'a ClientSessionAffinity>,
     pub(crate) routing_policy: Option<&'a ResolvedRoutingPolicy>,
     pub(crate) scheduler_affinity_epoch: Option<u64>,
-    /// Routing policy sticky-key attempt budget; read back by the attempt
+    /// Routing policy default same-key retries; read back by the attempt
     /// loop to derive same-key retries lazily.
-    pub(crate) sticky_key_attempts: Option<u32>,
+    pub(crate) same_key_retries: Option<u32>,
     pub(crate) client_requested_stream: bool,
     pub(crate) upstream_is_stream: bool,
     pub(crate) has_envelope: bool,
@@ -141,10 +141,10 @@ pub(crate) fn build_local_execution_report_context(
             Value::Number(epoch.into()),
         );
     }
-    if let Some(sticky_key_attempts) = parts.sticky_key_attempts {
+    if let Some(same_key_retries) = parts.same_key_retries {
         extra_fields.insert(
-            STICKY_KEY_ATTEMPTS_REPORT_FIELD.to_string(),
-            Value::Number(sticky_key_attempts.into()),
+            SAME_KEY_RETRIES_REPORT_FIELD.to_string(),
+            Value::Number(same_key_retries.into()),
         );
     }
     insert_request_path_fields(
@@ -388,7 +388,7 @@ mod tests {
                 client_session_affinity: Some(&client_session_affinity),
                 routing_policy: None,
                 scheduler_affinity_epoch: None,
-                sticky_key_attempts: None,
+                same_key_retries: None,
                 client_requested_stream: false,
                 upstream_is_stream: false,
                 has_envelope: false,
@@ -476,7 +476,7 @@ mod tests {
                 client_session_affinity: None,
                 routing_policy: None,
                 scheduler_affinity_epoch: None,
-                sticky_key_attempts: None,
+                same_key_retries: None,
                 client_requested_stream: false,
                 upstream_is_stream: true,
                 has_envelope: false,
@@ -550,7 +550,7 @@ mod tests {
                 client_session_affinity: None,
                 routing_policy: None,
                 scheduler_affinity_epoch: None,
-                sticky_key_attempts: None,
+                same_key_retries: None,
                 client_requested_stream: false,
                 upstream_is_stream: false,
                 has_envelope: false,

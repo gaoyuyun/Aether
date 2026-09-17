@@ -3041,7 +3041,7 @@ impl<'a> AdminAppState<'a> {
                                 imported_endpoint.body_rules,
                                 credentials_not_exported,
                             ),
-                            imported_endpoint.max_retries.unwrap_or(2),
+                            imported_endpoint.max_retries,
                             prepare_imported_secret_safe_json(
                                 None,
                                 imported_endpoint.config,
@@ -5961,7 +5961,7 @@ impl<'a> AdminAppState<'a> {
                             imported_endpoint.body_rules.clone(),
                             credentials_not_exported,
                         ),
-                        imported_endpoint.max_retries.unwrap_or(2),
+                        imported_endpoint.max_retries,
                         prepare_imported_secret_safe_json(
                             None,
                             imported_endpoint.config.clone(),

@@ -292,7 +292,7 @@ pub fn build_admin_provider_endpoint_response(
         "custom_path": endpoint.custom_path,
         "header_rules": admin_secret_safe_header_rules(endpoint.header_rules.as_ref()),
         "body_rules": admin_secret_safe_body_rules(endpoint.body_rules.as_ref()),
-        "max_retries": endpoint.max_retries.unwrap_or(2),
+        "max_retries": endpoint.max_retries,
         "is_active": endpoint.is_active,
         "config": admin_secret_safe_json(endpoint.config.as_ref()),
         "proxy": admin_secret_safe_proxy(endpoint.proxy.as_ref()),
@@ -335,7 +335,7 @@ pub fn build_admin_provider_endpoint_record(
     custom_path: Option<String>,
     header_rules: Option<Value>,
     body_rules: Option<Value>,
-    max_retries: i32,
+    max_retries: Option<i32>,
     config: Option<Value>,
     proxy: Option<Value>,
     format_acceptance_config: Option<Value>,
@@ -355,7 +355,7 @@ pub fn build_admin_provider_endpoint_record(
         base_url,
         header_rules,
         body_rules,
-        Some(max_retries),
+        max_retries,
         trimmed_non_empty_string(custom_path),
         config,
         format_acceptance_config,
@@ -435,17 +435,18 @@ where
     }
 
     if contains_field("max_retries") {
-        let Some(max_retries) = payload.max_retries else {
-            return Err(if is_null_field("max_retries") {
-                "max_retries 必须是 0 到 999 之间的整数".to_string()
-            } else {
-                "max_retries 必须是整数".to_string()
-            });
+        updated.max_retries = if is_null_field("max_retries") {
+            // Clearing the endpoint value falls back to the provider setting.
+            None
+        } else {
+            let Some(max_retries) = payload.max_retries else {
+                return Err("max_retries 必须是整数或 null".to_string());
+            };
+            if !(0..=999).contains(&max_retries) {
+                return Err("max_retries 必须在 0 到 999 之间".to_string());
+            }
+            Some(max_retries)
         };
-        if !(0..=999).contains(&max_retries) {
-            return Err("max_retries 必须在 0 到 999 之间".to_string());
-        }
-        updated.max_retries = Some(max_retries);
     }
 
     if contains_field("is_active") {

@@ -1,7 +1,7 @@
 use aether_data_contracts::repository::routing_profiles::RoutingGroupLookupKey;
 use aether_routing_core::{
     ResolvedRoutingPolicy, RoutingDefaultPolicy, RoutingSchedulingMode, RoutingSetPriorityMode,
-    DEFAULT_STICKY_KEY_ATTEMPTS,
+    DEFAULT_SAME_KEY_RETRIES,
 };
 use aether_scheduler_core::SchedulerPriorityMode;
 use tracing::warn;
@@ -38,8 +38,8 @@ pub(crate) struct SchedulerOrderingConfig {
     pub(crate) priority_mode: SchedulerPriorityMode,
     pub(crate) scheduling_mode: SchedulerSchedulingMode,
     pub(crate) keep_priority_on_conversion: bool,
-    /// Total attempts on the first-ranked (sticky) candidate before failover.
-    pub(crate) sticky_key_attempts: u32,
+    /// Default same-key retries for every candidate key; providers may override.
+    pub(crate) same_key_retries: u32,
 }
 
 impl Default for SchedulerOrderingConfig {
@@ -48,7 +48,7 @@ impl Default for SchedulerOrderingConfig {
             priority_mode: SchedulerPriorityMode::Provider,
             scheduling_mode: SchedulerSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
-            sticky_key_attempts: DEFAULT_STICKY_KEY_ATTEMPTS,
+            same_key_retries: DEFAULT_SAME_KEY_RETRIES,
         }
     }
 }
@@ -61,7 +61,7 @@ impl SchedulerOrderingConfig {
             priority_mode: scheduler_priority_mode_from_routing(policy.priority_mode),
             scheduling_mode: scheduler_scheduling_mode_from_routing(policy.scheduling_mode),
             keep_priority_on_conversion: policy.keep_priority_on_conversion,
-            sticky_key_attempts: policy.sticky_key_attempts,
+            same_key_retries: policy.same_key_retries,
         }
     }
 
@@ -70,7 +70,7 @@ impl SchedulerOrderingConfig {
             priority_mode: scheduler_priority_mode_from_routing(policy.priority_mode),
             scheduling_mode: scheduler_scheduling_mode_from_routing(policy.scheduling_mode),
             keep_priority_on_conversion: policy.keep_priority_on_conversion,
-            sticky_key_attempts: policy.sticky_key_attempts,
+            same_key_retries: policy.same_key_retries,
         }
     }
 
@@ -86,7 +86,7 @@ impl SchedulerOrderingConfig {
                 SchedulerSchedulingMode::LoadBalance => RoutingSchedulingMode::LoadBalance,
             },
             keep_priority_on_conversion: self.keep_priority_on_conversion,
-            sticky_key_attempts: self.sticky_key_attempts,
+            same_key_retries: self.same_key_retries,
             execution_policy: aether_routing_core::RoutingExecutionPolicy::default(),
         }
     }
@@ -274,7 +274,7 @@ mod tests {
                 "priority_mode": "provider",
                 "scheduling_mode": "cache_affinity",
                 "keep_priority_on_conversion": false,
-                "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS,
+                "same_key_retries": DEFAULT_SAME_KEY_RETRIES,
                 "max_transfer_count": 0,
                 "max_transfer_timeout_seconds": 0,
                 "failover_rules": {
@@ -329,7 +329,7 @@ mod tests {
                 "priority_mode": "provider",
                 "scheduling_mode": "cache_affinity",
                 "keep_priority_on_conversion": false,
-                "sticky_key_attempts": DEFAULT_STICKY_KEY_ATTEMPTS,
+                "same_key_retries": DEFAULT_SAME_KEY_RETRIES,
                 "max_transfer_count": 0,
                 "max_transfer_timeout_seconds": 0,
                 "failover_rules": {

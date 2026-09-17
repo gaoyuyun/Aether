@@ -5,7 +5,7 @@
 ```json
 {
   "default_policy": {
-    "sticky_key_attempts": 2,
+    "same_key_retries": 1,
     "max_transfer_count": 3,
     "max_transfer_timeout_seconds": 90,
     "failover_rules": {
@@ -23,7 +23,8 @@
 
 ## 预算语义
 
-- `sticky_key_attempts` 是首个粘性候选上的总尝试次数，`2` 表示首次请求加一次同 Key 重试。该行为保持不变。
+- `same_key_retries` 是所有候选 Key 的默认同 Key 重试次数，`0` 表示失败后直接转移到下一个候选，`1` 表示在同一 Key 上再试一次（共两次请求）。它对每一个候选生效，与候选排第几位、是否已建立缓存亲和无关。
+- 提供商可以单独配置同 Key 重试次数：提供商表单的“同 Key 重试次数”写入提供商的 `max_retries` 列，`failover_rules.max_retries` 与端点级 `max_retries` 依次优先于它。配置后对该提供商的每一个 Key 生效（含号池中的每一把 Key，单 Key 上限 99 次）；留空（`null`）则沿用调度策略的默认值。同 Key 重试同样受全局与提供商级的累计时间预算约束，但不计入转移次数。历史上由管理接口自动填充的 `2` 已在迁移 `20260917000000` 中清空为沿用策略；旧策略字段 `sticky_key_attempts` 不再读取。
 - 全局 `max_transfer_count` 统计切换候选的次数，首次尝试不计数。同一提供商、端点、Key 上的重试不计数；改变该组合计一次。`3` 最多允许首次候选之后再切换三次。
 - 全局 `max_transfer_timeout_seconds` 从首次候选开始执行时计时，覆盖后续重试与切换间的累计耗时。它在准备下一次尝试时检查，不会强制打断已经执行中的调用或已提交给客户端的流；单次连接、首字节、读取和非流式完整调用超时仍独立生效。
 - 两个全局预算的 `0` 都表示不限制。被筛除、禁用或被提供商级预算跳过而未执行的候选不计数。

@@ -11,10 +11,18 @@ use crate::AppState;
 
 pub(crate) const RESPONSES_WEBSOCKET_CONFIG_KEY: &str = "responses_websocket";
 pub(crate) const ROUTING_EXECUTION_POLICY_REPORT_FIELD: &str = "routing_execution_policy";
+/// Report-context field carrying the provider-level failover policy snapshot
+/// (`LocalFailoverPolicy`) for the attempt; its `max_retries` is the
+/// provider's same-key retry override read by the attempt loop.
+pub(crate) const LOCAL_FAILOVER_POLICY_REPORT_FIELD: &str = "local_failover_policy";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalFailoverPolicy {
     pub(crate) routing_rules: RoutingFailoverRules,
+    /// Provider-level same-key retry override: retries after the first
+    /// attempt on each key of this provider (`failover_rules.max_retries`,
+    /// then the endpoint column, then the provider column). `None` inherits
+    /// the routing policy's `same_key_retries` behaviour.
     pub(crate) max_retries: Option<u64>,
     pub(crate) max_transfer_count: u64,
     pub(crate) max_transfer_timeout_seconds: u64,
@@ -187,7 +195,7 @@ pub(crate) fn local_failover_policy_from_report_context(
 ) -> Option<LocalFailoverPolicy> {
     let object = report_context
         .and_then(Value::as_object)?
-        .get("local_failover_policy")?
+        .get(LOCAL_FAILOVER_POLICY_REPORT_FIELD)?
         .as_object()?;
 
     Some(LocalFailoverPolicy {
@@ -237,7 +245,7 @@ pub(crate) fn append_local_failover_policy_to_value(
         return value;
     };
     object.insert(
-        "local_failover_policy".to_string(),
+        LOCAL_FAILOVER_POLICY_REPORT_FIELD.to_string(),
         local_failover_policy_to_value(&local_failover_policy_from_transport(transport)),
     );
     if transport

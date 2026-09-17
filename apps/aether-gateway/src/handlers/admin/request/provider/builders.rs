@@ -251,7 +251,10 @@ impl<'a> AdminAppState<'a> {
         if self.provider_type_is_fixed(&provider.provider_type) {
             return Err("固定类型 Provider 不允许手动新增 Endpoint".to_string());
         }
-        if !(0..=999).contains(&payload.max_retries) {
+        if payload
+            .max_retries
+            .is_some_and(|max_retries| !(0..=999).contains(&max_retries))
+        {
             return Err("max_retries 必须在 0 到 999 之间".to_string());
         }
 

@@ -111,17 +111,7 @@ pub(super) fn video_provider_catalog_repository(
         provider_type.to_string(),
     )
     .expect("provider should build")
-    .with_transport_fields(
-        true,
-        false,
-        false,
-        None,
-        Some(2),
-        None,
-        Some(20.0),
-        None,
-        None,
-    );
+    .with_transport_fields(true, false, false, None, None, None, Some(20.0), None, None);
     let endpoint = StoredProviderCatalogEndpoint::new(
         endpoint_id.to_string(),
         provider_id.to_string(),
@@ -135,7 +125,7 @@ pub(super) fn video_provider_catalog_repository(
         endpoint_base_url.to_string(),
         None,
         None,
-        Some(2),
+        None,
         None,
         None,
         None,

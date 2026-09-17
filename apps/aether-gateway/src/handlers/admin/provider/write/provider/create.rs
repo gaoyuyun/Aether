@@ -107,10 +107,12 @@ pub(crate) async fn build_admin_create_provider_record(
         Some(_) => return Err("concurrent_limit 必须是非负整数".to_string()),
         None => None,
     };
+    // `None` inherits the routing policy's same-key retry budget; only an
+    // explicit value overrides it for every key of this provider.
     let max_retries = match payload.max_retries {
         Some(value) if (0..=999).contains(&value) => Some(value),
         Some(_) => return Err("max_retries 必须是 0 到 999 之间的整数".to_string()),
-        None => Some(2),
+        None => None,
     };
     let proxy = normalize_json_object(payload.proxy, "proxy")?;
     let stream_first_byte_timeout_secs =

@@ -130,17 +130,7 @@ async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_loca
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -604,17 +594,7 @@ async fn gateway_executes_openai_responses_cross_format_function_call_upstream_s
             "custom".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -1090,17 +1070,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
             "antigravity".to_string(),
         )
         .expect("provider should build")
-        .with_transport_fields(
-            true,
-            false,
-            true,
-            None,
-            Some(2),
-            None,
-            Some(20.0),
-            None,
-            None,
-        )
+        .with_transport_fields(true, false, true, None, None, None, Some(20.0), None, None)
     }
 
     fn sample_provider_catalog_endpoint() -> StoredProviderCatalogEndpoint {
@@ -1117,7 +1087,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
             "https://antigravity.googleapis.com".to_string(),
             None,
             None,
-            Some(2),
+            None,
             None,
             None,
             None,

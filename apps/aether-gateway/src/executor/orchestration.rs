@@ -1663,21 +1663,21 @@ mod tests {
         endpoint_id: &str,
         candidate_id: &str,
     ) -> AiSyncAttempt {
-        test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+        test_openai_image_heartbeat_attempt_with_same_key_retries(
             candidate_index,
             endpoint_id,
             candidate_id,
-            1,
+            0,
         )
     }
 
-    /// `sticky_key_attempts` is pinned so these tests exercise candidate
-    /// failover; the default same-key retry is covered separately.
-    fn test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+    /// `same_key_retries` is pinned so these tests exercise candidate
+    /// failover; same-key retries are covered separately.
+    fn test_openai_image_heartbeat_attempt_with_same_key_retries(
         candidate_index: u32,
         endpoint_id: &str,
         candidate_id: &str,
-        sticky_key_attempts: u32,
+        same_key_retries: u32,
     ) -> AiSyncAttempt {
         AiSyncAttempt {
             plan: test_openai_image_heartbeat_plan(endpoint_id, candidate_id),
@@ -1685,7 +1685,7 @@ mod tests {
             report_context: Some(json!({
                 "candidate_index": candidate_index,
                 "retry_index": 0,
-                "sticky_key_attempts": sticky_key_attempts,
+                "same_key_retries": same_key_retries,
             })),
         }
     }
@@ -1891,8 +1891,8 @@ mod tests {
                 "candidate_index": candidate_index,
                 "retry_index": 0,
                 // Pin to a single attempt so this helper exercises candidate
-                // failover rather than the default same-key retry.
-                "sticky_key_attempts": 1,
+                // failover rather than same-key retries.
+                "same_key_retries": 0,
                 "client_api_format": client_api_format,
                 "provider_api_format": client_api_format,
             })),
@@ -2103,7 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_image_sync_heartbeat_retries_sticky_key_lazily_before_failover() {
+    async fn openai_image_sync_heartbeat_retries_same_key_lazily_before_failover() {
         let seen_plans = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
         let seen_plans_for_override = Arc::clone(&seen_plans);
         let state = AppState::new()
@@ -2127,26 +2127,27 @@ mod tests {
                     ))
                 }
             });
-        // Three total attempts on the sticky key; only one attempt is
-        // materialized up front, the other two are derived after each failure.
+        // Two same-key retries, i.e. three total attempts on the first key;
+        // only one attempt is materialized up front, the other two are derived
+        // after each failure.
         let attempts = vec![
-            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+            test_openai_image_heartbeat_attempt_with_same_key_retries(
                 0,
                 "endpoint-retry",
                 "candidate-retry",
-                3,
+                2,
             ),
-            test_openai_image_heartbeat_attempt_with_sticky_key_attempts(
+            test_openai_image_heartbeat_attempt_with_same_key_retries(
                 1,
                 "endpoint-success",
                 "candidate-success",
-                3,
+                2,
             ),
         ];
         let outcome = execute_openai_image_sync_heartbeat_attempts(
             state,
             "/v1/images/generations".to_string(),
-            "trace-image-heartbeat-sticky-retry".to_string(),
+            "trace-image-heartbeat-same-key-retry".to_string(),
             test_openai_image_heartbeat_decision(),
             TEST_OPENAI_IMAGE_SYNC_PLAN_KIND.to_string(),
             attempts,
@@ -2174,12 +2175,12 @@ mod tests {
                 "endpoint-success"
             ]
         );
-        let sticky_candidate_ids = seen_plans[..3]
+        let same_key_candidate_ids = seen_plans[..3]
             .iter()
             .map(|(_, candidate_id)| candidate_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            sticky_candidate_ids.len(),
+            same_key_candidate_ids.len(),
             3,
             "each derived same-key retry must carry a fresh candidate id"
         );
@@ -2219,7 +2220,7 @@ mod tests {
             attempt.report_context = Some(json!({
                 "candidate_index": index,
                 "retry_index": 0,
-                "sticky_key_attempts": 1,
+                "same_key_retries": 0,
                 "local_failover_policy": {
                     "max_transfer_count": 1,
                     "max_transfer_timeout_seconds": 0
