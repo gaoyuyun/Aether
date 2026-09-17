@@ -2126,15 +2126,36 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         .list_by_request_id("trace-claude-cli-usage-local-miss-123")
         .await
         .expect("request candidate trace should read");
-    assert_eq!(stored_candidates.len(), 1);
-    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Skipped);
+    // The standard-family step and the same-format provider step each evaluate
+    // the only key and skip it. Candidate slots are request-wide, so every
+    // execution path keeps its own skipped row instead of overwriting the first.
+    assert_eq!(stored_candidates.len(), 2);
     assert_eq!(
-        stored_candidates[0].skip_reason.as_deref(),
-        Some("format_conversion_disabled")
+        stored_candidates
+            .iter()
+            .map(|candidate| (candidate.candidate_index, candidate.retry_index))
+            .collect::<Vec<_>>(),
+        vec![(0, 0), (1, 0)]
     );
-    assert_eq!(
-        stored_usage.routing_candidate_id(),
-        Some(stored_candidates[0].id.as_str())
+    for candidate in &stored_candidates {
+        assert_eq!(candidate.status, RequestCandidateStatus::Skipped);
+        assert_eq!(
+            candidate.skip_reason.as_deref(),
+            Some("format_conversion_disabled")
+        );
+        assert_eq!(
+            candidate.key_id.as_deref(),
+            Some("key-claude-cli-usage-local-miss-1")
+        );
+    }
+    let routing_candidate_id = stored_usage
+        .routing_candidate_id()
+        .expect("usage should reference a skipped candidate");
+    assert!(
+        stored_candidates
+            .iter()
+            .any(|candidate| candidate.id == routing_candidate_id),
+        "usage must reference one of the skipped candidate rows"
     );
     assert_eq!(
         stored_usage.routing_candidate_skip_reason(),
@@ -2394,12 +2415,22 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
             .list_by_request_id("trace-claude-cli-usage-local-miss-large-123")
             .await
             .expect("request candidate trace should read");
-        assert_eq!(stored_candidates.len(), 1);
-        assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Skipped);
+        // One skipped row per execution path, as in the non-large variant.
+        assert_eq!(stored_candidates.len(), 2);
         assert_eq!(
-            stored_candidates[0].skip_reason.as_deref(),
-            Some("format_conversion_disabled")
+            stored_candidates
+                .iter()
+                .map(|candidate| (candidate.candidate_index, candidate.retry_index))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 0)]
         );
+        for candidate in &stored_candidates {
+            assert_eq!(candidate.status, RequestCandidateStatus::Skipped);
+            assert_eq!(
+                candidate.skip_reason.as_deref(),
+                Some("format_conversion_disabled")
+            );
+        }
 
         gateway_handle.abort();
         execution_runtime_handle.abort();
@@ -2820,18 +2851,38 @@ async fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_req
         .list_by_request_id(TRACE_ID)
         .await
         .expect("request candidate trace should read");
-    let owner_candidate = stored_candidates
+    // The standard-family step and the same-format provider step both hit the
+    // only key and both received the 429. Each keeps its own row; only the last
+    // one owns the preserved client response and therefore the request terminal
+    // state, while the earlier one stays an intermediate failure.
+    let failed_candidates = stored_candidates
         .iter()
-        .find(|candidate| {
+        .filter(|candidate| {
             candidate.status == RequestCandidateStatus::Failed && candidate.status_code == Some(429)
         })
+        .collect::<Vec<_>>();
+    fn request_lifecycle(extra_data: Option<&serde_json::Value>) -> Option<&str> {
+        extra_data
+            .and_then(|value| value.get("request_lifecycle"))
+            .and_then(serde_json::Value::as_str)
+    }
+    let (owner_candidate, intermediate_candidates) = failed_candidates
+        .split_last()
         .expect("the candidate timeline keeps the upstream failure");
     assert_eq!(
-        owner_candidate
-            .extra_data
-            .as_ref()
-            .and_then(|value| value.get("request_lifecycle"))
-            .and_then(serde_json::Value::as_str),
+        intermediate_candidates.len(),
+        1,
+        "the standard-family and same-format steps each record their own 429 attempt"
+    );
+    for candidate in intermediate_candidates {
+        assert_eq!(
+            request_lifecycle(candidate.extra_data.as_ref()),
+            None,
+            "an intermediate 429 must stay unmarked so a later candidate can still conclude the request"
+        );
+    }
+    assert_eq!(
+        request_lifecycle(owner_candidate.extra_data.as_ref()),
         Some("request_terminal"),
         "the candidate owning the preserved response must own the request terminal state"
     );
