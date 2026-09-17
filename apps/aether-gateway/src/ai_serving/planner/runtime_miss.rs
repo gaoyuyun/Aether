@@ -6,6 +6,8 @@ use aether_ai_serving::{
     apply_ai_runtime_candidate_terminal_reason, build_ai_runtime_candidate_evaluation_diagnostic,
     build_ai_runtime_execution_exhausted_diagnostic, record_ai_runtime_candidate_skip_reason,
     record_ai_runtime_candidate_skip_reason_on_diagnostic,
+    record_ai_runtime_candidate_skip_reason_once,
+    record_ai_runtime_candidate_skip_reason_once_on_diagnostic,
     set_ai_runtime_candidate_evaluation_diagnostic, set_ai_runtime_execution_exhausted_diagnostic,
     set_ai_runtime_miss_diagnostic_reason, AiRuntimeMissDiagnosticFields,
     AiRuntimeMissDiagnosticPort,
@@ -50,6 +52,28 @@ impl AiRuntimeMissDiagnosticFields for LocalExecutionRuntimeMissDiagnostic {
             .or_insert(0) += 1;
         *self.skipped_candidate_count.get_or_insert(0) += 1;
     }
+
+    fn record_candidate_skip_reason_once(
+        &mut self,
+        candidate_key: &str,
+        skip_reason: &'static str,
+    ) {
+        if self
+            .counted_candidate_skips
+            .insert((candidate_key.to_string(), skip_reason.to_string()))
+        {
+            *self
+                .skip_reasons
+                .entry(skip_reason.to_string())
+                .or_insert(0) += 1;
+        }
+        if self
+            .counted_skipped_candidates
+            .insert(candidate_key.to_string())
+        {
+            *self.skipped_candidate_count.get_or_insert(0) += 1;
+        }
+    }
 }
 
 impl AiRuntimeMissDiagnosticPort for GatewayRuntimeMissDiagnosticPort<'_> {
@@ -73,6 +97,8 @@ impl AiRuntimeMissDiagnosticPort for GatewayRuntimeMissDiagnosticPort<'_> {
             candidate_count: None,
             skipped_candidate_count: None,
             skip_reasons: std::collections::BTreeMap::new(),
+            counted_candidate_skips: std::collections::BTreeSet::new(),
+            counted_skipped_candidates: std::collections::BTreeSet::new(),
         }
     }
 
@@ -102,6 +128,19 @@ impl AiRuntimeMissDiagnosticPort for GatewayRuntimeMissDiagnosticPort<'_> {
         skip_reason: &'static str,
     ) {
         record_ai_runtime_candidate_skip_reason_on_diagnostic(diagnostic, skip_reason);
+    }
+
+    fn record_candidate_skip_reason_once(
+        &self,
+        diagnostic: &mut Self::Diagnostic,
+        candidate_key: &str,
+        skip_reason: &'static str,
+    ) {
+        record_ai_runtime_candidate_skip_reason_once_on_diagnostic(
+            diagnostic,
+            candidate_key,
+            skip_reason,
+        );
     }
 
     fn set_runtime_miss_diagnostic(&self, trace_id: &str, diagnostic: Self::Diagnostic) {
@@ -253,4 +292,111 @@ pub(crate) fn record_local_runtime_candidate_skip_reason(
 ) {
     let port = GatewayRuntimeMissDiagnosticPort { state: Some(state) };
     record_ai_runtime_candidate_skip_reason(&port, trace_id, skip_reason);
+}
+
+/// Identity of a planner candidate inside one request. Execution paths that
+/// re-evaluate the same key produce the same key, so the runtime miss summary
+/// counts the candidate once.
+pub(crate) fn local_runtime_candidate_skip_key(
+    provider_id: &str,
+    endpoint_id: &str,
+    key_id: &str,
+) -> String {
+    format!("{provider_id}/{endpoint_id}/{key_id}")
+}
+
+pub(crate) fn record_local_runtime_candidate_skip_reason_once(
+    state: &AppState,
+    trace_id: &str,
+    candidate_key: &str,
+    skip_reason: &'static str,
+) {
+    let port = GatewayRuntimeMissDiagnosticPort { state: Some(state) };
+    record_ai_runtime_candidate_skip_reason_once(&port, trace_id, candidate_key, skip_reason);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_local_runtime_candidate_terminal_reason, local_runtime_candidate_skip_key,
+        record_local_runtime_candidate_skip_reason_once,
+    };
+    use crate::{AppState, LocalExecutionRuntimeMissDiagnostic};
+
+    #[test]
+    fn same_candidate_skipped_by_several_paths_counts_once() {
+        let state = AppState::new().expect("state should build");
+        let trace_id = "trace-runtime-miss-dedupe";
+        state.set_local_execution_runtime_miss_diagnostic(
+            trace_id,
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                candidate_count: Some(1),
+                ..LocalExecutionRuntimeMissDiagnostic::default()
+            },
+        );
+        let key = local_runtime_candidate_skip_key("provider-1", "endpoint-1", "key-1");
+
+        // Standard-family path, same-format path and the plan fallback each skip the key.
+        for _ in 0..3 {
+            record_local_runtime_candidate_skip_reason_once(
+                &state,
+                trace_id,
+                &key,
+                "transport_operation_unsupported",
+            );
+        }
+        apply_local_runtime_candidate_terminal_reason(&state, trace_id, "no_local_sync_plans");
+
+        let diagnostic = state
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("diagnostic should exist");
+        assert_eq!(diagnostic.reason, "all_candidates_skipped");
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(
+            diagnostic
+                .skip_reasons
+                .get("transport_operation_unsupported"),
+            Some(&1)
+        );
+        assert_eq!(
+            diagnostic.skip_reasons_summary().as_deref(),
+            Some("transport_operation_unsupported=1")
+        );
+    }
+
+    #[test]
+    fn distinct_candidates_and_reasons_still_count_separately() {
+        let state = AppState::new().expect("state should build");
+        let trace_id = "trace-runtime-miss-distinct";
+        state.set_local_execution_runtime_miss_diagnostic(
+            trace_id,
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                candidate_count: Some(2),
+                ..LocalExecutionRuntimeMissDiagnostic::default()
+            },
+        );
+        let first = local_runtime_candidate_skip_key("provider-1", "endpoint-1", "key-1");
+        let second = local_runtime_candidate_skip_key("provider-1", "endpoint-1", "key-2");
+
+        record_local_runtime_candidate_skip_reason_once(&state, trace_id, &first, "key_inactive");
+        record_local_runtime_candidate_skip_reason_once(
+            &state,
+            trace_id,
+            &first,
+            "provider_request_body_missing",
+        );
+        record_local_runtime_candidate_skip_reason_once(&state, trace_id, &second, "key_inactive");
+
+        let diagnostic = state
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("diagnostic should exist");
+        assert_eq!(diagnostic.skipped_candidate_count, Some(2));
+        assert_eq!(diagnostic.skip_reasons.get("key_inactive"), Some(&2));
+        assert_eq!(
+            diagnostic.skip_reasons.get("provider_request_body_missing"),
+            Some(&1)
+        );
+    }
 }

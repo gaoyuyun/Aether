@@ -1214,6 +1214,7 @@ export const legacyUiEnglishMessages: Record<string, string> = {
   '上游账号并发已达上限': 'The upstream account concurrency limit has been reached',
   '上游请求体转换失败': 'Failed to convert upstream request body',
   '无法构建上游请求体': 'Unable to build upstream request body',
+  '端点不支持该 API 操作': 'The endpoint does not support this API operation',
   '请求体转换失败': 'Request body conversion failed',
   '解析': 'Parsing',
   '生成': 'Generation',

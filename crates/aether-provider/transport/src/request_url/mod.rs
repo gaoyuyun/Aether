@@ -554,41 +554,62 @@ fn build_path_params(
     path_params
 }
 
+/// Why a transport cannot serve an API operation. Surfaced to operators as the
+/// candidate skip diagnostic, so each variant names the configuration to look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportOperationUnsupportedReason {
+    /// The provider adapter (for example Kiro or Grok) has no request envelope for
+    /// this operation; no endpoint configuration can enable it.
+    ProviderAdapter,
+    /// The endpoint's provider API format has no such operation.
+    ApiFormat,
+    /// The endpoint's `supported_operations` list deliberately excludes it.
+    EndpointConfig,
+}
+
 pub fn transport_supports_api_operation(
     transport: &GatewayProviderTransportSnapshot,
     provider_api_format: &str,
     operation: Option<ApiOperation>,
 ) -> bool {
-    if operation != Some(ApiOperation::ClaudeCountTokens) {
-        return true;
-    }
-    if aether_ai_formats::normalize_api_format_alias(provider_api_format) != "claude:messages" {
-        return false;
-    }
-
-    anthropic_count_tokens_supported(transport)
+    transport_api_operation_unsupported_reason(transport, provider_api_format, operation).is_none()
 }
 
-fn anthropic_count_tokens_supported(transport: &GatewayProviderTransportSnapshot) -> bool {
+pub fn transport_api_operation_unsupported_reason(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_api_format: &str,
+    operation: Option<ApiOperation>,
+) -> Option<TransportOperationUnsupportedReason> {
+    if operation != Some(ApiOperation::ClaudeCountTokens) {
+        return None;
+    }
+    if aether_ai_formats::normalize_api_format_alias(provider_api_format) != "claude:messages" {
+        return Some(TransportOperationUnsupportedReason::ApiFormat);
+    }
+
+    anthropic_count_tokens_unsupported_reason(transport)
+}
+
+fn anthropic_count_tokens_unsupported_reason(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<TransportOperationUnsupportedReason> {
     // Private message adapters do not implement Anthropic's token-counting
     // operation. A config flag cannot make their request envelopes compatible.
     if crate::kiro::is_kiro_provider_transport(transport)
         || crate::grok::is_grok_provider_transport(transport)
     {
-        return false;
+        return Some(TransportOperationUnsupportedReason::ProviderAdapter);
     }
 
-    let Some(operations) = anthropic_transport_config_field(transport, "supported_operations")
-    else {
-        return true;
-    };
-    operations.as_array().is_some_and(|operations| {
+    let operations = anthropic_transport_config_field(transport, "supported_operations")?;
+    let supported = operations.as_array().is_some_and(|operations| {
         operations.iter().any(|operation| {
             operation
                 .as_str()
                 .is_some_and(|value| value.eq_ignore_ascii_case("count_tokens"))
         })
-    })
+    });
+    (!supported).then_some(TransportOperationUnsupportedReason::EndpointConfig)
 }
 
 fn build_configured_claude_count_tokens_url(

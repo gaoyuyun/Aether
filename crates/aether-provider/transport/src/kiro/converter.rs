@@ -8,18 +8,66 @@ const SYSTEM_CHUNKED_POLICY: &str = "When the Write or Edit tool has content siz
 const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
 const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
 
+/// Why a Claude Messages request could not be wrapped into a Kiro conversation state.
+///
+/// The variants describe the request shape only, so they are safe to surface to
+/// operators as candidate diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KiroConversationStateError {
+    EmptyModel,
+    MissingMessages,
+    EmptyMessages,
+    /// The trailing block of messages (after the last assistant turn) contains no
+    /// `user` or `system` message that could become Kiro's current message.
+    UnsupportedTrailingRole {
+        index: usize,
+        role: String,
+    },
+}
+
+impl KiroConversationStateError {
+    pub fn path(&self) -> String {
+        match self {
+            Self::EmptyModel => "$.model".to_string(),
+            Self::MissingMessages | Self::EmptyMessages => "$.messages".to_string(),
+            Self::UnsupportedTrailingRole { index, .. } => format!("$.messages[{index}].role"),
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::EmptyModel => "Kiro 反代需要非空的映射模型名".to_string(),
+            Self::MissingMessages => "Kiro 反代需要 messages 数组".to_string(),
+            Self::EmptyMessages => "Kiro 反代需要至少一条消息".to_string(),
+            Self::UnsupportedTrailingRole { role, .. } => format!(
+                "Kiro 反代无法把 role 为 {role} 的末尾消息作为当前输入；末尾消息需为 user、system 或 assistant"
+            ),
+        }
+    }
+}
+
 pub fn convert_claude_messages_to_conversation_state(
     request_body: &Value,
     model: &str,
 ) -> Option<Value> {
+    try_convert_claude_messages_to_conversation_state(request_body, model).ok()
+}
+
+pub fn try_convert_claude_messages_to_conversation_state(
+    request_body: &Value,
+    model: &str,
+) -> Result<Value, KiroConversationStateError> {
     let model_id = model.trim();
     if model_id.is_empty() {
-        return None;
+        return Err(KiroConversationStateError::EmptyModel);
     }
 
-    let messages = request_body.get("messages")?.as_array()?;
+    let messages = request_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or(KiroConversationStateError::MissingMessages)?;
     if messages.is_empty() {
-        return None;
+        return Err(KiroConversationStateError::EmptyMessages);
     }
 
     let conversation_id = request_body
@@ -59,10 +107,20 @@ pub fn convert_claude_messages_to_conversation_state(
         .and_then(|message| message.get("role"))
         .and_then(Value::as_str)
         .is_some_and(|role| role == "assistant");
+    // Kiro has a single current message. It is the last `user` message plus any
+    // `role: "system"` context notes Claude Code appends after it (the
+    // mid-conversation-system beta); everything before that stays history.
     let history_end_index = if last_is_assistant {
         messages.len()
     } else {
-        messages.len().saturating_sub(1)
+        let last_assistant_end = messages
+            .iter()
+            .rposition(|message| message_role(message) == Some("assistant"))
+            .map_or(0, |index| index + 1);
+        messages[last_assistant_end..]
+            .iter()
+            .rposition(|message| message_role(message) == Some("user"))
+            .map_or(last_assistant_end, |index| last_assistant_end + index)
     };
 
     let mut user_buffer = Vec::new();
@@ -71,7 +129,10 @@ pub fn convert_claude_messages_to_conversation_state(
             continue;
         };
         match message.get("role").and_then(Value::as_str) {
-            Some("user") => user_buffer.push(message),
+            // Mid-conversation `system` messages carry extra context for the model at
+            // that point in the dialogue; Kiro has no system turn, so they join the
+            // adjacent user turn as plain text.
+            Some("user") | Some("system") => user_buffer.push(message),
             Some("assistant") => {
                 if let Some(user_item) = flush_user_buffer(&mut user_buffer, model_id) {
                     history.push(user_item);
@@ -106,11 +167,7 @@ pub fn convert_claude_messages_to_conversation_state(
     let (mut text_content, images, tool_results) = if last_is_assistant {
         ("Continue.".to_string(), Vec::new(), Vec::new())
     } else {
-        let last = messages.last()?.as_object()?;
-        if last.get("role").and_then(Value::as_str) != Some("user") {
-            return None;
-        }
-        process_message_content(last.get("content"))
+        merge_trailing_messages(messages, history_end_index)?
     };
 
     let mut tools = convert_tools(request_body.get("tools"));
@@ -272,7 +329,7 @@ pub fn convert_claude_messages_to_conversation_state(
         user_input.insert("images".to_string(), Value::Array(images));
     }
 
-    Some(json!({
+    Ok(json!({
         "agentContinuationId": agent_continuation_id,
         "agentTaskType": "vibe",
         "chatTriggerType": "MANUAL",
@@ -282,6 +339,55 @@ pub fn convert_claude_messages_to_conversation_state(
         "conversationId": conversation_id,
         "history": history,
     }))
+}
+
+fn message_role(message: &Value) -> Option<&str> {
+    message
+        .as_object()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+}
+
+/// Merges the trailing `user`/`system` messages into one current-message payload:
+/// text parts are joined with newlines, images and tool results are concatenated in
+/// order. Fails when the block holds no message Kiro can treat as user input.
+fn merge_trailing_messages(
+    messages: &[Value],
+    start_index: usize,
+) -> Result<(String, Vec<Value>, Vec<Value>), KiroConversationStateError> {
+    let mut text_parts = Vec::new();
+    let mut images = Vec::new();
+    let mut tool_results = Vec::new();
+    let mut merged_any = false;
+    let mut unsupported = None;
+
+    for (offset, message) in messages[start_index..].iter().enumerate() {
+        match message_role(message) {
+            Some("user") | Some("system") => {
+                let (text, mut message_images, mut message_tool_results) =
+                    process_message_content(message.get("content"));
+                if !text.is_empty() {
+                    text_parts.push(text);
+                }
+                images.append(&mut message_images);
+                tool_results.append(&mut message_tool_results);
+                merged_any = true;
+            }
+            role => {
+                unsupported.get_or_insert_with(|| {
+                    KiroConversationStateError::UnsupportedTrailingRole {
+                        index: start_index + offset,
+                        role: role.unwrap_or_default().to_string(),
+                    }
+                });
+            }
+        }
+    }
+
+    if !merged_any {
+        return Err(unsupported.unwrap_or(KiroConversationStateError::EmptyMessages));
+    }
+    Ok((text_parts.join("\n"), images, tool_results))
 }
 
 fn extract_session_id(user_id: &str) -> Option<String> {
@@ -670,9 +776,158 @@ fn convert_assistant_message(message: &Map<String, Value>) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
 
-    use super::convert_claude_messages_to_conversation_state;
+    use super::{
+        convert_claude_messages_to_conversation_state,
+        try_convert_claude_messages_to_conversation_state, KiroConversationStateError,
+    };
+
+    fn current_message_content(conversation_state: &Value) -> &str {
+        conversation_state["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .expect("current message content")
+    }
+
+    fn history(conversation_state: &Value) -> &Vec<Value> {
+        conversation_state["history"]
+            .as_array()
+            .expect("history array")
+    }
+
+    #[test]
+    fn merges_trailing_system_context_into_current_message() {
+        // Claude Code (mid-conversation-system beta) appends a `system` message
+        // after the user's turn; Kiro has no system turn, so it joins the current
+        // message instead of making the request unconvertible.
+        let conversation_state = convert_claude_messages_to_conversation_state(
+            &json!({
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "list the files"}]},
+                    {"role": "system", "content": "The following deferred tools are now available"}
+                ]
+            }),
+            "claude-opus-5",
+        )
+        .expect("conversation state should build");
+
+        assert_eq!(
+            current_message_content(&conversation_state),
+            "list the files\nThe following deferred tools are now available"
+        );
+        assert!(history(&conversation_state).is_empty());
+    }
+
+    #[test]
+    fn keeps_system_notes_with_their_turn_across_tool_calls() {
+        let conversation_state = convert_claude_messages_to_conversation_state(
+            &json!({
+                "messages": [
+                    {"role": "user", "content": "run it"},
+                    {"role": "system", "content": "tools available"},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "running"},
+                        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"cmd": "ls"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"}
+                    ]},
+                    {"role": "system", "content": "<total_tokens>10</total_tokens>"}
+                ]
+            }),
+            "claude-opus-5",
+        )
+        .expect("conversation state should build");
+
+        let history = history(&conversation_state);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[0]["userInputMessage"]["content"],
+            json!("run it\ntools available")
+        );
+        assert_eq!(
+            history[1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"],
+            json!("toolu_1")
+        );
+        assert_eq!(
+            current_message_content(&conversation_state),
+            "<total_tokens>10</total_tokens>"
+        );
+        assert_eq!(
+            conversation_state["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+                ["toolResults"][0]["toolUseId"],
+            json!("toolu_1")
+        );
+    }
+
+    #[test]
+    fn earlier_user_turns_before_the_last_user_message_stay_history() {
+        let conversation_state = convert_claude_messages_to_conversation_state(
+            &json!({
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {"role": "user", "content": "second"}
+                ]
+            }),
+            "claude-opus-5",
+        )
+        .expect("conversation state should build");
+
+        let history = history(&conversation_state);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["userInputMessage"]["content"], json!("first"));
+        assert_eq!(
+            history[1]["assistantResponseMessage"]["content"],
+            json!("OK")
+        );
+        assert_eq!(current_message_content(&conversation_state), "second");
+    }
+
+    #[test]
+    fn explains_why_a_request_cannot_be_converted() {
+        assert_eq!(
+            try_convert_claude_messages_to_conversation_state(
+                &json!({"messages": [{"role": "user", "content": "hi"}]}),
+                "  ",
+            )
+            .unwrap_err(),
+            KiroConversationStateError::EmptyModel
+        );
+        assert_eq!(
+            try_convert_claude_messages_to_conversation_state(&json!({}), "claude-opus-5")
+                .unwrap_err(),
+            KiroConversationStateError::MissingMessages
+        );
+        assert_eq!(
+            try_convert_claude_messages_to_conversation_state(
+                &json!({"messages": []}),
+                "claude-opus-5"
+            )
+            .unwrap_err(),
+            KiroConversationStateError::EmptyMessages
+        );
+
+        let error = try_convert_claude_messages_to_conversation_state(
+            &json!({
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "tool", "content": "unsupported"}
+                ]
+            }),
+            "claude-opus-5",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            KiroConversationStateError::UnsupportedTrailingRole {
+                index: 2,
+                role: "tool".to_string(),
+            }
+        );
+        assert_eq!(error.path(), "$.messages[2].role");
+        assert!(error.message().contains("tool"));
+    }
 
     #[test]
     fn converts_simple_claude_request_into_conversation_state() {

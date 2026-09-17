@@ -2743,6 +2743,7 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
         "transport_header_rules_unsupported" => "Header 规则不支持本地执行",
         "transport_header_rules_apply_failed" => "Header 规则应用失败",
         "transport_oauth_resolution_unsupported" => "OAuth 认证解析不支持本地执行",
+        "transport_operation_unsupported" => "端点不支持该 API 操作",
         "transport_provider_type_unsupported" => "提供商类型不支持本地执行",
         "transport_proxy_or_profile_unsupported" => "代理或传输指纹配置不支持本地执行",
         "transport_proxy_unsupported" => "代理配置不支持本地执行",

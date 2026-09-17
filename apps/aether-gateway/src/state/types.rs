@@ -36,6 +36,12 @@ pub(crate) struct LocalExecutionRuntimeMissDiagnostic {
     pub(crate) candidate_count: Option<usize>,
     pub(crate) skipped_candidate_count: Option<usize>,
     pub(crate) skip_reasons: std::collections::BTreeMap<String, usize>,
+    /// `(candidate key, skip reason)` pairs already counted. Several execution
+    /// paths evaluate the same candidate for one request; each pair is counted
+    /// once so the summary reflects candidates, not evaluations.
+    pub(crate) counted_candidate_skips: std::collections::BTreeSet<(String, String)>,
+    /// Candidate keys that contributed to `skipped_candidate_count`.
+    pub(crate) counted_skipped_candidates: std::collections::BTreeSet<String>,
 }
 
 impl LocalExecutionRuntimeMissDiagnostic {

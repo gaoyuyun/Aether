@@ -140,6 +140,8 @@ pub use runtime_miss::{
     apply_ai_runtime_candidate_terminal_reason, build_ai_runtime_candidate_evaluation_diagnostic,
     build_ai_runtime_execution_exhausted_diagnostic, record_ai_runtime_candidate_skip_reason,
     record_ai_runtime_candidate_skip_reason_on_diagnostic,
+    record_ai_runtime_candidate_skip_reason_once,
+    record_ai_runtime_candidate_skip_reason_once_on_diagnostic,
     set_ai_runtime_candidate_evaluation_diagnostic, set_ai_runtime_execution_exhausted_diagnostic,
     set_ai_runtime_miss_diagnostic_reason, AiRuntimeMissDiagnosticFields,
     AiRuntimeMissDiagnosticPort,

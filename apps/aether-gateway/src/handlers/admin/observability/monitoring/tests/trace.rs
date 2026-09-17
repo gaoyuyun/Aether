@@ -322,6 +322,221 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
 }
 
 #[tokio::test]
+async fn admin_monitoring_trace_shows_planner_rejected_candidates_when_nothing_was_attempted() {
+    // Every candidate was skipped by the planner: nothing was dispatched, so the
+    // attempted-only view would be empty. The real rows carry the skip reason and
+    // the failure diagnostic, so they must be returned instead of a candidate
+    // synthesized from the usage row.
+    let mut skipped = sample_candidate(
+        "cand-skipped",
+        "request-all-skipped",
+        0,
+        RequestCandidateStatus::Skipped,
+        None,
+        None,
+        None,
+    );
+    skipped.skip_reason = Some("transport_operation_unsupported".to_string());
+    skipped.finished_at_unix_ms = Some(101_000);
+    skipped.extra_data = Some(json!({
+        "failure_diagnostic": {
+            "kind": "transport_operation",
+            "path": "$.endpoint.config.anthropic.supported_operations",
+            "message": "端点配置的 supported_operations 未包含 count_tokens",
+            "safe_to_show": true
+        }
+    }));
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![skipped]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider()],
+        vec![sample_endpoint()],
+        vec![sample_key()],
+    ));
+    let mut usage = sample_usage(
+        "request-all-skipped",
+        "provider-1",
+        "OpenAI",
+        0,
+        0.0,
+        "failed",
+        Some(503),
+        1_789_601_454,
+    );
+    usage.candidate_id = Some("cand-skipped".to_string());
+    usage.candidate_index = Some(0);
+    usage.execution_path = Some("local_execution_runtime_miss".to_string());
+    usage.local_execution_runtime_miss_reason = Some("all_candidates_skipped".to_string());
+    usage.response_time_ms = Some(13);
+    usage.request_metadata = Some(json!({
+        "routing_candidate_skip_reason": "transport_operation_unsupported"
+    }));
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![usage]));
+    let data_state =
+        crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+            request_candidates,
+            usage_repository,
+        )
+        .with_provider_catalog_reader(provider_catalog);
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(data_state);
+    let context = request_context(
+        http::Method::GET,
+        "/api/admin/monitoring/trace/request-all-skipped?attempted_only=true",
+    );
+
+    let response = local_monitoring_response(&state, &context)
+        .await
+        .expect("handler should not error")
+        .expect("route should be handled locally");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(payload["total_candidates"], json!(1));
+    assert_eq!(payload["final_status"], json!("failed"));
+    let candidate = &payload["candidates"][0];
+    assert_eq!(candidate["id"], json!("cand-skipped"));
+    assert_eq!(candidate["status"], json!("skipped"));
+    assert_eq!(
+        candidate["skip_reason"],
+        json!("transport_operation_unsupported")
+    );
+    assert_eq!(
+        candidate["extra_data"]["failure_diagnostic"]["path"],
+        json!("$.endpoint.config.anthropic.supported_operations")
+    );
+    // A planner rejection never started an attempt, so there is no time range.
+    assert!(candidate["started_at"].is_null());
+    assert_eq!(candidate["finished_at"], json!("1970-01-01T00:01:41.000Z"));
+    assert!(candidate["extra_data"].get("source").is_none());
+}
+
+#[tokio::test]
+async fn admin_monitoring_trace_attempted_only_still_hides_unattempted_rows_when_one_was_attempted()
+{
+    let mut skipped = sample_candidate(
+        "cand-skipped",
+        "request-mixed",
+        0,
+        RequestCandidateStatus::Skipped,
+        None,
+        None,
+        None,
+    );
+    skipped.skip_reason = Some("key_inactive".to_string());
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        skipped,
+        sample_candidate(
+            "cand-unused",
+            "request-mixed",
+            1,
+            RequestCandidateStatus::Unused,
+            None,
+            None,
+            None,
+        ),
+        sample_candidate(
+            "cand-failed",
+            "request-mixed",
+            2,
+            RequestCandidateStatus::Failed,
+            Some(101),
+            Some(33),
+            Some(502),
+        ),
+    ]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider()],
+        vec![sample_endpoint()],
+        vec![sample_key()],
+    ));
+    let state = AppState::new()
+        .expect("state should build")
+        .with_decision_trace_data_readers_for_tests(request_candidates, provider_catalog);
+    let context = request_context(
+        http::Method::GET,
+        "/api/admin/monitoring/trace/request-mixed?attempted_only=true",
+    );
+
+    let response = local_monitoring_response(&state, &context)
+        .await
+        .expect("handler should not error")
+        .expect("route should be handled locally");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(payload["total_candidates"], json!(1));
+    assert_eq!(payload["candidates"][0]["id"], json!("cand-failed"));
+}
+
+#[tokio::test]
+async fn admin_monitoring_trace_usage_snapshot_fallback_converts_usage_seconds_to_milliseconds() {
+    // The usage row stores unix seconds in `created_at_unix_ms`. When no candidate
+    // rows exist at all, the synthesized candidate must not present those seconds
+    // as milliseconds (which rendered a 1970 start time next to a 2026 end time).
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider()],
+        vec![sample_endpoint()],
+        vec![sample_key()],
+    ));
+    let mut usage = sample_usage(
+        "request-usage-only",
+        "provider-1",
+        "OpenAI",
+        0,
+        0.0,
+        "failed",
+        Some(503),
+        1_789_601_454,
+    );
+    usage.candidate_index = Some(0);
+    usage.execution_path = Some("local_execution_runtime_miss".to_string());
+    usage.local_execution_runtime_miss_reason = Some("candidate_list_empty".to_string());
+    usage.response_time_ms = Some(13);
+    usage.finalized_at_unix_secs = None;
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![usage]));
+    let data_state =
+        crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+            request_candidates,
+            usage_repository,
+        )
+        .with_provider_catalog_reader(provider_catalog);
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(data_state);
+    let context = request_context(
+        http::Method::GET,
+        "/api/admin/monitoring/trace/request-usage-only?attempted_only=true",
+    );
+
+    let response = local_monitoring_response(&state, &context)
+        .await
+        .expect("handler should not error")
+        .expect("route should be handled locally");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    let candidate = &payload["candidates"][0];
+    assert_eq!(
+        candidate["extra_data"]["source"],
+        json!("usage_routing_snapshot")
+    );
+    assert_eq!(candidate["created_at"], json!("2026-09-16T23:30:54.000Z"));
+    assert_eq!(candidate["started_at"], json!("2026-09-16T23:30:54.000Z"));
+    assert_eq!(candidate["finished_at"], json!("2026-09-16T23:30:54.013Z"));
+}
+
+#[tokio::test]
 async fn admin_monitoring_trace_recovers_only_a_missing_successful_terminal_attempt() {
     for (status, final_candidate_id, expected_count) in [
         ("completed", "final-candidate", 4),

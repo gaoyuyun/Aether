@@ -9,7 +9,9 @@ pub use super::super::rules::{
     body_rules_are_locally_supported, header_rules_are_locally_supported,
 };
 use super::super::should_skip_upstream_passthrough_header;
-use super::converter::convert_claude_messages_to_conversation_state;
+use super::converter::{
+    try_convert_claude_messages_to_conversation_state, KiroConversationStateError,
+};
 use super::credentials::KiroAuthConfig;
 use super::headers::build_generate_assistant_headers;
 
@@ -20,6 +22,31 @@ pub fn supports_local_kiro_request_shape(
     header_rules_are_locally_supported(header_rules) && body_rules_are_locally_supported(body_rules)
 }
 
+/// Why a Kiro provider request body could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KiroRequestBodyError {
+    ConversationState(KiroConversationStateError),
+    BodyRules,
+}
+
+impl KiroRequestBodyError {
+    pub fn path(&self) -> String {
+        match self {
+            Self::ConversationState(error) => error.path(),
+            Self::BodyRules => "$.endpoint.body_rules".to_string(),
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::ConversationState(error) => error.message(),
+            Self::BodyRules => {
+                "Kiro 反代请求体应用 Endpoint Body 规则失败；请检查规则格式与条件配置".to_string()
+            }
+        }
+    }
+}
+
 pub fn build_kiro_provider_request_body(
     body_json: &Value,
     mapped_model: &str,
@@ -27,8 +54,26 @@ pub fn build_kiro_provider_request_body(
     body_rules: Option<&Value>,
     request_headers: Option<&http::HeaderMap>,
 ) -> Option<Value> {
+    try_build_kiro_provider_request_body(
+        body_json,
+        mapped_model,
+        auth_config,
+        body_rules,
+        request_headers,
+    )
+    .ok()
+}
+
+pub fn try_build_kiro_provider_request_body(
+    body_json: &Value,
+    mapped_model: &str,
+    auth_config: &KiroAuthConfig,
+    body_rules: Option<&Value>,
+    request_headers: Option<&http::HeaderMap>,
+) -> Result<Value, KiroRequestBodyError> {
     let conversation_state =
-        convert_claude_messages_to_conversation_state(body_json, mapped_model)?;
+        try_convert_claude_messages_to_conversation_state(body_json, mapped_model)
+            .map_err(KiroRequestBodyError::ConversationState)?;
     let mut provider_request_body = json!({
         "conversationState": conversation_state
     });
@@ -59,18 +104,19 @@ pub fn build_kiro_provider_request_body(
     {
         inference_config.insert("topP".to_string(), Value::from(top_p));
     }
-    if !inference_config.is_empty() {
-        provider_request_body.as_object_mut()?.insert(
-            "inferenceConfig".to_string(),
-            Value::Object(inference_config),
-        );
-    }
-
-    if let Some(profile_arn) = auth_config.profile_arn_for_payload() {
-        provider_request_body.as_object_mut()?.insert(
-            "profileArn".to_string(),
-            Value::String(profile_arn.to_string()),
-        );
+    if let Some(object) = provider_request_body.as_object_mut() {
+        if !inference_config.is_empty() {
+            object.insert(
+                "inferenceConfig".to_string(),
+                Value::Object(inference_config),
+            );
+        }
+        if let Some(profile_arn) = auth_config.profile_arn_for_payload() {
+            object.insert(
+                "profileArn".to_string(),
+                Value::String(profile_arn.to_string()),
+            );
+        }
     }
 
     if !apply_local_body_rules_with_request_headers(
@@ -79,10 +125,10 @@ pub fn build_kiro_provider_request_body(
         Some(body_json),
         request_headers,
     ) {
-        return None;
+        return Err(KiroRequestBodyError::BodyRules);
     }
 
-    Some(provider_request_body)
+    Ok(provider_request_body)
 }
 
 #[derive(Clone, Copy)]

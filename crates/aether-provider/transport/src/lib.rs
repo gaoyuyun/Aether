@@ -143,7 +143,8 @@ pub use request_url::{
     build_kiro_cross_format_upstream_url, build_local_openai_chat_upstream_url,
     build_local_openai_responses_upstream_url, build_transport_request_url,
     build_transport_request_url_for_request_body, gemini_embedding_request_body_uses_batch,
-    transport_supports_api_operation, TransportRequestUrlParams,
+    transport_api_operation_unsupported_reason, transport_supports_api_operation,
+    TransportOperationUnsupportedReason, TransportRequestUrlParams,
 };
 pub use rules::{
     apply_local_body_rules, apply_local_body_rules_with_request_headers, apply_local_header_rules,

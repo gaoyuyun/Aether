@@ -30,6 +30,16 @@ pub trait AiRuntimeMissDiagnosticPort: Send + Sync {
         skip_reason: &'static str,
     );
 
+    /// Records a skip for an identified candidate. Implementations count each
+    /// `(candidate_key, skip_reason)` pair once, so re-evaluating the same
+    /// candidate on another execution path does not inflate the counts.
+    fn record_candidate_skip_reason_once(
+        &self,
+        diagnostic: &mut Self::Diagnostic,
+        candidate_key: &str,
+        skip_reason: &'static str,
+    );
+
     fn set_runtime_miss_diagnostic(&self, trace_id: &str, diagnostic: Self::Diagnostic);
 
     fn mutate_runtime_miss_diagnostic<F>(&self, trace_id: &str, apply: F)
@@ -59,6 +69,17 @@ pub trait AiRuntimeMissDiagnosticFields {
     fn skip_reason_count(&self, skip_reason: &str) -> usize;
     fn skip_reason_len(&self) -> usize;
     fn record_skip_reason(&mut self, skip_reason: &'static str);
+    /// Counts `skip_reason` for `candidate_key` at most once per pair and counts the
+    /// candidate itself at most once. Diagnostics that do not track identities may
+    /// keep the plain per-evaluation counting.
+    fn record_candidate_skip_reason_once(
+        &mut self,
+        candidate_key: &str,
+        skip_reason: &'static str,
+    ) {
+        let _ = candidate_key;
+        self.record_skip_reason(skip_reason);
+    }
 }
 
 pub fn apply_ai_runtime_candidate_evaluation_progress_to_diagnostic<Diagnostic>(
@@ -104,6 +125,16 @@ pub fn record_ai_runtime_candidate_skip_reason_on_diagnostic<Diagnostic>(
     Diagnostic: AiRuntimeMissDiagnosticFields,
 {
     diagnostic.record_skip_reason(skip_reason);
+}
+
+pub fn record_ai_runtime_candidate_skip_reason_once_on_diagnostic<Diagnostic>(
+    diagnostic: &mut Diagnostic,
+    candidate_key: &str,
+    skip_reason: &'static str,
+) where
+    Diagnostic: AiRuntimeMissDiagnosticFields,
+{
+    diagnostic.record_candidate_skip_reason_once(candidate_key, skip_reason);
 }
 
 pub fn set_ai_runtime_miss_diagnostic_reason<Port>(
@@ -257,6 +288,19 @@ pub fn record_ai_runtime_candidate_skip_reason<Port>(
     });
 }
 
+pub fn record_ai_runtime_candidate_skip_reason_once<Port>(
+    port: &Port,
+    trace_id: &str,
+    candidate_key: &str,
+    skip_reason: &'static str,
+) where
+    Port: AiRuntimeMissDiagnosticPort,
+{
+    port.mutate_runtime_miss_diagnostic(trace_id, |diagnostic| {
+        port.record_candidate_skip_reason_once(diagnostic, candidate_key, skip_reason);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +321,7 @@ mod tests {
         candidate_count: Option<usize>,
         terminal_reason: Option<&'static str>,
         skip_reasons: BTreeMap<&'static str, usize>,
+        counted_candidate_skips: std::collections::BTreeSet<(String, &'static str)>,
     }
 
     #[derive(Default)]
@@ -332,6 +377,19 @@ mod tests {
             *diagnostic.skip_reasons.entry(skip_reason).or_insert(0) += 1;
         }
 
+        fn record_candidate_skip_reason_once(
+            &self,
+            diagnostic: &mut Self::Diagnostic,
+            candidate_key: &str,
+            skip_reason: &'static str,
+        ) {
+            record_ai_runtime_candidate_skip_reason_once_on_diagnostic(
+                diagnostic,
+                candidate_key,
+                skip_reason,
+            );
+        }
+
         fn set_runtime_miss_diagnostic(&self, trace_id: &str, diagnostic: Self::Diagnostic) {
             self.diagnostics
                 .lock()
@@ -385,6 +443,61 @@ mod tests {
         fn record_skip_reason(&mut self, skip_reason: &'static str) {
             *self.skip_reasons.entry(skip_reason).or_insert(0) += 1;
         }
+
+        fn record_candidate_skip_reason_once(
+            &mut self,
+            candidate_key: &str,
+            skip_reason: &'static str,
+        ) {
+            if self
+                .counted_candidate_skips
+                .insert((candidate_key.to_string(), skip_reason))
+            {
+                self.record_skip_reason(skip_reason);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_miss_counts_an_identified_candidate_skip_once_per_reason() {
+        let port = TestPort::default();
+
+        // The same candidate evaluated by two execution paths.
+        record_ai_runtime_candidate_skip_reason_once(
+            &port,
+            "trace-a",
+            "provider-1/endpoint-1/key-1",
+            "transport_operation_unsupported",
+        );
+        record_ai_runtime_candidate_skip_reason_once(
+            &port,
+            "trace-a",
+            "provider-1/endpoint-1/key-1",
+            "transport_operation_unsupported",
+        );
+        // A different candidate and a different reason for the first one both count.
+        record_ai_runtime_candidate_skip_reason_once(
+            &port,
+            "trace-a",
+            "provider-1/endpoint-1/key-2",
+            "transport_operation_unsupported",
+        );
+        record_ai_runtime_candidate_skip_reason_once(
+            &port,
+            "trace-a",
+            "provider-1/endpoint-1/key-1",
+            "key_inactive",
+        );
+
+        let diagnostics = port.diagnostics.lock().unwrap();
+        let diagnostic = diagnostics.get("trace-a").expect("diagnostic");
+        assert_eq!(
+            diagnostic
+                .skip_reasons
+                .get("transport_operation_unsupported"),
+            Some(&2)
+        );
+        assert_eq!(diagnostic.skip_reasons.get("key_inactive"), Some(&1));
     }
 
     #[test]

@@ -140,8 +140,10 @@ fn append_missing_terminal_usage_candidate(resolved: &mut ResolvedAdminMonitorin
         recovered.candidate.finished_at_unix_ms,
         recovered.candidate.latency_ms,
     ) {
-        recovered.candidate.started_at_unix_ms =
-            Some(end.saturating_sub(latency).max(usage.created_at_unix_ms));
+        recovered.candidate.started_at_unix_ms = Some(
+            end.saturating_sub(latency)
+                .max(admin_monitoring_usage_created_at_unix_ms(usage)),
+        );
     }
     resolved.trace.total_latency_ms = resolved
         .trace
@@ -166,11 +168,8 @@ async fn resolve_admin_monitoring_trace(
     attempted_only: bool,
 ) -> Result<Option<ResolvedAdminMonitoringTrace>, GatewayError> {
     let app = state.as_ref();
-    if let Some(trace) = app
-        .data
-        .read_decision_trace(request_id, attempted_only)
-        .await
-        .map_err(|err| GatewayError::Internal(err.to_string()))?
+    if let Some(trace) =
+        read_admin_monitoring_decision_trace(state, request_id, attempted_only).await?
     {
         let usage = app
             .data
@@ -201,11 +200,9 @@ async fn resolve_admin_monitoring_trace(
             if trace_request_id == request_id {
                 continue;
             }
-            if let Some(trace) = app
-                .data
-                .read_decision_trace(&trace_request_id, attempted_only)
-                .await
-                .map_err(|err| GatewayError::Internal(err.to_string()))?
+            if let Some(trace) =
+                read_admin_monitoring_decision_trace(state, &trace_request_id, attempted_only)
+                    .await?
             {
                 return Ok(Some(ResolvedAdminMonitoringTrace {
                     trace,
@@ -224,6 +221,49 @@ async fn resolve_admin_monitoring_trace(
     }
 
     Ok(usage_snapshot_fallback)
+}
+
+/// Reads the persisted candidate rows for a request. `attempted_only` hides the
+/// rows that were never dispatched, but when nothing was dispatched at all (every
+/// candidate was skipped by the planner) those rows are the only record of why
+/// the request failed, so they are returned instead of an empty trace. That keeps
+/// the real skip reasons and failure diagnostics visible rather than falling back
+/// to a candidate synthesized from the usage row.
+async fn read_admin_monitoring_decision_trace(
+    state: &AdminAppState<'_>,
+    request_id: &str,
+    attempted_only: bool,
+) -> Result<Option<DecisionTrace>, GatewayError> {
+    let app = state.as_ref();
+    if let Some(trace) = app
+        .data
+        .read_decision_trace(request_id, attempted_only)
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?
+    {
+        return Ok(Some(trace));
+    }
+    if !attempted_only {
+        return Ok(None);
+    }
+    let Some(trace) = app
+        .data
+        .read_decision_trace(request_id, false)
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let rejected_by_planner = trace
+        .candidates
+        .iter()
+        .all(|item| item.candidate.status == RequestCandidateStatus::Skipped);
+    Ok(rejected_by_planner.then_some(trace))
+}
+
+/// The legacy `created_at_unix_ms` usage column stores unix seconds.
+fn admin_monitoring_usage_created_at_unix_ms(usage: &StoredRequestUsageAudit) -> u64 {
+    usage.created_at_unix_ms.saturating_mul(1_000)
 }
 
 fn build_admin_monitoring_usage_routing_snapshot_trace(
@@ -282,8 +322,8 @@ fn build_admin_monitoring_usage_routing_snapshot_trace(
             build_admin_monitoring_usage_routing_snapshot_extra_data(usage),
         ),
         required_capabilities: None,
-        created_at_unix_ms: usage.created_at_unix_ms,
-        started_at_unix_ms: Some(usage.created_at_unix_ms),
+        created_at_unix_ms: admin_monitoring_usage_created_at_unix_ms(usage),
+        started_at_unix_ms: Some(admin_monitoring_usage_created_at_unix_ms(usage)),
         finished_at_unix_ms: admin_monitoring_usage_finished_at_unix_ms(usage),
     };
 
@@ -374,9 +414,9 @@ fn admin_monitoring_usage_finished_at_unix_ms(usage: &StoredRequestUsageAudit) -
         .finalized_at_unix_secs
         .map(|value| value.saturating_mul(1_000))
         .or_else(|| {
-            usage
-                .response_time_ms
-                .map(|latency_ms| usage.created_at_unix_ms.saturating_add(latency_ms))
+            usage.response_time_ms.map(|latency_ms| {
+                admin_monitoring_usage_created_at_unix_ms(usage).saturating_add(latency_ms)
+            })
         })
 }
 

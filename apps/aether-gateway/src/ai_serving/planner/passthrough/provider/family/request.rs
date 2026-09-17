@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::ai_serving::planner::common::{
     enforce_provider_body_stream_policy, request_requires_body_stream_field,
 };
+use crate::ai_serving::planner::kiro_diagnostics::kiro_envelope_failure_diagnostic;
 use crate::ai_serving::planner::redaction::{
     request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
 };
@@ -19,12 +20,14 @@ use crate::ai_serving::transport::antigravity::{
 use crate::ai_serving::transport::{
     build_gemini_cli_v1internal_request, build_grok_browser_headers, build_grok_upstream_url,
     build_same_format_provider_headers, resolve_local_gemini_cli_request_auth,
-    GeminiCliRequestAuth, GeminiCliRequestAuthSupport, GeminiCliRequestEnvelopeSupport,
-    GrokHeaderInput, SameFormatProviderCompatibilityEdit,
+    transport_api_operation_unsupported_reason, GeminiCliRequestAuth, GeminiCliRequestAuthSupport,
+    GeminiCliRequestEnvelopeSupport, GrokHeaderInput, SameFormatProviderCompatibilityEdit,
     SameFormatProviderCompatibilityEditAction, SameFormatProviderHeadersInput,
-    GEMINI_CLI_USER_AGENT, GROK_CHAT_PATH,
+    TransportOperationUnsupportedReason, GEMINI_CLI_USER_AGENT, GROK_CHAT_PATH,
 };
-use crate::ai_serving::{CandidateFailureDiagnostic, GatewayProviderTransportSnapshot};
+use crate::ai_serving::{
+    CandidateFailureDiagnostic, CandidateFailureDiagnosticKind, GatewayProviderTransportSnapshot,
+};
 use crate::{AppState, GatewayError};
 
 mod policy;
@@ -129,12 +132,12 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     spec: LocalSameFormatProviderSpec,
 ) -> Result<Option<LocalSameFormatProviderCandidatePayloadParts>, GatewayError> {
     let candidate = &attempt.eligible.candidate;
-    if let Some(skip_reason) = same_format_provider_operation_skip_reason(
+    if let Some((skip_reason, unsupported_reason)) = same_format_provider_operation_skip_reason(
         &attempt.eligible.transport,
         attempt.eligible.provider_api_format.as_str(),
         spec.operation,
     ) {
-        mark_skipped_local_same_format_provider_candidate(
+        mark_skipped_local_same_format_provider_candidate_with_failure_diagnostic(
             state,
             input,
             trace_id,
@@ -142,6 +145,12 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             attempt.candidate_index,
             &attempt.candidate_id,
             skip_reason,
+            same_format_provider_operation_failure_diagnostic(
+                &attempt.eligible.transport,
+                attempt.eligible.provider_api_format.as_str(),
+                spec.operation,
+                unsupported_reason,
+            ),
         )
         .await;
         return Ok(None);
@@ -214,6 +223,29 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             reasoning_replay_policy,
         )
     else {
+        let provider_api_format = attempt.eligible.provider_api_format.as_str();
+        let body_rules = prepared.transport.endpoint.body_rules.as_ref();
+        let extra_data = match prepared.kiro_auth.as_ref() {
+            Some(kiro_auth) => Some(
+                kiro_envelope_failure_diagnostic(
+                    body_json,
+                    prepared.mapped_model.as_str(),
+                    &kiro_auth.auth_config,
+                    body_rules,
+                    Some(effective_headers),
+                    provider_api_format,
+                    provider_api_format,
+                    "kiro_envelope",
+                )
+                .to_extra_data(),
+            ),
+            None => same_format_provider_request_body_failure_extra_data(
+                body_json,
+                provider_api_format,
+                body_rules,
+                "same_format",
+            ),
+        };
         mark_skipped_local_same_format_provider_candidate_with_extra_data(
             state,
             input,
@@ -222,16 +254,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             attempt.candidate_index,
             &attempt.candidate_id,
             "provider_request_body_missing",
-            same_format_provider_request_body_failure_extra_data(
-                body_json,
-                attempt.eligible.provider_api_format.as_str(),
-                prepared.transport.endpoint.body_rules.as_ref(),
-                if prepared.kiro_auth.is_some() {
-                    "kiro_envelope"
-                } else {
-                    "same_format"
-                },
-            ),
+            extra_data,
         )
         .await;
         return Ok(None);
@@ -612,18 +635,54 @@ fn same_format_provider_operation_skip_reason(
     transport: &GatewayProviderTransportSnapshot,
     provider_api_format: &str,
     operation: Option<crate::ai_serving::ApiOperation>,
-) -> Option<&'static str> {
-    (!crate::ai_serving::transport::transport_supports_api_operation(
-        transport,
-        provider_api_format,
-        operation,
-    ))
-    .then_some("transport_operation_unsupported")
+) -> Option<(&'static str, TransportOperationUnsupportedReason)> {
+    transport_api_operation_unsupported_reason(transport, provider_api_format, operation)
+        .map(|reason| ("transport_operation_unsupported", reason))
+}
+
+/// Explains an operation-level skip in terms of the configuration an operator can
+/// change, instead of the bare `transport_operation_unsupported` code.
+fn same_format_provider_operation_failure_diagnostic(
+    transport: &GatewayProviderTransportSnapshot,
+    provider_api_format: &str,
+    operation: Option<crate::ai_serving::ApiOperation>,
+    reason: TransportOperationUnsupportedReason,
+) -> CandidateFailureDiagnostic {
+    let operation_label = operation.map_or("该操作", |operation| operation.as_str());
+    let provider_type = transport.provider.provider_type.trim();
+    let (path, message) = match reason {
+        TransportOperationUnsupportedReason::ProviderAdapter => (
+            "$.provider.provider_type",
+            format!(
+                "{provider_type} 类型的提供商没有 {operation_label} 操作的上游接口，无法由该渠道处理；请为此操作配置其他渠道"
+            ),
+        ),
+        TransportOperationUnsupportedReason::ApiFormat => (
+            "$.endpoint.api_format",
+            format!("端点 API 格式 {provider_api_format} 不支持 {operation_label} 操作"),
+        ),
+        TransportOperationUnsupportedReason::EndpointConfig => (
+            "$.endpoint.config.anthropic.supported_operations",
+            format!(
+                "端点配置的 supported_operations 未包含 {operation_label}；如该上游支持此操作，请在端点设置中启用"
+            ),
+        ),
+    };
+    CandidateFailureDiagnostic::new(
+        CandidateFailureDiagnosticKind::TransportOperation,
+        path,
+        message,
+    )
+    .formats(provider_api_format, provider_api_format)
+    .source("same_format_provider_operation")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::same_format_provider_operation_skip_reason;
+    use super::{
+        same_format_provider_operation_failure_diagnostic,
+        same_format_provider_operation_skip_reason, TransportOperationUnsupportedReason,
+    };
     use crate::ai_serving::transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
         GatewayProviderTransportProvider,
@@ -696,9 +755,66 @@ mod tests {
                     "claude:messages",
                     Some(ApiOperation::ClaudeCountTokens),
                 ),
-                Some("transport_operation_unsupported"),
+                Some((
+                    "transport_operation_unsupported",
+                    TransportOperationUnsupportedReason::ProviderAdapter
+                )),
                 "provider_type={provider_type}"
             );
         }
+    }
+
+    #[test]
+    fn operation_skip_diagnostic_names_the_endpoint_setting_that_disables_count_tokens() {
+        let mut transport = private_adapter_transport("custom");
+        transport.endpoint.config = Some(serde_json::json!({
+            "anthropic": {"supported_operations": ["messages"]}
+        }));
+
+        let (skip_reason, reason) = same_format_provider_operation_skip_reason(
+            &transport,
+            "claude:messages",
+            Some(ApiOperation::ClaudeCountTokens),
+        )
+        .expect("count_tokens should be skipped");
+        assert_eq!(skip_reason, "transport_operation_unsupported");
+        assert_eq!(reason, TransportOperationUnsupportedReason::EndpointConfig);
+
+        let extra_data = same_format_provider_operation_failure_diagnostic(
+            &transport,
+            "claude:messages",
+            Some(ApiOperation::ClaudeCountTokens),
+            reason,
+        )
+        .to_extra_data();
+        assert_eq!(
+            extra_data["failure_diagnostic"]["kind"],
+            "transport_operation"
+        );
+        assert_eq!(
+            extra_data["failure_diagnostic"]["path"],
+            "$.endpoint.config.anthropic.supported_operations"
+        );
+        assert!(extra_data["failure_diagnostic"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("count_tokens"));
+        assert_eq!(extra_data["failure_diagnostic"]["safe_to_show"], true);
+
+        let adapter_extra_data = same_format_provider_operation_failure_diagnostic(
+            &private_adapter_transport("kiro"),
+            "claude:messages",
+            Some(ApiOperation::ClaudeCountTokens),
+            TransportOperationUnsupportedReason::ProviderAdapter,
+        )
+        .to_extra_data();
+        assert_eq!(
+            adapter_extra_data["failure_diagnostic"]["path"],
+            "$.provider.provider_type"
+        );
+        assert!(adapter_extra_data["failure_diagnostic"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("kiro"));
     }
 }

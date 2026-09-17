@@ -29,10 +29,10 @@ use tracing::{debug, warn};
 
 use crate::ai_serving::{
     candidate_auth_channel_skip_reason, candidate_common_transport_skip_reason,
-    provider_key_pool_score_scope, read_candidate_transport_snapshot,
-    record_local_runtime_candidate_skip_reason, CandidateTransportPolicyFacts,
-    EligibleLocalExecutionCandidate, LocalExecutionCandidateKind, PlannerAppState,
-    SkippedLocalExecutionCandidate,
+    local_runtime_candidate_skip_key, provider_key_pool_score_scope,
+    read_candidate_transport_snapshot, record_local_runtime_candidate_skip_reason_once,
+    CandidateTransportPolicyFacts, EligibleLocalExecutionCandidate, LocalExecutionCandidateKind,
+    PlannerAppState, SkippedLocalExecutionCandidate,
 };
 use crate::clock::current_unix_ms;
 use crate::handlers::shared::provider_pool::read_admin_provider_pool_runtime_state;
@@ -600,16 +600,27 @@ impl<'a> PoolKeyCursor<'a> {
             return;
         };
         self.exhaustion_skip_recorded = true;
+        let candidate_key = local_runtime_candidate_skip_key(
+            self.provider_id(),
+            self.endpoint_id(),
+            self.group.candidate.key_id.as_str(),
+        );
         if self.skip_reason_counts.is_empty() {
-            record_local_runtime_candidate_skip_reason(
+            record_local_runtime_candidate_skip_reason_once(
                 self.state.app(),
                 trace_id,
+                &candidate_key,
                 "pool_group_exhausted",
             );
             return;
         }
         for reason in self.skip_reason_counts.keys() {
-            record_local_runtime_candidate_skip_reason(self.state.app(), trace_id, reason);
+            record_local_runtime_candidate_skip_reason_once(
+                self.state.app(),
+                trace_id,
+                &candidate_key,
+                reason,
+            );
         }
     }
 
@@ -3358,7 +3369,9 @@ mod tests {
             .take_local_execution_runtime_miss_diagnostic(trace_id)
             .expect("runtime miss diagnostic should exist");
         assert_eq!(diagnostic.reason, "all_candidates_skipped");
-        assert_eq!(diagnostic.skipped_candidate_count, Some(2));
+        // The pool group is one logical candidate no matter how many reasons its
+        // keys were rejected for.
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
         assert_eq!(diagnostic.skip_reasons.get("pool_cooldown"), Some(&1));
         assert_eq!(
             diagnostic.skip_reasons.get("transport_snapshot_missing"),

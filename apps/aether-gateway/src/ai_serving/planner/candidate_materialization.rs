@@ -35,7 +35,9 @@ use crate::ai_serving::planner::candidate_source::{
 };
 use crate::ai_serving::planner::materialization_policy::LocalCandidatePersistencePolicy;
 use crate::ai_serving::planner::pool_scheduler::PoolKeyCursor;
-use crate::ai_serving::planner::runtime_miss::record_local_runtime_candidate_skip_reason;
+use crate::ai_serving::planner::runtime_miss::{
+    local_runtime_candidate_skip_key, record_local_runtime_candidate_skip_reason_once,
+};
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::cache::{
@@ -2013,7 +2015,16 @@ pub(crate) async fn persist_skipped_local_execution_candidate(
     record_runtime_miss_diagnostic: bool,
 ) {
     if record_runtime_miss_diagnostic {
-        record_local_runtime_candidate_skip_reason(state, trace_id, skip_reason);
+        record_local_runtime_candidate_skip_reason_once(
+            state,
+            trace_id,
+            &local_runtime_candidate_skip_key(
+                &candidate.provider_id,
+                &candidate.endpoint_id,
+                &candidate.key_id,
+            ),
+            skip_reason,
+        );
     }
 
     PlannerAppState::new(state)

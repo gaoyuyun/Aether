@@ -8,6 +8,7 @@ pub enum CandidateFailureDiagnosticKind {
     HeaderRules,
     UrlBuild,
     TransportAuth,
+    TransportOperation,
     EnvelopeBuild,
 }
 
@@ -20,6 +21,7 @@ impl CandidateFailureDiagnosticKind {
             Self::HeaderRules => "header_rules",
             Self::UrlBuild => "url_build",
             Self::TransportAuth => "transport_auth",
+            Self::TransportOperation => "transport_operation",
             Self::EnvelopeBuild => "envelope_build",
         }
     }

@@ -22,6 +22,7 @@ use crate::ai_serving::planner::gemini_cli::{
     build_gemini_cli_v1internal_provider_request, GeminiCliV1InternalRequestError,
     GeminiCliV1InternalRequestInput,
 };
+use crate::ai_serving::planner::kiro_diagnostics::kiro_envelope_failure_diagnostic;
 use crate::ai_serving::planner::redaction::{
     request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
 };
@@ -1935,7 +1936,12 @@ async fn build_kiro_openai_responses_payload_parts(
                 candidate_index,
                 candidate_id,
                 "provider_request_body_build_failed",
-                CandidateFailureDiagnostic::envelope_build_failed(
+                kiro_envelope_failure_diagnostic(
+                    &claude_request_body,
+                    &mapped_model,
+                    &kiro_auth.auth_config,
+                    transport.endpoint.body_rules.as_ref(),
+                    Some(effective_headers),
                     client_api_format,
                     provider_api_format,
                     "openai_responses_kiro_envelope",

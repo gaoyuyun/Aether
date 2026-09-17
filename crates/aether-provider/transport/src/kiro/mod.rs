@@ -29,7 +29,10 @@ pub use auth::{
     supports_local_kiro_auth_prerequisites, supports_local_kiro_request_auth_resolution,
     KiroBearerAuth, KiroRequestAuth, KIRO_AUTH_HEADER, PROVIDER_TYPE,
 };
-pub use converter::convert_claude_messages_to_conversation_state;
+pub use converter::{
+    convert_claude_messages_to_conversation_state,
+    try_convert_claude_messages_to_conversation_state, KiroConversationStateError,
+};
 pub use credentials::{
     generate_machine_id, is_valid_kiro_region, normalize_kiro_region, normalize_machine_id,
     KiroAuthConfig,
@@ -48,7 +51,8 @@ pub use request::{
     apply_local_body_rules_with_request_headers, apply_local_header_rules_with_request_headers,
     body_rules_are_locally_supported, build_kiro_provider_headers,
     build_kiro_provider_request_body, header_rules_are_locally_supported,
-    supports_local_kiro_request_shape, KiroProviderHeadersInput,
+    supports_local_kiro_request_shape, try_build_kiro_provider_request_body,
+    KiroProviderHeadersInput, KiroRequestBodyError,
 };
 pub use url::{
     build_kiro_generate_assistant_response_url, build_kiro_list_available_models_url,

@@ -20,6 +20,7 @@ use crate::ai_serving::planner::gemini_cli::{
     build_gemini_cli_v1internal_provider_request, GeminiCliV1InternalRequestError,
     GeminiCliV1InternalRequestInput,
 };
+use crate::ai_serving::planner::kiro_diagnostics::kiro_envelope_failure_diagnostic;
 use crate::ai_serving::planner::redaction::{
     request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
 };
@@ -1599,7 +1600,7 @@ async fn build_kiro_cross_format_payload_parts(
     ) {
         Some(body) => body,
         None => {
-            mark_skipped_local_standard_candidate_with_extra_data(
+            mark_skipped_local_standard_candidate_with_failure_diagnostic(
                 state,
                 input,
                 trace_id,
@@ -1607,10 +1608,15 @@ async fn build_kiro_cross_format_payload_parts(
                 attempt.candidate_index,
                 &attempt.candidate_id,
                 "provider_request_body_build_failed",
-                request_body_build_failure_extra_data(
+                kiro_envelope_failure_diagnostic(
                     &claude_request_body,
+                    &mapped_model,
+                    &kiro_auth.auth_config,
+                    transport.endpoint.body_rules.as_ref(),
+                    Some(effective_headers),
                     provider_api_format,
                     provider_api_format,
+                    "standard_family_kiro_envelope",
                 ),
             )
             .await;

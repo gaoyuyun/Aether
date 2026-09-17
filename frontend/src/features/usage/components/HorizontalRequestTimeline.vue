@@ -1391,6 +1391,7 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   provider_key_concurrency_limit_reached: '上游账号并发已达上限',
   provider_request_body_build_failed: '上游请求体转换失败',
   provider_request_body_missing: '无法构建上游请求体',
+  transport_operation_unsupported: '端点不支持该 API 操作',
 }
 const currentAttemptSkipReasonDisplay = computed(() => {
   const attempt = currentAttempt.value

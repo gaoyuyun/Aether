@@ -1006,6 +1006,39 @@ describe('HorizontalRequestTimeline', () => {
     expect(root.querySelector('.diagnostic-json-panel')).toBeNull()
   })
 
+  it('labels operation-level skips and shows the endpoint setting to change', async () => {
+    const trace = buildTrace([
+      buildCandidate({
+        id: 'cand-count-tokens',
+        provider_name: 'Anyrouter',
+        candidate_index: 0,
+        status: 'skipped',
+        skip_reason: 'transport_operation_unsupported',
+        started_at: undefined,
+        finished_at: '2026-09-16T23:30:54.049Z',
+        extra_data: {
+          failure_diagnostic: {
+            kind: 'transport_operation',
+            path: '$.endpoint.config.anthropic.supported_operations',
+            message: '端点配置的 supported_operations 未包含 count_tokens；如该上游支持此操作，请在端点设置中启用',
+            safe_to_show: true,
+          },
+        },
+      }),
+    ])
+
+    const root = mountTimeline(trace, { requestStatus: 'failed', overrideStatusCode: 503 })
+    await nextTick()
+
+    const skipReason = root.querySelector('.skip-reason')?.textContent ?? ''
+    expect(skipReason).toContain('端点不支持该 API 操作')
+    expect(skipReason).not.toContain('transport_operation_unsupported')
+    expect(skipReason).toContain('$.endpoint.config.anthropic.supported_operations')
+    expect(skipReason).toContain('未包含 count_tokens')
+    // A planner skip never started, so no time range is rendered for it.
+    expect(root.textContent).not.toContain('时间范围')
+  })
+
   it('formats unsupported stream finish reasons with the failing field', async () => {
     const trace = buildTrace([
       buildCandidate({
