@@ -117,6 +117,35 @@ describe('useUsageData', () => {
     expect(totalRecords.value).toBe(1)
   })
 
+  it('applies token counting visibility to both records and exact totals without reusing a different filter total', async () => {
+    const { loadRecords, totalRecords } = useUsageData({ isAdminPage: ref(true) })
+    getAllUsageRecordsMock.mockResolvedValue({ records: [], total: 21, total_is_estimated: true })
+    getAllUsageRecordTotalMock.mockResolvedValue(42)
+
+    await loadRecords({ page: 1, pageSize: 20 }, { hideCountTokensRecords: true, search: 'claude' })
+    await flushMicrotasks()
+
+    expect(getAllUsageRecordsMock).toHaveBeenLastCalledWith(expect.objectContaining({
+      hide_count_tokens: true,
+      search: 'claude',
+      include_total: false,
+    }))
+    expect(getAllUsageRecordTotalMock).toHaveBeenLastCalledWith(expect.objectContaining({
+      hide_count_tokens: true,
+      search: 'claude',
+    }))
+    expect(totalRecords.value).toBe(42)
+
+    await loadRecords(
+      { page: 1, pageSize: 20 },
+      { hideCountTokensRecords: false, search: 'claude' },
+      undefined,
+      { loadExactTotal: false },
+    )
+    expect(getAllUsageRecordsMock.mock.lastCall?.[0]).not.toHaveProperty('hide_count_tokens')
+    expect(totalRecords.value).toBe(21)
+  })
+
   it('tracks provider visibility from the current-user usage response', async () => {
     const isAdminPage = ref(false)
     meGetUsageMock.mockResolvedValueOnce({

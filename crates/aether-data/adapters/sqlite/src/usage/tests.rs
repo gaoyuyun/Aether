@@ -2233,6 +2233,112 @@ WHERE request_id = 'request-1'
 }
 
 #[tokio::test]
+async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keyword_totals() {
+    let pool = crate::test_support::migrated_pool().await;
+    seed_stats_targets(&pool).await;
+    let writer = SqliteUsageWriteRepository::new(pool.clone());
+    let cases = [
+        ("normal", None, None),
+        (
+            "normal-path",
+            Some("chat"),
+            Some(serde_json::json!({"request_path": "/v1/messages"})),
+        ),
+        (
+            "normal-query",
+            None,
+            Some(
+                serde_json::json!({"request_path_and_query": "/v1/messages?redirect=/v1/messages/count_tokens"}),
+            ),
+        ),
+        ("typed", Some("count_tokens"), None),
+        (
+            "legacy-path",
+            Some("chat"),
+            Some(serde_json::json!({"request_path": "/v1/messages/count_tokens"})),
+        ),
+        (
+            "legacy-query",
+            None,
+            Some(
+                serde_json::json!({"request_path_and_query": "/v1/messages/count_tokens/?beta=true"}),
+            ),
+        ),
+        (
+            "singular",
+            None,
+            Some(serde_json::json!({"request_path": "/v1/messages/count_token"})),
+        ),
+    ];
+    for (index, (id, request_type, metadata)) in cases.into_iter().enumerate() {
+        let mut record = sample_usage(id, "completed", "settled", 1_000 + index as u64);
+        record.request_type = request_type.map(str::to_owned);
+        record.request_metadata = metadata;
+        writer.upsert(record).await.expect("usage should seed");
+    }
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let mut query = UsageAuditListQuery {
+        exclude_count_tokens: true,
+        newest_first: true,
+        limit: Some(1),
+        offset: Some(1),
+        ..UsageAuditListQuery::default()
+    };
+    let rows = reader
+        .list_usage_audits(&query)
+        .await
+        .expect("list should load");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id, "normal-path");
+    assert_eq!(
+        reader
+            .count_usage_audits(&query)
+            .await
+            .expect("count should load"),
+        3
+    );
+    query.exclude_count_tokens = false;
+    assert_eq!(
+        reader
+            .count_usage_audits(&query)
+            .await
+            .expect("unfiltered count should load"),
+        7
+    );
+
+    let mut keyword_query = UsageAuditKeywordSearchQuery {
+        exclude_count_tokens: true,
+        keywords: vec!["model-1".to_string()],
+        newest_first: true,
+        limit: Some(1),
+        offset: Some(1),
+        ..UsageAuditKeywordSearchQuery::default()
+    };
+    let rows = reader
+        .list_usage_audits_by_keyword_search(&keyword_query)
+        .await
+        .expect("keyword list should load");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id, "normal-path");
+    assert_eq!(
+        reader
+            .count_usage_audits_by_keyword_search(&keyword_query)
+            .await
+            .expect("keyword count should load"),
+        3
+    );
+    keyword_query.exclude_count_tokens = false;
+    assert_eq!(
+        reader
+            .count_usage_audits_by_keyword_search(&keyword_query)
+            .await
+            .expect("unfiltered keyword count should load"),
+        7
+    );
+}
+
+#[tokio::test]
 async fn sqlite_usage_websocket_filter_applies_to_list_count_and_keyword_search() {
     let pool = crate::test_support::migrated_pool().await;
     seed_stats_targets(&pool).await;

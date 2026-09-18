@@ -691,6 +691,15 @@ fn push_list_filters(
 AND LOWER(TRIM(COALESCE(`usage`.provider_name, ''))) NOT IN ('unknown', 'unknow'))",
         );
     }
+    if query.exclude_count_tokens {
+        push_where(builder, has_where);
+        builder.push("COALESCE(`usage`.request_type, '') <> 'count_tokens'");
+        for key in ["request_path", "request_path_and_query"] {
+            builder.push(format!(
+                " AND TRIM(TRAILING '/' FROM SUBSTRING_INDEX(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.{key}')), ''), '?', 1)) NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
+            ));
+        }
+    }
     if let Some(statuses) = query
         .statuses
         .as_deref()
@@ -749,6 +758,7 @@ fn push_keyword_filters(
             api_format: query.api_format.clone(),
             client_family: query.client_family.clone(),
             exclude_unknown_model_or_provider: query.exclude_unknown_model_or_provider,
+            exclude_count_tokens: query.exclude_count_tokens,
             statuses: query.statuses.clone(),
             exclude_status_codes: query.exclude_status_codes.clone(),
             is_stream: query.is_stream,

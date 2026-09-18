@@ -1735,6 +1735,24 @@ AND lower(BTRIM(COALESCE(\"usage\".provider_name, ''))) NOT IN ('unknown', 'unkn
     );
 }
 
+fn push_postgres_usage_exclude_count_tokens_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+    exclude_count_tokens: bool,
+) {
+    if !exclude_count_tokens {
+        return;
+    }
+
+    push_postgres_usage_where(builder, has_where);
+    builder.push("COALESCE(\"usage\".request_type, '') <> 'count_tokens'");
+    for key in ["request_path", "request_path_and_query"] {
+        builder.push(format!(
+            " AND RTRIM(SPLIT_PART(COALESCE(\"usage\".request_metadata->>'{key}', ''), '?', 1), '/') NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
+        ));
+    }
+}
+
 const USAGE_PROVIDER_IDENTITY_FILTER_SQL: &str = r#" AND (
       (
         BTRIM(COALESCE("usage".provider_id, '')) <> ''
@@ -3200,6 +3218,11 @@ ORDER BY request_count DESC, "usage".provider_name ASC
             &mut has_where,
             query.exclude_unknown_model_or_provider,
         );
+        push_postgres_usage_exclude_count_tokens_filter(
+            &mut builder,
+            &mut has_where,
+            query.exclude_count_tokens,
+        );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
                 builder.push(if has_where { " AND " } else { " WHERE " });
@@ -3312,6 +3335,11 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             &mut builder,
             &mut has_where,
             query.exclude_unknown_model_or_provider,
+        );
+        push_postgres_usage_exclude_count_tokens_filter(
+            &mut builder,
+            &mut has_where,
+            query.exclude_count_tokens,
         );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -3507,6 +3535,11 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             &mut has_where,
             query.exclude_unknown_model_or_provider,
         );
+        push_postgres_usage_exclude_count_tokens_filter(
+            &mut builder,
+            &mut has_where,
+            query.exclude_count_tokens,
+        );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
                 builder.push(if has_where { " AND " } else { " WHERE " });
@@ -3608,6 +3641,11 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             &mut builder,
             &mut has_where,
             query.exclude_unknown_model_or_provider,
+        );
+        push_postgres_usage_exclude_count_tokens_filter(
+            &mut builder,
+            &mut has_where,
+            query.exclude_count_tokens,
         );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {

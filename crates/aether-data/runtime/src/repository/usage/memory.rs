@@ -274,6 +274,29 @@ fn usage_has_admin_unknown_model_or_provider(item: &StoredRequestUsageAudit) -> 
     usage_admin_unknown_label(&item.model) || usage_admin_unknown_label(&item.provider_name)
 }
 
+fn usage_is_count_tokens(item: &StoredRequestUsageAudit) -> bool {
+    if item.request_type.as_deref() == Some("count_tokens") {
+        return true;
+    }
+    ["request_path", "request_path_and_query"]
+        .iter()
+        .any(|key| {
+            item.request_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(key))
+                .and_then(Value::as_str)
+                .is_some_and(|path| {
+                    matches!(
+                        path.split('?')
+                            .next()
+                            .unwrap_or_default()
+                            .trim_end_matches('/'),
+                        "/v1/messages/count_tokens" | "/v1/messages/count_token"
+                    )
+                })
+        })
+}
+
 fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditListQuery) -> bool {
     // The field is historically named `created_at_unix_ms`, but usage audit rows
     // across gateway handlers, SQL repositories and tests are stored as epoch seconds.
@@ -320,6 +343,9 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
         }
     }
     if query.exclude_unknown_model_or_provider && usage_has_admin_unknown_model_or_provider(item) {
+        return false;
+    }
+    if query.exclude_count_tokens && usage_is_count_tokens(item) {
         return false;
     }
     if let Some(statuses) = query.statuses.as_ref() {
@@ -406,6 +432,9 @@ fn usage_matches_keyword_search_query(
         }
     }
     if query.exclude_unknown_model_or_provider && usage_has_admin_unknown_model_or_provider(item) {
+        return false;
+    }
+    if query.exclude_count_tokens && usage_is_count_tokens(item) {
         return false;
     }
     if let Some(statuses) = query.statuses.as_ref() {

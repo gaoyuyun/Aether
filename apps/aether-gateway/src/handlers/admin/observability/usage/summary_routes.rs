@@ -627,6 +627,7 @@ fn build_admin_usage_keyword_search_query(
         api_format: base_query.api_format.clone(),
         client_family: base_query.client_family.clone(),
         exclude_unknown_model_or_provider: base_query.exclude_unknown_model_or_provider,
+        exclude_count_tokens: base_query.exclude_count_tokens,
         statuses: base_query.statuses.clone(),
         exclude_status_codes: base_query.exclude_status_codes.clone(),
         is_stream: base_query.is_stream,
@@ -852,6 +853,8 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             );
             base_query.client_family = active_client_family_filter.map(str::to_owned);
             base_query.exclude_unknown_model_or_provider = hide_unknown_records;
+            base_query.exclude_count_tokens =
+                admin_usage_bool_query_param(query, "hide_count_tokens");
             let (usage, total, total_is_estimated) = if attempt_status_filter.is_some() {
                 let mut usage = state.list_usage_audits(&base_query).await?;
                 let user_ids: Vec<String> = usage

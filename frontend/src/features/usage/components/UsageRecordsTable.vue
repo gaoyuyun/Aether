@@ -28,6 +28,20 @@
       </div>
 
       <Button
+        v-if="isAdmin"
+        variant="ghost"
+        size="icon"
+        data-usage-hide-count-tokens-toggle="mobile"
+        class="absolute right-20 top-2.5 h-8 w-8 shrink-0 md:hidden"
+        :class="hideCountTokensRecords ? 'text-primary' : ''"
+        :title="hideCountTokensRecords ? '显示 Token 计数请求' : '隐藏 Token 计数请求'"
+        aria-label="隐藏 Token 计数请求"
+        :aria-pressed="hideCountTokensRecords"
+        @click="$emit('update:hideCountTokensRecords', !hideCountTokensRecords)"
+      >
+        <Calculator class="w-3.5 h-3.5" />
+      </Button>
+      <Button
         variant="ghost"
         size="icon"
         data-usage-hide-unknown-toggle="mobile"
@@ -197,7 +211,21 @@
       <!-- 分隔线 -->
       <div class="hidden sm:block h-4 w-px bg-border" />
 
-      <!-- 自动刷新按钮 -->
+      <!-- 记录显示开关 -->
+      <Button
+        v-if="isAdmin"
+        variant="ghost"
+        size="icon"
+        data-usage-hide-count-tokens-toggle="desktop"
+        class="hidden h-8 w-8 shrink-0 md:inline-flex"
+        :class="hideCountTokensRecords ? 'text-primary' : ''"
+        :title="hideCountTokensRecords ? '显示 Token 计数请求' : '隐藏 Token 计数请求'"
+        aria-label="隐藏 Token 计数请求"
+        :aria-pressed="hideCountTokensRecords"
+        @click="$emit('update:hideCountTokensRecords', !hideCountTokensRecords)"
+      >
+        <Calculator class="w-3.5 h-3.5" />
+      </Button>
       <Button
         variant="ghost"
         size="icon"
@@ -1089,7 +1117,7 @@ import {
   SortableTableHead,
   TableFilterMenu,
 } from '@/components/ui'
-import { EyeOff, RefreshCcw, Search, Shuffle } from 'lucide-vue-next'
+import { Calculator, EyeOff, RefreshCcw, Search, Shuffle } from 'lucide-vue-next'
 import { formatTokens, formatCurrency } from '@/utils/format'
 import { getCacheCreationTokens, getCacheReadTokens, getEffectiveInputTokens } from '../token-normalization'
 import {
@@ -1183,6 +1211,7 @@ const props = defineProps<{
   // 自动刷新
   autoRefresh: boolean
   hideUnknownRecords: boolean
+  hideCountTokensRecords: boolean
 }>()
 
 const emit = defineEmits<{
@@ -1198,6 +1227,7 @@ const emit = defineEmits<{
   'update:pageSize': [value: number]
   'update:autoRefresh': [value: boolean]
   'update:hideUnknownRecords': [value: boolean]
+  'update:hideCountTokensRecords': [value: boolean]
   'refresh': []
   'showDetail': [id: string]
   'prefetchDetail': [id: string]

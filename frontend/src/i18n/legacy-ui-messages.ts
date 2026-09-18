@@ -1109,6 +1109,8 @@ export const legacyUiEnglishMessages: Record<string, string> = {
   '显示 unknown 请求': 'Show unknown requests',
   '隐藏 unknown 请求': 'Hide unknown requests',
   '隐藏 unknown 模型或提供商的请求': 'Hide requests with unknown models or providers',
+  '显示 Token 计数请求': 'Show token counting requests',
+  '隐藏 Token 计数请求': 'Hide token counting requests',
   '全部提供商': 'All providers',
   '发生重试': 'Retried',
   '发生转移': 'Failed over',

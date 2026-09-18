@@ -931,6 +931,16 @@ fn push_sqlite_usage_list_filters(
 AND LOWER(TRIM(COALESCE(provider_name, ''))) NOT IN ('unknown', 'unknow'))",
         );
     }
+    if query.exclude_count_tokens {
+        push_sqlite_usage_where(builder, has_where);
+        builder.push("COALESCE(request_type, '') <> 'count_tokens'");
+        for key in ["request_path", "request_path_and_query"] {
+            let path = format!("COALESCE(json_extract(request_metadata, '$.{key}'), '')");
+            builder.push(format!(
+                " AND RTRIM(SUBSTR({path}, 1, INSTR({path} || '?', '?') - 1), '/') NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
+            ));
+        }
+    }
     if let Some(statuses) = query.statuses.as_deref() {
         if !statuses.is_empty() {
             push_sqlite_usage_where(builder, has_where);
@@ -998,6 +1008,7 @@ fn push_sqlite_usage_keyword_filters(
             api_format: query.api_format.clone(),
             client_family: query.client_family.clone(),
             exclude_unknown_model_or_provider: query.exclude_unknown_model_or_provider,
+            exclude_count_tokens: query.exclude_count_tokens,
             statuses: query.statuses.clone(),
             exclude_status_codes: query.exclude_status_codes.clone(),
             is_stream: query.is_stream,

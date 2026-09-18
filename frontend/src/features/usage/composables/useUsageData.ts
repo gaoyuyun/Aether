@@ -52,6 +52,7 @@ export interface FilterParams {
   status?: string
   client_family?: string
   hideUnknownRecords?: boolean
+  hideCountTokensRecords?: boolean
 }
 
 export function useUsageData(options: UseUsageDataOptions) {
@@ -408,6 +409,9 @@ export function useUsageData(options: UseUsageDataOptions) {
         }
         if (filters?.hideUnknownRecords) {
           params.hide_unknown = true
+        }
+        if (filters?.hideCountTokensRecords) {
+          params.hide_count_tokens = true
         }
 
         const response = await usageApi.getAllUsageRecords({

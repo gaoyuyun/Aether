@@ -1049,6 +1049,8 @@ pub struct UsageAuditListQuery {
     pub api_format: Option<String>,
     pub client_family: Option<String>,
     pub exclude_unknown_model_or_provider: bool,
+    #[serde(default)]
+    pub exclude_count_tokens: bool,
     pub statuses: Option<Vec<String>>,
     pub exclude_status_codes: Vec<u16>,
     pub is_stream: Option<bool>,
@@ -1069,6 +1071,8 @@ pub struct UsageAuditKeywordSearchQuery {
     pub api_format: Option<String>,
     pub client_family: Option<String>,
     pub exclude_unknown_model_or_provider: bool,
+    #[serde(default)]
+    pub exclude_count_tokens: bool,
     pub statuses: Option<Vec<String>>,
     pub exclude_status_codes: Vec<u16>,
     pub is_stream: Option<bool>,

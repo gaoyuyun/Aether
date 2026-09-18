@@ -102,6 +102,7 @@
       :page-size-options="pageSizeOptions"
       :auto-refresh="globalAutoRefresh"
       :hide-unknown-records="hideUnknownRecords"
+      :hide-count-tokens-records="hideCountTokensRecords"
       @update:time-range="handleTimeRangeChange"
       @update:filter-search="handleFilterSearchChange"
       @update:filter-user="handleFilterUserChange"
@@ -114,6 +115,7 @@
       @update:page-size="handlePageSizeChange"
       @update:auto-refresh="handleAutoRefreshChange"
       @update:hide-unknown-records="handleHideUnknownRecordsChange"
+      @update:hide-count-tokens-records="handleHideCountTokensRecordsChange"
       @refresh="handleManualRefresh"
       @prefetch-detail="prefetchRequestDetail"
       @show-detail="showRequestDetail"
@@ -172,6 +174,7 @@ import {
   resolveDisplayRequestStatus,
 } from '@/features/usage/utils/status'
 import { matchesUsageRecordSearch } from '@/features/usage/utils/recordSearch'
+import { isUsageCountTokensRequest } from '@/features/usage/utils/countTokens'
 import {
   isUserLocalOnlyRecordStatus,
   shouldUseServerUserRecordFilters,
@@ -196,6 +199,7 @@ const isAdminPage = computed(() => route.path.startsWith('/admin'))
 // 每次进入页面默认收起分析面板，优先展示使用记录。
 const statsExpanded = ref(false)
 const hideUnknownRecords = useLocalStorage('usage-hide-unknown-records', false)
+const hideCountTokensRecords = useLocalStorage('usage-hide-count-tokens-records', true)
 const analyticsReady = ref(false)
 let analyticsLoadStarted = false
 let analyticsIdleHandle: number | null = null
@@ -453,11 +457,15 @@ function hasUnknownModelOrProvider(record: UsageRecord): boolean {
   return false
 }
 
-// 用户页面需要前端筛选；隐藏 unknown 的开关对管理员当前页也生效。
+// 用户页面需要前端筛选；记录显示开关也应用于管理员当前页。
 const filteredRecords = computed(() => {
   let records = hideUnknownRecords.value
     ? currentRecords.value.filter(record => !hasUnknownModelOrProvider(record))
     : [...currentRecords.value]
+
+  if (isAdminPage.value && hideCountTokensRecords.value) {
+    records = records.filter(record => !isUsageCountTokensRequest(record))
+  }
 
   if (!isAdminPage.value) {
     if (isUserLocalOnlyRecordStatus(filterStatus.value) && filterSearch.value.trim()) {
@@ -913,6 +921,14 @@ async function handleHideUnknownRecordsChange(value: boolean) {
   }
 }
 
+async function handleHideCountTokensRecordsChange(value: boolean) {
+  hideCountTokensRecords.value = value
+  currentPage.value = 1
+  if (isAdminPage.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  }
+}
+
 function handleVisibilityChange() {
   isPageVisible.value = !document.hidden
   if (!isPageVisible.value) {
@@ -1074,7 +1090,8 @@ function getCurrentFilters() {
     api_format: filterApiFormat.value !== '__all__' ? filterApiFormat.value : undefined,
     status: filterStatus.value !== '__all__' ? filterStatus.value : undefined,
     client_family: filterClientFamily.value !== '__all__' ? filterClientFamily.value : undefined,
-    hideUnknownRecords: hideUnknownRecords.value || undefined
+    hideUnknownRecords: hideUnknownRecords.value || undefined,
+    hideCountTokensRecords: hideCountTokensRecords.value || undefined
   }
 }
 

@@ -94,6 +94,7 @@ vi.mock('lucide-vue-next', async () => {
   return {
     RefreshCcw: Icon,
     EyeOff: Icon,
+    Calculator: Icon,
     Search: Icon,
     Shuffle: Icon,
     ChevronDown: Icon,
@@ -167,6 +168,7 @@ function mountUsageRecordsTable(records: UsageRecord[], overrides: Record<string
     pageSizeOptions: [20, 50],
     autoRefresh: false,
     hideUnknownRecords: false,
+    hideCountTokensRecords: true,
     ...overrides,
   })
 
@@ -697,6 +699,18 @@ describe('UsageRecordsTable', () => {
     root.querySelector<HTMLElement>('[data-usage-hide-unknown-toggle="desktop"]')?.click()
 
     expect(onUpdateHideUnknownRecords).toHaveBeenCalledWith(true)
+  })
+
+  it.each(['desktop', 'mobile'])('can show token counting requests on %s', layout => {
+    const onUpdateHideCountTokensRecords = vi.fn()
+    const root = mountUsageRecordsTable([buildRecord()], {
+      'onUpdate:hideCountTokensRecords': onUpdateHideCountTokensRecords,
+    })
+    const toggle = root.querySelector<HTMLElement>(`[data-usage-hide-count-tokens-toggle="${layout}"]`)
+
+    expect(toggle?.getAttribute('aria-pressed')).toBe('true')
+    toggle?.click()
+    expect(onUpdateHideCountTokensRecords).toHaveBeenCalledWith(false)
   })
 
   it('debounces usage search updates', async () => {

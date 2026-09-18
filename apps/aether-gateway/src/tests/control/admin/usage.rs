@@ -1645,6 +1645,93 @@ async fn gateway_filters_admin_usage_records_with_unknown_model_or_provider() {
 }
 
 #[tokio::test]
+async fn gateway_filters_admin_usage_records_count_tokens() {
+    let normal = sample_usage_row(
+        "usage-normal",
+        "req-normal",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "Anthropic",
+        "claude",
+        "completed",
+        120,
+        30,
+        0.3,
+        0.36,
+        DAY_1_UNIX_SECS,
+    );
+    let mut rows = vec![normal.clone()];
+    for (index, metadata) in [
+        serde_json::json!({"request_path": "/v1/messages/count_tokens"}),
+        serde_json::json!({"request_path_and_query": "/v1/messages/count_tokens/?beta=true"}),
+        serde_json::json!({"request_path": "/v1/messages/count_token"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut record = normal.clone();
+        record.id = format!("usage-count-{index}");
+        record.request_id = format!("req-count-{index}");
+        record.created_at_unix_ms = DAY_2_UNIX_SECS as u64;
+        record.request_metadata = Some(metadata);
+        rows.push(record);
+    }
+    let mut typed = normal.clone();
+    typed.id = "usage-typed".to_string();
+    typed.request_id = "req-typed".to_string();
+    typed.request_type = Some("count_tokens".to_string());
+    rows.push(typed);
+
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(Arc::new(
+                InMemoryUsageReadRepository::seed(rows),
+            ))),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let base_url = format!("{gateway_url}/api/admin/usage/records?start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0");
+    for search in ["", "&search=claude"] {
+        for (visibility, expected_total) in [
+            ("&hide_count_tokens=true", 1),
+            ("&hide_count_tokens=false", 5),
+            ("", 5),
+        ] {
+            let response = admin_request(
+                reqwest::Client::new()
+                    .get(format!("{base_url}{search}{visibility}&limit=1&offset=0")),
+            )
+            .send()
+            .await
+            .expect("records request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: serde_json::Value =
+                response.json().await.expect("records JSON should parse");
+            assert_eq!(payload["total"], expected_total);
+            assert_eq!(payload["records"].as_array().unwrap().len(), 1);
+            if expected_total == 1 {
+                assert_eq!(payload["records"][0]["id"], "usage-normal");
+            }
+
+            let response = admin_request(
+                reqwest::Client::new()
+                    .get(format!("{base_url}{search}{visibility}&total_only=true")),
+            )
+            .send()
+            .await
+            .expect("total request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: serde_json::Value =
+                response.json().await.expect("total JSON should parse");
+            assert_eq!(payload["total"], expected_total);
+            assert!(payload["records"].as_array().unwrap().is_empty());
+        }
+    }
+    gateway_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_supports_fast_admin_usage_record_totals() {
     let (upstream_url, upstream_hits, upstream_handle) =
         start_usage_upstream("/api/admin/usage/records").await;

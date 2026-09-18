@@ -530,6 +530,7 @@ export const usageApi = {
     status?: UsageRecordStatusFilter
     client_family?: string
     hide_unknown?: boolean
+    hide_count_tokens?: boolean
     include_total?: boolean
     total_only?: boolean
     limit?: number
@@ -569,6 +570,7 @@ export const usageApi = {
     status?: UsageRecordStatusFilter
     client_family?: string
     hide_unknown?: boolean
+    hide_count_tokens?: boolean
   }): Promise<number> {
     const requestParams = compactParams({
       ...params,
