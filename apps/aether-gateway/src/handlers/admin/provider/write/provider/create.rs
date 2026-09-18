@@ -1,9 +1,10 @@
 use crate::handlers::admin::provider::shared::payloads::AdminProviderCreateRequest;
 use crate::handlers::admin::provider::shared::support::{
-    normalize_provider_billing_type, normalize_provider_quota_windows,
-    normalize_provider_transfer_limit, normalize_provider_transfer_limit_json,
-    parse_optional_rfc3339_unix_secs, PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
-    PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY, PROVIDER_QUOTA_WINDOWS_CONFIG_KEY,
+    normalize_provider_billing_type, normalize_provider_quota_reservation,
+    normalize_provider_quota_windows, normalize_provider_transfer_limit,
+    normalize_provider_transfer_limit_json, parse_optional_rfc3339_unix_secs,
+    PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY, PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
+    PROVIDER_QUOTA_RESERVATION_CONFIG_KEY, PROVIDER_QUOTA_WINDOWS_CONFIG_KEY,
 };
 use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redaction_config;
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
@@ -182,6 +183,29 @@ pub(crate) async fn build_admin_create_provider_record(
             config_map.remove(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY);
         } else {
             config_map.insert(PROVIDER_QUOTA_WINDOWS_CONFIG_KEY.to_string(), value);
+        }
+    }
+    if let Some(quota_reservation) = payload.quota_reservation.as_ref() {
+        match normalize_provider_quota_reservation(Some(quota_reservation))? {
+            Some(value) => {
+                config_map.insert(PROVIDER_QUOTA_RESERVATION_CONFIG_KEY.to_string(), value);
+            }
+            None => {
+                config_map.remove(PROVIDER_QUOTA_RESERVATION_CONFIG_KEY);
+            }
+        }
+    }
+    if let Some(raw_reservation) = config_map
+        .get(PROVIDER_QUOTA_RESERVATION_CONFIG_KEY)
+        .cloned()
+    {
+        match normalize_provider_quota_reservation(Some(&raw_reservation))? {
+            Some(value) => {
+                config_map.insert(PROVIDER_QUOTA_RESERVATION_CONFIG_KEY.to_string(), value);
+            }
+            None => {
+                config_map.remove(PROVIDER_QUOTA_RESERVATION_CONFIG_KEY);
+            }
         }
     }
     if let Some(value) = normalize_json_object(payload.failover_rules, "failover_rules")? {

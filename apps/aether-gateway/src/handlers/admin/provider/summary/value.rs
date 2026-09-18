@@ -198,6 +198,7 @@ pub(crate) fn build_admin_provider_summary_value(
         "quota_next_reset_at": cycle_start.zip(quota_reset_day).map(|(start, days)| start + days * 86_400).and_then(unix_secs_to_rfc3339),
         "quota_expires_at": quota_expires_at,
         "quota_windows": config.and_then(|cfg| cfg.get("quota_windows")).cloned(),
+        "quota_reservation": config.and_then(|cfg| cfg.get("quota_reservation")).cloned(),
         "max_retries": provider.max_retries,
         "max_transfer_count": max_transfer_count,
         "max_transfer_timeout_seconds": max_transfer_timeout_seconds,

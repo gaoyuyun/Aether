@@ -326,6 +326,64 @@
               </Button>
             </div>
           </div>
+          <div class="col-span-2 space-y-2">
+            <Label class="text-xs">{{ legacyT('额度预留策略') }}</Label>
+            <p class="text-xs text-muted-foreground">
+              {{ legacyT('每次请求发出前按“输入大小 × 单价 × 安全系数”预留额度，占用周期总额与滚动窗口，请求结束后按实际费用结算。留空使用默认值。') }}
+            </p>
+            <div class="grid grid-cols-2 gap-2">
+              <div class="space-y-1">
+                <Label class="text-xs">{{ legacyT('缓存命中占比 (%)') }}</Label>
+                <Input
+                  :model-value="form.quota_reservation.cached_input_ratio_percent ?? ''"
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  :placeholder="legacyT('默认 0，Codex/Claude Code 类客户端建议 80-95')"
+                  @update:model-value="(v) => form.quota_reservation.cached_input_ratio_percent = parseNumberInput(v, { allowFloat: true, min: 0, max: 100 })"
+                />
+              </div>
+              <div class="space-y-1">
+                <Label class="text-xs">{{ legacyT('安全系数') }}</Label>
+                <Input
+                  :model-value="form.quota_reservation.safety_multiplier ?? ''"
+                  type="number"
+                  min="1"
+                  max="10"
+                  step="0.05"
+                  :placeholder="legacyT('默认 1.25')"
+                  @update:model-value="(v) => form.quota_reservation.safety_multiplier = parseNumberInput(v, { allowFloat: true, min: 1, max: 10 })"
+                />
+              </div>
+              <div class="space-y-1">
+                <Label class="text-xs">{{ legacyT('预估输出 tokens') }}</Label>
+                <Input
+                  :model-value="form.quota_reservation.output_tokens ?? ''"
+                  type="number"
+                  min="1"
+                  max="1000000"
+                  step="1"
+                  :placeholder="legacyT('默认 4096，高推理强度翻倍')"
+                  @update:model-value="(v) => form.quota_reservation.output_tokens = parseNumberInput(v, { min: 1, max: 1_000_000 })"
+                />
+              </div>
+              <div class="space-y-1">
+                <Label class="text-xs">{{ legacyT('单次最低预留 (USD)') }}</Label>
+                <Input
+                  :model-value="form.quota_reservation.minimum_usd ?? ''"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  :placeholder="legacyT('默认 0.01')"
+                  @update:model-value="(v) => form.quota_reservation.minimum_usd = parseNumberInput(v, { allowFloat: true, min: 0 })"
+                />
+              </div>
+            </div>
+            <p class="text-xs text-muted-foreground">
+              {{ legacyT('缓存命中占比表示输入里预计命中提示缓存、按缓存读取价计费的比例。多轮对话类客户端几乎整段上下文都命中缓存，占比留 0 会把整段输入按全价预留，小窗口很快被撑满。') }}
+            </p>
+          </div>
           <div class="space-y-1.5">
             <Label class="text-xs">
               {{ legacyT('订阅开始时间（精确到分）') }} <span class="text-red-500">*</span>
@@ -482,6 +540,7 @@ import {
   createProvider,
   normalizePoolAdvancedConfig,
   updateProvider,
+  type ProviderQuotaReservation,
   type ProviderQuotaWindow,
   type ProviderType,
   type ProviderWithEndpointsSummary,
@@ -537,6 +596,7 @@ const form = ref({
   quota_subscription_started_at: '',  // 订阅开始时间
   quota_expires_at: '',
   quota_windows: [] as ProviderQuotaWindow[],
+  quota_reservation: emptyQuotaReservationForm(),
   provider_priority: 100,
   // 状态配置
   is_active: true,
@@ -574,6 +634,7 @@ function resetForm() {
     quota_subscription_started_at: '',
     quota_expires_at: '',
     quota_windows: [],
+    quota_reservation: emptyQuotaReservationForm(),
     provider_priority: defaultPriority.value,
     is_active: true,
     rate_limit: undefined,
@@ -612,6 +673,7 @@ function loadProviderData() {
     quota_subscription_started_at: formatDateTimeLocalInput(props.provider.quota_subscription_started_at ?? props.provider.quota_last_reset_at),
     quota_expires_at: formatDateTimeLocalInput(props.provider.quota_expires_at),
     quota_windows: (props.provider.quota_windows ?? []).map(window => ({ ...window })),
+    quota_reservation: quotaReservationToForm(props.provider.quota_reservation),
     provider_priority: props.provider.provider_priority || 999,
     is_active: props.provider.is_active,
     rate_limit: undefined,
@@ -651,6 +713,50 @@ function updateQuotaWindowDuration(index: number, value: string | number | null 
 
 function updateQuotaWindowLimit(index: number, value: string | number | null | undefined) {
   form.value.quota_windows[index].limit_usd = parseNumberInput(value, { allowFloat: true, min: 0 }) ?? 0
+}
+
+interface QuotaReservationForm {
+  cached_input_ratio_percent: number | undefined
+  safety_multiplier: number | undefined
+  output_tokens: number | undefined
+  minimum_usd: number | undefined
+}
+
+function emptyQuotaReservationForm(): QuotaReservationForm {
+  return {
+    cached_input_ratio_percent: undefined,
+    safety_multiplier: undefined,
+    output_tokens: undefined,
+    minimum_usd: undefined,
+  }
+}
+
+function quotaReservationToForm(
+  reservation: ProviderQuotaReservation | null | undefined,
+): QuotaReservationForm {
+  if (!reservation) return emptyQuotaReservationForm()
+  return {
+    cached_input_ratio_percent: typeof reservation.cached_input_ratio === 'number'
+      ? Math.round(reservation.cached_input_ratio * 1000) / 10
+      : undefined,
+    safety_multiplier: reservation.safety_multiplier ?? undefined,
+    output_tokens: reservation.output_tokens ?? undefined,
+    minimum_usd: reservation.minimum_usd ?? undefined,
+  }
+}
+
+/** 全部留空返回 undefined，表示使用后端默认值 */
+function quotaReservationFromForm(
+  reservation: QuotaReservationForm,
+): ProviderQuotaReservation | undefined {
+  const payload: ProviderQuotaReservation = {}
+  if (reservation.cached_input_ratio_percent != null) {
+    payload.cached_input_ratio = Math.round(reservation.cached_input_ratio_percent * 10) / 1000
+  }
+  if (reservation.safety_multiplier != null) payload.safety_multiplier = reservation.safety_multiplier
+  if (reservation.output_tokens != null) payload.output_tokens = reservation.output_tokens
+  if (reservation.minimum_usd != null) payload.minimum_usd = reservation.minimum_usd
+  return Object.keys(payload).length > 0 ? payload : undefined
 }
 
 // 使用 useFormDialog 统一处理对话框逻辑
@@ -715,6 +821,10 @@ const handleSubmit = async () => {
       // switching back to a subscription can then resume the same policy.
       quota_windows: form.value.billing_type === 'monthly_quota'
         ? form.value.quota_windows.map(window => ({ ...window }))
+        : undefined,
+      // 预留策略同样只在月卡下提交；编辑时清空需显式发送 null 才会恢复默认值
+      quota_reservation: form.value.billing_type === 'monthly_quota'
+        ? (quotaReservationFromForm(form.value.quota_reservation) ?? (isEditMode.value ? null : undefined))
         : undefined,
       responses_websocket_enabled: form.value.responses_websocket_enabled,
       is_active: form.value.is_active,

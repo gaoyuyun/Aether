@@ -902,6 +902,7 @@ export interface ProviderWithEndpointsSummary {
   quota_next_reset_at?: string
   quota_expires_at?: string
   quota_windows?: ProviderQuotaWindow[]
+  quota_reservation?: ProviderQuotaReservation | null
   // 请求配置（从 Endpoint 迁移）
   max_retries?: number | null  // 同 Key 重试次数；null 表示沿用调度策略
   max_transfer_count?: number  // 提供商内最大转移次数，0 表示不限制
@@ -934,6 +935,19 @@ export interface ProviderWithEndpointsSummary {
   ops_quota_alert_enabled?: boolean
   created_at: string
   updated_at: string
+}
+
+/**
+ * 月卡渠道的额度预留策略。字段缺省时使用后端默认值：
+ * minimum_usd 0.01、fallback_usd 0.5、output_tokens 4096、safety_multiplier 1.25、cached_input_ratio 0。
+ */
+export interface ProviderQuotaReservation {
+  minimum_usd?: number
+  fallback_usd?: number
+  output_tokens?: number
+  safety_multiplier?: number
+  /** 预计命中提示缓存、按缓存读取价计费的输入占比（0-1） */
+  cached_input_ratio?: number
 }
 
 export interface ProviderQuotaWindow {

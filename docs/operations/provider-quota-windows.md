@@ -124,7 +124,8 @@ Provider configuration accepts an optional `quota_reservation` object:
     "minimum_usd": 0.01,
     "fallback_usd": 0.5,
     "output_tokens": 4096,
-    "safety_multiplier": 1.25
+    "safety_multiplier": 1.25,
+    "cached_input_ratio": 0.0
   }
 }
 ```
@@ -132,6 +133,12 @@ Provider configuration accepts an optional `quota_reservation` object:
 These are the defaults. The estimate uses the dispatch pricing snapshot, request input size and
 an output budget; high/xhigh/max/ultra reasoning doubles that budget. A smaller explicit output
 limit is respected in the estimate. The original request and its output limit are not modified.
+`cached_input_ratio` (0 to 1) is the share of the input that is expected to hit the provider's
+prompt cache and is priced at the cache-read rate instead of the fresh-input rate. Agent clients
+such as Codex or Claude Code resend nearly the same context every turn (typically 90% or more is a
+cache read), so leaving it at 0 reserves the full fresh price for every turn and a small rolling
+window fills up long before the real spend reaches the limit. The provider form exposes the policy
+under the monthly-quota section; the reservation is still settled against the measured cost.
 The fallback applies when a meaningful input or cost estimate is unavailable. The configured
 minimum and any known per-request charge are lower bounds. These estimates are availability-oriented,
 not a guarantee that actual upstream cost cannot exceed the quota. An actual overrun is recorded in

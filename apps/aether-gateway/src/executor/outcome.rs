@@ -59,6 +59,14 @@ pub(crate) struct LocalExecutionExhaustion {
     upstream_error_type: Option<String>,
 }
 
+impl LocalExecutionExhaustion {
+    /// The usage attribution the request will be recorded with.
+    #[cfg(test)]
+    pub(crate) fn usage_data(&self) -> &UsageEventData {
+        &self.data
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LocalExecutionRuntimeMissContext {
     pub(crate) auth_user_id: Option<String>,
@@ -248,20 +256,33 @@ pub(crate) async fn build_local_execution_exhaustion(
 ) -> LocalExecutionExhaustion {
     let mut exhaustion = build_fast_local_execution_exhaustion(plan, report_context);
     let mut data = build_usage_event_data_seed(plan, report_context);
-    let last_failed_candidate = match state
+    let candidates = match state
         .read_request_candidates_by_request_id(plan.request_id.as_str())
         .await
     {
-        Ok(candidates) => select_last_failed_request_candidate(&candidates).cloned(),
+        Ok(candidates) => candidates,
         Err(err) => {
             warn!(
                 request_id = %plan.request_id,
                 error = ?err,
                 "gateway failed to load request candidates for exhausted local execution"
             );
-            None
+            Vec::new()
         }
     };
+    let last_failed_candidate = select_last_failed_request_candidate(&candidates).cloned();
+
+    // The candidate loop hands over the last plan it looked at. When that plan was
+    // rejected before dispatch (quota reservation refused, concurrency limit, ...)
+    // its row is `skipped`, and the request must be attributed to the provider
+    // that actually answered last instead of the one that was never called.
+    if let Some(candidate) = last_failed_candidate.as_ref().filter(|candidate| {
+        exhaustion_seed_candidate_was_skipped(&candidates, plan.candidate_id.as_deref())
+            && plan.candidate_id.as_deref() != Some(candidate.id.as_str())
+    }) {
+        let attribution = load_exhaustion_candidate_attribution(state, candidate).await;
+        apply_exhaustion_candidate_attribution(&mut data, candidate, &attribution);
+    }
 
     if let Some(candidate) = last_failed_candidate.as_ref() {
         data.user_id = data.user_id.or_else(|| candidate.user_id.clone());
@@ -294,6 +315,139 @@ pub(crate) async fn build_local_execution_exhaustion(
             .and_then(|candidate| candidate.error_type.clone()),
     );
     exhaustion
+}
+
+/// Whether the plan the candidate loop ended on was never dispatched upstream.
+///
+/// A missing row is treated as dispatched: the failed terminal write may still be
+/// in flight, and attributing the request to an older candidate would be wrong.
+fn exhaustion_seed_candidate_was_skipped(
+    candidates: &[StoredRequestCandidate],
+    seed_candidate_id: Option<&str>,
+) -> bool {
+    let Some(seed_candidate_id) = seed_candidate_id.map(str::trim).filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    candidates
+        .iter()
+        .find(|candidate| candidate.id == seed_candidate_id)
+        .is_some_and(|candidate| !request_candidate_represents_provider_execution(candidate))
+}
+
+#[derive(Debug, Default)]
+struct ExhaustionCandidateAttribution {
+    provider_name: Option<String>,
+    key_name: Option<String>,
+    provider_api_format: Option<String>,
+}
+
+async fn load_exhaustion_candidate_attribution(
+    state: &AppState,
+    candidate: &StoredRequestCandidate,
+) -> ExhaustionCandidateAttribution {
+    let mut attribution = ExhaustionCandidateAttribution {
+        provider_name: candidate_extra_data_string(candidate, "provider_name"),
+        key_name: candidate_extra_data_string(candidate, "key_name"),
+        provider_api_format: candidate_extra_data_string(candidate, "provider_api_format")
+            .or_else(|| candidate_extra_data_string(candidate, "provider_contract")),
+    };
+    if !state.has_provider_catalog_data_reader() {
+        return attribution;
+    }
+    if attribution.provider_name.is_none() {
+        if let Some(provider_id) = candidate.provider_id.as_deref() {
+            match state
+                .read_provider_catalog_providers_by_ids(std::slice::from_ref(
+                    &provider_id.to_string(),
+                ))
+                .await
+            {
+                Ok(providers) => {
+                    attribution.provider_name = providers.into_iter().next().map(|p| p.name);
+                }
+                Err(err) => warn!(
+                    request_id = %candidate.request_id,
+                    error = ?err,
+                    "gateway failed to load provider name for exhausted local execution"
+                ),
+            }
+        }
+    }
+    if attribution.key_name.is_none() {
+        if let Some(key_id) = candidate.key_id.as_deref() {
+            match state
+                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id.to_string()))
+                .await
+            {
+                Ok(keys) => {
+                    attribution.key_name = keys.into_iter().next().map(|key| key.name);
+                }
+                Err(err) => warn!(
+                    request_id = %candidate.request_id,
+                    error = ?err,
+                    "gateway failed to load key name for exhausted local execution"
+                ),
+            }
+        }
+    }
+    if attribution.provider_api_format.is_none() {
+        if let Some(endpoint_id) = candidate.endpoint_id.as_deref() {
+            match state
+                .read_provider_catalog_endpoints_by_ids(std::slice::from_ref(
+                    &endpoint_id.to_string(),
+                ))
+                .await
+            {
+                Ok(endpoints) => {
+                    attribution.provider_api_format = endpoints
+                        .into_iter()
+                        .next()
+                        .map(|endpoint| endpoint.api_format);
+                }
+                Err(err) => warn!(
+                    request_id = %candidate.request_id,
+                    error = ?err,
+                    "gateway failed to load endpoint for exhausted local execution"
+                ),
+            }
+        }
+    }
+    attribution
+}
+
+/// Re-points the request usage seed at the candidate that really produced the
+/// last upstream failure. Only provider identity and its derived fields change;
+/// request-level facts (client format, bodies, auth context) stay as seeded.
+fn apply_exhaustion_candidate_attribution(
+    data: &mut UsageEventData,
+    candidate: &StoredRequestCandidate,
+    attribution: &ExhaustionCandidateAttribution,
+) {
+    data.provider_id = candidate.provider_id.clone().or(data.provider_id.take());
+    data.provider_endpoint_id = candidate
+        .endpoint_id
+        .clone()
+        .or(data.provider_endpoint_id.take());
+    data.provider_api_key_id = candidate.key_id.clone().or(data.provider_api_key_id.take());
+    data.candidate_id = Some(candidate.id.clone());
+    data.candidate_index = Some(u64::from(candidate.candidate_index));
+    if let Some(provider_name) = attribution.provider_name.as_deref() {
+        data.provider_name = provider_name.to_string();
+    } else if let Some(provider_id) = candidate.provider_id.as_deref() {
+        data.provider_name = provider_id.to_string();
+    }
+    data.key_name = attribution.key_name.clone();
+    if let Some(provider_api_format) = attribution.provider_api_format.as_deref() {
+        data.endpoint_api_format = Some(provider_api_format.to_string());
+        data.provider_api_family = infer_api_family(provider_api_format).map(ToOwned::to_owned);
+        data.provider_endpoint_kind =
+            infer_endpoint_kind(provider_api_format).map(ToOwned::to_owned);
+        data.has_format_conversion = data
+            .api_format
+            .as_deref()
+            .map(|client| !client.eq_ignore_ascii_case(provider_api_format));
+    }
 }
 
 pub(crate) fn build_fast_local_execution_exhaustion(
@@ -1423,16 +1577,25 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         apply_runtime_miss_usage_routing, beautify_local_execution_client_error_message,
-        insert_runtime_miss_candidate_usage_metadata,
+        build_local_execution_exhaustion, insert_runtime_miss_candidate_usage_metadata,
         request_candidate_represents_provider_execution, runtime_miss_client_error_body,
         runtime_miss_original_headers_json, select_last_runtime_miss_executed_candidate,
         select_last_runtime_miss_routing_candidate, LocalExecutionRuntimeMissContext,
         RuntimeMissCandidateContext,
     };
+    use std::sync::Arc;
+
     use crate::constants::EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS;
     use crate::state::LocalExecutionRuntimeMissDiagnostic;
+    use crate::AppState;
+    use aether_contracts::{ExecutionPlan, RequestBody};
+    use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
+    };
+    use aether_data_contracts::repository::provider_catalog::{
+        StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
     use aether_usage_runtime::UsageEventData;
     use serde_json::{json, Map, Value};
@@ -1676,5 +1839,193 @@ mod tests {
         assert!(!detail.contains("字段路径"));
         assert!(!detail.contains("OpenAI Responses"));
         assert!(detail.contains("provider_request_body_build_failed"));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exhaustion_candidate(
+        id: &str,
+        candidate_index: i32,
+        provider_id: &str,
+        endpoint_id: &str,
+        key_id: &str,
+        status: RequestCandidateStatus,
+        skip_reason: Option<&str>,
+        started_at_unix_ms: Option<i64>,
+    ) -> StoredRequestCandidate {
+        StoredRequestCandidate::new(
+            id.to_string(),
+            "req-exhaustion".to_string(),
+            Some("user-1".to_string()),
+            Some("api-key-1".to_string()),
+            None,
+            None,
+            candidate_index,
+            0,
+            Some(provider_id.to_string()),
+            Some(endpoint_id.to_string()),
+            Some(key_id.to_string()),
+            status,
+            skip_reason.map(str::to_string),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_700_000_000_000 + i64::from(candidate_index) * 1_000,
+            started_at_unix_ms,
+            started_at_unix_ms.map(|value| value + 500),
+        )
+        .expect("candidate should build")
+    }
+
+    fn exhaustion_plan(provider_id: &str, candidate_id: &str) -> ExecutionPlan {
+        ExecutionPlan {
+            request_id: "req-exhaustion".to_string(),
+            candidate_id: Some(candidate_id.to_string()),
+            provider_name: Some(format!("{provider_id} name")),
+            provider_id: provider_id.to_string(),
+            endpoint_id: format!("endpoint-{provider_id}"),
+            key_id: format!("key-{provider_id}"),
+            method: "POST".to_string(),
+            url: "https://example.test/v1/responses".to_string(),
+            headers: Default::default(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model": "gpt-6-astra"})),
+            stream: true,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-6-astra".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        }
+    }
+
+    fn exhaustion_state(candidates: Vec<StoredRequestCandidate>) -> AppState {
+        let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(candidates));
+        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![
+                StoredProviderCatalogProvider::new(
+                    "provider-a".to_string(),
+                    "Anyrouter".to_string(),
+                    None,
+                    "custom".to_string(),
+                )
+                .expect("provider should build"),
+                StoredProviderCatalogProvider::new(
+                    "provider-b".to_string(),
+                    "CPA Plus".to_string(),
+                    None,
+                    "custom".to_string(),
+                )
+                .expect("provider should build"),
+            ],
+            vec![StoredProviderCatalogEndpoint::new(
+                "endpoint-provider-a".to_string(),
+                "provider-a".to_string(),
+                "openai:responses".to_string(),
+                Some("openai".to_string()),
+                Some("responses".to_string()),
+                true,
+            )
+            .expect("endpoint should build")],
+            vec![StoredProviderCatalogKey::new(
+                "key-provider-a".to_string(),
+                "provider-a".to_string(),
+                "SJTU邮箱".to_string(),
+                "api_key".to_string(),
+                None,
+                true,
+            )
+            .expect("key should build")],
+        ));
+        AppState::new()
+            .expect("state should build")
+            .with_decision_trace_data_readers_for_tests(request_candidates, provider_catalog)
+    }
+
+    #[tokio::test]
+    async fn exhaustion_is_attributed_to_the_last_executed_candidate_not_a_skipped_one() {
+        // provider-a really answered (and failed); provider-b was refused before dispatch
+        // because its quota window could not be reserved.
+        let state = exhaustion_state(vec![
+            exhaustion_candidate(
+                "cand-failed",
+                1,
+                "provider-a",
+                "endpoint-provider-a",
+                "key-provider-a",
+                RequestCandidateStatus::Failed,
+                None,
+                Some(1_700_000_001_000),
+            ),
+            exhaustion_candidate(
+                "cand-skipped",
+                2,
+                "provider-b",
+                "endpoint-provider-b",
+                "key-provider-b",
+                RequestCandidateStatus::Skipped,
+                Some("provider_quota_blocked"),
+                None,
+            ),
+        ]);
+        let plan = exhaustion_plan("provider-b", "cand-skipped");
+
+        let exhaustion = build_local_execution_exhaustion(&state, &plan, None).await;
+
+        assert_eq!(exhaustion.data.provider_id.as_deref(), Some("provider-a"));
+        assert_eq!(exhaustion.data.provider_name, "Anyrouter");
+        assert_eq!(
+            exhaustion.data.provider_endpoint_id.as_deref(),
+            Some("endpoint-provider-a")
+        );
+        assert_eq!(
+            exhaustion.data.provider_api_key_id.as_deref(),
+            Some("key-provider-a")
+        );
+        assert_eq!(exhaustion.data.key_name.as_deref(), Some("SJTU邮箱"));
+        assert_eq!(exhaustion.data.candidate_id.as_deref(), Some("cand-failed"));
+        assert_eq!(exhaustion.data.candidate_index, Some(1));
+        assert_eq!(exhaustion.candidate_id.as_deref(), Some("cand-failed"));
+        assert_eq!(exhaustion.candidate_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn exhaustion_keeps_the_plan_attribution_when_the_plan_candidate_really_failed() {
+        let state = exhaustion_state(vec![
+            exhaustion_candidate(
+                "cand-first",
+                0,
+                "provider-a",
+                "endpoint-provider-a",
+                "key-provider-a",
+                RequestCandidateStatus::Failed,
+                None,
+                Some(1_700_000_000_000),
+            ),
+            exhaustion_candidate(
+                "cand-last",
+                1,
+                "provider-b",
+                "endpoint-provider-b",
+                "key-provider-b",
+                RequestCandidateStatus::Failed,
+                None,
+                Some(1_700_000_001_000),
+            ),
+        ]);
+        let plan = exhaustion_plan("provider-b", "cand-last");
+
+        let exhaustion = build_local_execution_exhaustion(&state, &plan, None).await;
+
+        assert_eq!(exhaustion.data.provider_id.as_deref(), Some("provider-b"));
+        assert_eq!(exhaustion.data.provider_name, "provider-b name");
+        assert_eq!(exhaustion.data.candidate_id.as_deref(), Some("cand-last"));
+        assert_eq!(exhaustion.candidate_id.as_deref(), Some("cand-last"));
     }
 }

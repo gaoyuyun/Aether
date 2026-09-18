@@ -10,8 +10,8 @@ pub use types::{
     DecisionTrace, DecisionTraceCandidate, ProviderQuotaDispatchSnapshot, PublicHealthStatusCount,
     PublicHealthTimelineBucket, RequestCandidateFinalStatus, RequestCandidateReadRepository,
     RequestCandidateRepository, RequestCandidateStatus, RequestCandidateTrace,
-    RequestCandidateWriteRepository, StoredRequestCandidate, UpsertRequestCandidateRecord,
-    PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY, PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION,
-    REQUEST_CANDIDATE_ERROR_TYPES, REQUEST_CANDIDATE_ERROR_TYPE_ALIASES,
-    REQUEST_CANDIDATE_SKIP_REASONS,
+    RequestCandidateTraceScope, RequestCandidateWriteRepository, StoredRequestCandidate,
+    UpsertRequestCandidateRecord, PROVIDER_QUOTA_DISPATCH_SNAPSHOT_KEY,
+    PROVIDER_QUOTA_DISPATCH_SNAPSHOT_SCHEMA_VERSION, REQUEST_CANDIDATE_ERROR_TYPES,
+    REQUEST_CANDIDATE_ERROR_TYPE_ALIASES, REQUEST_CANDIDATE_SKIP_REASONS,
 };

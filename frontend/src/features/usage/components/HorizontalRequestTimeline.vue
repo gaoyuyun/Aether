@@ -1389,9 +1389,22 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   pool_key_lease_busy: '池内账号正被其他请求占用',
   provider_concurrency_limit_reached: '上游提供商并发已达上限',
   provider_key_concurrency_limit_reached: '上游账号并发已达上限',
+  provider_quota_blocked: '上游订阅额度不足或额度预留失败',
   provider_request_body_build_failed: '上游请求体转换失败',
   provider_request_body_missing: '无法构建上游请求体',
   transport_operation_unsupported: '端点不支持该 API 操作',
+}
+// 配额预留被拒绝时，候选的 error_message 记录了具体的拒绝原因代码
+const PROVIDER_QUOTA_BLOCK_DETAIL_LABELS: Record<string, string> = {
+  window_reservation_insufficient: '滚动窗口剩余额度不足以预留本次请求',
+  cycle_reservation_insufficient: '周期剩余额度不足以预留本次请求',
+  subscription_unavailable: '订阅未生效、已过期或提供商已停用',
+  quota_reset_due: '额度周期待重置',
+  quota_accounting_unavailable: '额度账务尚未就绪',
+  quota_window_unavailable: '滚动窗口计数器尚未就绪',
+  quota_windows_invalid: '滚动窗口配置无效',
+  quota_dispatch_context_unavailable: '缺少额度计费上下文',
+  provider_missing: '提供商不存在',
 }
 const currentAttemptSkipReasonDisplay = computed(() => {
   const attempt = currentAttempt.value
@@ -1399,6 +1412,12 @@ const currentAttemptSkipReasonDisplay = computed(() => {
 
   const skipReasonLabel = SKIP_REASON_LABELS[attempt.skip_reason]
   if (skipReasonLabel) {
+    if (attempt.skip_reason === 'provider_quota_blocked') {
+      const detailCode = typeof attempt.error_message === 'string' ? attempt.error_message.trim() : ''
+      const detailLabel = detailCode ? PROVIDER_QUOTA_BLOCK_DETAIL_LABELS[detailCode] : ''
+      if (detailLabel) return `${skipReasonLabel}：${detailLabel}（${detailCode}）`
+      if (detailCode) return `${skipReasonLabel}：${detailCode}`
+    }
     return skipReasonLabel
   }
 

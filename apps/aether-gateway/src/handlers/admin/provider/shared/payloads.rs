@@ -225,6 +225,8 @@ pub(crate) struct AdminProviderCreateRequest {
     #[serde(default)]
     pub(crate) quota_windows: Option<Vec<AdminProviderQuotaWindowRequest>>,
     #[serde(default)]
+    pub(crate) quota_reservation: Option<serde_json::Value>,
+    #[serde(default)]
     pub(crate) provider_priority: Option<i32>,
     #[serde(default)]
     pub(crate) keep_priority_on_conversion: Option<bool>,
@@ -291,6 +293,8 @@ pub(crate) struct AdminProviderUpdateRequest {
     pub(crate) quota_expires_at: Option<String>,
     #[serde(default)]
     pub(crate) quota_windows: Option<Vec<AdminProviderQuotaWindowRequest>>,
+    #[serde(default)]
+    pub(crate) quota_reservation: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) provider_priority: Option<i32>,
     #[serde(default)]

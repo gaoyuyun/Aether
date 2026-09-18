@@ -61,7 +61,11 @@ where
         + diagnostic.skip_reason_count(LEGACY_API_KEY_CONCURRENCY_LIMIT_SKIP_REASON)
 }
 
+pub const EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON: &str =
+    "execution_runtime_candidates_exhausted";
+
 pub trait AiRuntimeMissDiagnosticFields {
+    fn reason(&self) -> &str;
     fn set_reason(&mut self, reason: String);
     fn set_candidate_count(&mut self, candidate_count: usize);
     fn candidate_count(&self) -> Option<usize>;
@@ -82,6 +86,24 @@ pub trait AiRuntimeMissDiagnosticFields {
     }
 }
 
+/// An upstream attempt was made and failed. Later execution paths of the same
+/// request re-evaluate candidates and may find no plan at all; that must not
+/// relabel the request as "no plans" or "all skipped".
+pub fn runtime_miss_diagnostic_is_execution_exhausted<Diagnostic>(diagnostic: &Diagnostic) -> bool
+where
+    Diagnostic: AiRuntimeMissDiagnosticFields,
+{
+    diagnostic.reason() == EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON
+}
+
+pub fn apply_ai_runtime_execution_exhausted_reason_to_diagnostic<Diagnostic>(
+    diagnostic: &mut Diagnostic,
+) where
+    Diagnostic: AiRuntimeMissDiagnosticFields,
+{
+    diagnostic.set_reason(EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON.to_string());
+}
+
 pub fn apply_ai_runtime_candidate_evaluation_progress_to_diagnostic<Diagnostic>(
     diagnostic: &mut Diagnostic,
     candidate_count: usize,
@@ -89,6 +111,9 @@ pub fn apply_ai_runtime_candidate_evaluation_progress_to_diagnostic<Diagnostic>(
     Diagnostic: AiRuntimeMissDiagnosticFields,
 {
     diagnostic.set_candidate_count(candidate_count);
+    if runtime_miss_diagnostic_is_execution_exhausted(diagnostic) {
+        return;
+    }
     diagnostic.set_reason(if candidate_count == 0 {
         "candidate_list_empty".to_string()
     } else {
@@ -102,6 +127,9 @@ pub fn apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic<Diagnostic>
 ) where
     Diagnostic: AiRuntimeMissDiagnosticFields,
 {
+    if runtime_miss_diagnostic_is_execution_exhausted(diagnostic) {
+        return;
+    }
     let candidate_count = diagnostic.candidate_count().unwrap_or(0);
     let skipped_candidate_count = diagnostic.skipped_candidate_count().unwrap_or(0);
     diagnostic.set_reason(if candidate_count == 0 {
@@ -276,6 +304,18 @@ pub fn apply_ai_runtime_candidate_terminal_reason<Port>(
     });
 }
 
+/// Marks the request diagnostic as "candidates were tried and all failed" while
+/// keeping the candidate count and skip reasons collected during planning.
+pub fn apply_ai_runtime_execution_exhausted_reason<Port>(port: &Port, trace_id: &str)
+where
+    Port: AiRuntimeMissDiagnosticPort,
+    Port::Diagnostic: AiRuntimeMissDiagnosticFields,
+{
+    port.mutate_runtime_miss_diagnostic(trace_id, |diagnostic| {
+        apply_ai_runtime_execution_exhausted_reason_to_diagnostic(diagnostic);
+    });
+}
+
 pub fn record_ai_runtime_candidate_skip_reason<Port>(
     port: &Port,
     trace_id: &str,
@@ -416,6 +456,10 @@ mod tests {
     }
 
     impl AiRuntimeMissDiagnosticFields for TestDiagnostic {
+        fn reason(&self) -> &str {
+            self.reason.as_str()
+        }
+
         fn set_reason(&mut self, reason: String) {
             self.reason = reason;
         }
@@ -592,5 +636,54 @@ mod tests {
             "no_local_sync_plans",
         );
         assert_eq!(diagnostic.reason, "all_candidates_skipped");
+    }
+
+    #[test]
+    fn execution_exhausted_reason_survives_later_planning_paths() {
+        let mut diagnostic = TestDiagnostic::default();
+        apply_ai_runtime_candidate_evaluation_progress_to_diagnostic(&mut diagnostic, 3);
+        record_ai_runtime_candidate_skip_reason_on_diagnostic(
+            &mut diagnostic,
+            "provider_quota_blocked",
+        );
+
+        // The first path dispatched candidates and every upstream attempt failed.
+        apply_ai_runtime_execution_exhausted_reason_to_diagnostic(&mut diagnostic);
+        assert_eq!(
+            diagnostic.reason,
+            EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON
+        );
+
+        // A later path re-evaluates the same request, finds nothing to plan and
+        // reports planner-level reasons; the request still failed upstream.
+        apply_ai_runtime_candidate_evaluation_progress_to_diagnostic(&mut diagnostic, 0);
+        apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic(
+            &mut diagnostic,
+            "no_local_stream_plans",
+        );
+
+        assert_eq!(
+            diagnostic.reason,
+            EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON
+        );
+        assert_eq!(diagnostic.candidate_count, Some(0));
+        assert_eq!(
+            diagnostic.skip_reasons.get("provider_quota_blocked"),
+            Some(&1)
+        );
+
+        // The port-level helper mutates the stored diagnostic in place.
+        let port = TestPort::default();
+        apply_ai_runtime_candidate_evaluation_progress(&port, "trace-a", 2);
+        apply_ai_runtime_execution_exhausted_reason(&port, "trace-a");
+        let stored = port
+            .diagnostics
+            .lock()
+            .unwrap()
+            .get("trace-a")
+            .cloned()
+            .expect("diagnostic should exist");
+        assert_eq!(stored.reason, EXECUTION_RUNTIME_CANDIDATES_EXHAUSTED_REASON);
+        assert_eq!(stored.candidate_count, Some(2));
     }
 }

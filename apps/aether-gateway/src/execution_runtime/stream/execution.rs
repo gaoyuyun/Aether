@@ -3746,6 +3746,7 @@ pub(crate) fn execute_execution_runtime_stream<'a>(
             report_context,
             None,
             None,
+            None,
             &mut cancellation_guard,
         )
         .await;
@@ -3775,6 +3776,7 @@ pub(crate) fn execute_execution_runtime_stream_with_retry_scope<'a>(
     Box::pin(async move {
         let mut retry_scope = AiAttemptRetryScope::Candidate;
         let mut fallback_response = None;
+        let mut attempt_skipped = false;
         let mut cancellation_guard = AttemptCancellationGuard::disarmed(
             state,
             STREAM_ATTEMPT_CANCELLED_ERROR_TYPE,
@@ -3790,6 +3792,7 @@ pub(crate) fn execute_execution_runtime_stream_with_retry_scope<'a>(
             report_context,
             Some(&mut retry_scope),
             Some(&mut fallback_response),
+            Some(&mut attempt_skipped),
             &mut cancellation_guard,
         )
         .await;
@@ -3799,6 +3802,7 @@ pub(crate) fn execute_execution_runtime_stream_with_retry_scope<'a>(
         let response = result?;
         Ok(match response {
             Some(response) => AiAttemptExecutionOutcome::Responded(response),
+            None if attempt_skipped => AiAttemptExecutionOutcome::skipped(retry_scope),
             None => AiAttemptExecutionOutcome::Retry {
                 scope: retry_scope,
                 fallback_response,
@@ -3853,6 +3857,7 @@ async fn execute_execution_runtime_stream_inner(
     mut report_context: Option<serde_json::Value>,
     mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
     mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
+    mut attempt_skipped_out: Option<&mut bool>,
     cancellation_guard: &mut AttemptCancellationGuard,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let stream_started_at = Instant::now();
@@ -3885,6 +3890,9 @@ async fn execute_execution_runtime_stream_inner(
                 );
                 if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
                     *retry_scope = AiAttemptRetryScope::Candidate;
+                }
+                if let Some(skipped) = attempt_skipped_out.as_mut() {
+                    **skipped = true;
                 }
                 if let Some(snapshot) = request_candidate_status_snapshot.as_ref() {
                     record_local_request_candidate_status_snapshot(
@@ -3950,6 +3958,9 @@ async fn execute_execution_runtime_stream_inner(
                 );
                 if let Some(scope) = retry_scope_out.as_deref_mut() {
                     *scope = AiAttemptRetryScope::Provider;
+                }
+                if let Some(skipped) = attempt_skipped_out.as_mut() {
+                    **skipped = true;
                 }
                 record_local_request_candidate_status_snapshot(
                     state,

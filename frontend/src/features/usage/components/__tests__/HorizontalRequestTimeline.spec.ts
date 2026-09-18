@@ -1006,6 +1006,54 @@ describe('HorizontalRequestTimeline', () => {
     expect(root.querySelector('.diagnostic-json-panel')).toBeNull()
   })
 
+  it('explains a quota-refused provider next to the attempted ones', async () => {
+    const trace = buildTrace([
+      buildCandidate({
+        id: 'cand-anyrouter',
+        provider_id: 'provider-anyrouter',
+        provider_name: 'Anyrouter',
+        key_id: 'key-anyrouter',
+        candidate_index: 1,
+        status: 'failed',
+        status_code: 500,
+      }),
+      buildCandidate({
+        id: 'cand-cpa',
+        provider_id: 'provider-cpa',
+        provider_name: 'CPA Plus',
+        key_id: 'key-cpa',
+        candidate_index: 2,
+        status: 'skipped',
+        skip_reason: 'provider_quota_blocked',
+        error_type: 'provider_quota_blocked',
+        error_message: 'window_reservation_insufficient',
+        status_code: undefined,
+        started_at: undefined,
+        finished_at: '2026-05-06T12:00:03.000Z',
+      }),
+    ])
+    trace.final_status = 'failed'
+
+    const root = mountTimeline(trace, { requestStatus: 'failed', overrideStatusCode: 503 })
+    await nextTick()
+
+    const labels = [...root.querySelectorAll<HTMLElement>('.node-label')]
+      .map(label => label.textContent?.trim())
+    expect(labels).toEqual(['Anyrouter', 'CPA Plus'])
+    const nodeDots = [...root.querySelectorAll<HTMLElement>('.node-dot')]
+    expect(nodeDots[0].classList.contains('status-failed')).toBe(true)
+    expect(nodeDots[1].classList.contains('status-skipped')).toBe(true)
+
+    // The failed provider is selected by default; open the refused one.
+    nodeDots[1].click()
+    await nextTick()
+
+    const reason = root.querySelector<HTMLElement>('.skip-reason .reason-value')
+    expect(reason?.textContent).toBe(
+      '上游订阅额度不足或额度预留失败：滚动窗口剩余额度不足以预留本次请求（window_reservation_insufficient）',
+    )
+  })
+
   it('labels operation-level skips and shows the endpoint setting to change', async () => {
     const trace = buildTrace([
       buildCandidate({

@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use aether_data_contracts::repository::candidates::build_decision_trace;
+use aether_data_contracts::repository::candidates::{
+    build_decision_trace, RequestCandidateTraceScope,
+};
 use aether_data_contracts::DataLayerError;
 
 use super::state::GatewayDataState;
@@ -14,8 +16,21 @@ pub(crate) async fn read_decision_trace(
     request_id: &str,
     attempted_only: bool,
 ) -> Result<Option<DecisionTrace>, DataLayerError> {
+    read_decision_trace_in_scope(
+        state,
+        request_id,
+        RequestCandidateTraceScope::from_attempted_only(attempted_only),
+    )
+    .await
+}
+
+pub(crate) async fn read_decision_trace_in_scope(
+    state: &GatewayDataState,
+    request_id: &str,
+    scope: RequestCandidateTraceScope,
+) -> Result<Option<DecisionTrace>, DataLayerError> {
     let Some(trace) = state
-        .read_request_candidate_trace(request_id, attempted_only)
+        .read_request_candidate_trace_in_scope(request_id, scope)
         .await?
     else {
         return Ok(None);

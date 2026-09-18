@@ -16,6 +16,7 @@ pub(crate) const PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY: &str = "max_transfer_co
 pub(crate) const PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY: &str =
     "max_transfer_timeout_seconds";
 pub(crate) const PROVIDER_QUOTA_WINDOWS_CONFIG_KEY: &str = "quota_windows";
+pub(crate) const PROVIDER_QUOTA_RESERVATION_CONFIG_KEY: &str = "quota_reservation";
 const PROVIDER_QUOTA_WINDOW_MIN_DURATION_SECS: u64 = 60;
 const PROVIDER_QUOTA_WINDOW_MAX_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 const PROVIDER_QUOTA_WINDOW_MAX_COUNT: usize = 8;
@@ -80,6 +81,108 @@ pub(crate) fn normalize_provider_quota_windows(value: Option<&Value>) -> Result<
         }));
     }
     Ok(Value::Array(normalized))
+}
+
+fn quota_reservation_number(object: &serde_json::Map<String, Value>, key: &str) -> Option<Value> {
+    object.get(key).filter(|value| !value.is_null()).cloned()
+}
+
+fn quota_reservation_f64(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<f64>, String> {
+    let Some(value) = quota_reservation_number(object, key) else {
+        return Ok(None);
+    };
+    value
+        .as_f64()
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+        })
+        .filter(|value| value.is_finite())
+        .map(Some)
+        .ok_or_else(|| format!("quota_reservation.{key} 必须是数字"))
+}
+
+fn quota_reservation_u64(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    let Some(value) = quota_reservation_number(object, key) else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        })
+        .map(Some)
+        .ok_or_else(|| format!("quota_reservation.{key} 必须是非负整数"))
+}
+
+/// Validates the optional monthly-quota reservation policy. Fields left out keep
+/// the billing crate defaults; an empty object means "use the defaults" and is
+/// removed from the stored config.
+pub(crate) fn normalize_provider_quota_reservation(
+    value: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object() else {
+        return Err("quota_reservation 必须是对象".to_string());
+    };
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "minimum_usd"
+                | "fallback_usd"
+                | "output_tokens"
+                | "safety_multiplier"
+                | "cached_input_ratio"
+        ) {
+            return Err(format!("quota_reservation 不支持字段 {key}"));
+        }
+    }
+    let mut normalized = serde_json::Map::new();
+    if let Some(minimum_usd) = quota_reservation_f64(object, "minimum_usd")? {
+        if minimum_usd < 0.0 {
+            return Err("quota_reservation.minimum_usd 必须是非负数".to_string());
+        }
+        normalized.insert("minimum_usd".to_string(), json!(minimum_usd));
+    }
+    if let Some(fallback_usd) = quota_reservation_f64(object, "fallback_usd")? {
+        if fallback_usd <= 0.0 {
+            return Err("quota_reservation.fallback_usd 必须大于 0".to_string());
+        }
+        normalized.insert("fallback_usd".to_string(), json!(fallback_usd));
+    }
+    if let Some(output_tokens) = quota_reservation_u64(object, "output_tokens")? {
+        if !(1..=1_000_000).contains(&output_tokens) {
+            return Err("quota_reservation.output_tokens 必须在 1 到 1000000 之间".to_string());
+        }
+        normalized.insert("output_tokens".to_string(), json!(output_tokens));
+    }
+    if let Some(safety_multiplier) = quota_reservation_f64(object, "safety_multiplier")? {
+        if !(1.0..=10.0).contains(&safety_multiplier) {
+            return Err("quota_reservation.safety_multiplier 必须在 1 到 10 之间".to_string());
+        }
+        normalized.insert("safety_multiplier".to_string(), json!(safety_multiplier));
+    }
+    if let Some(cached_input_ratio) = quota_reservation_f64(object, "cached_input_ratio")? {
+        if !(0.0..=1.0).contains(&cached_input_ratio) {
+            return Err("quota_reservation.cached_input_ratio 必须在 0 到 1 之间".to_string());
+        }
+        normalized.insert("cached_input_ratio".to_string(), json!(cached_input_ratio));
+    }
+    Ok((!normalized.is_empty()).then_some(Value::Object(normalized)))
 }
 
 pub(crate) fn normalize_provider_transfer_limit(
@@ -218,7 +321,7 @@ pub(crate) fn parse_optional_rfc3339_unix_secs(
 mod tests {
     use serde_json::json;
 
-    use super::normalize_provider_quota_windows;
+    use super::{normalize_provider_quota_reservation, normalize_provider_quota_windows};
 
     #[test]
     fn quota_window_validation_rejects_unsafe_values() {
@@ -230,6 +333,48 @@ mod tests {
             {"duration_secs": 86_400, "limit_usd": -1.0}
         ])))
         .is_err());
+    }
+
+    #[test]
+    fn quota_reservation_policy_is_validated_and_defaults_are_dropped() {
+        assert_eq!(normalize_provider_quota_reservation(None).unwrap(), None);
+        assert_eq!(
+            normalize_provider_quota_reservation(Some(&json!(null))).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_provider_quota_reservation(Some(&json!({}))).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_provider_quota_reservation(Some(&json!({
+                "cached_input_ratio": "0.9",
+                "safety_multiplier": 1.1,
+                "output_tokens": 2048,
+                "minimum_usd": null
+            })))
+            .unwrap(),
+            Some(json!({
+                "cached_input_ratio": 0.9,
+                "safety_multiplier": 1.1,
+                "output_tokens": 2048
+            }))
+        );
+        for invalid in [
+            json!({"cached_input_ratio": 1.5}),
+            json!({"cached_input_ratio": -0.1}),
+            json!({"safety_multiplier": 0.5}),
+            json!({"output_tokens": 0}),
+            json!({"fallback_usd": 0}),
+            json!({"minimum_usd": -1}),
+            json!({"unknown": 1}),
+            json!([1]),
+        ] {
+            assert!(
+                normalize_provider_quota_reservation(Some(&invalid)).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
     }
 
     #[test]

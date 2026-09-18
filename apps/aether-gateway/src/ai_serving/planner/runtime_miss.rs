@@ -3,7 +3,8 @@ use aether_ai_serving::{
     apply_ai_runtime_candidate_evaluation_progress_preserving_candidate_signal,
     apply_ai_runtime_candidate_evaluation_progress_to_diagnostic,
     apply_ai_runtime_candidate_terminal_plan_reason_to_diagnostic,
-    apply_ai_runtime_candidate_terminal_reason, build_ai_runtime_candidate_evaluation_diagnostic,
+    apply_ai_runtime_candidate_terminal_reason, apply_ai_runtime_execution_exhausted_reason,
+    build_ai_runtime_candidate_evaluation_diagnostic,
     build_ai_runtime_execution_exhausted_diagnostic, record_ai_runtime_candidate_skip_reason,
     record_ai_runtime_candidate_skip_reason_on_diagnostic,
     record_ai_runtime_candidate_skip_reason_once,
@@ -21,6 +22,10 @@ struct GatewayRuntimeMissDiagnosticPort<'a> {
 }
 
 impl AiRuntimeMissDiagnosticFields for LocalExecutionRuntimeMissDiagnostic {
+    fn reason(&self) -> &str {
+        self.reason.as_str()
+    }
+
     fn set_reason(&mut self, reason: String) {
         self.reason = reason;
     }
@@ -294,6 +299,14 @@ pub(crate) fn record_local_runtime_candidate_skip_reason(
     record_ai_runtime_candidate_skip_reason(&port, trace_id, skip_reason);
 }
 
+/// Every dispatched candidate of this request failed upstream. The reason sticks
+/// even when a later execution path of the same request finds no plan, so the
+/// request is reported as "all candidates failed" rather than "no local plans".
+pub(crate) fn apply_local_runtime_execution_exhausted_reason(state: &AppState, trace_id: &str) {
+    let port = GatewayRuntimeMissDiagnosticPort { state: Some(state) };
+    apply_ai_runtime_execution_exhausted_reason(&port, trace_id);
+}
+
 /// Identity of a planner candidate inside one request. Execution paths that
 /// re-evaluate the same key produce the same key, so the runtime miss summary
 /// counts the candidate once.
@@ -362,6 +375,42 @@ mod tests {
         assert_eq!(
             diagnostic.skip_reasons_summary().as_deref(),
             Some("transport_operation_unsupported=1")
+        );
+    }
+
+    #[test]
+    fn exhausted_reason_is_not_downgraded_by_a_later_no_plan_path() {
+        let state = AppState::new().expect("state should build");
+        let trace_id = "trace-runtime-miss-exhausted";
+        state.set_local_execution_runtime_miss_diagnostic(
+            trace_id,
+            LocalExecutionRuntimeMissDiagnostic {
+                reason: "candidate_evaluation_incomplete".to_string(),
+                candidate_count: Some(4),
+                ..LocalExecutionRuntimeMissDiagnostic::default()
+            },
+        );
+        let key = local_runtime_candidate_skip_key("provider-quota", "endpoint-1", "key-1");
+        record_local_runtime_candidate_skip_reason_once(
+            &state,
+            trace_id,
+            &key,
+            "provider_quota_blocked",
+        );
+
+        super::apply_local_runtime_execution_exhausted_reason(&state, trace_id);
+        // The same-format path re-plans the request afterwards and finds nothing.
+        apply_local_runtime_candidate_terminal_reason(&state, trace_id, "no_local_stream_plans");
+
+        let diagnostic = state
+            .take_local_execution_runtime_miss_diagnostic(trace_id)
+            .expect("diagnostic should exist");
+        assert_eq!(diagnostic.reason, "execution_runtime_candidates_exhausted");
+        assert_eq!(diagnostic.candidate_count, Some(4));
+        assert_eq!(diagnostic.skipped_candidate_count, Some(1));
+        assert_eq!(
+            diagnostic.skip_reasons.get("provider_quota_blocked"),
+            Some(&1)
         );
     }
 

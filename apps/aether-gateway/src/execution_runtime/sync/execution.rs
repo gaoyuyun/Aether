@@ -1813,6 +1813,7 @@ fn build_openai_image_sync_json_heartbeat_response(
                 Some(progress_snapshot),
                 None,
                 None,
+                None,
             )
             .await,
         )
@@ -2010,6 +2011,7 @@ pub(crate) async fn execute_execution_runtime_sync(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2027,6 +2029,7 @@ pub(crate) async fn execute_execution_runtime_sync_with_retry_scope(
 ) -> Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError> {
     let mut retry_scope = AiAttemptRetryScope::Candidate;
     let mut fallback_response = None;
+    let mut attempt_skipped = false;
     let response = execute_execution_runtime_sync_impl(
         state,
         request_path,
@@ -2040,10 +2043,12 @@ pub(crate) async fn execute_execution_runtime_sync_with_retry_scope(
         None,
         Some(&mut retry_scope),
         Some(&mut fallback_response),
+        Some(&mut attempt_skipped),
     )
     .await?;
     Ok(match response {
         Some(response) => AiAttemptExecutionOutcome::Responded(response),
+        None if attempt_skipped => AiAttemptExecutionOutcome::skipped(retry_scope),
         None => AiAttemptExecutionOutcome::Retry {
             scope: retry_scope,
             fallback_response,
@@ -2065,6 +2070,7 @@ async fn execute_execution_runtime_sync_impl(
     progress_snapshot: Option<Arc<Mutex<OpenAiImageSyncProgressSnapshot>>>,
     mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
     mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
+    mut attempt_skipped_out: Option<&mut bool>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     if allow_json_heartbeat
         && should_enable_openai_image_sync_json_heartbeat(plan_kind, &plan, report_context.as_ref())
@@ -2112,6 +2118,9 @@ async fn execute_execution_runtime_sync_impl(
             if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
                 *retry_scope = AiAttemptRetryScope::Candidate;
             }
+            if let Some(skipped) = attempt_skipped_out.as_mut() {
+                **skipped = true;
+            }
             record_local_request_candidate_status(
                 state,
                 &plan,
@@ -2157,6 +2166,9 @@ async fn execute_execution_runtime_sync_impl(
             record_local_runtime_candidate_skip_reason(state, trace_id, "provider_quota_blocked");
             if let Some(scope) = retry_scope_out.as_deref_mut() {
                 *scope = AiAttemptRetryScope::Provider;
+            }
+            if let Some(skipped) = attempt_skipped_out.as_mut() {
+                **skipped = true;
             }
             record_local_request_candidate_status(
                 state,

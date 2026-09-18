@@ -6,6 +6,7 @@ import type {
   FailoverRulesConfig,
   PoolAdvancedConfig,
   ProviderConfig,
+  ProviderQuotaReservation,
   ProviderType,
   ProviderWithEndpointsSummary,
   ProxyConfig,
@@ -126,6 +127,7 @@ export async function updateProvider(
     quota_subscription_started_at?: string
     quota_expires_at: string | null
     quota_windows: Array<{ duration_secs: number; limit_usd: number }>
+    quota_reservation: ProviderQuotaReservation | null
     rpm_limit: number | null
     // 请求配置（从 Endpoint 迁移）
     max_retries: number | null  // 同 Key 重试次数；null 表示继承调度策略
@@ -165,6 +167,7 @@ export async function createProvider(
     quota_subscription_started_at?: string
     quota_expires_at?: string | null
     quota_windows?: Array<{ duration_secs: number; limit_usd: number }>
+    quota_reservation?: ProviderQuotaReservation | null
     provider_priority?: number
     keep_priority_on_conversion?: boolean
     responses_websocket_enabled?: boolean

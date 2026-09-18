@@ -13,7 +13,8 @@ use aether_data_contracts::repository::{
     candidates::{
         sanitize_request_candidate_error_type, sanitize_request_candidate_extra_data,
         sanitize_request_candidate_skip_reason, DecisionTrace, DecisionTraceCandidate,
-        RequestCandidateFinalStatus, RequestCandidateStatus, StoredRequestCandidate,
+        RequestCandidateFinalStatus, RequestCandidateStatus, RequestCandidateTraceScope,
+        StoredRequestCandidate,
     },
     provider_catalog::StoredProviderCatalogKey,
     usage::StoredRequestUsageAudit,
@@ -224,41 +225,28 @@ async fn resolve_admin_monitoring_trace(
 }
 
 /// Reads the persisted candidate rows for a request. `attempted_only` hides the
-/// rows that were never dispatched, but when nothing was dispatched at all (every
-/// candidate was skipped by the planner) those rows are the only record of why
-/// the request failed, so they are returned instead of an empty trace. That keeps
-/// the real skip reasons and failure diagnostics visible rather than falling back
-/// to a candidate synthesized from the usage row.
+/// planner-only `available`/`unused` rows, but keeps every candidate the gateway
+/// explicitly skipped with a reason (quota blocked, concurrency limit, transport
+/// unsupported, ...). A skipped provider never received a request, yet the request
+/// summary can still be attributed to it and the operator has to see why it was
+/// not tried, so those rows stay in the trace next to the attempted ones. Several
+/// execution paths evaluate the same candidate, so skipped rows are reported once
+/// per candidate identity and reason.
 async fn read_admin_monitoring_decision_trace(
     state: &AdminAppState<'_>,
     request_id: &str,
     attempted_only: bool,
 ) -> Result<Option<DecisionTrace>, GatewayError> {
     let app = state.as_ref();
-    if let Some(trace) = app
-        .data
-        .read_decision_trace(request_id, attempted_only)
-        .await
-        .map_err(|err| GatewayError::Internal(err.to_string()))?
-    {
-        return Ok(Some(trace));
-    }
-    if !attempted_only {
-        return Ok(None);
-    }
-    let Some(trace) = app
-        .data
-        .read_decision_trace(request_id, false)
-        .await
-        .map_err(|err| GatewayError::Internal(err.to_string()))?
-    else {
-        return Ok(None);
+    let scope = if attempted_only {
+        RequestCandidateTraceScope::AttemptedOrSkipped
+    } else {
+        RequestCandidateTraceScope::All
     };
-    let rejected_by_planner = trace
-        .candidates
-        .iter()
-        .all(|item| item.candidate.status == RequestCandidateStatus::Skipped);
-    Ok(rejected_by_planner.then_some(trace))
+    app.data
+        .read_decision_trace_in_scope(request_id, scope)
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))
 }
 
 /// The legacy `created_at_unix_ms` usage column stores unix seconds.

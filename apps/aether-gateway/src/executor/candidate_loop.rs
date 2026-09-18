@@ -17,7 +17,9 @@ use futures_util::StreamExt;
 use tokio::time::{timeout, Duration, Instant};
 use tracing::{debug, warn, Instrument};
 
-use crate::ai_serving::LocalExecutionAttemptSource;
+use crate::ai_serving::{
+    apply_local_runtime_execution_exhausted_reason, LocalExecutionAttemptSource,
+};
 use crate::clock::current_unix_ms;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::{
@@ -168,6 +170,7 @@ where
                 mark_deferred_upstream_response(response, owner_plan, owner_report_context),
             )),
             AiAttemptLoopOutcome::Exhausted(exhaustion) => {
+                apply_local_runtime_execution_exhausted_reason(state, trace_id);
                 Ok(LocalExecutionRequestOutcome::Exhausted(exhaustion))
             }
             AiAttemptLoopOutcome::NoPath => Ok(LocalExecutionRequestOutcome::NoPath),
@@ -252,6 +255,9 @@ where
                 "dynamic_candidate_loop_error",
             )
             .await;
+        }
+        if let Ok(LocalExecutionRequestOutcome::Exhausted(_)) = &loop_result {
+            apply_local_runtime_execution_exhausted_reason(state, trace_id);
         }
         loop_result
     }
@@ -425,7 +431,8 @@ where
             AiAttemptExecutionOutcome::Retry {
                 fallback_response: None,
                 ..
-            } => {}
+            }
+            | AiAttemptExecutionOutcome::Skipped { .. } => {}
         }
         Ok(execution)
     }
@@ -552,6 +559,7 @@ where
                 mark_deferred_upstream_response(response, owner_plan, owner_report_context),
             )),
             AiAttemptLoopOutcome::Exhausted(exhaustion) => {
+                apply_local_runtime_execution_exhausted_reason(state, trace_id);
                 Ok(LocalExecutionRequestOutcome::Exhausted(exhaustion))
             }
             AiAttemptLoopOutcome::NoPath => Ok(LocalExecutionRequestOutcome::NoPath),
@@ -632,6 +640,9 @@ where
                 "dynamic_candidate_loop_error",
             )
             .await;
+        }
+        if let Ok(LocalExecutionRequestOutcome::Exhausted(_)) = &loop_result {
+            apply_local_runtime_execution_exhausted_reason(state, trace_id);
         }
         loop_result
     }
@@ -1148,6 +1159,12 @@ where
                 }
                 apply_attempt_retry_scope(source, &attempt, scope).await?;
             }
+            AiAttemptExecutionOutcome::Skipped { scope } => {
+                // The attempt never reached the upstream: it neither counts as a
+                // failed transfer nor becomes the request's exhaustion attribution.
+                apply_attempt_retry_scope(source, &attempt, scope).await?;
+                continue;
+            }
         }
 
         port.record_attempt_failed(&attempt).await?;
@@ -1436,7 +1453,8 @@ where
             AiAttemptExecutionOutcome::Retry {
                 fallback_response: None,
                 ..
-            } => {}
+            }
+            | AiAttemptExecutionOutcome::Skipped { .. } => {}
         }
         Ok(execution)
     }
@@ -2036,6 +2054,14 @@ where
                 },
             ))
         }
+        Ok(StreamCandidateWatchdogOutcome::Executed(AiAttemptExecutionOutcome::Skipped {
+            scope,
+        })) => {
+            drop(permit_hold);
+            Ok(StreamCandidateWatchdogOutcome::Executed(
+                AiAttemptExecutionOutcome::Skipped { scope },
+            ))
+        }
         Ok(StreamCandidateWatchdogOutcome::TransportTimeout) => {
             drop(permit_hold);
             Ok(StreamCandidateWatchdogOutcome::TransportTimeout)
@@ -2426,6 +2452,9 @@ mod tests {
         state: &'a AppState,
         tracker: ProviderTransferTracker,
         retry_scope: AiAttemptRetryScope,
+        /// Attempts of this provider are rejected before dispatch (quota
+        /// reservation refused), mirroring the execution runtime's skip path.
+        skipped_provider: Option<&'static str>,
         executed: StdMutex<Vec<&'static str>>,
         unused: StdMutex<Vec<&'static str>>,
     }
@@ -2440,6 +2469,7 @@ mod tests {
                 state,
                 tracker,
                 retry_scope: AiAttemptRetryScope::Candidate,
+                skipped_provider: None,
                 executed: StdMutex::new(Vec::new()),
                 unused: StdMutex::new(Vec::new()),
             }
@@ -2450,9 +2480,15 @@ mod tests {
                 state,
                 tracker: ProviderTransferTracker::default(),
                 retry_scope,
+                skipped_provider: None,
                 executed: StdMutex::new(Vec::new()),
                 unused: StdMutex::new(Vec::new()),
             }
+        }
+
+        fn with_skipped_provider(mut self, provider_id: &'static str) -> Self {
+            self.skipped_provider = Some(provider_id);
+            self
         }
     }
 
@@ -2503,11 +2539,15 @@ mod tests {
             attempt: &TransferTestAttempt,
         ) -> Result<AiAttemptExecutionOutcome<Self::Response>, Self::Error> {
             self.executed.lock().unwrap().push(attempt.label);
-            Ok(if attempt.plan.provider_id == "provider-b" {
-                AiAttemptExecutionOutcome::Responded(Response::new(Body::from("ok")))
-            } else {
-                AiAttemptExecutionOutcome::retry(self.retry_scope)
-            })
+            Ok(
+                if self.skipped_provider == Some(attempt.plan.provider_id.as_str()) {
+                    AiAttemptExecutionOutcome::skipped(AiAttemptRetryScope::Provider)
+                } else if attempt.plan.provider_id == "provider-b" {
+                    AiAttemptExecutionOutcome::Responded(Response::new(Body::from("ok")))
+                } else {
+                    AiAttemptExecutionOutcome::retry(self.retry_scope)
+                },
+            )
         }
 
         async fn mark_unused_attempts(
@@ -2839,6 +2879,107 @@ mod tests {
             ["a-key1-retry0", "b-key1-retry0"]
         );
         assert_eq!(source.skipped_providers, ["provider-a"]);
+    }
+
+    #[tokio::test]
+    async fn dynamic_loop_treats_pre_dispatch_skips_as_not_executed() {
+        let state = AppState::new().expect("state should build");
+        let port = TransferTestPort::new(&state).with_skipped_provider("provider-a");
+        let mut source = TransferTestAttemptSource {
+            attempts: transfer_test_attempts().into(),
+            skipped_providers: Vec::new(),
+        };
+
+        let outcome = run_dynamic_attempt_loop(
+            &port,
+            &mut source,
+            "trace-quota-skip-test",
+            "quota_skip_test",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("dynamic attempt loop should succeed");
+
+        assert!(matches!(
+            outcome,
+            LocalExecutionRequestOutcome::Responded(_)
+        ));
+        // The refused provider is dropped as a whole, without same-key retries
+        // and without counting as a failed transfer.
+        assert_eq!(
+            port.executed.lock().unwrap().as_slice(),
+            ["a-key1-retry0", "b-key1-retry0"]
+        );
+        assert_eq!(source.skipped_providers, ["provider-a"]);
+    }
+
+    #[tokio::test]
+    async fn dynamic_loop_attributes_exhaustion_to_the_last_executed_attempt() {
+        let state = AppState::new().expect("state should build");
+        // provider-a really fails upstream; provider-b is refused before dispatch.
+        let port = TransferTestPort::with_retry_scope(&state, AiAttemptRetryScope::Provider)
+            .with_skipped_provider("provider-b");
+        let mut source = TransferTestAttemptSource {
+            attempts: transfer_test_attempts().into(),
+            skipped_providers: Vec::new(),
+        };
+
+        let outcome = run_dynamic_attempt_loop(
+            &port,
+            &mut source,
+            "trace-quota-exhaustion-test",
+            "quota_exhaustion_test",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("dynamic attempt loop should finish");
+
+        let LocalExecutionRequestOutcome::Exhausted(exhaustion) = outcome else {
+            panic!("expected exhaustion");
+        };
+        assert_eq!(
+            port.executed.lock().unwrap().as_slice(),
+            ["a-key1-retry0", "b-key1-retry0"]
+        );
+        assert_eq!(source.skipped_providers, ["provider-a", "provider-b"]);
+        assert_eq!(
+            exhaustion.usage_data().provider_id.as_deref(),
+            Some("provider-a")
+        );
+        assert_eq!(
+            exhaustion.usage_data().provider_api_key_id.as_deref(),
+            Some("key-1")
+        );
+        assert_eq!(
+            exhaustion.usage_data().candidate_id.as_deref(),
+            Some("cand_watchdog")
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_loop_with_only_skipped_attempts_has_no_path() {
+        let state = AppState::new().expect("state should build");
+        let port = TransferTestPort::new(&state).with_skipped_provider("provider-b");
+        let mut source = TransferTestAttemptSource {
+            attempts: transfer_test_attempts()
+                .into_iter()
+                .filter(|attempt| attempt.plan.provider_id == "provider-b")
+                .collect(),
+            skipped_providers: Vec::new(),
+        };
+
+        let outcome = run_dynamic_attempt_loop(
+            &port,
+            &mut source,
+            "trace-only-skipped-test",
+            "only_skipped_test",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("dynamic attempt loop should finish");
+
+        assert!(matches!(outcome, LocalExecutionRequestOutcome::NoPath));
+        assert_eq!(port.executed.lock().unwrap().as_slice(), ["b-key1-retry0"]);
     }
 
     #[test]

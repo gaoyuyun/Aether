@@ -1,13 +1,13 @@
 use super::{
-    read_decision_trace, read_provider_transport_snapshot, read_request_candidate_trace,
-    AdjustWalletBalanceInput, AdminBillingCollectorRecord, AdminBillingCollectorWriteInput,
-    AdminBillingMutationOutcome, AdminBillingPresetApplyResult, AdminBillingRuleRecord,
-    AdminBillingRuleWriteInput, AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery,
-    AdminRedeemCodeListQuery, AdminWalletLedgerQuery, AdminWalletListQuery,
-    AdminWalletRefundRequestListQuery, AnnouncementListQuery, AuditLogListQuery,
-    BackgroundTaskListQuery, BackgroundTaskSummary, BillingModelContextCacheKey,
-    BillingModelContextCacheState, BillingModelContextInflightState, BillingPlanRecord,
-    BillingPlanWriteInput, CompareAndSwapPaymentOrderStripeClientSecretInput,
+    read_decision_trace, read_decision_trace_in_scope, read_provider_transport_snapshot,
+    read_request_candidate_trace, read_request_candidate_trace_in_scope, AdjustWalletBalanceInput,
+    AdminBillingCollectorRecord, AdminBillingCollectorWriteInput, AdminBillingMutationOutcome,
+    AdminBillingPresetApplyResult, AdminBillingRuleRecord, AdminBillingRuleWriteInput,
+    AdminPaymentOrderListQuery, AdminRedeemCodeBatchListQuery, AdminRedeemCodeListQuery,
+    AdminWalletLedgerQuery, AdminWalletListQuery, AdminWalletRefundRequestListQuery,
+    AnnouncementListQuery, AuditLogListQuery, BackgroundTaskListQuery, BackgroundTaskSummary,
+    BillingModelContextCacheKey, BillingModelContextCacheState, BillingModelContextInflightState,
+    BillingPlanRecord, BillingPlanWriteInput, CompareAndSwapPaymentOrderStripeClientSecretInput,
     CompleteAdminWalletRefundInput, CreateAdminRedeemCodeBatchInput,
     CreateAdminRedeemCodeBatchResult, CreateAnnouncementRecord, CreateManualWalletRechargeInput,
     CreatePlanPurchaseOrderInput, CreatePlanPurchaseOrderOutcome, CreateWalletRechargeOrderInput,
@@ -21,12 +21,12 @@ use super::{
     ProcessPaymentCallbackInput, ProcessPaymentCallbackOutcome, ReclaimWalletRechargeCheckoutInput,
     ReconcileUsagePolicyCostInput, RedeemWalletCodeInput, RedeemWalletCodeOutcome,
     ReleaseUsagePolicyRequestAdmissionInput, RequestAuditBundle, RequestCandidateTrace,
-    ReserveUsagePolicyCostInput, ReserveUsagePolicyCostOutcome, ReserveUsagePolicyRequestInput,
-    ReserveUsagePolicyRequestOutcome, StoredAdminAuditLogPage, StoredAdminPaymentCallbackPage,
-    StoredAdminPaymentOrder, StoredAdminPaymentOrderPage, StoredAdminRedeemCodeBatch,
-    StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage, StoredAdminWalletLedgerPage,
-    StoredAdminWalletListPage, StoredAdminWalletRefund, StoredAdminWalletRefundPage,
-    StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
+    RequestCandidateTraceScope, ReserveUsagePolicyCostInput, ReserveUsagePolicyCostOutcome,
+    ReserveUsagePolicyRequestInput, ReserveUsagePolicyRequestOutcome, StoredAdminAuditLogPage,
+    StoredAdminPaymentCallbackPage, StoredAdminPaymentOrder, StoredAdminPaymentOrderPage,
+    StoredAdminRedeemCodeBatch, StoredAdminRedeemCodeBatchPage, StoredAdminRedeemCodePage,
+    StoredAdminWalletLedgerPage, StoredAdminWalletListPage, StoredAdminWalletRefund,
+    StoredAdminWalletRefundPage, StoredAdminWalletRefundRequestPage, StoredAdminWalletTransaction,
     StoredAdminWalletTransactionPage, StoredAnnouncement, StoredAnnouncementPage,
     StoredBackgroundTaskEvent, StoredBackgroundTaskRun, StoredBackgroundTaskRunPage,
     StoredBillingModelContext, StoredProviderQuotaSnapshot, StoredProviderUsageSummary,
@@ -3010,12 +3010,28 @@ impl GatewayDataState {
         read_request_candidate_trace(self, request_id, attempted_only).await
     }
 
+    pub(crate) async fn read_request_candidate_trace_in_scope(
+        &self,
+        request_id: &str,
+        scope: RequestCandidateTraceScope,
+    ) -> Result<Option<RequestCandidateTrace>, DataLayerError> {
+        read_request_candidate_trace_in_scope(self, request_id, scope).await
+    }
+
     pub(crate) async fn read_decision_trace(
         &self,
         request_id: &str,
         attempted_only: bool,
     ) -> Result<Option<DecisionTrace>, DataLayerError> {
         read_decision_trace(self, request_id, attempted_only).await
+    }
+
+    pub(crate) async fn read_decision_trace_in_scope(
+        &self,
+        request_id: &str,
+        scope: RequestCandidateTraceScope,
+    ) -> Result<Option<DecisionTrace>, DataLayerError> {
+        read_decision_trace_in_scope(self, request_id, scope).await
     }
 
     pub(crate) async fn read_request_usage_audit(

@@ -79,6 +79,11 @@ struct ReservationPolicy {
     fallback_usd: f64,
     output_tokens: u64,
     safety_multiplier: f64,
+    /// Share of the request input expected to be served from the provider's
+    /// prompt cache and therefore billed at the cache-read rate. Agent clients
+    /// resend almost the same context every turn, so pricing the whole input at
+    /// the fresh rate over-reserves rolling windows by an order of magnitude.
+    cached_input_ratio: f64,
 }
 
 impl Default for ReservationPolicy {
@@ -88,8 +93,36 @@ impl Default for ReservationPolicy {
             fallback_usd: 0.5,
             output_tokens: 4096,
             safety_multiplier: 1.25,
+            cached_input_ratio: 0.0,
         }
     }
+}
+
+impl ReservationPolicy {
+    fn is_valid(&self) -> bool {
+        self.minimum_usd.is_finite()
+            && self.fallback_usd.is_finite()
+            && self.safety_multiplier.is_finite()
+            && self.cached_input_ratio.is_finite()
+            && self.minimum_usd >= 0.0
+            && self.fallback_usd > 0.0
+            && (1.0..=10.0).contains(&self.safety_multiplier)
+            && (1..=1_000_000).contains(&self.output_tokens)
+            && (0.0..=1.0).contains(&self.cached_input_ratio)
+    }
+}
+
+/// Splits the estimated input into fresh and cache-read tokens according to the
+/// configured ratio. The total context size is unchanged so tier selection still
+/// sees the full prompt.
+fn split_cached_input_tokens(input_tokens: i64, cached_input_ratio: f64) -> (i64, i64) {
+    let input_tokens = input_tokens.max(0);
+    if input_tokens == 0 || cached_input_ratio <= 0.0 {
+        return (input_tokens, 0);
+    }
+    let cache_read_tokens = ((input_tokens as f64) * cached_input_ratio.min(1.0)).floor() as i64;
+    let cache_read_tokens = cache_read_tokens.clamp(0, input_tokens);
+    (input_tokens - cache_read_tokens, cache_read_tokens)
 }
 
 pub fn estimate_provider_quota_reservation(
@@ -108,14 +141,7 @@ pub fn estimate_provider_quota_reservation(
         .transpose()
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
-    if !policy.minimum_usd.is_finite()
-        || !policy.fallback_usd.is_finite()
-        || !policy.safety_multiplier.is_finite()
-        || policy.minimum_usd < 0.0
-        || policy.fallback_usd <= 0.0
-        || !(1.0..=10.0).contains(&policy.safety_multiplier)
-        || !(1..=1_000_000).contains(&policy.output_tokens)
-    {
+    if !policy.is_valid() {
         return Err("invalid provider quota reservation policy".to_owned());
     }
     let budget = policy.output_tokens.saturating_mul(
@@ -134,9 +160,22 @@ pub fn estimate_provider_quota_reservation(
         .unwrap_or(budget)
         .saturating_mul(input.choices.max(1))
         .min(i64::MAX as u64) as i64;
+    let (fresh_input_tokens, cache_read_tokens) =
+        split_cached_input_tokens(input.input_tokens, policy.cached_input_ratio);
     let mut usage = BillingUsageInput::new("chat");
     usage.api_format = Some(api_format.to_owned());
-    usage.input_tokens = input.input_tokens;
+    // OpenAI-style accounting reports cached tokens inside `input_tokens`; the
+    // billing normalizer subtracts them again. Claude/Gemini report them apart.
+    usage.input_tokens = if api_format
+        .split(':')
+        .next()
+        .is_some_and(|family| family.eq_ignore_ascii_case("openai"))
+    {
+        fresh_input_tokens.saturating_add(cache_read_tokens)
+    } else {
+        fresh_input_tokens
+    };
+    usage.cache_read_tokens = cache_read_tokens;
     usage.output_tokens = output_tokens;
     usage.requested_processing_tier = input.processing_tier.clone();
     let result = BillingService::new()
@@ -210,6 +249,58 @@ mod tests {
                 .unwrap()
                 > small
         );
+    }
+
+    #[test]
+    fn cached_input_ratio_prices_the_cached_share_at_the_cache_read_rate() {
+        let pricing: BillingModelPricingSnapshot = serde_json::from_value(json!({
+            "provider_id":"monthly", "provider_billing_type":"monthly_quota",
+            "global_model_id":"model", "global_model_name":"model",
+            "default_tiered_pricing":{"tiers":[{"up_to":null,"input_price_per_1m":10,"output_price_per_1m":50,"cache_read_price_per_1m":1}]}
+        })).unwrap();
+        // ~100k input tokens, explicit small output limit so the input dominates.
+        let input = ProviderQuotaReservationInput::from_body(Some(
+            &json!({"input":"a".repeat(300_000),"max_output_tokens":10}),
+        ));
+        let fresh = estimate_provider_quota_reservation(&pricing, "openai:responses", &input, None)
+            .unwrap();
+        let mostly_cached = estimate_provider_quota_reservation(
+            &pricing,
+            "openai:responses",
+            &input,
+            Some(&json!({"quota_reservation":{"cached_input_ratio":0.9}})),
+        )
+        .unwrap();
+        let claude_cached = estimate_provider_quota_reservation(
+            &pricing,
+            "claude:messages",
+            &input,
+            Some(&json!({"quota_reservation":{"cached_input_ratio":0.9}})),
+        )
+        .unwrap();
+
+        // 100% fresh: 100k * $10/1M * 1.25 = $1.25 (+ tiny output).
+        assert!(fresh > 1.2 && fresh < 1.3, "fresh estimate was {fresh}");
+        // 90% cached: (10k * $10 + 90k * $1) / 1M * 1.25 = $0.2375 (+ tiny output).
+        assert!(
+            mostly_cached > 0.23 && mostly_cached < 0.26,
+            "cached estimate was {mostly_cached}"
+        );
+        assert!((claude_cached - mostly_cached).abs() < 0.001);
+        assert!(estimate_provider_quota_reservation(
+            &pricing,
+            "openai:responses",
+            &input,
+            Some(&json!({"quota_reservation":{"cached_input_ratio":1.5}}))
+        )
+        .is_err());
+        assert!(estimate_provider_quota_reservation(
+            &pricing,
+            "openai:responses",
+            &input,
+            Some(&json!({"quota_reservation":{"cached_input_ratio":-0.1}}))
+        )
+        .is_err());
     }
 
     #[test]

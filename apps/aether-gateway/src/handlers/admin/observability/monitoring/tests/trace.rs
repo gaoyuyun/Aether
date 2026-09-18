@@ -415,8 +415,11 @@ async fn admin_monitoring_trace_shows_planner_rejected_candidates_when_nothing_w
 }
 
 #[tokio::test]
-async fn admin_monitoring_trace_attempted_only_still_hides_unattempted_rows_when_one_was_attempted()
-{
+async fn admin_monitoring_trace_attempted_only_keeps_skipped_rows_but_hides_unused_rows() {
+    // A provider the gateway refused before dispatch (quota window, concurrency
+    // limit, ...) never produced an attempt, but the request summary can still
+    // be attributed to it. The attempted-only trace therefore keeps skipped rows
+    // with their reason and only hides the planner-only unused rows.
     let mut skipped = sample_candidate(
         "cand-skipped",
         "request-mixed",
@@ -426,7 +429,18 @@ async fn admin_monitoring_trace_attempted_only_still_hides_unattempted_rows_when
         None,
         None,
     );
-    skipped.skip_reason = Some("key_inactive".to_string());
+    skipped.skip_reason = Some("provider_quota_blocked".to_string());
+    // The same candidate is evaluated again by a later execution path.
+    let mut skipped_again = sample_candidate(
+        "cand-skipped-again",
+        "request-mixed",
+        3,
+        RequestCandidateStatus::Skipped,
+        None,
+        None,
+        None,
+    );
+    skipped_again.skip_reason = Some("provider_quota_blocked".to_string());
     let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
         skipped,
         sample_candidate(
@@ -447,6 +461,7 @@ async fn admin_monitoring_trace_attempted_only_still_hides_unattempted_rows_when
             Some(33),
             Some(502),
         ),
+        skipped_again,
     ]));
     let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider()],
@@ -471,8 +486,23 @@ async fn admin_monitoring_trace_attempted_only_still_hides_unattempted_rows_when
         .await
         .expect("body should read");
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
-    assert_eq!(payload["total_candidates"], json!(1));
-    assert_eq!(payload["candidates"][0]["id"], json!("cand-failed"));
+    assert_eq!(payload["total_candidates"], json!(2));
+    assert_eq!(payload["final_status"], json!("failed"));
+    assert_eq!(
+        payload["candidates"]
+            .as_array()
+            .expect("candidates should be an array")
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["cand-skipped", "cand-failed"]
+    );
+    assert_eq!(payload["candidates"][0]["status"], json!("skipped"));
+    assert_eq!(
+        payload["candidates"][0]["skip_reason"],
+        json!("provider_quota_blocked")
+    );
+    assert_eq!(payload["candidates"][1]["status"], json!("failed"));
 }
 
 #[tokio::test]

@@ -2598,8 +2598,9 @@ fn local_execution_runtime_miss_diagnostic_detail(
             ));
         }
         "execution_runtime_candidates_exhausted" => {
-            return Some(format!(
-                "已尝试所有本地执行候选提供商，但没有任何候选成功完成请求（{route_label}，原因代码: execution_runtime_candidates_exhausted）"
+            return Some(local_execution_runtime_miss_candidates_exhausted_detail(
+                diagnostic,
+                route_label,
             ));
         }
         "candidate_evaluation_incomplete" => {
@@ -2624,6 +2625,27 @@ fn local_execution_runtime_miss_diagnostic_detail(
             "当前请求无法在本地执行：{route_label} 的执行路径未就绪（原因代码: {reason}）"
         ))
     }
+}
+
+/// Every dispatched candidate failed. Candidates the gateway refused to dispatch
+/// (quota window full, concurrency limit, ...) are listed too, because the
+/// operator otherwise sees a provider that "should have been available" and no
+/// hint why it was never tried.
+fn local_execution_runtime_miss_candidates_exhausted_detail(
+    diagnostic: &LocalExecutionRuntimeMissDiagnostic,
+    route_label: &str,
+) -> String {
+    let skipped_summary = diagnostic
+        .skipped_candidate_count
+        .filter(|count| *count > 0)
+        .zip(local_execution_runtime_miss_skip_reasons_summary(
+            &diagnostic.skip_reasons,
+        ))
+        .map(|(count, summary)| format!("；另有 {count} 个候选未被请求：{summary}"))
+        .unwrap_or_default();
+    format!(
+        "已尝试所有本地执行候选提供商，但没有任何候选成功完成请求{skipped_summary}（{route_label}，原因代码: execution_runtime_candidates_exhausted）"
+    )
 }
 
 fn local_execution_runtime_miss_candidate_list_empty_detail(
@@ -2734,6 +2756,7 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
         "provider_concurrency_limit_reached" => "上游提供商并发已达上限",
         "provider_inactive" => "提供商未启用",
         "provider_key_concurrency_limit_reached" => "上游账号并发已达上限",
+        "provider_quota_blocked" => "上游订阅额度不足或额度预留失败",
         "provider_request_body_missing" => "无法构建上游请求体",
         "provider_request_body_build_failed" => "上游请求体转换失败",
         "transport_api_format_mismatch" => "传输层 API 格式不匹配",
@@ -3476,6 +3499,48 @@ mod tests {
         assert_eq!(
             detail.as_deref(),
             Some("当前调用方 API Key 并发请求数已达上限，请稍后重试")
+        );
+    }
+
+    #[test]
+    fn runtime_miss_detail_lists_skipped_candidates_next_to_exhausted_attempts() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            Some("openai:responses".to_string()),
+        );
+        let diagnostic = LocalExecutionRuntimeMissDiagnostic {
+            reason: "execution_runtime_candidates_exhausted".to_string(),
+            candidate_count: Some(4),
+            skipped_candidate_count: Some(1),
+            skip_reasons: std::collections::BTreeMap::from([(
+                "provider_quota_blocked".to_string(),
+                1,
+            )]),
+            requested_model: Some("gpt-6-astra".to_string()),
+            ..LocalExecutionRuntimeMissDiagnostic::default()
+        };
+
+        let detail =
+            local_execution_runtime_miss_detail(Some(&decision), Some(&diagnostic), false, true)
+                .expect("detail should exist");
+
+        assert_eq!(
+            detail,
+            "已尝试所有本地执行候选提供商，但没有任何候选成功完成请求；另有 1 个候选未被请求：上游订阅额度不足或额度预留失败 1 次（OpenAI Responses，原因代码: execution_runtime_candidates_exhausted）"
+        );
+
+        let without_skips = LocalExecutionRuntimeMissDiagnostic {
+            skipped_candidate_count: None,
+            skip_reasons: std::collections::BTreeMap::new(),
+            ..diagnostic
+        };
+        assert_eq!(
+            local_execution_runtime_miss_detail(Some(&decision), Some(&without_skips), false, true)
+                .as_deref(),
+            Some("已尝试所有本地执行候选提供商，但没有任何候选成功完成请求（OpenAI Responses，原因代码: execution_runtime_candidates_exhausted）")
         );
     }
 

@@ -6,9 +6,12 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 
 use super::auth::GatewayAuthApiKeySnapshot;
-use super::candidates::{read_request_candidate_trace, RequestCandidateTrace};
+use super::candidates::{
+    read_request_candidate_trace, read_request_candidate_trace_in_scope, RequestCandidateTrace,
+    RequestCandidateTraceScope,
+};
 use super::config::GatewayDataConfig;
-use super::decision_trace::{read_decision_trace, DecisionTrace};
+use super::decision_trace::{read_decision_trace, read_decision_trace_in_scope, DecisionTrace};
 use crate::provider_transport::{
     read_provider_transport_snapshot, GatewayProviderTransportSnapshot,
 };

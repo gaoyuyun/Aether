@@ -58,6 +58,13 @@ pub enum AiAttemptExecutionOutcome<Response> {
         scope: AiAttemptRetryScope,
         fallback_response: Option<Response>,
     },
+    /// The attempt was rejected before anything reached the upstream (quota
+    /// reservation refused, provider key concurrency limit, ...). It never
+    /// counts as an executed attempt: it does not consume the provider transfer
+    /// budget and cannot become the request's exhaustion attribution.
+    Skipped {
+        scope: AiAttemptRetryScope,
+    },
 }
 
 impl<Response> AiAttemptExecutionOutcome<Response> {
@@ -73,6 +80,10 @@ impl<Response> AiAttemptExecutionOutcome<Response> {
             Some(response) => Self::Responded(response),
             None => Self::retry(AiAttemptRetryScope::Candidate),
         }
+    }
+
+    pub fn skipped(scope: AiAttemptRetryScope) -> Self {
+        Self::Skipped { scope }
     }
 }
 
@@ -176,6 +187,14 @@ where
                 } else {
                     retry_filters.push(AiAttemptRetryFilter::new(&attempt, scope));
                 }
+            }
+            AiAttemptExecutionOutcome::Skipped { scope } => {
+                // Nothing was dispatched: no failure to record, no same-key
+                // retry, and the last executed attempt stays the same.
+                if scope != AiAttemptRetryScope::Candidate {
+                    retry_filters.push(AiAttemptRetryFilter::new(&attempt, scope));
+                }
+                continue;
             }
         }
 
@@ -359,9 +378,11 @@ mod tests {
         unused: Mutex<Vec<&'static str>>,
     }
 
+    #[derive(Default)]
     struct ScopedRetryPort {
         executed: Mutex<Vec<&'static str>>,
         unused: Mutex<Vec<&'static str>>,
+        exhausted_on: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -379,6 +400,9 @@ mod tests {
                 .expect("executed attempts should lock")
                 .push(attempt.id);
             Ok(match attempt.id {
+                "quota-skipped" => {
+                    AiAttemptExecutionOutcome::skipped(AiAttemptRetryScope::Provider)
+                }
                 "endpoint-failure" => {
                     AiAttemptExecutionOutcome::retry(AiAttemptRetryScope::Endpoint)
                 }
@@ -406,9 +430,13 @@ mod tests {
 
         async fn build_exhaustion(
             &self,
-            _last_plan: aether_contracts::ExecutionPlan,
+            last_plan: aether_contracts::ExecutionPlan,
             _last_report_context: Option<serde_json::Value>,
         ) -> Result<Self::Exhaustion, Self::Error> {
+            self.exhausted_on
+                .lock()
+                .expect("exhausted plan should lock")
+                .replace(last_plan.endpoint_id.clone());
             Ok(())
         }
     }
@@ -519,10 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_scopes_skip_matching_static_candidates() {
-        let port = ScopedRetryPort {
-            executed: Mutex::new(Vec::new()),
-            unused: Mutex::new(Vec::new()),
-        };
+        let port = ScopedRetryPort::default();
         let attempts = vec![
             routed_attempt("endpoint-failure", "provider-a", "endpoint-a", "key-a"),
             routed_attempt("same-endpoint", "provider-a", "endpoint-a", "key-b"),
@@ -557,11 +582,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skipped_attempts_do_not_become_the_exhaustion_attribution() {
+        let port = ScopedRetryPort::default();
+        let outcome = run_ai_attempt_loop(
+            &port,
+            vec![
+                routed_attempt("endpoint-failure", "provider-a", "endpoint-a", "key-a"),
+                routed_attempt("quota-skipped", "provider-b", "endpoint-b", "key-b"),
+                routed_attempt("same-provider", "provider-b", "endpoint-c", "key-c"),
+            ],
+        )
+        .await
+        .expect("loop should exhaust");
+
+        assert!(matches!(
+            outcome,
+            super::AiAttemptLoopOutcome::Exhausted(())
+        ));
+        assert_eq!(
+            *port.executed.lock().expect("executed attempts should lock"),
+            vec!["endpoint-failure", "quota-skipped"]
+        );
+        // The provider-scoped skip still removes the provider's other keys.
+        assert_eq!(
+            *port.unused.lock().expect("unused attempts should lock"),
+            vec!["same-provider"]
+        );
+        // Exhaustion is attributed to the last attempt that really executed.
+        assert_eq!(
+            port.exhausted_on
+                .lock()
+                .expect("exhausted plan should lock")
+                .as_deref(),
+            Some("endpoint-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn only_skipped_attempts_yield_no_path() {
+        let port = ScopedRetryPort::default();
+        let outcome = run_ai_attempt_loop(
+            &port,
+            vec![routed_attempt(
+                "quota-skipped",
+                "provider-b",
+                "endpoint-b",
+                "key-b",
+            )],
+        )
+        .await
+        .expect("loop should finish");
+
+        assert!(matches!(outcome, super::AiAttemptLoopOutcome::NoPath));
+        assert!(port
+            .exhausted_on
+            .lock()
+            .expect("exhausted plan should lock")
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn returns_preserved_upstream_response_after_candidates_exhaust() {
-        let port = ScopedRetryPort {
-            executed: Mutex::new(Vec::new()),
-            unused: Mutex::new(Vec::new()),
-        };
+        let port = ScopedRetryPort::default();
         let outcome = run_ai_attempt_loop(
             &port,
             vec![
@@ -590,10 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn preserved_response_keeps_its_owner_when_a_later_failure_has_no_response() {
-        let port = ScopedRetryPort {
-            executed: Mutex::new(Vec::new()),
-            unused: Mutex::new(Vec::new()),
-        };
+        let port = ScopedRetryPort::default();
         let outcome = run_ai_attempt_loop(
             &port,
             vec![

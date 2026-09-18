@@ -478,6 +478,51 @@ pub struct RequestCandidateTrace {
     pub candidates: Vec<StoredRequestCandidate>,
 }
 
+/// Which persisted candidate rows a request trace should expose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestCandidateTraceScope {
+    /// Every persisted row, including planner-only `available`/`unused` rows.
+    All,
+    /// Only rows that were dispatched upstream.
+    Attempted,
+    /// Dispatched rows plus rows the gateway explicitly skipped with a reason.
+    /// Several execution paths evaluate the same candidate for one request, so
+    /// skipped rows are reported once per candidate identity and reason.
+    AttemptedOrSkipped,
+}
+
+impl RequestCandidateTraceScope {
+    pub fn from_attempted_only(attempted_only: bool) -> Self {
+        if attempted_only {
+            Self::Attempted
+        } else {
+            Self::All
+        }
+    }
+
+    fn includes(self, candidate: &StoredRequestCandidate) -> bool {
+        match self {
+            Self::All => true,
+            Self::Attempted => candidate.status.is_attempted(candidate.started_at_unix_ms),
+            Self::AttemptedOrSkipped => {
+                candidate.status.is_attempted(candidate.started_at_unix_ms)
+                    || candidate.status == RequestCandidateStatus::Skipped
+            }
+        }
+    }
+}
+
+fn request_candidate_skip_identity(
+    candidate: &StoredRequestCandidate,
+) -> (String, String, String, String) {
+    (
+        candidate.provider_id.clone().unwrap_or_default(),
+        candidate.endpoint_id.clone().unwrap_or_default(),
+        candidate.key_id.clone().unwrap_or_default(),
+        candidate.skip_reason.clone().unwrap_or_default(),
+    )
+}
+
 impl RequestCandidateTrace {
     pub fn sanitize_sensitive_diagnostics(&mut self) {
         for candidate in &mut self.candidates {
@@ -487,8 +532,20 @@ impl RequestCandidateTrace {
 
     pub fn from_candidates(
         request_id: impl Into<String>,
-        mut all_candidates: Vec<StoredRequestCandidate>,
+        all_candidates: Vec<StoredRequestCandidate>,
         attempted_only: bool,
+    ) -> Option<Self> {
+        Self::from_candidates_in_scope(
+            request_id,
+            all_candidates,
+            RequestCandidateTraceScope::from_attempted_only(attempted_only),
+        )
+    }
+
+    pub fn from_candidates_in_scope(
+        request_id: impl Into<String>,
+        mut all_candidates: Vec<StoredRequestCandidate>,
+        scope: RequestCandidateTraceScope,
     ) -> Option<Self> {
         for candidate in &mut all_candidates {
             candidate.sanitize_for_persistence();
@@ -497,14 +554,25 @@ impl RequestCandidateTrace {
             return None;
         }
 
-        let candidates = if attempted_only {
-            all_candidates
+        let candidates = match scope {
+            RequestCandidateTraceScope::All => all_candidates.clone(),
+            RequestCandidateTraceScope::Attempted => all_candidates
                 .iter()
-                .filter(|candidate| candidate.status.is_attempted(candidate.started_at_unix_ms))
+                .filter(|candidate| scope.includes(candidate))
                 .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            all_candidates.clone()
+                .collect::<Vec<_>>(),
+            RequestCandidateTraceScope::AttemptedOrSkipped => {
+                let mut seen_skips = std::collections::BTreeSet::new();
+                all_candidates
+                    .iter()
+                    .filter(|candidate| scope.includes(candidate))
+                    .filter(|candidate| {
+                        candidate.status != RequestCandidateStatus::Skipped
+                            || seen_skips.insert(request_candidate_skip_identity(candidate))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
         };
 
         let total_latency_ms = candidates
@@ -527,11 +595,12 @@ impl RequestCandidateTrace {
                 })
             })
             .fold(0_u64, u64::saturating_add);
-        let final_status_source = if attempted_only && candidates.is_empty() {
-            &all_candidates
-        } else {
-            &candidates
-        };
+        let final_status_source =
+            if scope != RequestCandidateTraceScope::All && candidates.is_empty() {
+                &all_candidates
+            } else {
+                &candidates
+            };
 
         Some(Self {
             request_id: request_id.into(),
@@ -2017,10 +2086,11 @@ mod tests {
     use super::{
         derive_request_candidate_final_status, request_candidate_lifecycle_would_regress,
         sanitize_request_candidate_error_type, sanitize_request_candidate_skip_reason,
-        RequestCandidateFinalStatus, RequestCandidateStatus, StoredRequestCandidate,
-        UpsertRequestCandidateRecord, REQUEST_CANDIDATE_ERROR_TYPES,
-        REQUEST_CANDIDATE_ERROR_TYPE_ALIASES, REQUEST_CANDIDATE_SKIP_REASONS,
-        UNCLASSIFIED_CANDIDATE_ERROR_TYPE, UNCLASSIFIED_CANDIDATE_SKIP_REASON,
+        RequestCandidateFinalStatus, RequestCandidateStatus, RequestCandidateTrace,
+        RequestCandidateTraceScope, StoredRequestCandidate, UpsertRequestCandidateRecord,
+        REQUEST_CANDIDATE_ERROR_TYPES, REQUEST_CANDIDATE_ERROR_TYPE_ALIASES,
+        REQUEST_CANDIDATE_SKIP_REASONS, UNCLASSIFIED_CANDIDATE_ERROR_TYPE,
+        UNCLASSIFIED_CANDIDATE_SKIP_REASON,
     };
 
     fn candidate(
@@ -2055,6 +2125,166 @@ mod tests {
             Some(1_700_000_000_100),
         )
         .expect("candidate should build")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scoped_candidate(
+        id: &str,
+        candidate_index: i32,
+        provider_id: &str,
+        key_id: &str,
+        status: RequestCandidateStatus,
+        skip_reason: Option<&str>,
+        started_at_unix_ms: Option<i64>,
+    ) -> StoredRequestCandidate {
+        StoredRequestCandidate::new(
+            id.to_string(),
+            "req-scope".to_string(),
+            None,
+            None,
+            None,
+            None,
+            candidate_index,
+            0,
+            Some(provider_id.to_string()),
+            Some(format!("endpoint-{provider_id}")),
+            Some(key_id.to_string()),
+            status,
+            skip_reason.map(str::to_string),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_700_000_000_000 + i64::from(candidate_index) * 1_000,
+            started_at_unix_ms,
+            started_at_unix_ms.map(|value| value + 100),
+        )
+        .expect("candidate should build")
+    }
+
+    fn scoped_rows() -> Vec<StoredRequestCandidate> {
+        vec![
+            scoped_candidate(
+                "failed",
+                0,
+                "provider-a",
+                "key-a",
+                RequestCandidateStatus::Failed,
+                None,
+                Some(1_700_000_000_000),
+            ),
+            scoped_candidate(
+                "quota-first-path",
+                1,
+                "provider-b",
+                "key-b",
+                RequestCandidateStatus::Skipped,
+                Some("provider_quota_blocked"),
+                None,
+            ),
+            scoped_candidate(
+                "quota-second-path",
+                2,
+                "provider-b",
+                "key-b",
+                RequestCandidateStatus::Skipped,
+                Some("provider_quota_blocked"),
+                None,
+            ),
+            scoped_candidate(
+                "other-reason",
+                3,
+                "provider-b",
+                "key-b",
+                RequestCandidateStatus::Skipped,
+                Some("transport_operation_unsupported"),
+                None,
+            ),
+            scoped_candidate(
+                "unused",
+                4,
+                "provider-c",
+                "key-c",
+                RequestCandidateStatus::Unused,
+                None,
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn attempted_or_skipped_scope_keeps_each_skipped_candidate_once() {
+        let trace = RequestCandidateTrace::from_candidates_in_scope(
+            "req-scope",
+            scoped_rows(),
+            RequestCandidateTraceScope::AttemptedOrSkipped,
+        )
+        .expect("trace should exist");
+
+        assert_eq!(
+            trace
+                .candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["failed", "quota-first-path", "other-reason"]
+        );
+        assert_eq!(trace.total_candidates, 3);
+        assert_eq!(trace.final_status, RequestCandidateFinalStatus::Failed);
+        assert_eq!(trace.total_latency_ms, 100);
+    }
+
+    #[test]
+    fn attempted_scope_still_hides_every_undispatched_row() {
+        let trace = RequestCandidateTrace::from_candidates_in_scope(
+            "req-scope",
+            scoped_rows(),
+            RequestCandidateTraceScope::Attempted,
+        )
+        .expect("trace should exist");
+        assert_eq!(trace.total_candidates, 1);
+        assert_eq!(trace.candidates[0].id, "failed");
+
+        let all = RequestCandidateTrace::from_candidates_in_scope(
+            "req-scope",
+            scoped_rows(),
+            RequestCandidateTraceScope::All,
+        )
+        .expect("trace should exist");
+        assert_eq!(all.total_candidates, 5);
+        assert_eq!(
+            RequestCandidateTraceScope::from_attempted_only(true),
+            RequestCandidateTraceScope::Attempted
+        );
+        assert_eq!(
+            RequestCandidateTraceScope::from_attempted_only(false),
+            RequestCandidateTraceScope::All
+        );
+    }
+
+    #[test]
+    fn scoped_trace_falls_back_to_all_rows_for_final_status_when_nothing_matches() {
+        let rows = vec![scoped_candidate(
+            "unused",
+            0,
+            "provider-c",
+            "key-c",
+            RequestCandidateStatus::Unused,
+            None,
+            None,
+        )];
+        let trace = RequestCandidateTrace::from_candidates_in_scope(
+            "req-scope",
+            rows,
+            RequestCandidateTraceScope::AttemptedOrSkipped,
+        )
+        .expect("trace should exist");
+        assert_eq!(trace.total_candidates, 0);
+        assert_eq!(trace.final_status, RequestCandidateFinalStatus::Failed);
     }
 
     #[test]

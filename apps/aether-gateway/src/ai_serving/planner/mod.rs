@@ -55,8 +55,9 @@ pub(crate) use self::redaction::resolve_provider_chat_pii_redaction;
 pub(crate) use self::request_gzip::resolve_transport_request_encoding_policy;
 pub(crate) use self::route::is_matching_stream_request as planner_is_matching_stream_request;
 pub(crate) use self::runtime_miss::{
-    apply_local_runtime_candidate_terminal_reason, local_runtime_candidate_skip_key,
-    record_local_runtime_candidate_skip_reason, record_local_runtime_candidate_skip_reason_once,
+    apply_local_runtime_candidate_terminal_reason, apply_local_runtime_execution_exhausted_reason,
+    local_runtime_candidate_skip_key, record_local_runtime_candidate_skip_reason,
+    record_local_runtime_candidate_skip_reason_once,
 };
 pub(crate) use self::specialized::{
     build_local_gemini_files_stream_attempt_source_for_kind,
