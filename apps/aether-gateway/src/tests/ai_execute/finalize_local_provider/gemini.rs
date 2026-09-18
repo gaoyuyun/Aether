@@ -141,6 +141,7 @@ async fn gateway_executes_gemini_chat_sync_same_format_via_local_finalize_respon
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -646,6 +647,7 @@ async fn gateway_executes_gemini_chat_sync_upstream_stream_via_local_finalize_re
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1141,6 +1143,7 @@ async fn gateway_executes_gemini_cli_sync_upstream_stream_via_local_finalize_res
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1650,6 +1653,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

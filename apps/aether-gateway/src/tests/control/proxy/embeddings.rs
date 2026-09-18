@@ -421,6 +421,7 @@ fn embedding_candidate_row() -> StoredMinimalCandidateSelectionRow {
         model_supports_streaming: Some(false),
         model_is_active: true,
         model_is_available: true,
+        provider_pool_enabled: false,
     }
 }
 
@@ -455,6 +456,7 @@ fn gemini_embedding_candidate_row() -> StoredMinimalCandidateSelectionRow {
         model_supports_streaming: Some(false),
         model_is_active: true,
         model_is_available: true,
+        provider_pool_enabled: false,
     }
 }
 
@@ -502,6 +504,7 @@ fn aliyun_embedding_candidate_row() -> StoredMinimalCandidateSelectionRow {
         model_supports_streaming: Some(false),
         model_is_active: true,
         model_is_available: true,
+        provider_pool_enabled: false,
     }
 }
 

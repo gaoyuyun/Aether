@@ -169,6 +169,7 @@ fn provider_query_admin_model_selection_row(
         model_supports_streaming: model.supports_streaming,
         model_is_active: model.is_active,
         model_is_available: model.is_available,
+        provider_pool_enabled: false,
     }
 }
 

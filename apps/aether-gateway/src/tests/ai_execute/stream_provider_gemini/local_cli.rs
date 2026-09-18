@@ -106,6 +106,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_s
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -564,6 +565,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1130,6 +1132,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_wi
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1596,6 +1599,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

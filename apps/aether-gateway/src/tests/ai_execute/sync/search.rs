@@ -124,6 +124,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
             model_supports_streaming: Some(false),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

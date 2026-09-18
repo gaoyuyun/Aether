@@ -136,6 +136,7 @@ async fn gateway_executes_codex_image_stream_via_local_decision_gate_after_oauth
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -523,6 +524,7 @@ async fn gateway_bridges_codex_image_sync_json_to_streaming_image_sse_impl() {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -847,6 +849,7 @@ fn image_bridge_candidate_row(
         model_supports_streaming: Some(false),
         model_is_active: true,
         model_is_available: true,
+        provider_pool_enabled: false,
     }
 }
 

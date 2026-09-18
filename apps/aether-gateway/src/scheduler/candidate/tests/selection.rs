@@ -371,6 +371,50 @@ async fn selects_by_provider_priority_when_priority_mode_is_provider() {
 }
 
 #[tokio::test]
+async fn collect_with_skip_reasons_surfaces_key_model_not_allowed() {
+    let allowed = sample_row();
+
+    let mut not_allowed = sample_row();
+    not_allowed.key_id = "key-2".to_string();
+    not_allowed.key_name = "restricted".to_string();
+    not_allowed.key_allowed_models = Some(vec!["gpt-3.5".to_string()]);
+
+    let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+        allowed,
+        not_allowed,
+    ]));
+    let quotas = Arc::new(InMemoryProviderQuotaRepository::seed(vec![]));
+    let state = state_with_routing_default_policy(
+        GatewayDataState::with_candidate_selection_and_quota_for_tests(candidates, quotas),
+        json!({"priority_mode": "provider"}),
+    )
+    .await;
+
+    let (selected, skipped) = collect_selectable_candidates_with_skip_reasons(
+        state.data.as_ref(),
+        &state,
+        "openai:chat",
+        "gpt-4.1",
+        false,
+        None,
+        100,
+    )
+    .await
+    .expect("selection should succeed");
+
+    assert_eq!(
+        selected
+            .iter()
+            .map(|candidate| candidate.key_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["key-1"]
+    );
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].candidate.key_id, "key-2");
+    assert_eq!(skipped[0].skip_reason, "key_model_not_allowed");
+}
+
+#[tokio::test]
 async fn selects_by_global_key_priority_when_priority_mode_is_global_key() {
     let mut provider_first = sample_row();
     provider_first.provider_id = "provider-a".to_string();

@@ -202,6 +202,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -847,6 +848,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

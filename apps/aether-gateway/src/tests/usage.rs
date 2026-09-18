@@ -106,6 +106,7 @@ pub(super) fn sample_local_openai_candidate_row() -> StoredMinimalCandidateSelec
         model_supports_streaming: Some(true),
         model_is_active: true,
         model_is_available: true,
+        provider_pool_enabled: false,
     }
 }
 

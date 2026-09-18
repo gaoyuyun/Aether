@@ -44,6 +44,11 @@ pub struct StoredMinimalCandidateSelectionRow {
     pub model_supports_streaming: Option<bool>,
     pub model_is_active: bool,
     pub model_is_available: bool,
+    /// 供应商 config 含 `pool_advanced`，即池模式。SQL 适配器对池模式供应商按
+    /// (provider, endpoint, model) 只返回一把代表 Key 的行；调度核心据此不套用代表
+    /// Key 的模型白名单，逐 Key 校验交给池展开阶段完成。
+    #[serde(default)]
+    pub provider_pool_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

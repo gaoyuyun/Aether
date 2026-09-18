@@ -5,10 +5,11 @@ use aether_data_contracts::repository::candidate_selection::{
 };
 use aether_scheduler_core::{
     auth_constraints_allow_api_format, collect_global_model_names_for_required_capability,
-    enumerate_minimal_candidate_selection_with_model_directives, normalize_api_format,
-    resolve_requested_global_model_name_with_model_directives,
+    enumerate_minimal_candidate_selection_with_model_directives_and_rejections,
+    normalize_api_format, resolve_requested_global_model_name_with_model_directives,
     row_supports_requested_model_with_model_directives, EnumerateMinimalCandidateSelectionInput,
-    SchedulerAuthConstraints, SchedulerMinimalCandidateSelectionCandidate,
+    EnumeratedMinimalCandidateSelection, SchedulerAuthConstraints,
+    SchedulerMinimalCandidateSelectionCandidate,
 };
 use async_trait::async_trait;
 use std::collections::BTreeSet;
@@ -288,6 +289,7 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
         None,
     )
     .await
+    .map(|outcome| outcome.candidates)
 }
 
 pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabilities_for_request_operation(
@@ -299,17 +301,17 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
     required_capabilities: Option<&serde_json::Value>,
     enable_model_directives: bool,
     request_operation: Option<&str>,
-) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, DataLayerError> {
+) -> Result<EnumeratedMinimalCandidateSelection, DataLayerError> {
     let normalized_api_format = normalize_api_format(api_format);
     if normalized_api_format.is_empty() {
-        return Ok(Vec::new());
+        return Ok(EnumeratedMinimalCandidateSelection::default());
     }
 
     if !auth_constraints_allow_api_format(
         auth_snapshot.map(auth_snapshot_constraints).as_ref(),
         &normalized_api_format,
     ) {
-        return Ok(Vec::new());
+        return Ok(EnumeratedMinimalCandidateSelection::default());
     }
 
     let Some((resolved_global_model_name, rows)) = read_requested_model_rows(
@@ -320,10 +322,10 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
     )
     .await?
     else {
-        return Ok(Vec::new());
+        return Ok(EnumeratedMinimalCandidateSelection::default());
     };
     let auth_constraints = auth_snapshot.map(auth_snapshot_constraints);
-    enumerate_minimal_candidate_selection_with_model_directives(
+    enumerate_minimal_candidate_selection_with_model_directives_and_rejections(
         EnumerateMinimalCandidateSelectionInput {
             rows,
             normalized_api_format: &normalized_api_format,
@@ -552,6 +554,7 @@ mod tests {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

@@ -128,6 +128,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_with_local_syn
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -572,6 +573,7 @@ async fn gateway_returns_gemini_cli_error_for_local_sync_failure_impl() {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -886,6 +888,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_after_oauth_re
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1459,6 +1462,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_sync_via_local_decision_gate_with
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1912,6 +1916,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

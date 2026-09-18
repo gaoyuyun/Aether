@@ -1098,6 +1098,7 @@ fn map_candidate_selection_row(row: &SqliteRow) -> Result<CandidateSelectionRow,
             model_supports_streaming: row.try_get("model_supports_streaming").map_sql_err()?,
             model_is_active: row.try_get("model_is_active").map_sql_err()?,
             model_is_available: row.try_get("model_is_available").map_sql_err()?,
+            provider_pool_enabled: row.try_get("provider_pool_enabled").map_sql_err()?,
         },
         key_auth_config: row.try_get("key_auth_config").map_sql_err()?,
     })
@@ -1698,6 +1699,42 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model_id, "model-pagination-exact-1");
+    }
+
+    #[tokio::test]
+    async fn sqlite_rows_carry_provider_pool_enabled() {
+        let pool = crate::test_support::migrated_pool().await;
+        seed_candidate_selection(&pool).await;
+
+        let repository = SqliteMinimalCandidateSelectionReadRepository::new(pool);
+        let rows = repository
+            .list_for_exact_api_format("openai:chat")
+            .await
+            .expect("candidate rows should load");
+        let pool_flags = rows
+            .iter()
+            .map(|row| (row.key_id.as_str(), row.provider_pool_enabled))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pool_flags,
+            vec![("key-windsurf-oauth", false), ("key-1", true)]
+        );
+
+        let group_rows = repository
+            .list_pool_key_rows_for_group(&StoredPoolKeyCandidateRowsQuery {
+                api_format: "openai:chat".to_string(),
+                provider_id: "provider-1".to_string(),
+                endpoint_id: "endpoint-1".to_string(),
+                model_id: "model-1".to_string(),
+                selected_provider_model_name: "provider-model".to_string(),
+                order: StoredPoolKeyCandidateOrder::InternalPriority,
+                offset: 0,
+                limit: 10,
+            })
+            .await
+            .expect("pool group rows should load");
+        assert_eq!(group_rows.len(), 2);
+        assert!(group_rows.iter().all(|row| row.provider_pool_enabled));
     }
 
     #[tokio::test]

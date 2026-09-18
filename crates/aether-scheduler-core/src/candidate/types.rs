@@ -29,6 +29,22 @@ pub struct SchedulerMinimalCandidateSelectionCandidate {
     pub mapping_matched_model: Option<String>,
 }
 
+/// 枚举阶段因 Key 模型白名单不含请求模型而被拒绝的候选行，对应
+/// `request_candidates.skip_reason` 白名单里的 `key_model_not_allowed`。
+pub const KEY_MODEL_NOT_ALLOWED_SKIP_REASON: &str = "key_model_not_allowed";
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RejectedMinimalCandidateSelectionRow {
+    pub candidate: SchedulerMinimalCandidateSelectionCandidate,
+    pub skip_reason: &'static str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct EnumeratedMinimalCandidateSelection {
+    pub candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
+    pub rejected: Vec<RejectedMinimalCandidateSelectionRow>,
+}
+
 pub struct EnumerateMinimalCandidateSelectionInput<'a> {
     pub rows: Vec<StoredMinimalCandidateSelectionRow>,
     pub normalized_api_format: &'a str,

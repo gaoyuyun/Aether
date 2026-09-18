@@ -155,6 +155,7 @@ async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restore
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -460,6 +461,7 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -839,6 +841,7 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1123,6 +1126,7 @@ async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candida
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1685,6 +1689,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -2147,6 +2152,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -2586,6 +2592,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -3004,6 +3011,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -3462,6 +3470,7 @@ async fn gateway_executes_openai_chat_sync_with_custom_path_via_local_decision_g
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

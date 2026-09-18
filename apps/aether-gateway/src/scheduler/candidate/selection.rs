@@ -3,7 +3,11 @@ use crate::data::candidate_selection::MinimalCandidateSelectionRowSource;
 use crate::scheduler::affinity::SCHEDULER_AFFINITY_TTL;
 use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
 use crate::GatewayError;
-use aether_scheduler_core::ClientSessionAffinity;
+use aether_scheduler_core::{
+    candidate_key, ClientSessionAffinity, EnumeratedMinimalCandidateSelection,
+    RejectedMinimalCandidateSelectionRow,
+};
+use std::collections::BTreeSet;
 
 use super::affinity::{
     build_scheduler_affinity_cache_key, has_explicit_session_affinity, remember_scheduler_affinity,
@@ -71,7 +75,8 @@ pub(super) async fn select_minimal_candidate(
         enable_model_directives,
         None,
     )
-    .await?;
+    .await?
+    .candidates;
     Ok(collect_selectable_enumerated_candidates_with_skip_reasons(
         runtime_state,
         api_format,
@@ -232,7 +237,10 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ranking_
         client_session_affinity,
         ordering_config.scheduling_mode,
     );
-    let candidates = enumerate_scheduler_candidates(
+    let EnumeratedMinimalCandidateSelection {
+        candidates,
+        rejected,
+    } = enumerate_scheduler_candidates(
         selection_row_source,
         api_format,
         global_model_name,
@@ -243,20 +251,49 @@ pub(super) async fn collect_selectable_candidates_with_skip_reasons_and_ranking_
         request_operation,
     )
     .await?;
-    collect_selectable_enumerated_candidates_with_skip_reasons_and_ranking_seed(
-        runtime_state,
-        api_format,
-        global_model_name,
-        candidates,
-        required_capabilities,
-        auth_snapshot,
-        client_session_affinity,
-        now_unix_secs,
-        ranking_seed,
-        ordering_config,
-        priority_affinity_key,
-    )
-    .await
+    let (selected, mut skipped) =
+        collect_selectable_enumerated_candidates_with_skip_reasons_and_ranking_seed(
+            runtime_state,
+            api_format,
+            global_model_name,
+            candidates,
+            required_capabilities,
+            auth_snapshot,
+            client_session_affinity,
+            now_unix_secs,
+            ranking_seed,
+            ordering_config,
+            priority_affinity_key,
+        )
+        .await?;
+    append_enumeration_rejections_as_skipped(&selected, &mut skipped, rejected);
+    Ok((selected, skipped))
+}
+
+/// 枚举阶段因 Key 模型白名单被拒绝的行追加为跳过候选，让它们与运行时跳过一样
+/// 落库并计入未命中诊断；已在已选或已跳过列表中出现过的 Key 不重复记录。
+fn append_enumeration_rejections_as_skipped(
+    selected: &[SchedulerMinimalCandidateSelectionCandidate],
+    skipped: &mut Vec<SchedulerSkippedCandidate>,
+    rejected: Vec<RejectedMinimalCandidateSelectionRow>,
+) {
+    if rejected.is_empty() {
+        return;
+    }
+    let mut seen_keys = selected
+        .iter()
+        .chain(skipped.iter().map(|skipped| &skipped.candidate))
+        .map(candidate_key)
+        .collect::<BTreeSet<_>>();
+    for rejection in rejected {
+        if !seen_keys.insert(candidate_key(&rejection.candidate)) {
+            continue;
+        }
+        skipped.push(SchedulerSkippedCandidate {
+            candidate: rejection.candidate,
+            skip_reason: rejection.skip_reason,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

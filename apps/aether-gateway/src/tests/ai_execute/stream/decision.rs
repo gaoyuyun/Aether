@@ -136,6 +136,7 @@ async fn gateway_executes_openai_chat_stream_via_local_decision_gate_without_exe
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -563,6 +564,7 @@ async fn gateway_executes_openai_chat_stream_via_local_openai_responses_cross_fo
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1039,6 +1041,7 @@ async fn gateway_executes_openai_chat_stream_via_local_cross_format_gemini_candi
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1468,6 +1471,7 @@ async fn gateway_executes_openai_chat_stream_with_custom_path_via_local_decision
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1977,6 +1981,7 @@ async fn gateway_retries_next_local_openai_chat_stream_candidate_after_retryable
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

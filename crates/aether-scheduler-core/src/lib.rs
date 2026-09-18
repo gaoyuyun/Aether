@@ -24,9 +24,11 @@ pub use candidate::{
     candidate_runtime_skip_reason_with_state, candidate_supports_required_capability,
     collect_global_model_names_for_required_capability, enumerate_minimal_candidate_selection,
     enumerate_minimal_candidate_selection_with_model_directives,
+    enumerate_minimal_candidate_selection_with_model_directives_and_rejections,
     requested_capability_priority_for_candidate, CandidateRuntimeSelectabilityInput,
-    EnumerateMinimalCandidateSelectionInput, SchedulerMinimalCandidateSelectionCandidate,
-    SchedulerPriorityMode,
+    EnumerateMinimalCandidateSelectionInput, EnumeratedMinimalCandidateSelection,
+    RejectedMinimalCandidateSelectionRow, SchedulerMinimalCandidateSelectionCandidate,
+    SchedulerPriorityMode, KEY_MODEL_NOT_ALLOWED_SKIP_REASON,
 };
 pub use health::{
     aggregate_provider_key_health_score, any_provider_key_circuit_open_at,

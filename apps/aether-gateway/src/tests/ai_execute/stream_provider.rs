@@ -187,6 +187,7 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -712,6 +713,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1183,6 +1185,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1730,6 +1733,7 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

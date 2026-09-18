@@ -409,6 +409,7 @@ mod tests {
             model_supports_streaming: None,
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

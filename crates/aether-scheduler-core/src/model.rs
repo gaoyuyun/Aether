@@ -202,6 +202,12 @@ pub fn resolve_provider_model_name_with_model_directives_and_request_operation(
 ) -> Option<(String, Option<String>)> {
     let selected_provider_model_name =
         resolve_selected_provider_model_name(row, api_format, request_operation)?;
+    // 池模式供应商在枚举阶段只有一把代表 Key 的行，代表 Key 的模型白名单不能代表
+    // 整个池；逐 Key 的白名单校验由池展开阶段（transport 门控 `key_model_disabled`）
+    // 完成，这里只确认供应商模型本身可用。
+    if row.provider_pool_enabled {
+        return Some((selected_provider_model_name, None));
+    }
     let Some(key_allowed_models) = row.key_allowed_models.as_ref() else {
         return Some((selected_provider_model_name, None));
     };
@@ -256,6 +262,16 @@ pub fn select_provider_model_name(
 ) -> String {
     resolve_selected_provider_model_name(row, api_format, None)
         .unwrap_or_else(|| row.model_provider_model_name.clone())
+}
+
+/// 只按供应商模型映射解析上游模型名，不看 Key 白名单；供枚举阶段为被白名单拒绝的行
+/// 构造跳过候选时复用。
+pub(crate) fn resolve_selected_provider_model_name_for_row(
+    row: &StoredMinimalCandidateSelectionRow,
+    api_format: &str,
+    request_operation: Option<&str>,
+) -> Option<String> {
+    resolve_selected_provider_model_name(row, api_format, request_operation)
 }
 
 fn resolve_selected_provider_model_name(
@@ -818,6 +834,27 @@ mod tests {
     }
 
     #[test]
+    fn pool_row_ignores_representative_key_allowed_models() {
+        let mut row = sample_row("gpt-6-astra", "gpt-6-astra");
+        row.provider_pool_enabled = true;
+        row.key_allowed_models = Some(vec!["gpt-5.5".to_string()]);
+
+        let resolved = resolve_provider_model_name(&row, "gpt-6-astra", "openai:responses")
+            .expect("pool representative key allowlist must not drop the pool group");
+
+        assert_eq!(resolved.0, "gpt-6-astra");
+        assert_eq!(resolved.1, None);
+    }
+
+    #[test]
+    fn non_pool_row_still_enforces_key_allowed_models() {
+        let mut row = sample_row("gpt-6-astra", "gpt-6-astra");
+        row.key_allowed_models = Some(vec!["gpt-5.5".to_string()]);
+
+        assert!(resolve_provider_model_name(&row, "gpt-6-astra", "openai:responses").is_none());
+    }
+
+    #[test]
     fn windsurf_dashed_gpt55_alias_matches_dotted_model_name() {
         let row = sample_row("gpt-5.5-low", "gpt-5.5-low");
 
@@ -933,6 +970,7 @@ mod tests {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 }

@@ -119,6 +119,7 @@ async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_loca
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -583,6 +584,7 @@ async fn gateway_executes_openai_responses_cross_format_function_call_upstream_s
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1059,6 +1061,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

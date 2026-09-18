@@ -3797,6 +3797,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_key_cursor_skips_keys_whose_allowlist_excludes_requested_model() {
+        let provider_config = Some(json!({"pool_advanced": {}}));
+        let (provider, endpoint, mut keys, rows) = large_pool_fixture(2, provider_config.clone());
+        keys[0].allowed_models = Some(json!(["gpt-4"]));
+        keys[1].allowed_models = Some(json!(["gpt-5"]));
+
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+
+        let mut cursor =
+            PoolKeyCursor::new(PlannerAppState::new(&app), group, None, Some("gpt-5"), None);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("key whose allowlist contains the model should be scheduled");
+        assert_eq!(candidate.candidate.key_id, "key-00001");
+        assert_eq!(
+            cursor.skip_reason_counts.get("key_model_disabled"),
+            Some(&1)
+        );
+        assert!(cursor.next_key().await.is_none());
+    }
+
+    #[tokio::test]
     async fn pool_key_cursor_continues_after_exhausted_window() {
         let provider_config = Some(json!({
             "pool_advanced": {
@@ -4837,6 +4880,7 @@ mod tests {
         Vec<StoredProviderCatalogKey>,
         Vec<StoredMinimalCandidateSelectionRow>,
     ) {
+        let provider_pool_enabled = provider_config.is_some();
         let provider = StoredProviderCatalogProvider::new(
             "provider-pool".to_string(),
             "provider-pool".to_string(),
@@ -4944,6 +4988,7 @@ mod tests {
                 model_supports_streaming: Some(true),
                 model_is_active: true,
                 model_is_available: true,
+                provider_pool_enabled,
             });
         }
         (provider, endpoint, keys, rows)
@@ -5101,6 +5146,7 @@ mod tests {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: true,
         }
     }
 

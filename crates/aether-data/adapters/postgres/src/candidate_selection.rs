@@ -264,7 +264,8 @@ SELECT
   model_provider_model_mappings,
   model_supports_streaming,
   model_is_active,
-  model_is_available
+  model_is_available,
+  provider_pool_enabled
 FROM selected_rows
 ORDER BY
   global_model_name ASC,
@@ -528,7 +529,8 @@ SELECT
   model_provider_model_mappings,
   model_supports_streaming,
   model_is_active,
-  model_is_available
+  model_is_available,
+  provider_pool_enabled
 FROM selected_rows
 ORDER BY
   provider_priority ASC,
@@ -576,7 +578,8 @@ SELECT
   m.provider_model_mappings AS model_provider_model_mappings,
   m.supports_streaming AS model_supports_streaming,
   m.is_active AS model_is_active,
-  m.is_available AS model_is_available
+  m.is_available AS model_is_available,
+  (p.config -> 'pool_advanced') IS NOT NULL AS provider_pool_enabled
 FROM providers p
 INNER JOIN provider_endpoints pe
   ON pe.provider_id = p.id
@@ -1288,6 +1291,7 @@ fn map_candidate_selection_row(
         model_supports_streaming: row.try_get("model_supports_streaming").map_postgres_err()?,
         model_is_active: row.try_get("model_is_active").map_postgres_err()?,
         model_is_available: row.try_get("model_is_available").map_postgres_err()?,
+        provider_pool_enabled: row.try_get("provider_pool_enabled").map_postgres_err()?,
     })
 }
 
@@ -1639,6 +1643,29 @@ mod tests {
         assert!(!LIST_POOL_KEYS_FOR_GROUP_SQL.contains("INNER JOIN LATERAL"));
         assert!(LIST_POOL_KEYS_FOR_GROUP_SQL.contains("AND pak.is_active IS TRUE"));
         assert!(!LIST_POOL_KEYS_FOR_GROUP_SQL.contains("AND pak.is_active = TRUE"));
+    }
+
+    #[test]
+    fn candidate_selection_sql_projects_provider_pool_enabled() {
+        let requested_model_sql = requested_model_selection_sql();
+        for sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+            LIST_POOL_KEYS_FOR_GROUP_SQL,
+            requested_model_sql.as_str(),
+        ] {
+            assert!(
+                sql.contains("(p.config -> 'pool_advanced') IS NOT NULL AS provider_pool_enabled")
+            );
+        }
+        for sql in [
+            LIST_FOR_EXACT_API_FORMAT_SQL,
+            LIST_FOR_EXACT_API_FORMAT_AND_GLOBAL_MODEL_SQL,
+        ] {
+            assert!(
+                sql.contains("  model_is_available,\n  provider_pool_enabled\nFROM selected_rows")
+            );
+        }
     }
 
     #[test]

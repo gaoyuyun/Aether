@@ -136,6 +136,7 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

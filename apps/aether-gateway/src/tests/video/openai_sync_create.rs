@@ -123,6 +123,7 @@ async fn gateway_executes_openai_video_create_via_local_decision_gate_with_local
             model_supports_streaming: Some(false),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

@@ -2724,6 +2724,7 @@ fn local_execution_runtime_miss_skip_reason_label(reason: &str) -> &str {
         "key_api_format_disabled" => "API Key 未启用该 API 格式",
         "key_inactive" => "API Key 未启用",
         "key_model_disabled" => "API Key 未允许该模型",
+        "key_model_not_allowed" => "API Key 模型白名单未包含该模型",
         "mapped_model_missing" => "模型映射缺失",
         "pool_active_probe_sealed" => "池内账号未进入主动探测热池",
         "pool_cooldown" => "池内账号处于冷却中",

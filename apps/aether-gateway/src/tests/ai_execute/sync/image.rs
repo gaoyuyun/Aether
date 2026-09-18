@@ -134,6 +134,7 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -488,6 +489,7 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -838,6 +840,7 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -1248,6 +1251,7 @@ async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url_imp
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

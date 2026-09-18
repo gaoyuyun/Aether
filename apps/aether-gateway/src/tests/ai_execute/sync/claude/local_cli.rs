@@ -129,6 +129,7 @@ async fn gateway_executes_claude_cli_sync_via_local_decision_gate_with_local_syn
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -582,6 +583,7 @@ async fn gateway_returns_claude_cli_error_for_local_sync_failure_impl() {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -878,6 +880,7 @@ async fn gateway_marks_claude_cli_cross_format_runtime_miss_when_format_conversi
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

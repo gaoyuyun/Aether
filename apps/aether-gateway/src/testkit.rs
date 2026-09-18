@@ -252,6 +252,7 @@ fn openai_chat_pressure_candidates(
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         })
         .collect()
 }

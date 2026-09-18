@@ -1908,6 +1908,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -2235,6 +2236,7 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -2689,6 +2691,7 @@ async fn gateway_records_failed_usage_when_preserved_upstream_error_ends_the_req
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 

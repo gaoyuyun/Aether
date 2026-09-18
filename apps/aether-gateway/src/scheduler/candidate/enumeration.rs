@@ -1,4 +1,4 @@
-use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
+use aether_scheduler_core::EnumeratedMinimalCandidateSelection;
 
 use crate::data::auth::GatewayAuthApiKeySnapshot;
 use crate::data::candidate_selection::{
@@ -16,7 +16,7 @@ pub(super) async fn enumerate_scheduler_candidates(
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     enable_model_directives: bool,
     request_operation: Option<&str>,
-) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
+) -> Result<EnumeratedMinimalCandidateSelection, GatewayError> {
     enumerate_minimal_candidate_selection_with_required_capabilities_for_request_operation(
         selection_row_source,
         api_format,

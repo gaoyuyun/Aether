@@ -9,14 +9,16 @@ pub use capability::{
 pub use enumeration::{
     collect_global_model_names_for_required_capability, enumerate_minimal_candidate_selection,
     enumerate_minimal_candidate_selection_with_model_directives,
+    enumerate_minimal_candidate_selection_with_model_directives_and_rejections,
 };
 pub use selectability::{
     auth_api_key_concurrency_limit_reached, candidate_is_selectable_with_runtime_state,
     candidate_runtime_skip_reason_with_state, CandidateRuntimeSelectabilityInput,
 };
 pub use types::{
-    EnumerateMinimalCandidateSelectionInput, SchedulerMinimalCandidateSelectionCandidate,
-    SchedulerPriorityMode,
+    EnumerateMinimalCandidateSelectionInput, EnumeratedMinimalCandidateSelection,
+    RejectedMinimalCandidateSelectionRow, SchedulerMinimalCandidateSelectionCandidate,
+    SchedulerPriorityMode, KEY_MODEL_NOT_ALLOWED_SKIP_REASON,
 };
 
 #[cfg(test)]
@@ -36,6 +38,7 @@ mod tests {
         candidate_runtime_skip_reason_with_state, candidate_supports_required_capability,
         collect_global_model_names_for_required_capability, CandidateRuntimeSelectabilityInput,
         EnumerateMinimalCandidateSelectionInput, SchedulerMinimalCandidateSelectionCandidate,
+        KEY_MODEL_NOT_ALLOWED_SKIP_REASON,
     };
     use crate::SchedulerAuthConstraints;
 
@@ -76,6 +79,7 @@ mod tests {
             model_supports_streaming: None,
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
     fn sample_candidate(
@@ -216,6 +220,95 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].provider_id, "provider-1");
         assert_eq!(candidates[0].selected_provider_model_name, "gpt-5-canary-1");
+    }
+
+    #[test]
+    fn enumeration_reports_key_model_not_allowed_rejections() {
+        let allowed = sample_row("1");
+        let mut rejected = sample_row("2");
+        rejected.key_allowed_models = Some(vec!["gpt-4".to_string()]);
+
+        let outcome =
+            super::enumerate_minimal_candidate_selection_with_model_directives_and_rejections(
+                EnumerateMinimalCandidateSelectionInput {
+                    rows: vec![allowed, rejected],
+                    normalized_api_format: "openai:chat",
+                    request_operation: None,
+                    requested_model_name: "gpt-5",
+                    resolved_global_model_name: "gpt-5",
+                    require_streaming: false,
+                    required_capabilities: None,
+                    auth_constraints: None,
+                },
+                false,
+            )
+            .expect("candidate selection should build");
+
+        assert_eq!(
+            outcome
+                .candidates
+                .iter()
+                .map(|candidate| candidate.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-1"]
+        );
+        assert_eq!(outcome.rejected.len(), 1);
+        let rejection = &outcome.rejected[0];
+        assert_eq!(rejection.skip_reason, KEY_MODEL_NOT_ALLOWED_SKIP_REASON);
+        assert_eq!(rejection.candidate.key_id, "key-2");
+        assert_eq!(rejection.candidate.provider_id, "provider-2");
+        assert_eq!(
+            rejection.candidate.selected_provider_model_name,
+            "gpt-5-canary-2"
+        );
+        assert_eq!(rejection.candidate.mapping_matched_model, None);
+
+        // 旧入口只返回候选，行为不变。
+        let candidates =
+            super::enumerate_minimal_candidate_selection(EnumerateMinimalCandidateSelectionInput {
+                rows: vec![sample_row("1"), {
+                    let mut row = sample_row("2");
+                    row.key_allowed_models = Some(vec!["gpt-4".to_string()]);
+                    row
+                }],
+                normalized_api_format: "openai:chat",
+                request_operation: None,
+                requested_model_name: "gpt-5",
+                resolved_global_model_name: "gpt-5",
+                require_streaming: false,
+                required_capabilities: None,
+                auth_constraints: None,
+            })
+            .expect("candidate selection should build");
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn enumeration_keeps_pool_row_with_restrictive_representative_key() {
+        let mut pool_row = sample_row("pool");
+        pool_row.provider_pool_enabled = true;
+        pool_row.key_allowed_models = Some(vec!["gpt-4".to_string()]);
+
+        let outcome =
+            super::enumerate_minimal_candidate_selection_with_model_directives_and_rejections(
+                EnumerateMinimalCandidateSelectionInput {
+                    rows: vec![pool_row],
+                    normalized_api_format: "openai:chat",
+                    request_operation: None,
+                    requested_model_name: "gpt-5",
+                    resolved_global_model_name: "gpt-5",
+                    require_streaming: false,
+                    required_capabilities: None,
+                    auth_constraints: None,
+                },
+                false,
+            )
+            .expect("candidate selection should build");
+
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(outcome.candidates.len(), 1);
+        assert_eq!(outcome.candidates[0].key_id, "key-pool");
+        assert_eq!(outcome.candidates[0].mapping_matched_model, None);
     }
 
     #[test]

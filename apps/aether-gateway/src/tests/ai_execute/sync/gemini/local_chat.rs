@@ -128,6 +128,7 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
@@ -562,6 +563,7 @@ async fn gateway_returns_gemini_chat_error_for_local_sync_failure_impl() {
             model_supports_streaming: Some(true),
             model_is_active: true,
             model_is_available: true,
+            provider_pool_enabled: false,
         }
     }
 
