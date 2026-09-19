@@ -11,6 +11,8 @@ use aether_provider_transport::url::{
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::preset_catalog::current_preset_model_catalog;
+
 const MODEL_FETCH_FORMAT_PRIORITY: &[&[&str]] = &[
     &[
         "openai:chat",
@@ -550,63 +552,16 @@ pub fn provider_type_uses_preset_models(provider_type: &str) -> bool {
     )
 }
 
-#[rustfmt::skip]
+/// 预设模型清单。codex 由 `aether-ai-formats` 的内置模型卡提供；其余渠道类型来自
+/// 预设目录（内嵌副本，或远程刷新后的版本），见 [`crate::preset_catalog`]。
 pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
-    let models = match provider_type.trim().to_ascii_lowercase().as_str() {
-        "gemini_cli" => vec![
-            preset_model("gemini-2.5-pro", "google", "Gemini 2.5 Pro", "gemini:generate_content"),
-            preset_model("gemini-2.5-flash", "google", "Gemini 2.5 Flash", "gemini:generate_content"),
-            preset_model("gemini-3-pro-preview", "google", "Gemini 3 Pro Preview", "gemini:generate_content"),
-            preset_model("gemini-3-flash-preview", "google", "Gemini 3 Flash Preview", "gemini:generate_content"),
-            preset_model("gemini-3.1-pro-preview", "google", "Gemini 3.1 Pro Preview", "gemini:generate_content"),
-        ],
-        "kiro" => vec![
-            preset_model("auto", "kiro", "Auto", "claude:messages"),
-            preset_model("claude-opus-4.7", "anthropic", "Claude Opus 4.7", "claude:messages"),
-            preset_model("claude-opus-4.6", "anthropic", "Claude Opus 4.6", "claude:messages"),
-            preset_model("claude-sonnet-4.6", "anthropic", "Claude Sonnet 4.6", "claude:messages"),
-            preset_model("claude-opus-4.5", "anthropic", "Claude Opus 4.5", "claude:messages"),
-            preset_model("claude-sonnet-4.5", "anthropic", "Claude Sonnet 4.5", "claude:messages"),
-            preset_model("claude-sonnet-4", "anthropic", "Claude Sonnet 4", "claude:messages"),
-            preset_model("claude-haiku-4.5", "anthropic", "Claude Haiku 4.5", "claude:messages"),
-            preset_model("deepseek-3.2", "deepseek", "Deepseek v3.2", "claude:messages"),
-            preset_model("minimax-m2.5", "minimax", "MiniMax M2.5", "claude:messages"),
-            preset_model("minimax-m2.1", "minimax", "MiniMax M2.1", "claude:messages"),
-            preset_model("glm-5", "zhipu", "GLM 5", "claude:messages"),
-            preset_model("qwen3-coder-next", "alibaba", "Qwen3 Coder Next", "claude:messages"),
-        ],
-        "claude_code" => vec![
-            preset_model("claude-opus-4-5-20251101", "anthropic", "Claude Opus 4.5", "claude:messages"),
-            preset_model("claude-opus-4-6", "anthropic", "Claude Opus 4.6", "claude:messages"),
-            preset_model("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6", "claude:messages"),
-            preset_model("claude-sonnet-4-5-20250929", "anthropic", "Claude Sonnet 4.5", "claude:messages"),
-            preset_model("claude-haiku-4-5-20251001", "anthropic", "Claude Haiku 4.5", "claude:messages"),
-        ],
-        "codex" => aether_ai_formats::bundled_codex_model_cards().to_vec(),
-        "grok" => vec![
-            preset_model("grok-4.20-0309-non-reasoning", "xai", "Grok 4.20 0309 Non-Reasoning", "openai:chat"),
-            preset_model("grok-4.20-0309", "xai", "Grok 4.20 0309", "openai:chat"),
-            preset_model("grok-4.20-0309-reasoning", "xai", "Grok 4.20 0309 Reasoning", "openai:chat"),
-            preset_model("grok-4.20-0309-non-reasoning-super", "xai", "Grok 4.20 0309 Non-Reasoning Super", "openai:chat"),
-            preset_model("grok-4.20-0309-super", "xai", "Grok 4.20 0309 Super", "openai:chat"),
-            preset_model("grok-4.20-0309-reasoning-super", "xai", "Grok 4.20 0309 Reasoning Super", "openai:chat"),
-            preset_model("grok-4.20-0309-non-reasoning-heavy", "xai", "Grok 4.20 0309 Non-Reasoning Heavy", "openai:chat"),
-            preset_model("grok-4.20-0309-heavy", "xai", "Grok 4.20 0309 Heavy", "openai:chat"),
-            preset_model("grok-4.20-0309-reasoning-heavy", "xai", "Grok 4.20 0309 Reasoning Heavy", "openai:chat"),
-            preset_model("grok-4.20-multi-agent-0309", "xai", "Grok 4.20 Multi-Agent 0309", "openai:chat"),
-            preset_model("grok-4.20-auto", "xai", "Grok 4.20 Auto", "openai:chat"),
-            preset_model("grok-4.20-fast", "xai", "Grok 4.20 Fast", "openai:chat"),
-            preset_model("grok-4.20-expert", "xai", "Grok 4.20 Expert", "openai:chat"),
-            preset_model("grok-4.20-heavy", "xai", "Grok 4.20 Heavy", "openai:chat"),
-            preset_model("grok-4.3-beta", "xai", "Grok 4.3 Beta", "openai:chat"),
-            preset_model("grok-imagine-image-lite", "xai", "Grok Imagine Image Lite", "openai:image"),
-            preset_model("grok-imagine-image", "xai", "Grok Imagine Image", "openai:image"),
-            preset_model("grok-imagine-image-pro", "xai", "Grok Imagine Image Pro", "openai:image"),
-            preset_model("grok-imagine-image-edit", "xai", "Grok Imagine Image Edit", "openai:image"),
-        ],
-        _ => return None,
-    };
-    Some(models)
+    let normalized = provider_type.trim().to_ascii_lowercase();
+    if normalized == "codex" {
+        return Some(aether_ai_formats::bundled_codex_model_cards().to_vec());
+    }
+    current_preset_model_catalog()
+        .models_for_provider(&normalized)
+        .map(<[Value]>::to_vec)
 }
 
 pub fn merge_upstream_metadata(current: Option<&Value>, incoming: &Value) -> Value {
@@ -1132,16 +1087,6 @@ fn normalize_cached_model(item: &Value, model_id: &str, api_format: &str) -> Val
     }
     object.remove("api_format");
     Value::Object(object)
-}
-
-fn preset_model(model_id: &str, owned_by: &str, display_name: &str, api_format: &str) -> Value {
-    json!({
-        "id": model_id,
-        "object": "model",
-        "owned_by": owned_by,
-        "display_name": display_name,
-        "api_formats": [api_format],
-    })
 }
 
 fn wildcard_matches(pattern: &str, model_id: &str) -> bool {

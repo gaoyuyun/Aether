@@ -1,6 +1,7 @@
 mod association_sync;
 mod config;
 mod logic;
+mod preset_catalog;
 mod strategy;
 mod transport;
 
@@ -19,6 +20,13 @@ pub use logic::{
     project_codex_models_for_legacy_cache, provider_type_uses_preset_models,
     select_models_fetch_endpoint, selected_models_fetch_endpoints,
     upstream_metadata_namespace_updates, ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
+};
+pub use preset_catalog::{
+    apply_remote_preset_model_catalog, current_preset_model_catalog, embedded_preset_model_catalog,
+    parse_preset_model_catalog, preset_model_catalog_refresh_enabled,
+    preset_model_catalog_refresh_minutes, preset_model_catalog_urls,
+    reset_preset_model_catalog_to_embedded, ParsedPresetModelCatalog, PresetModelCatalog,
+    PresetModelCatalogUpdate, PRESET_CATALOG_PROVIDER_TYPES,
 };
 pub use strategy::{
     antigravity_model_id_is_routable, fetch_models_from_transports,

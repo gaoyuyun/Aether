@@ -24,6 +24,8 @@ pub(crate) const TASK_KEY_USAGE_QUEUE_WORKER: &str = "usage.queue.worker";
 pub(crate) const TASK_KEY_USAGE_COUNTER_FLUSH: &str = "usage.counter.flush.worker";
 pub(crate) const TASK_KEY_VIDEO_TASK_POLLER: &str = "video.task.poller";
 pub(crate) const TASK_KEY_MODEL_FETCH_WORKER: &str = "model.fetch.worker";
+pub(crate) const TASK_KEY_PRESET_CATALOG_REFRESH_WORKER: &str =
+    "model.preset_catalog.refresh.worker";
 pub(crate) const TASK_KEY_PROVIDER_QUOTA_RESET: &str = "provider.quota.reset.worker";
 pub(crate) const TASK_KEY_ACCOUNT_SELF_CHECK: &str = "account.self_check.worker";
 pub(crate) const TASK_KEY_POOL_SCORE_REBUILD: &str = "pool.score.rebuild.worker";
@@ -200,6 +202,15 @@ const TASK_DEFINITIONS: &[TaskDefinition] = &[
         TaskKind::Scheduled,
         "interval",
         true,
+        true,
+        RETRY_ONCE,
+    ),
+    // 预设目录存在每个进程内存里，因此每个实例各自刷新，不走单例租约。
+    TaskDefinition::new(
+        TASK_KEY_PRESET_CATALOG_REFRESH_WORKER,
+        TaskKind::Scheduled,
+        "interval",
+        false,
         true,
         RETRY_ONCE,
     ),

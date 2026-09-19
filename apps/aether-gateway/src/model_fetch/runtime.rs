@@ -94,6 +94,25 @@ pub(crate) async fn perform_model_fetch_for_keys(
     perform_model_fetch_for_keys_with_state(state, provider_id, key_ids).await
 }
 
+/// 对指定渠道类型下所有启用了自动拉取的 Key 重新拉取模型。用于预设目录变化后
+/// 让缓存立即跟进，而不是等下一次周期性拉取。
+pub(crate) async fn perform_model_fetch_for_provider_types(
+    state: &AppState,
+    provider_types: &[String],
+) -> Result<ModelFetchRunSummary, GatewayError> {
+    let targets = collect_fetch_targets(state, None, None)
+        .await?
+        .into_iter()
+        .filter(|target| {
+            let provider_type = target.provider.provider_type.trim().to_ascii_lowercase();
+            provider_types
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&provider_type))
+        })
+        .collect::<Vec<_>>();
+    execute_fetch_targets(state, targets).await
+}
+
 async fn perform_model_fetch_once_with_state<S>(
     state: &S,
 ) -> Result<ModelFetchRunSummary, GatewayError>

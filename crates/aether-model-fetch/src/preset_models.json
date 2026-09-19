@@ -1,0 +1,509 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-09-20",
+  "providers": {
+    "claude_code": [
+      {
+        "id": "claude-fable-5-1",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Fable 5.1",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-fable-5",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Fable 5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-5",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-sonnet-5",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Sonnet 5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4-8",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.8",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4-7",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.7",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4-6",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.6",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-sonnet-4-6",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Sonnet 4.6",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4-5-20251101",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-sonnet-4-5-20250929",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Sonnet 4.5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-haiku-4-5-20251001",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Haiku 4.5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4-1-20250805",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.1",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4-20250514",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-sonnet-4-20250514",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Sonnet 4",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-3-7-sonnet-20250219",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude 3.7 Sonnet",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-3-5-haiku-20241022",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude 3.5 Haiku",
+        "api_formats": [
+          "claude:messages"
+        ]
+      }
+    ],
+    "gemini_cli": [
+      {
+        "id": "gemini-3.1-pro-preview",
+        "object": "model",
+        "owned_by": "google",
+        "display_name": "Gemini 3.1 Pro Preview",
+        "api_formats": [
+          "gemini:generate_content"
+        ]
+      },
+      {
+        "id": "gemini-3.1-flash-lite-preview",
+        "object": "model",
+        "owned_by": "google",
+        "display_name": "Gemini 3.1 Flash Lite Preview",
+        "api_formats": [
+          "gemini:generate_content"
+        ]
+      },
+      {
+        "id": "gemini-3-pro-preview",
+        "object": "model",
+        "owned_by": "google",
+        "display_name": "Gemini 3 Pro Preview",
+        "api_formats": [
+          "gemini:generate_content"
+        ]
+      },
+      {
+        "id": "gemini-3-flash-preview",
+        "object": "model",
+        "owned_by": "google",
+        "display_name": "Gemini 3 Flash Preview",
+        "api_formats": [
+          "gemini:generate_content"
+        ]
+      },
+      {
+        "id": "gemini-2.5-pro",
+        "object": "model",
+        "owned_by": "google",
+        "display_name": "Gemini 2.5 Pro",
+        "api_formats": [
+          "gemini:generate_content"
+        ]
+      },
+      {
+        "id": "gemini-2.5-flash",
+        "object": "model",
+        "owned_by": "google",
+        "display_name": "Gemini 2.5 Flash",
+        "api_formats": [
+          "gemini:generate_content"
+        ]
+      },
+      {
+        "id": "gemini-2.5-flash-lite",
+        "object": "model",
+        "owned_by": "google",
+        "display_name": "Gemini 2.5 Flash Lite",
+        "api_formats": [
+          "gemini:generate_content"
+        ]
+      }
+    ],
+    "grok": [
+      {
+        "id": "grok-4.20-0309-non-reasoning",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Non-Reasoning",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-reasoning",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Reasoning",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-non-reasoning-super",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Non-Reasoning Super",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-super",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Super",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-reasoning-super",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Reasoning Super",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-non-reasoning-heavy",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Non-Reasoning Heavy",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-heavy",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Heavy",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-reasoning-heavy",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Reasoning Heavy",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-multi-agent-0309",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 Multi-Agent 0309",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-auto",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 Auto",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-fast",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 Fast",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-expert",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 Expert",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.20-heavy",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 Heavy",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-4.3-beta",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.3 Beta",
+        "api_formats": [
+          "openai:chat"
+        ]
+      },
+      {
+        "id": "grok-imagine-image-lite",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok Imagine Image Lite",
+        "api_formats": [
+          "openai:image"
+        ]
+      },
+      {
+        "id": "grok-imagine-image",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok Imagine Image",
+        "api_formats": [
+          "openai:image"
+        ]
+      },
+      {
+        "id": "grok-imagine-image-pro",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok Imagine Image Pro",
+        "api_formats": [
+          "openai:image"
+        ]
+      },
+      {
+        "id": "grok-imagine-image-edit",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok Imagine Image Edit",
+        "api_formats": [
+          "openai:image"
+        ]
+      }
+    ],
+    "kiro": [
+      {
+        "id": "auto",
+        "object": "model",
+        "owned_by": "kiro",
+        "display_name": "Auto",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4.7",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.7",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4.6",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.6",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-sonnet-4.6",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Sonnet 4.6",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-opus-4.5",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Opus 4.5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-sonnet-4.5",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Sonnet 4.5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-sonnet-4",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Sonnet 4",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "claude-haiku-4.5",
+        "object": "model",
+        "owned_by": "anthropic",
+        "display_name": "Claude Haiku 4.5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "deepseek-3.2",
+        "object": "model",
+        "owned_by": "deepseek",
+        "display_name": "Deepseek v3.2",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "minimax-m2.5",
+        "object": "model",
+        "owned_by": "minimax",
+        "display_name": "MiniMax M2.5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "minimax-m2.1",
+        "object": "model",
+        "owned_by": "minimax",
+        "display_name": "MiniMax M2.1",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "glm-5",
+        "object": "model",
+        "owned_by": "zhipu",
+        "display_name": "GLM 5",
+        "api_formats": [
+          "claude:messages"
+        ]
+      },
+      {
+        "id": "qwen3-coder-next",
+        "object": "model",
+        "owned_by": "alibaba",
+        "display_name": "Qwen3 Coder Next",
+        "api_formats": [
+          "claude:messages"
+        ]
+      }
+    ]
+  }
+}

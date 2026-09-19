@@ -1,4 +1,5 @@
 mod catalog;
+mod preset_catalog_refresh;
 mod runtime;
 #[cfg(test)]
 mod tests;
@@ -10,6 +11,7 @@ pub(crate) use catalog::{
     store_codex_management_catalog, CodexCatalogLoad, CodexCatalogRuntime, CodexCatalogTarget,
     NormalizedCodexClientVersion,
 };
+pub(crate) use preset_catalog_refresh::spawn_preset_catalog_refresh_worker;
 pub(crate) use runtime::state::ModelFetchRuntimeState;
 pub(crate) use runtime::{
     perform_model_fetch_for_key, perform_model_fetch_for_keys, perform_model_fetch_once,
