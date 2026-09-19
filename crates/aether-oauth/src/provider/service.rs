@@ -20,8 +20,8 @@ impl ProviderOAuthService {
     pub fn with_builtin_adapters() -> Self {
         use super::providers::{
             AntigravityProviderOAuthAdapter, ClaudeCodeProviderOAuthAdapter,
-            CodexProviderOAuthAdapter, GenericProviderOAuthAdapter, KiroProviderOAuthAdapter,
-            WindsurfProviderOAuthAdapter,
+            CodexProviderOAuthAdapter, GenericProviderOAuthAdapter, GrokBuildProviderOAuthAdapter,
+            KiroProviderOAuthAdapter, WindsurfProviderOAuthAdapter,
         };
 
         let mut service = Self::new()
@@ -29,7 +29,8 @@ impl ProviderOAuthService {
             .with_adapter(Arc::new(ClaudeCodeProviderOAuthAdapter::default()))
             .with_adapter(Arc::new(CodexProviderOAuthAdapter::default()))
             .with_adapter(Arc::new(AntigravityProviderOAuthAdapter::default()))
-            .with_adapter(Arc::new(WindsurfProviderOAuthAdapter));
+            .with_adapter(Arc::new(WindsurfProviderOAuthAdapter))
+            .with_adapter(Arc::new(GrokBuildProviderOAuthAdapter::default()));
         for provider_type in ["chatgpt_web", "gemini_cli"] {
             if let Some(adapter) = GenericProviderOAuthAdapter::for_provider_type(provider_type) {
                 service = service.with_adapter(Arc::new(adapter));
@@ -144,6 +145,7 @@ mod tests {
             "antigravity",
             "kiro",
             "windsurf",
+            "grok_build",
         ] {
             assert!(
                 service.adapter(provider_type).is_ok(),

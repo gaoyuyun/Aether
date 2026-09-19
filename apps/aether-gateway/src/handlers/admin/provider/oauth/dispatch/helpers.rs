@@ -97,6 +97,7 @@ mod tests {
         " Grok ",
         "kiro",
         "windsurf",
+        "grok_build",
     ];
 
     #[test]

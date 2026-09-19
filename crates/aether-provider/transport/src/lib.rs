@@ -12,6 +12,7 @@ pub mod gemini_cli;
 mod gemini_files;
 mod generic_oauth;
 pub mod grok;
+pub mod grok_build;
 mod headers;
 pub mod kiro;
 mod network;
@@ -74,13 +75,14 @@ pub use diagnostics::{
     build_transport_diagnostics,
 };
 pub use gemini_cli::{
-    build_gemini_cli_v1internal_request, build_gemini_cli_v1internal_url,
-    classify_gemini_cli_v1internal_request_body, gemini_cli_v1internal_requires_upstream_streaming,
-    is_gemini_cli_provider_transport, resolve_gemini_cli_project_id,
-    resolve_local_gemini_cli_request_auth, GeminiCliRequestAuth, GeminiCliRequestAuthSupport,
-    GeminiCliRequestAuthUnsupportedReason, GeminiCliRequestEnvelopeSupport,
-    GeminiCliRequestEnvelopeUnsupportedReason, GeminiCliRequestUrlAction, GEMINI_CLI_PROVIDER_TYPE,
-    GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT,
+    build_gemini_cli_client_metadata, build_gemini_cli_v1internal_request,
+    build_gemini_cli_v1internal_url, classify_gemini_cli_v1internal_request_body,
+    gemini_cli_v1internal_requires_upstream_streaming, is_gemini_cli_provider_transport,
+    resolve_gemini_cli_project_id, resolve_local_gemini_cli_request_auth, GeminiCliRequestAuth,
+    GeminiCliRequestAuthSupport, GeminiCliRequestAuthUnsupportedReason,
+    GeminiCliRequestEnvelopeSupport, GeminiCliRequestEnvelopeUnsupportedReason,
+    GeminiCliRequestUrlAction, GEMINI_CLI_IDE_TYPE, GEMINI_CLI_PLATFORM, GEMINI_CLI_PLUGIN_TYPE,
+    GEMINI_CLI_PROVIDER_TYPE, GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT,
     GEMINI_CLI_V1INTERNAL_ENVELOPE_NAME, GEMINI_CLI_V1INTERNAL_PATH_TEMPLATE,
 };
 pub use gemini_files::{
@@ -102,6 +104,11 @@ pub use grok::{
     resolve_grok_session_auth, GrokBrowserProfileMetadata, GrokHeaderInput, GROK_CHAT_PATH,
     GROK_DEFAULT_BASE_URL, GROK_DEFAULT_BROWSER_PROFILE, GROK_DEFAULT_USER_AGENT,
     GROK_INTERNAL_HEADER, GROK_RATE_LIMITS_PATH,
+};
+pub use grok_build::{
+    apply_grok_build_client_headers, grok_build_client_headers, is_grok_build_provider_transport,
+    GROK_BUILD_CLIENT_IDENTIFIER, GROK_BUILD_CLIENT_VERSION, GROK_BUILD_DEFAULT_BASE_URL,
+    GROK_BUILD_PROVIDER_TYPE,
 };
 pub use headers::{should_skip_request_header, should_skip_upstream_passthrough_header};
 pub use network::{

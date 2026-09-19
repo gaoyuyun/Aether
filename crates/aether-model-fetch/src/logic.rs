@@ -548,7 +548,7 @@ pub fn endpoint_supports_rust_models_fetch(api_format: &str) -> bool {
 pub fn provider_type_uses_preset_models(provider_type: &str) -> bool {
     matches!(
         provider_type.trim().to_ascii_lowercase().as_str(),
-        "claude_code" | "gemini_cli" | "grok"
+        "claude_code" | "gemini_cli" | "grok" | "grok_build"
     )
 }
 

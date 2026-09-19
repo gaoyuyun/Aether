@@ -79,6 +79,7 @@ mod tests {
                 "codex",
                 "gemini_cli",
                 "grok",
+                "grok_build",
                 "kiro",
                 "vertex_ai",
                 "windsurf"

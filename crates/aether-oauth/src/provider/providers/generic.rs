@@ -19,6 +19,10 @@ use super::claude_code::{
     CLAUDE_CODE_AUTHORIZE_URL, CLAUDE_CODE_CLIENT_ID, CLAUDE_CODE_OAUTH_SCOPES,
     CLAUDE_CODE_PROVIDER_TYPE, CLAUDE_CODE_REDIRECT_URI, CLAUDE_CODE_TOKEN_URL,
 };
+use super::grok_build::{
+    GROK_BUILD_CLIENT_ID, GROK_BUILD_DEVICE_AUTHORIZATION_URL, GROK_BUILD_OAUTH_SCOPES,
+    GROK_BUILD_PROVIDER_TYPE, GROK_BUILD_TOKEN_URL,
+};
 
 pub const GEMINI_CLI_OAUTH_CLIENT_ID_ENV: &str = "AETHER_GEMINI_CLI_OAUTH_CLIENT_ID";
 pub const GEMINI_CLI_OAUTH_CLIENT_SECRET_ENV: &str = "AETHER_GEMINI_CLI_OAUTH_CLIENT_SECRET";
@@ -150,6 +154,20 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
         uses_json_payload: false,
         include_scope_in_token_request: true,
     },
+    GenericProviderOAuthTemplate {
+        provider_type: GROK_BUILD_PROVIDER_TYPE,
+        display_name: "Grok Build",
+        authorize_url: GROK_BUILD_DEVICE_AUTHORIZATION_URL,
+        token_url: GROK_BUILD_TOKEN_URL,
+        client_id: GROK_BUILD_CLIENT_ID,
+        client_id_env: None,
+        client_secret_env: None,
+        scopes: GROK_BUILD_OAUTH_SCOPES,
+        redirect_uri: "device-code",
+        use_pkce: false,
+        uses_json_payload: false,
+        include_scope_in_token_request: false,
+    },
 ];
 
 #[derive(Clone)]
@@ -221,6 +239,18 @@ impl GenericProviderOAuthAdapter {
         self.token_url_override
             .clone()
             .unwrap_or_else(|| self.template.token_url.to_string())
+    }
+
+    /// 生效的 token 端点（含测试覆盖），供设备码等扩展流程复用。
+    pub fn resolved_token_url(&self) -> String {
+        self.token_url()
+    }
+
+    pub(super) fn provider_token_set_from_payload(
+        &self,
+        payload: Value,
+    ) -> Result<ProviderOAuthTokenSet, OAuthError> {
+        self.token_set_from_payload(payload)
     }
 
     fn client_id(&self) -> String {
@@ -781,6 +811,27 @@ fn enrich_generic_identity(
         }
         return;
     }
+    if provider_type.eq_ignore_ascii_case(GROK_BUILD_PROVIDER_TYPE) {
+        auth_config
+            .entry("auth_method".to_string())
+            .or_insert_with(|| json!("device_code"));
+        for token in ["id_token", "access_token"] {
+            let Some(claims) = token_payload
+                .get(token)
+                .and_then(Value::as_str)
+                .and_then(decode_jwt_claims)
+            else {
+                continue;
+            };
+            if let Some(email) = claims.get("email").cloned().filter(non_empty_json_string) {
+                auth_config.entry("email".to_string()).or_insert(email);
+            }
+            if let Some(subject) = claims.get("sub").cloned().filter(non_empty_json_string) {
+                auth_config.entry("user_id".to_string()).or_insert(subject);
+            }
+        }
+        return;
+    }
     if !matches!(
         provider_type.trim().to_ascii_lowercase().as_str(),
         "codex" | "chatgpt_web"
@@ -895,6 +946,10 @@ fn metadata_invalid_reason(value: &Value) -> Option<String> {
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(value_to_string)
+}
+
+fn non_empty_json_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| !value.trim().is_empty())
 }
 
 fn value_to_string(value: &Value) -> Option<String> {

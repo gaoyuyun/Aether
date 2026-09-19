@@ -89,6 +89,7 @@ impl ProviderOutboundRequestContext {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOutboundRequestPolicy {
     CodexFingerprintConvergence,
+    GrokBuildClientIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,24 +188,25 @@ pub fn apply_provider_outbound_request_policies(
     provider_request_headers: &mut BTreeMap<String, String>,
     provider_request_body: &mut Value,
 ) -> Vec<ProviderOutboundRequestPolicyResult> {
-    if !transport
-        .provider
-        .provider_type
-        .trim()
-        .eq_ignore_ascii_case("codex")
-    {
-        return Vec::new();
+    let provider_type = transport.provider.provider_type.trim();
+    if provider_type.eq_ignore_ascii_case("codex") {
+        return vec![
+            crate::codex_fingerprint::apply_codex_fingerprint_convergence_policy(
+                transport,
+                provider_api_format,
+                context,
+                provider_request_headers,
+                provider_request_body,
+            ),
+        ];
     }
-
-    vec![
-        crate::codex_fingerprint::apply_codex_fingerprint_convergence_policy(
+    if provider_type.eq_ignore_ascii_case(crate::grok_build::GROK_BUILD_PROVIDER_TYPE) {
+        return vec![crate::grok_build::apply_grok_build_client_identity_policy(
             transport,
-            provider_api_format,
-            context,
             provider_request_headers,
-            provider_request_body,
-        ),
-    ]
+        )];
+    }
+    Vec::new()
 }
 
 fn canonical_required_value(value: String, field: &str) -> String {

@@ -70,6 +70,10 @@ fn select_provider_oauth_runtime_endpoint(
                 .eq_ignore_ascii_case("openai:chat")
         })
         .or_else(|| matching_endpoint(endpoints, include_inactive, |_| true)),
+        "grok_build" => matching_endpoint(endpoints, include_inactive, |endpoint| {
+            crate::ai_serving::is_openai_responses_format(&endpoint.api_format)
+        })
+        .or_else(|| matching_endpoint(endpoints, include_inactive, |_| true)),
         "antigravity" => matching_endpoint(endpoints, include_inactive, |endpoint| {
             endpoint
                 .api_format

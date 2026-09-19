@@ -186,10 +186,10 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
         ));
     };
     let provider_type = provider.provider_type.trim().to_ascii_lowercase();
-    if provider_type != "kiro" && provider_type != "windsurf" {
+    if provider_type != "kiro" && provider_type != "windsurf" && provider_type != "grok_build" {
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
-            "设备授权仅支持 Kiro / Windsurf provider",
+            "设备授权仅支持 Kiro / Windsurf / Grok Build provider",
         ));
     }
     let Some(principal) = request_context
@@ -218,6 +218,17 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
             ],
         )
         .await;
+
+    if provider_type == "grok_build" {
+        return handle_admin_provider_oauth_grok_build_device_authorize(
+            state,
+            &provider,
+            principal,
+            &payload,
+            request_proxy,
+        )
+        .await;
+    }
 
     if provider_type == "windsurf" {
         let session_id = generate_provider_oauth_nonce();
@@ -537,6 +548,117 @@ pub(super) async fn handle_admin_provider_oauth_device_authorize(
         "interval": interval,
     }))
     .into_response())
+}
+
+async fn handle_admin_provider_oauth_grok_build_device_authorize(
+    state: &AdminAppState<'_>,
+    provider: &aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider,
+    principal: &crate::control::GatewayAdminPrincipalContext,
+    payload: &AdminProviderOAuthDeviceAuthorizePayload,
+    request_proxy: Option<aether_contracts::ProxySnapshot>,
+) -> Result<Response<Body>, GatewayError> {
+    let ctx = ProviderOAuthTransportContext {
+        provider_id: provider.id.clone(),
+        provider_type: "grok_build".to_string(),
+        endpoint_id: None,
+        key_id: None,
+        auth_type: Some("oauth".to_string()),
+        decrypted_api_key: None,
+        decrypted_auth_config: None,
+        provider_config: provider.config.clone(),
+        endpoint_config: None,
+        key_config: None,
+        network: aether_oauth::network::OAuthNetworkContext::provider_operation(request_proxy),
+    };
+    let adapter = grok_build_device_adapter(state);
+    let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
+    let authorization = match adapter.start_device_authorization(&executor, &ctx).await {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            tracing::warn!(
+                provider_id = %provider.id,
+                error = %error,
+                "grok build device authorization request failed"
+            );
+            return Ok(build_internal_control_error_response(
+                http::StatusCode::BAD_REQUEST,
+                "发起 Grok Build 设备授权失败，请检查网络或代理后重试",
+            ));
+        }
+    };
+
+    let now_unix_secs = current_unix_secs();
+    let session_id = generate_provider_oauth_nonce();
+    let session = StoredAdminProviderOAuthDeviceSession {
+        session_id: session_id.clone(),
+        provider_id: provider.id.clone(),
+        initiated_by_user_id: principal.user_id.clone(),
+        initiated_by_session_id: principal.session_id.clone(),
+        initiated_by_management_token_id: principal.management_token_id.clone(),
+        region: String::new(),
+        client_id: aether_oauth::provider::providers::GROK_BUILD_CLIENT_ID.to_string(),
+        client_secret: String::new(),
+        device_code: authorization.device_code.clone(),
+        auth_type: Some("device_code".to_string()),
+        social_provider: None,
+        code_verifier: None,
+        redirect_uri: None,
+        machine_id: None,
+        interval: authorization.interval,
+        expires_at_unix_secs: now_unix_secs.saturating_add(authorization.expires_in),
+        status: "pending".to_string(),
+        proxy_node_id: payload
+            .proxy_node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        created_at_unix_ms: now_unix_secs,
+        key_id: None,
+        email: None,
+        replaced: false,
+        error_msg: None,
+    };
+    if let Err(response) = state
+        .save_provider_oauth_device_session(
+            &session_id,
+            &session,
+            authorization
+                .expires_in
+                .saturating_add(KIRO_DEVICE_AUTH_SESSION_TTL_BUFFER_SECS),
+        )
+        .await
+    {
+        return Ok(response);
+    }
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "user_code": authorization.user_code,
+        "verification_uri": authorization.verification_uri,
+        "verification_uri_complete": authorization.verification_uri_complete,
+        "expires_in": authorization.expires_in,
+        "interval": authorization.interval,
+        "auth_type": "device_code",
+        "callback_required": false,
+    }))
+    .into_response())
+}
+
+/// 设备码与 token 端点走管理端可覆盖的 URL（测试用本地回环）。
+pub(super) fn grok_build_device_adapter(
+    state: &AdminAppState<'_>,
+) -> aether_oauth::provider::providers::GrokBuildProviderOAuthAdapter {
+    use aether_oauth::provider::providers::{
+        GrokBuildProviderOAuthAdapter, GROK_BUILD_DEVICE_AUTHORIZATION_URL, GROK_BUILD_TOKEN_URL,
+    };
+    GrokBuildProviderOAuthAdapter::default().with_endpoint_overrides(
+        Some(state.provider_oauth_token_url(
+            "grok_build_device_authorize",
+            GROK_BUILD_DEVICE_AUTHORIZATION_URL,
+        )),
+        Some(state.provider_oauth_token_url("grok_build", GROK_BUILD_TOKEN_URL)),
+    )
 }
 
 #[cfg(test)]

@@ -16,6 +16,12 @@ describe('providerTypeUtils', () => {
     expect(isKeyManagedProviderType('grok')).toBe(false)
   })
 
+  it('treats Grok Build as an OAuth account provider', () => {
+    expect(isOAuthAccountProviderType('grok_build')).toBe(true)
+    expect(isOAuthAccountProviderType('GROK_BUILD')).toBe(true)
+    expect(isKeyManagedProviderType('grok_build')).toBe(false)
+  })
+
   it('treats Windsurf as an OAuth account provider', () => {
     expect(isOAuthAccountProviderType('windsurf')).toBe(true)
     expect(isOAuthAccountProviderType('Windsurf')).toBe(true)

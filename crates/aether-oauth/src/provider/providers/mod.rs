@@ -2,6 +2,7 @@ mod antigravity;
 mod claude_code;
 mod codex;
 mod generic;
+mod grok_build;
 mod kiro;
 mod windsurf;
 
@@ -17,6 +18,11 @@ pub use generic::{
     ANTIGRAVITY_OAUTH_CLIENT_ID_ENV, ANTIGRAVITY_OAUTH_CLIENT_SECRET_ENV,
     GEMINI_CLI_OAUTH_CLIENT_ID_ENV, GEMINI_CLI_OAUTH_CLIENT_SECRET_ENV,
     GENERIC_PROVIDER_OAUTH_TEMPLATES,
+};
+pub use grok_build::{
+    GrokBuildDevicePollOutcome, GrokBuildProviderOAuthAdapter, GROK_BUILD_CLIENT_ID,
+    GROK_BUILD_DEVICE_AUTHORIZATION_URL, GROK_BUILD_DEVICE_CODE_GRANT_TYPE, GROK_BUILD_ISSUER,
+    GROK_BUILD_OAUTH_SCOPES, GROK_BUILD_PROVIDER_TYPE, GROK_BUILD_TOKEN_URL,
 };
 pub use kiro::{
     generate_kiro_machine_id, is_valid_kiro_region, normalize_kiro_machine_id,

@@ -39,6 +39,7 @@ const MODEL_TEST_OAUTH_INHERITS_PROVIDER_FORMATS = new Set([
   'vertex_ai',
   'antigravity',
   'kiro',
+  'grok_build',
 ])
 
 const MODEL_TEST_BEARER_INHERITS_PROVIDER_FORMATS = new Set([

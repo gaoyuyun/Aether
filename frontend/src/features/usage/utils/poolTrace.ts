@@ -15,6 +15,7 @@ export const TIMELINE_STATUS: CandidateRecord['status'][] = [
 const PROVIDER_TYPE_LIKE_NAMES = new Set<string>([
   'codex',
   'kiro',
+  'grok_build',
   'antigravity',
   'claude_code',
   'claude code',

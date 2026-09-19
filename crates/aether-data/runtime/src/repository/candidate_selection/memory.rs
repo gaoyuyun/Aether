@@ -350,6 +350,10 @@ fn key_auth_channel_matches(row: &StoredMinimalCandidateSelectionRow, api_format
             matches!(auth_type.as_str(), "oauth" | "api_key" | "bearer")
                 && api_format == "openai:chat"
         }
+        "grok_build" => {
+            auth_type == "oauth"
+                && matches!(api_format.as_str(), "openai:responses" | "openai:chat")
+        }
         "vertex_ai" => {
             matches!(
                 auth_type.as_str(),

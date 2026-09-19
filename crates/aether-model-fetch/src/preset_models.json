@@ -386,6 +386,98 @@
         ]
       }
     ],
+    "grok_build": [
+      {
+        "id": "grok-4.6",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.6",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-build-0.1",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok Build 0.1",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-4.5",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.5",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-4.3",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.3",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-reasoning",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Reasoning",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-4.20-0309-non-reasoning",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 0309 Non Reasoning",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-4.20-multi-agent-0309",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 4.20 Multi Agent 0309",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-3-mini",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 3 Mini",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-3-mini-fast",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Grok 3 Mini Fast",
+        "api_formats": [
+          "openai:responses"
+        ]
+      },
+      {
+        "id": "grok-composer-2.5-fast",
+        "object": "model",
+        "owned_by": "xai",
+        "display_name": "Composer 2.5 Fast",
+        "api_formats": [
+          "openai:responses"
+        ]
+      }
+    ],
     "kiro": [
       {
         "id": "auto",

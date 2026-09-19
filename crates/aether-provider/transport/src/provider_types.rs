@@ -264,6 +264,18 @@ const GROK_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     ..STANDARD_RUNTIME_POLICY
 };
 
+// Grok Build：xAI 设备码 OAuth，上游是 OpenAI 兼容的 cli-chat-proxy。access_token
+// 直接作为 Bearer 使用，因此按 bearer-like 处理；模型清单来自预设目录。
+const GROK_BUILD_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuth,
+    enable_format_conversion_by_default: true,
+    oauth_is_bearer_like: true,
+    supports_model_fetch: false,
+    supports_local_openai_chat_transport: false,
+    ..STANDARD_RUNTIME_POLICY
+};
+
 const WINDSURF_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     fixed_provider: true,
     api_format_inheritance: ProviderApiFormatInheritance::OAuthOrBearer,
@@ -433,6 +445,30 @@ const GROK_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplat
     runtime_policy: GROK_RUNTIME_POLICY,
 };
 
+pub const GROK_BUILD_PROVIDER_TYPE: &str = "grok_build";
+pub const GROK_BUILD_DEFAULT_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+
+const GROK_BUILD_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: GROK_BUILD_PROVIDER_TYPE,
+    version: 1,
+    base_url: GROK_BUILD_DEFAULT_BASE_URL,
+    endpoints: &[
+        FixedProviderEndpointTemplate {
+            item_key: "openai:responses",
+            api_format: "openai:responses",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:chat",
+            api_format: "openai:chat",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+    ],
+    runtime_policy: GROK_BUILD_RUNTIME_POLICY,
+};
+
 const WINDSURF_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "windsurf",
     version: 1,
@@ -494,6 +530,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "chatgpt_web" => Some(&CHATGPT_WEB_FIXED_PROVIDER_TEMPLATE),
         "kiro" => Some(&KIRO_FIXED_PROVIDER_TEMPLATE),
         "grok" => Some(&GROK_FIXED_PROVIDER_TEMPLATE),
+        "grok_build" => Some(&GROK_BUILD_FIXED_PROVIDER_TEMPLATE),
         "gemini_cli" => Some(&GEMINI_CLI_FIXED_PROVIDER_TEMPLATE),
         "vertex_ai" => Some(&VERTEX_AI_FIXED_PROVIDER_TEMPLATE),
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
@@ -603,6 +640,16 @@ pub fn provider_type_admin_oauth_template(provider_type: &str) -> Option<Provide
             redirect_uri: "http://localhost:51121/oauth2callback",
             use_pkce: true,
         }),
+        "grok_build" => Some(ProviderOAuthTemplate {
+            provider_type: "grok_build",
+            display_name: "Grok Build",
+            authorize_url: aether_oauth::provider::providers::GROK_BUILD_DEVICE_AUTHORIZATION_URL,
+            token_url: aether_oauth::provider::providers::GROK_BUILD_TOKEN_URL,
+            client_id: aether_oauth::provider::providers::GROK_BUILD_CLIENT_ID,
+            scopes: aether_oauth::provider::providers::GROK_BUILD_OAUTH_SCOPES,
+            redirect_uri: "device-code",
+            use_pkce: false,
+        }),
         "windsurf" => Some(ProviderOAuthTemplate {
             provider_type: "windsurf",
             display_name: "Windsurf",
@@ -624,6 +671,7 @@ pub const ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES: &[&str] = &[
     "gemini_cli",
     "antigravity",
     "windsurf",
+    "grok_build",
 ];
 
 #[cfg(test)]
@@ -808,6 +856,43 @@ mod tests {
         assert!(policy.oauth_is_bearer_like);
         assert!(!policy.supports_model_fetch);
         assert!(!policy.supports_local_same_format_transport);
+    }
+
+    #[test]
+    fn grok_build_fixed_provider_targets_cli_chat_proxy_with_bearer_like_oauth() {
+        let template =
+            fixed_provider_template("grok_build").expect("grok build template should exist");
+        assert_eq!(template.base_url, "https://cli-chat-proxy.grok.com/v1");
+        assert_eq!(
+            template
+                .endpoints
+                .iter()
+                .map(|item| item.api_format)
+                .collect::<Vec<_>>(),
+            vec!["openai:responses", "openai:chat"]
+        );
+        let policy = provider_runtime_policy("grok_build");
+        assert!(policy.fixed_provider);
+        assert!(policy.oauth_is_bearer_like);
+        assert!(policy.enable_format_conversion_by_default);
+        assert!(!policy.supports_model_fetch);
+        assert!(policy.supports_local_same_format_transport);
+        assert!(!policy.supports_local_openai_chat_transport);
+        assert!(fixed_provider_key_inherits_api_formats(
+            "grok_build",
+            "oauth",
+            None
+        ));
+
+        let oauth = provider_type_admin_oauth_template("grok_build")
+            .expect("grok build oauth template should exist");
+        assert_eq!(oauth.display_name, "Grok Build");
+        assert_eq!(oauth.authorize_url, "https://auth.x.ai/oauth2/device/code");
+        assert_eq!(oauth.token_url, "https://auth.x.ai/oauth2/token");
+        assert_eq!(oauth.redirect_uri, "device-code");
+        assert!(!oauth.use_pkce);
+        assert!(oauth.scopes.contains(&"grok-cli:access"));
+        assert!(ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"grok_build"));
     }
 
     #[test]

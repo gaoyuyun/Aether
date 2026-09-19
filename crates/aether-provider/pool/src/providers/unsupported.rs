@@ -39,3 +39,9 @@ pub const VERTEX_AI_PROVIDER_POOL_ADAPTER: UnsupportedQuotaProviderPoolAdapter =
         "vertex_ai",
         "Vertex AI 暂不支持自动刷新额度：额度属于 Google Cloud 项目/区域配额",
     );
+
+pub const GROK_BUILD_PROVIDER_POOL_ADAPTER: UnsupportedQuotaProviderPoolAdapter =
+    UnsupportedQuotaProviderPoolAdapter::new(
+        "grok_build",
+        "Grok Build 暂不支持自动刷新额度：cli-chat-proxy 没有账号额度查询接口",
+    );

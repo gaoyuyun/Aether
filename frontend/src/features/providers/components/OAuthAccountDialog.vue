@@ -244,6 +244,117 @@
             </div>
           </template>
 
+          <!-- Grok Build: xAI 设备码授权 -->
+          <template v-else-if="isGrokBuildProvider">
+            <div class="min-h-[265px]">
+              <div
+                v-if="device.status === 'error' || device.status === 'expired'"
+                class="rounded-xl border border-destructive/20 bg-destructive/5 p-5"
+              >
+                <div class="flex flex-col items-center text-center space-y-3">
+                  <div class="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center">
+                    <AlertCircle class="w-5 h-5 text-destructive" />
+                  </div>
+                  <div class="space-y-1">
+                    <p class="text-sm font-medium text-destructive">
+                      {{ legacyT(device.status === 'expired' ? '授权已过期' : '授权失败') }}
+                    </p>
+                    <p class="text-xs text-muted-foreground">
+                      {{ legacyT(device.error || '请重试') }}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    @click="resetDevice"
+                  >
+                    {{ legacyT('重新开始') }}
+                  </Button>
+                </div>
+              </div>
+
+              <div
+                v-else-if="device.starting && !device.session_id"
+                class="flex items-center justify-center py-12"
+              >
+                <div class="text-center">
+                  <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
+                  <p class="text-xs text-muted-foreground">
+                    {{ legacyT('正在申请设备码...') }}
+                  </p>
+                </div>
+              </div>
+
+              <div
+                v-else-if="device.session_id && device.status === 'pending'"
+                class="rounded-xl border border-border bg-muted/20 p-5"
+              >
+                <div class="flex flex-col items-center text-center space-y-4">
+                  <div class="space-y-1">
+                    <p class="text-xs text-muted-foreground">
+                      {{ legacyT('在 xAI 授权页面输入以下设备码') }}
+                    </p>
+                    <div class="flex items-center justify-center gap-2">
+                      <span
+                        class="text-2xl font-mono font-bold tracking-[0.2em]"
+                        data-testid="grok-build-user-code"
+                      >{{ device.user_code }}</span>
+                      <button
+                        class="p-1 rounded hover:bg-muted transition-colors"
+                        :title="legacyT('复制设备码')"
+                        @click="copyToClipboard(device.user_code)"
+                      >
+                        <Copy class="w-3.5 h-3.5 text-muted-foreground" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <div class="animate-spin rounded-full h-3 w-3 border-[1.5px] border-primary/30 border-t-primary" />
+                    <span>{{ remainingText }}</span>
+                  </div>
+                  <p class="text-xs text-muted-foreground">
+                    {{ legacyT('授权完成后此页面将自动更新') }}
+                  </p>
+
+                  <div class="flex gap-2 w-full">
+                    <Button
+                      class="flex-1"
+                      size="sm"
+                      @click="openDeviceVerificationUrl"
+                    >
+                      <ExternalLink class="w-3.5 h-3.5 mr-1.5" />
+                      {{ legacyT('打开授权页面') }}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      @click="copyToClipboard(device.verification_uri_complete)"
+                    >
+                      <Copy class="w-3.5 h-3.5" />
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              <div
+                v-else
+                class="flex h-full flex-col justify-center gap-4"
+              >
+                <p class="text-xs text-muted-foreground text-center">
+                  {{ legacyT('使用 xAI 账号登录 Grok Build，无需额外配置。授权后网关将通过 cli-chat-proxy 调用 Grok 模型。') }}
+                </p>
+                <Button
+                  class="w-full"
+                  :disabled="device.starting"
+                  @click="startDeviceAuth"
+                >
+                  {{ device.starting ? legacyT('正在准备授权...') : legacyT('开始授权') }}
+                </Button>
+              </div>
+            </div>
+          </template>
+
           <!-- Kiro: 设备授权模式 -->
           <template v-else-if="isKiroProvider">
             <div class="space-y-3">
@@ -1074,10 +1185,11 @@ const isOpen = computed(() => props.open)
 
 const isKiroProvider = computed(() => (props.providerType || '').toLowerCase() === 'kiro')
 const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok')
+const isGrokBuildProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok_build')
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
 const isCodexProvider = computed(() => (props.providerType || '').toLowerCase() === 'codex')
 const isClaudeCodeProvider = computed(() => (props.providerType || '').toLowerCase() === 'claude_code')
-const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value)
+const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value || isGrokBuildProvider.value)
 const showAuthorizationMode = computed(() => !isGrokProvider.value)
 const defaultMode = computed<DialogMode>(() => (isGrokProvider.value ? 'import' : 'oauth'))
 
@@ -1217,6 +1329,9 @@ const importManualPlaceholder = computed(() => {
   }
   if (isWindsurfProvider.value) {
     return legacyT('粘贴 show-auth-token Token、API key 或 JSON 内容')
+  }
+  if (isGrokBuildProvider.value) {
+    return legacyT('粘贴 xAI Refresh Token，或 Grok CLI 导出的包含 refresh_token 的 JSON')
   }
   return legacyT('粘贴 Refresh Token / Access Token / Agent Identity JSON 内容')
 })
@@ -1481,7 +1596,9 @@ function resetDevice() {
   device.value.start_url = start_url
   device.value.region = region
   device.value.totp_secret = totp_secret
-  if (!isWindsurfProvider.value && (device.value.auth_type === 'google' || device.value.auth_type === 'github')) {
+  if (isGrokBuildProvider.value) {
+    void ensureGrokBuildDeviceAuth()
+  } else if (!isWindsurfProvider.value && (device.value.auth_type === 'google' || device.value.auth_type === 'github')) {
     void ensureKiroSocialDeviceAuth()
   }
 }
@@ -1529,7 +1646,9 @@ function switchMode(newMode: DialogMode) {
 
   mode.value = newMode
   if (newMode === 'oauth') {
-    if (isKiroProvider.value) {
+    if (isGrokBuildProvider.value) {
+      void ensureGrokBuildDeviceAuth()
+    } else if (isKiroProvider.value) {
       void ensureKiroSocialDeviceAuth()
     } else if (!oauth.value.authorization_url && !oauth.value.starting) {
       initOAuth()
@@ -2367,17 +2486,20 @@ async function startDeviceAuth() {
   device.value.error = ''
   try {
     const isWindsurf = isWindsurfProvider.value
+    const isGrokBuild = isGrokBuildProvider.value
     const isBuilderID = requestedAuthType === 'builder_id'
-    const isSocial = requestedAuthType === 'google' || requestedAuthType === 'github'
+    const isSocial = !isGrokBuild && (requestedAuthType === 'google' || requestedAuthType === 'github')
     const windsurfLoginOption: WindsurfLoginOption = isSocial ? requestedAuthType : 'default'
-    const authTypeForRequest = isWindsurf
-      ? 'browser'
-      : (requestedAuthType === 'default' ? 'google' : requestedAuthType)
+    const authTypeForRequest = isGrokBuild
+      ? 'device_code'
+      : isWindsurf
+        ? 'browser'
+        : (requestedAuthType === 'default' ? 'google' : requestedAuthType)
     const resp = await startDeviceAuthorize(props.providerId, {
       auth_type: authTypeForRequest,
       login_option: isWindsurf ? windsurfLoginOption : undefined,
-      start_url: isWindsurf ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
-      region: isWindsurf ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
+      start_url: isWindsurf || isGrokBuild ? undefined : (isBuilderID ? BUILDER_ID_START_URL : (isSocial ? undefined : (device.value.start_url.trim() || undefined))),
+      region: isWindsurf || isGrokBuild ? undefined : (isBuilderID || isSocial ? BUILDER_ID_REGION : (device.value.region.trim() || undefined)),
       proxy_node_id: selectedProxyNodeId.value || undefined,
     })
     if (requestId !== deviceAuthRequestId || device.value.auth_type !== requestedAuthType) return
@@ -2408,6 +2530,14 @@ async function startDeviceAuth() {
       device.value.starting = false
     }
   }
+}
+
+async function ensureGrokBuildDeviceAuth() {
+  if (!props.open || !props.providerId || !isGrokBuildProvider.value) return
+  if (device.value.starting) return
+  if (device.value.session_id && device.value.status === 'pending') return
+  if (device.value.status === 'error' || device.value.status === 'expired') return
+  await startDeviceAuth()
 }
 
 async function ensureKiroSocialDeviceAuth() {
@@ -2525,6 +2655,8 @@ watch(
       }
       if (isWindsurfProvider.value) {
         device.value.auth_type = 'default'
+      } else if (isGrokBuildProvider.value) {
+        void ensureGrokBuildDeviceAuth()
       } else if (isKiroProvider.value) {
         void ensureKiroSocialDeviceAuth()
       } else {
@@ -2554,6 +2686,8 @@ watch(
       device.value.auth_type = ['default', 'google', 'github'].includes(device.value.auth_type)
         ? device.value.auth_type
         : 'default'
+    } else if (props.open && isGrokBuildProvider.value && mode.value === 'oauth') {
+      void ensureGrokBuildDeviceAuth()
     } else if (props.open && isKiroProvider.value && mode.value === 'oauth') {
       void ensureKiroSocialDeviceAuth()
     }

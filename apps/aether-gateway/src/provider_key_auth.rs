@@ -172,6 +172,7 @@ fn provider_uses_bearer_oauth_runtime(provider_type: &str) -> bool {
             | "antigravity"
             | "kiro"
             | "windsurf"
+            | "grok_build"
     )
 }
 

@@ -383,6 +383,7 @@ fn sanitize_background_task_metadata_value(key: &str, value: Value) -> Option<Va
                 "claude_code",
                 "codex",
                 "gemini_cli",
+                "grok_build",
                 "kiro",
                 "windsurf",
             ],

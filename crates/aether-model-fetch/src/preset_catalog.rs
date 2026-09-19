@@ -15,7 +15,8 @@ const PRESET_CATALOG_SCHEMA_VERSION: u64 = 1;
 const PRESET_CATALOG_MAX_MODELS_PER_PROVIDER: usize = 512;
 
 /// 允许通过目录配置的渠道类型。其它键会被忽略并在解析结果里报告。
-pub const PRESET_CATALOG_PROVIDER_TYPES: &[&str] = &["claude_code", "gemini_cli", "grok", "kiro"];
+pub const PRESET_CATALOG_PROVIDER_TYPES: &[&str] =
+    &["claude_code", "gemini_cli", "grok", "grok_build", "kiro"];
 
 const PRESET_MODEL_CATALOG_URLS_DEFAULT: &[&str] = &[
     "https://raw.githubusercontent.com/gaoyuyun/aether-models/main/models.json",

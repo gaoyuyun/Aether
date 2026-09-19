@@ -70,6 +70,12 @@ pub(super) async fn handle_admin_provider_oauth_start_key(
             "Windsurf 请使用浏览器登录或导入凭据。",
         ));
     }
+    if provider_type == "grok_build" {
+        return Ok(build_internal_control_error_response(
+            http::StatusCode::BAD_REQUEST,
+            "Grok Build 请使用设备授权或导入 Refresh Token。",
+        ));
+    }
     let Some(template) = admin_provider_oauth_template(&provider_type) else {
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
@@ -165,6 +171,12 @@ pub(super) async fn handle_admin_provider_oauth_start_provider(
         return Ok(build_internal_control_error_response(
             http::StatusCode::BAD_REQUEST,
             "Windsurf 请使用浏览器登录或导入凭据。",
+        ));
+    }
+    if provider_type == "grok_build" {
+        return Ok(build_internal_control_error_response(
+            http::StatusCode::BAD_REQUEST,
+            "Grok Build 请使用设备授权或导入 Refresh Token。",
         ));
     }
     let Some(template) = admin_provider_oauth_template(&provider_type) else {

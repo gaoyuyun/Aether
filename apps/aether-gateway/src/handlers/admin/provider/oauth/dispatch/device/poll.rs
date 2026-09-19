@@ -479,6 +479,18 @@ pub(super) async fn handle_admin_provider_oauth_device_poll(
             )
             .await;
 
+        if provider_type == "grok_build" {
+            return handle_admin_provider_oauth_grok_build_device_poll(
+                state,
+                &provider,
+                &endpoints,
+                request_proxy,
+                session_id,
+                session,
+            )
+            .await;
+        }
+
         if provider_type == "windsurf" {
             return handle_admin_provider_oauth_windsurf_browser_device_poll(
                 state,
@@ -981,6 +993,245 @@ async fn handle_admin_provider_oauth_windsurf_browser_device_poll(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let mut replaced = false;
+    let persisted_key = if let Some(existing_key) = duplicate {
+        replaced = true;
+        match state
+            .update_existing_provider_oauth_catalog_key(
+                &existing_key,
+                &provider.provider_type,
+                &access_token,
+                &auth_config,
+                &api_formats,
+                key_proxy.clone(),
+                expires_at,
+            )
+            .await?
+        {
+            Some(key) => key,
+            None => {
+                return Ok(build_internal_control_error_response(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "provider oauth write unavailable",
+                ));
+            }
+        }
+    } else {
+        let key_name = admin_provider_oauth_key_name_from_auth_config(
+            &provider.provider_type,
+            &auth_config,
+            None,
+        );
+        match state
+            .create_provider_oauth_catalog_key(
+                &provider.id,
+                &provider.provider_type,
+                &key_name,
+                &access_token,
+                &auth_config,
+                &api_formats,
+                key_proxy,
+                expires_at,
+            )
+            .await?
+        {
+            Some(key) => key,
+            None => {
+                return Ok(build_internal_control_error_response(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "provider oauth write unavailable",
+                ));
+            }
+        }
+    };
+
+    spawn_provider_oauth_account_state_refresh_after_update(
+        state.cloned_app(),
+        provider.clone(),
+        persisted_key.id.clone(),
+        request_proxy.clone(),
+    );
+
+    session.status = "authorized".to_string();
+    session.key_id = Some(persisted_key.id.clone());
+    session.email = email.clone();
+    session.replaced = replaced;
+    session.error_msg = None;
+    let _ = state
+        .save_provider_oauth_device_session(session_id, &session, 60)
+        .await;
+
+    Ok(attach_admin_provider_oauth_device_poll_terminal_response(
+        session_id,
+        "authorized",
+        Json(json!({
+            "status": "authorized",
+            "key_id": persisted_key.id,
+            "email": email,
+            "replaced": replaced,
+        }))
+        .into_response(),
+    ))
+}
+
+async fn handle_admin_provider_oauth_grok_build_device_poll(
+    state: &AdminAppState<'_>,
+    provider: &StoredProviderCatalogProvider,
+    endpoints: &[StoredProviderCatalogEndpoint],
+    request_proxy: Option<ProxySnapshot>,
+    session_id: &str,
+    mut session: StoredAdminProviderOAuthDeviceSession,
+) -> Result<Response<Body>, GatewayError> {
+    use aether_oauth::provider::providers::GrokBuildDevicePollOutcome;
+
+    let device_code = session.device_code.trim();
+    if device_code.is_empty() {
+        return Ok(Json(json!({
+            "status": "error",
+            "error": "会话缺少 device_code",
+            "replaced": false,
+        }))
+        .into_response());
+    }
+    let ctx = ProviderOAuthTransportContext {
+        provider_id: provider.id.clone(),
+        provider_type: "grok_build".to_string(),
+        endpoint_id: None,
+        key_id: None,
+        auth_type: Some("oauth".to_string()),
+        decrypted_api_key: None,
+        decrypted_auth_config: None,
+        provider_config: provider.config.clone(),
+        endpoint_config: None,
+        key_config: None,
+        network: aether_oauth::network::OAuthNetworkContext::provider_operation(
+            request_proxy.clone(),
+        ),
+    };
+    let adapter = super::authorize::grok_build_device_adapter(state);
+    let executor = crate::oauth::GatewayOAuthHttpExecutor::new(*state);
+    let result = match adapter
+        .poll_device_token(&executor, &ctx, device_code)
+        .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(GrokBuildDevicePollOutcome::Pending)) => {
+            return Ok(Json(json!({"status": "pending", "replaced": false})).into_response());
+        }
+        Ok(Err(GrokBuildDevicePollOutcome::SlowDown)) => {
+            return Ok(Json(json!({"status": "slow_down", "replaced": false})).into_response());
+        }
+        Ok(Err(GrokBuildDevicePollOutcome::Expired)) => {
+            session.status = "expired".to_string();
+            session.error_msg = Some("设备码已过期".to_string());
+            let _ = state
+                .save_provider_oauth_device_session(session_id, &session, 30)
+                .await;
+            return Ok(attach_admin_provider_oauth_device_poll_terminal_response(
+                session_id,
+                "expired",
+                Json(json!({
+                    "status": "expired",
+                    "error": "设备码已过期",
+                    "replaced": false,
+                }))
+                .into_response(),
+            ));
+        }
+        Ok(Err(GrokBuildDevicePollOutcome::AccessDenied)) => {
+            session.status = "error".to_string();
+            session.error_msg = Some("用户拒绝授权".to_string());
+            let _ = state
+                .save_provider_oauth_device_session(session_id, &session, 30)
+                .await;
+            return Ok(attach_admin_provider_oauth_device_poll_terminal_response(
+                session_id,
+                "error",
+                Json(json!({
+                    "status": "error",
+                    "error": "用户拒绝授权",
+                    "replaced": false,
+                }))
+                .into_response(),
+            ));
+        }
+        Ok(Err(GrokBuildDevicePollOutcome::Failed(code))) => {
+            let error_message = format!("{code}: 授权失败");
+            session.status = "error".to_string();
+            session.error_msg = Some(error_message.clone());
+            let _ = state
+                .save_provider_oauth_device_session(session_id, &session, 30)
+                .await;
+            return Ok(attach_admin_provider_oauth_device_poll_terminal_response(
+                session_id,
+                "error",
+                Json(json!({
+                    "status": "error",
+                    "error": error_message,
+                    "replaced": false,
+                }))
+                .into_response(),
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(
+                provider_id = %provider.id,
+                error = %error,
+                "grok build device token poll failed"
+            );
+            return Ok(Json(json!({
+                "status": "error",
+                "error": "token exchange 失败",
+                "replaced": false,
+            }))
+            .into_response());
+        }
+    };
+
+    let access_token = result.token_set.access_token.trim().to_string();
+    if access_token.is_empty() {
+        return Ok(Json(json!({
+            "status": "error",
+            "error": "token 响应缺少 access_token",
+            "replaced": false,
+        }))
+        .into_response());
+    }
+    if result.token_set.refresh_token.is_none() {
+        return Ok(Json(json!({
+            "status": "error",
+            "error": "token 响应缺少 refresh_token",
+            "replaced": false,
+        }))
+        .into_response());
+    }
+    let mut auth_config = result.auth_config.as_object().cloned().unwrap_or_default();
+    auth_config.insert("provider_type".to_string(), json!("grok_build"));
+    let email = auth_config
+        .get("email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let expires_at = result.token_set.expires_at_unix_secs;
+
+    let duplicate = match state
+        .find_duplicate_provider_oauth_key(&provider.id, &auth_config, None)
+        .await
+    {
+        Ok(duplicate) => duplicate,
+        Err(detail) => {
+            return Ok(Json(json!({
+                "status": "error",
+                "error": detail,
+                "replaced": false,
+            }))
+            .into_response());
+        }
+    };
+
+    let api_formats = provider_oauth_active_api_formats(endpoints);
+    let key_proxy = provider_oauth_key_proxy_value(session.proxy_node_id.as_deref());
     let mut replaced = false;
     let persisted_key = if let Some(existing_key) = duplicate {
         replaced = true;

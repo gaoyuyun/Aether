@@ -888,6 +888,7 @@ const AUTH_TYPE_PROVIDER_LABEL_MAP: Record<string, string> = {
   antigravity: 'Antigravity',
   claude_code: 'Claude Code',
   gemini_cli: 'Gemini CLI',
+  grok_build: 'Grok Build',
 }
 
 const getProviderDisplayName = (
@@ -1971,6 +1972,7 @@ const formatAuthTypeWithPlan = (authType: string, planType?: string): string => 
     'antigravity': 'Antigravity',
     'claude_code': 'Claude Code',
     'gemini_cli': 'Gemini CLI',
+    'grok_build': 'Grok Build',
   }
   const typeName = labels[authType] || authType
   if (planType) {

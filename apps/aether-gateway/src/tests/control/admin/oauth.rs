@@ -339,7 +339,7 @@ async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trust
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let items = payload.as_array().expect("items should be array");
-    assert_eq!(items.len(), 6);
+    assert_eq!(items.len(), 7);
     assert_eq!(items[0]["provider_type"], "claude_code");
     assert_eq!(
         items[0]["authorize_url"],
@@ -359,6 +359,10 @@ async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trust
     assert_eq!(items[3]["provider_type"], "gemini_cli");
     assert_eq!(items[4]["provider_type"], "antigravity");
     assert_eq!(items[5]["provider_type"], "windsurf");
+    assert_eq!(items[6]["provider_type"], "grok_build");
+    assert_eq!(items[6]["display_name"], "Grok Build");
+    assert_eq!(items[6]["supports_authorization_code"], false);
+    assert_eq!(items[6]["supports_refresh_token_import"], true);
     assert!(items[1..]
         .iter()
         .all(|item| item["supports_cookie_authorization"] == false));
@@ -1495,6 +1499,310 @@ async fn gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_s
         .as_str()
         .is_some_and(|value| !value.is_empty()));
     assert_eq!(stored["status"], "pending");
+}
+
+#[test]
+fn gateway_handles_admin_provider_oauth_device_authorize_for_grok_build() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_authorize_for_grok_build",
+        gateway_handles_admin_provider_oauth_device_authorize_for_grok_build_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_authorize_for_grok_build_impl() {
+    let device_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let device_requests_clone = Arc::clone(&device_requests);
+    let idp = Router::new().route(
+        "/oauth2/device/code",
+        post(move |request: Request| {
+            let device_requests_inner = Arc::clone(&device_requests_clone);
+            async move {
+                let raw_body = String::from_utf8(
+                    to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("body should read")
+                        .to_vec(),
+                )
+                .expect("body should be utf8");
+                device_requests_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(raw_body);
+                Json(json!({
+                    "device_code": "grok-device-code-123",
+                    "user_code": "GROK-CODE",
+                    "verification_uri": "https://auth.x.ai/device",
+                    "verification_uri_complete": "https://auth.x.ai/device?user_code=GROK-CODE",
+                    "expires_in": 900,
+                    "interval": 7,
+                }))
+            }
+        }),
+    );
+
+    let mut provider = sample_provider("provider-grok-build", "grok_build", 10);
+    provider.provider_type = "grok_build".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![],
+        vec![],
+    ));
+
+    let (idp_url, idp_handle) = start_server(idp).await;
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ))
+        .with_provider_oauth_token_url_for_tests(
+            "grok_build_device_authorize",
+            format!("{idp_url}/oauth2/device/code"),
+        )
+        .with_provider_oauth_token_url_for_tests("grok_build", format!("{idp_url}/oauth2/token"));
+    let gateway = build_router_with_state(state.clone());
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/providers/provider-grok-build/device-authorize"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "auth_type": "device_code",
+            "proxy_node_id": "proxy-node-grok",
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    let session_id = payload["session_id"]
+        .as_str()
+        .expect("session_id should exist")
+        .to_string();
+    assert_eq!(payload["user_code"], "GROK-CODE");
+    assert_eq!(payload["verification_uri"], "https://auth.x.ai/device");
+    assert_eq!(
+        payload["verification_uri_complete"],
+        "https://auth.x.ai/device?user_code=GROK-CODE"
+    );
+    assert_eq!(payload["expires_in"], 900);
+    assert_eq!(payload["interval"], 7);
+    assert_eq!(payload["auth_type"], "device_code");
+    assert_eq!(payload["callback_required"], false);
+
+    let device_requests = device_requests.lock().expect("mutex should lock");
+    assert_eq!(device_requests.len(), 1);
+    let form = url::form_urlencoded::parse(device_requests[0].as_bytes())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        form.get("client_id").map(String::as_str),
+        Some("b1a00492-073a-47ea-816f-4c329264a828")
+    );
+    assert!(form
+        .get("scope")
+        .is_some_and(|scope| scope.contains("grok-cli:access")));
+    drop(device_requests);
+
+    let stored = state
+        .load_provider_oauth_device_session_for_tests(&format!("device_auth_session:{session_id}"))
+        .expect("device session should be stored");
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored).expect("device session json should parse");
+    assert_eq!(stored["provider_id"], "provider-grok-build");
+    assert_eq!(stored["device_code"], "grok-device-code-123");
+    assert_eq!(stored["auth_type"], "device_code");
+    assert_eq!(stored["interval"], 7);
+    assert_eq!(stored["proxy_node_id"], "proxy-node-grok");
+    assert_eq!(stored["status"], "pending");
+
+    gateway_handle.abort();
+    idp_handle.abort();
+}
+
+#[test]
+fn gateway_handles_admin_provider_oauth_device_poll_for_grok_build() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_poll_for_grok_build",
+        gateway_handles_admin_provider_oauth_device_poll_for_grok_build_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_poll_for_grok_build_impl() {
+    let token_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let token_requests_clone = Arc::clone(&token_requests);
+    let id_token = sample_kiro_device_access_token("grok@example.com");
+    let token_server = Router::new().route(
+        "/oauth2/token",
+        post(move |request: Request| {
+            let token_requests_inner = Arc::clone(&token_requests_clone);
+            let id_token_inner = id_token.clone();
+            async move {
+                let raw_body = String::from_utf8(
+                    to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("body should read")
+                        .to_vec(),
+                )
+                .expect("body should be utf8");
+                let mut token_requests = token_requests_inner.lock().expect("mutex should lock");
+                token_requests.push(raw_body);
+                if token_requests.len() == 1 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "authorization_pending"})),
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "access_token": "grok-access-token",
+                        "refresh_token": "grok-refresh-token",
+                        "id_token": id_token_inner,
+                        "token_type": "Bearer",
+                        "expires_in": 1800,
+                    })),
+                )
+            }
+        }),
+    );
+
+    let mut provider = sample_provider("provider-grok-build", "grok_build", 10);
+    provider.provider_type = "grok_build".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![],
+        vec![],
+    ));
+
+    let (token_url, token_handle) = start_server(token_server).await;
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        )
+        .with_provider_oauth_device_session_entry_for_tests(
+            "session-grok",
+            json!({
+                "provider_id": "provider-grok-build",
+                "region": "",
+                "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+                "client_secret": "",
+                "device_code": "grok-device-code-123",
+                "auth_type": "device_code",
+                "interval": 5,
+                "expires_at_unix_secs": 4_102_444_800u64,
+                "status": "pending",
+                "proxy_node_id": "proxy-node-grok",
+                "created_at_unix_ms": 1_711_000_000u64,
+                "key_id": null,
+                "email": null,
+                "replaced": false,
+                "error_msg": null,
+            }),
+        )
+        .with_provider_oauth_token_url_for_tests("grok_build", format!("{token_url}/oauth2/token"));
+    let gateway = build_router_with_state(state.clone());
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let poll = || async {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{gateway_url}/api/admin/provider-oauth/providers/provider-grok-build/device-poll"
+            ))
+            .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .header(
+                TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER,
+                "management-token-123",
+            )
+            .json(&json!({"session_id": "session-grok"}))
+            .send()
+            .await
+            .expect("request should succeed");
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.expect("json body should parse");
+        (status, payload)
+    };
+
+    let (status, payload) = poll().await;
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["status"], "pending");
+
+    let (status, payload) = poll().await;
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["status"], "authorized");
+    assert_eq!(payload["email"], "grok@example.com");
+    assert_eq!(payload["replaced"], false);
+
+    let token_requests = token_requests.lock().expect("mutex should lock");
+    assert_eq!(token_requests.len(), 2);
+    let form = url::form_urlencoded::parse(token_requests[1].as_bytes())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("urn:ietf:params:oauth:grant-type:device_code")
+    );
+    assert_eq!(
+        form.get("device_code").map(String::as_str),
+        Some("grok-device-code-123")
+    );
+    drop(token_requests);
+
+    let stored = state
+        .load_provider_oauth_device_session_for_tests("device_auth_session:session-grok")
+        .expect("device session should persist");
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored).expect("device session json should parse");
+    assert_eq!(stored["status"], "authorized");
+    let key_id = stored["key_id"]
+        .as_str()
+        .expect("key_id should be stored")
+        .to_string();
+    assert_eq!(payload["key_id"], key_id);
+
+    let persisted = provider_catalog_repository
+        .list_keys_by_ids(std::slice::from_ref(&key_id))
+        .await
+        .expect("keys should load")
+        .into_iter()
+        .next()
+        .expect("persisted key should exist");
+    assert_eq!(persisted.auth_type, "oauth");
+    assert_eq!(persisted.name, "grok@example.com");
+    assert_eq!(
+        persisted.proxy,
+        Some(json!({"node_id": "proxy-node-grok", "enabled": true}))
+    );
+    assert_eq!(
+        decrypt_persisted_provider_api_key(&persisted),
+        "grok-access-token"
+    );
+    let auth_config: serde_json::Value =
+        serde_json::from_str(&decrypt_persisted_provider_auth_config(&persisted))
+            .expect("auth config should parse");
+    assert_eq!(auth_config["provider_type"], "grok_build");
+    assert_eq!(auth_config["auth_method"], "device_code");
+    assert_eq!(auth_config["refresh_token"], "grok-refresh-token");
+    assert_eq!(auth_config["email"], "grok@example.com");
+    assert_eq!(auth_config["user_id"], "kiro-user-123");
+    assert!(auth_config.get("id_token").is_none());
+    assert!(auth_config["expires_at"].as_u64().is_some());
+
+    gateway_handle.abort();
+    token_handle.abort();
 }
 
 #[test]
