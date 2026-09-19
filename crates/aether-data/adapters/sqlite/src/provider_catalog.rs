@@ -5181,4 +5181,153 @@ INSERT INTO provider_api_keys (
         .await
         .expect("key should seed");
     }
+
+    #[tokio::test]
+    async fn sqlite_upstream_metadata_cas_accepts_floats_read_back_through_serde_json() {
+        let pool = crate::test_support::migrated_pool().await;
+        let repository = SqliteProviderCatalogReadRepository::new(pool);
+        repository
+            .create_provider(
+                &StoredProviderCatalogProvider::new(
+                    "float-cas-provider".to_string(),
+                    "Float CAS Provider".to_string(),
+                    None,
+                    "kiro".to_string(),
+                )
+                .expect("provider should build"),
+                None,
+            )
+            .await
+            .expect("provider should create");
+
+        // 1000.0 - 611.43 serializes as 388.57000000000005. serde_json's default
+        // parser reads that text back as a neighbouring f64 that re-serializes
+        // as 388.5700000000001, so a textual JSON comparison would never match.
+        let remaining = 1000.0_f64 - 611.43_f64;
+        let mut key = StoredProviderCatalogKey::new(
+            "float-cas-key".to_string(),
+            "float-cas-provider".to_string(),
+            "default".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["claude:messages"])),
+            Some("encrypted-api-key".to_string()),
+            Some("encrypted-auth-v1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build");
+        key.upstream_metadata = Some(json!({
+            "kiro": {
+                "current_usage": 611.43,
+                "usage_limit": 1000.0,
+                "remaining": remaining,
+                "updated_at": 1_789_817_054u64
+            }
+        }));
+        repository
+            .create_key(&key)
+            .await
+            .expect("key should create");
+
+        let read_back_namespace = |keys: Vec<StoredProviderCatalogKey>| {
+            keys.into_iter()
+                .next()
+                .expect("key should exist")
+                .upstream_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("kiro"))
+                .cloned()
+        };
+        let observed_namespace = read_back_namespace(
+            repository
+                .list_keys_by_ids(&[key.id.clone()])
+                .await
+                .expect("keys should read"),
+        );
+        assert_eq!(
+            observed_namespace
+                .as_ref()
+                .and_then(|value| value.get("remaining"))
+                .and_then(serde_json::Value::as_f64),
+            Some(remaining),
+            "the stored float must read back as the value that was written"
+        );
+
+        let oauth_update = ProviderCatalogKeyOAuthRuntimeStateCasUpdate {
+            key_id: key.id.clone(),
+            expected_encrypted_auth_config: Some("encrypted-auth-v1".to_string()),
+            expected_credential: Some(ProviderCatalogKeyOAuthCredentialFence {
+                encrypted_api_key: Some("encrypted-api-key".to_string()),
+                auth_type: "oauth".to_string(),
+                provider_id: "float-cas-provider".to_string(),
+                provider_type: "kiro".to_string(),
+            }),
+            expected_upstream_metadata_namespace: Some(
+                ProviderCatalogUpstreamMetadataNamespaceExpectation {
+                    namespace: "kiro".to_string(),
+                    expected_value: observed_namespace,
+                },
+            ),
+            encrypted_auth_config: "encrypted-auth-v1".to_string(),
+            encrypted_api_key_update: None,
+            expires_at_unix_secs_update: None,
+            oauth_invalid_at_unix_secs: None,
+            oauth_invalid_reason: None,
+            upstream_metadata_patch: Some(json!({
+                "kiro": {
+                    "current_usage": 611.43,
+                    "usage_limit": 1000.0,
+                    "remaining": remaining,
+                    "updated_at": 1_789_817_100u64
+                }
+            })),
+            upstream_metadata_namespace_to_remove: None,
+            status_snapshot_patch: json!({"quota": {"code": "ok"}}),
+            reset_error_count: false,
+            updated_at_unix_secs: Some(200),
+        };
+        assert!(
+            repository
+                .compare_and_update_key_oauth_runtime_state(&oauth_update)
+                .await
+                .expect("OAuth runtime CAS should execute"),
+            "a namespace expectation read back from the row must match that row"
+        );
+
+        let observed_namespace = read_back_namespace(
+            repository
+                .list_keys_by_ids(&[key.id.clone()])
+                .await
+                .expect("keys should read"),
+        );
+        let metadata_update = ProviderCatalogKeyRuntimeMetadataUpdate {
+            key_id: key.id.clone(),
+            namespace: "kiro".to_string(),
+            expected_upstream_metadata_value: observed_namespace,
+            upstream_metadata_value: json!({
+                "current_usage": 611.43,
+                "usage_limit": 1000.0,
+                "remaining": remaining,
+                "updated_at": 1_789_817_200u64
+            }),
+            status_snapshot_patch: json!({}),
+            updated_at_unix_secs: Some(201),
+        };
+        assert!(
+            repository
+                .update_key_runtime_metadata(&metadata_update)
+                .await
+                .expect("runtime metadata CAS should execute"),
+            "a runtime metadata expectation read back from the row must match that row"
+        );
+    }
 }

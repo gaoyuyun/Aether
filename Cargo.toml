@@ -127,7 +127,7 @@ regex = "1"
 rustls = { version = "0.23", features = ["ring"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 serde_path_to_error = "0.1"
 sha2 = "0.10"
 socket2 = "0.6"
