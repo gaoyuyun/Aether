@@ -42,6 +42,7 @@ jobs:
         run: |
           python3 -m unittest discover -s .github/scripts -p 'test_*.py'
           bash tests/release_supply_chain_test.sh
+          bash .github/scripts/upstream_excluded_paths.sh check
 
       - name: Select jobs from changed files
         id: changes

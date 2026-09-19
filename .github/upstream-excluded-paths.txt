@@ -1,0 +1,16 @@
+# Upstream-only paths that this fork intentionally does not carry.
+# One path per line; blank lines and lines starting with '#' are ignored.
+#
+# After `git merge --no-commit <upstream ref>` run
+#   bash .github/scripts/upstream_excluded_paths.sh prune
+# to resolve every listed path as deleted. CI runs the `check` mode and fails
+# when any of them reappears. See docs/operations/upstream-release-integration.md.
+#
+# Nightly Release only runs from refs/heads/main and fails every night on the
+# fork/dev default branch; the other workflows drive upstream's own release,
+# tunnel and pages deployments.
+.github/workflows/nightly.yml
+.github/workflows/release.yml
+.github/workflows/rust-ci.yml
+.github/workflows/build-tunnel.yml
+.github/workflows/deploy-pages.yml

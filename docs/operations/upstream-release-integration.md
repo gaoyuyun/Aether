@@ -4,6 +4,19 @@
 
 已发布的 SQL 迁移不改写、不删除，也不复用已有版本号；确有结构变更时新增增量迁移并维护逻辑 schema、生成文件和 bootstrap。上游的 PostgreSQL 专用 SQL 不能直接用于另外两库。
 
+## 上游专属文件排除
+
+`.github/upstream-excluded-paths.txt` 列出本分支不携带的上游专属文件，目前是上游的 nightly、release、rust-ci、build-tunnel、deploy-pages 五个 workflow。它们只服务上游仓库自己的发布与部署；其中 Nightly Release 要求在 `main` 分支运行，在本仓库默认分支 `fork/dev` 上每天定时触发后随即失败。
+
+合并上游时这些路径一律按删除处理：上游未改动则自然保持删除；上游改动过时 Git 会报 modify/delete 冲突，不要接受上游版本。Git 没有让文件在合并时保持删除的属性机制（`merge=ours` 只处理内容冲突），因此用脚本统一解决：
+
+```bash
+git merge --no-commit vX.Y.Z
+bash .github/scripts/upstream_excluded_paths.sh prune
+```
+
+`prune` 对清单中每个仍被跟踪的路径执行 `git rm`，随后做一次与 CI 相同的检查。CI 的 `changes` 作业执行 `upstream_excluded_paths.sh check`，任一路径重新出现即失败。上游新增的仓库专属 workflow 先加入清单再删除，保证排除范围可追溯。
+
 ## v0.7.19
 
 合并来源：`fawney19/Aether` 的 `v0.7.19`，提交 `361952ada9e3d01ac180846cee497cd1f55ad1c3`。相对已合入的 v0.7.18 共 7 个提交，涵盖策略级故障转移、断连处理、流式恢复、格式转换诊断、DNS、模型测试及支付订单查询。
