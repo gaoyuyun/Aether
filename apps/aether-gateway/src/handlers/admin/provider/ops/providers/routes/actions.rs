@@ -2,14 +2,24 @@ use super::super::actions::{
     admin_provider_ops_is_valid_action_type, admin_provider_ops_local_action_response,
 };
 use super::super::balance_cache::{
-    admin_provider_ops_pending_balance_response, read_admin_provider_ops_balance_cache,
-    spawn_admin_provider_ops_balance_refresh, store_admin_provider_ops_balance_cache,
-    AdminProviderOpsBalanceCacheLookup,
+    admin_provider_ops_balance_now_unix_secs, apply_admin_provider_ops_balance_attempt,
+    attach_admin_provider_ops_balance_meta, build_admin_provider_ops_balance_response,
+    read_admin_provider_ops_balance_snapshot, write_admin_provider_ops_balance_snapshot,
+};
+use super::super::balance_refresh::{
+    admin_provider_ops_balance_refresh_state_label, enqueue_admin_provider_ops_balance_refresh,
+    AdminProviderOpsBalanceRefreshTrigger,
 };
 use super::super::config::admin_provider_ops_config_object;
 use super::super::support::AdminProviderOpsExecuteActionRequest;
+use super::super::verify::{
+    with_admin_provider_ops_request_timeouts, ADMIN_PROVIDER_OPS_BALANCE_QUERY_TIMEOUTS,
+};
 use crate::handlers::admin::request::AdminAppState;
 use crate::GatewayError;
+use aether_data_contracts::repository::provider_catalog::{
+    StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
+};
 use axum::{
     body::{Body, Bytes},
     http,
@@ -90,68 +100,116 @@ pub(super) async fn handle_admin_provider_ops_action(
     } else {
         Vec::new()
     };
-    let payload = if action_type == "query_balance"
-        && route_kind == "get_provider_balance"
-        && provider.is_some_and(|provider| admin_provider_ops_config_object(provider).is_some())
-    {
-        match read_admin_provider_ops_balance_cache(state, provider_id).await {
-            AdminProviderOpsBalanceCacheLookup::Hit(cached) => {
-                if query_param_bool(query_string, "refresh", true) {
-                    spawn_admin_provider_ops_balance_refresh(state, provider_id).await;
+    let ops_configured =
+        provider.is_some_and(|provider| admin_provider_ops_config_object(provider).is_some());
+    let payload =
+        if action_type == "query_balance" && route_kind == "get_provider_balance" && ops_configured
+        {
+            let refresh_requested = query_param_bool(query_string, "refresh", true);
+            let snapshot = read_admin_provider_ops_balance_snapshot(state, provider_id).await;
+            match snapshot {
+                Some(snapshot) => {
+                    if refresh_requested {
+                        enqueue_admin_provider_ops_balance_refresh(
+                            state,
+                            provider_id,
+                            AdminProviderOpsBalanceRefreshTrigger::Manual,
+                        );
+                    }
+                    build_admin_provider_ops_balance_response(
+                        Some(&snapshot),
+                        admin_provider_ops_balance_refresh_state_label(state, provider_id),
+                        admin_provider_ops_balance_now_unix_secs(),
+                    )
                 }
-                cached
-            }
-            AdminProviderOpsBalanceCacheLookup::Miss => {
-                if query_param_bool(query_string, "refresh", true)
-                    && !state.runtime_state().is_memory()
-                {
-                    spawn_admin_provider_ops_balance_refresh(state, provider_id).await;
-                    admin_provider_ops_pending_balance_response("余额数据加载中，请稍后刷新")
-                } else {
-                    let payload = admin_provider_ops_local_action_response(
+                None if refresh_requested => {
+                    enqueue_admin_provider_ops_balance_refresh(
+                        state,
+                        provider_id,
+                        AdminProviderOpsBalanceRefreshTrigger::Manual,
+                    );
+                    build_admin_provider_ops_balance_response(
+                        None,
+                        admin_provider_ops_balance_refresh_state_label(state, provider_id),
+                        admin_provider_ops_balance_now_unix_secs(),
+                    )
+                }
+                // `refresh=false` without a snapshot: the caller wants a value now.
+                None => {
+                    query_admin_provider_ops_balance_now(
                         state,
                         provider_id,
                         provider,
                         &endpoints,
-                        &action_type,
                         request_config.as_ref(),
                     )
-                    .await;
-                    store_admin_provider_ops_balance_cache(state, provider_id, &payload).await;
-                    payload
+                    .await
                 }
             }
-            AdminProviderOpsBalanceCacheLookup::Unavailable => {
-                let payload = admin_provider_ops_local_action_response(
-                    state,
-                    provider_id,
-                    provider,
-                    &endpoints,
-                    &action_type,
-                    request_config.as_ref(),
-                )
-                .await;
-                store_admin_provider_ops_balance_cache(state, provider_id, &payload).await;
-                payload
-            }
-        }
-    } else {
-        let payload = admin_provider_ops_local_action_response(
+        } else if action_type == "query_balance"
+            && route_kind == "refresh_provider_balance"
+            && ops_configured
+        {
+            query_admin_provider_ops_balance_now(
+                state,
+                provider_id,
+                provider,
+                &endpoints,
+                request_config.as_ref(),
+            )
+            .await
+        } else {
+            admin_provider_ops_local_action_response(
+                state,
+                provider_id,
+                provider,
+                &endpoints,
+                &action_type,
+                request_config.as_ref(),
+            )
+            .await
+        };
+
+    Ok(Some(Json(payload).into_response()))
+}
+
+/// Queries the upstream in the request and records the outcome in the snapshot
+/// so the page and the background refresher see the same value afterwards.
+async fn query_admin_provider_ops_balance_now(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+    provider: Option<&StoredProviderCatalogProvider>,
+    endpoints: &[StoredProviderCatalogEndpoint],
+    request_config: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let previous = read_admin_provider_ops_balance_snapshot(state, provider_id).await;
+    let mut payload = with_admin_provider_ops_request_timeouts(
+        ADMIN_PROVIDER_OPS_BALANCE_QUERY_TIMEOUTS,
+        admin_provider_ops_local_action_response(
             state,
             provider_id,
             provider,
-            &endpoints,
-            &action_type,
-            request_config.as_ref(),
-        )
-        .await;
-        if action_type == "query_balance" && route_kind == "refresh_provider_balance" {
-            store_admin_provider_ops_balance_cache(state, provider_id, &payload).await;
-        }
-        payload
-    };
-
-    Ok(Some(Json(payload).into_response()))
+            endpoints,
+            "query_balance",
+            request_config,
+        ),
+    )
+    .await;
+    let now_unix_secs = admin_provider_ops_balance_now_unix_secs();
+    let snapshot = apply_admin_provider_ops_balance_attempt(
+        previous.as_ref(),
+        provider_id,
+        &payload,
+        now_unix_secs,
+    );
+    write_admin_provider_ops_balance_snapshot(state, &snapshot).await;
+    attach_admin_provider_ops_balance_meta(
+        &mut payload,
+        Some(&snapshot),
+        admin_provider_ops_balance_refresh_state_label(state, provider_id),
+        now_unix_secs,
+    );
+    payload
 }
 
 fn query_param_bool(query: Option<&str>, key: &str, default: bool) -> bool {

@@ -48,6 +48,9 @@ use aether_data::repository::oauth_providers::{
     OAuthProviderReadRepository, OAuthProviderWriteRepository, StoredOAuthProviderConfig,
     UpsertOAuthProviderConfigRecord,
 };
+use aether_data::repository::provider_ops_balance::{
+    ProviderOpsBalanceSnapshotReadRepository, ProviderOpsBalanceSnapshotWriteRepository,
+};
 use aether_data::repository::proxy_nodes::{
     ProxyNodeEventQuery, ProxyNodeHeartbeatMutation, ProxyNodeManualCreateMutation,
     ProxyNodeManualUpdateMutation, ProxyNodeMetricsCleanupSummary, ProxyNodeMetricsStep,
@@ -192,6 +195,9 @@ pub(crate) struct GatewayDataState {
     background_task_writer: Option<Arc<dyn BackgroundTaskWriteRepository>>,
     gemini_file_mapping_reader: Option<Arc<dyn GeminiFileMappingReadRepository>>,
     gemini_file_mapping_writer: Option<Arc<dyn GeminiFileMappingWriteRepository>>,
+    provider_ops_balance_snapshot_reader: Option<Arc<dyn ProviderOpsBalanceSnapshotReadRepository>>,
+    provider_ops_balance_snapshot_writer:
+        Option<Arc<dyn ProviderOpsBalanceSnapshotWriteRepository>>,
     global_model_reader: Option<Arc<dyn GlobalModelReadRepository>>,
     global_model_writer: Option<Arc<dyn GlobalModelWriteRepository>>,
     minimal_candidate_selection_reader: Option<Arc<dyn MinimalCandidateSelectionReadRepository>>,
@@ -329,6 +335,14 @@ impl fmt::Debug for GatewayDataState {
                 &self.gemini_file_mapping_writer.is_some(),
             )
             .field(
+                "has_provider_ops_balance_snapshot_reader",
+                &self.provider_ops_balance_snapshot_reader.is_some(),
+            )
+            .field(
+                "has_provider_ops_balance_snapshot_writer",
+                &self.provider_ops_balance_snapshot_writer.is_some(),
+            )
+            .field(
                 "has_global_model_reader",
                 &self.global_model_reader.is_some(),
             )
@@ -401,6 +415,7 @@ mod integrations;
 mod models;
 mod pool_scores;
 mod provider_catalog_cache;
+mod provider_ops_balance;
 mod referrals;
 mod request_candidate_cache;
 mod routing_group_cache;

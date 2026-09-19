@@ -28,7 +28,11 @@ vi.mock('@/features/providers/composables/useProviderBalance', () => ({
   useProviderBalance: () => ({
     loadArchitectureSchemas: vi.fn(),
     loadBalances: vi.fn(),
+    refreshProviderBalance: vi.fn(),
     getProviderBalance: () => ({ available: 125, currency: 'USD' }),
+    getProviderBalanceMeta: () => null,
+    isBalanceRefreshing: () => false,
+    formatBalanceFetchedAt: () => '',
     getProviderBalanceBreakdown: () => null,
     getProviderBalanceError: () => null,
     isBalanceLoading: () => false,

@@ -76,7 +76,7 @@ pub(crate) const ADMIN_MONITORING_REDIS_CACHE_CATEGORIES: &[(&str, &str, &str, &
         "provider_balance",
         "Provider 余额",
         "provider_ops:balance:*",
-        "Provider 余额查询缓存",
+        "Provider 余额快照（无数据库时的运行时缓存）",
     ),
     ("health", "健康检查", "health:*", "端点健康状态缓存"),
     (

@@ -1,4 +1,4 @@
-use super::super::balance_cache::clear_admin_provider_ops_balance_cache;
+use super::super::balance_cache::delete_admin_provider_ops_balance_snapshot;
 use super::super::config::build_admin_provider_ops_saved_config_value;
 use super::super::support::AdminProviderOpsSaveConfigRequest;
 use crate::handlers::admin::request::AdminAppState;
@@ -85,7 +85,9 @@ pub(super) async fn handle_admin_provider_ops_save_config(
                 .into_response(),
         ));
     }
-    clear_admin_provider_ops_balance_cache(state, provider_id).await;
+    // The stored value belongs to the previous credentials; the next page load
+    // or monitor tick queries the new configuration.
+    delete_admin_provider_ops_balance_snapshot(state, provider_id).await;
 
     Ok(Some(
         Json(json!({
@@ -153,7 +155,7 @@ pub(super) async fn handle_admin_provider_ops_delete_config(
         ));
     }
     if removed {
-        clear_admin_provider_ops_balance_cache(state, provider_id).await;
+        delete_admin_provider_ops_balance_snapshot(state, provider_id).await;
     }
 
     Ok(Some(

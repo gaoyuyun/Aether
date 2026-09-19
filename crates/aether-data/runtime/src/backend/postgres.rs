@@ -46,6 +46,10 @@ use crate::repository::provider_catalog::{
     ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
     SqlxProviderCatalogReadRepository,
 };
+use crate::repository::provider_ops_balance::{
+    ProviderOpsBalanceSnapshotReadRepository, ProviderOpsBalanceSnapshotWriteRepository,
+    SqlxProviderOpsBalanceSnapshotRepository,
+};
 use crate::repository::proxy_nodes::{
     ProxyNodeReadRepository, ProxyNodeWriteRepository, SqlxProxyNodeRepository,
 };
@@ -159,6 +163,22 @@ impl PostgresBackend {
         &self,
     ) -> Arc<dyn GeminiFileMappingWriteRepository> {
         Arc::new(SqlxGeminiFileMappingRepository::new(self.pool_clone()))
+    }
+
+    pub fn provider_ops_balance_snapshot_read_repository(
+        &self,
+    ) -> Arc<dyn ProviderOpsBalanceSnapshotReadRepository> {
+        Arc::new(SqlxProviderOpsBalanceSnapshotRepository::new(
+            self.pool_clone(),
+        ))
+    }
+
+    pub fn provider_ops_balance_snapshot_write_repository(
+        &self,
+    ) -> Arc<dyn ProviderOpsBalanceSnapshotWriteRepository> {
+        Arc::new(SqlxProviderOpsBalanceSnapshotRepository::new(
+            self.pool_clone(),
+        ))
     }
 
     pub fn global_model_read_repository(&self) -> Arc<dyn GlobalModelReadRepository> {

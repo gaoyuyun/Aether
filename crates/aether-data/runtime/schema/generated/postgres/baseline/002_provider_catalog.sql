@@ -358,6 +358,21 @@ CREATE INDEX IF NOT EXISTS provider_usage_tracking_window_start_idx ON public.pr
 CREATE INDEX IF NOT EXISTS idx_provider_window ON public.provider_usage_tracking USING btree (provider_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_window_time ON public.provider_usage_tracking USING btree (window_start, window_end);
 
+CREATE TABLE IF NOT EXISTS public.provider_ops_balance_snapshots (
+    provider_id character varying(64) NOT NULL,
+    payload_json jsonb,
+    last_success_at bigint,
+    last_attempt_at bigint,
+    last_status character varying(32),
+    last_error text,
+    consecutive_failures integer DEFAULT 0 NOT NULL,
+    next_refresh_at bigint,
+    updated_at bigint NOT NULL
+);
+
+ALTER TABLE ONLY public.provider_ops_balance_snapshots ADD CONSTRAINT provider_ops_balance_snapshots_pkey PRIMARY KEY (provider_id);
+ALTER TABLE ONLY public.provider_ops_balance_snapshots ADD CONSTRAINT provider_ops_balance_snapshots_provider_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
+
 CREATE TABLE IF NOT EXISTS public.provider_quota_window_counters (
     provider_id character varying(64) NOT NULL,
     duration_secs bigint NOT NULL,

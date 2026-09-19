@@ -347,6 +347,20 @@ CREATE TABLE IF NOT EXISTS provider_usage_tracking (
     KEY idx_window_time (`window_start`, `window_end`)
 );
 
+CREATE TABLE IF NOT EXISTS provider_ops_balance_snapshots (
+    `provider_id` VARCHAR(64) NOT NULL,
+    `payload_json` JSON,
+    `last_success_at` BIGINT,
+    `last_attempt_at` BIGINT,
+    `last_status` VARCHAR(32),
+    `last_error` TEXT,
+    `consecutive_failures` INT NOT NULL DEFAULT 0,
+    `next_refresh_at` BIGINT,
+    `updated_at` BIGINT NOT NULL,
+    PRIMARY KEY (`provider_id`),
+    CONSTRAINT provider_ops_balance_snapshots_provider_fkey FOREIGN KEY (`provider_id`) REFERENCES providers (`id`) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS provider_quota_window_counters (
     `provider_id` VARCHAR(64) NOT NULL,
     `duration_secs` BIGINT NOT NULL,

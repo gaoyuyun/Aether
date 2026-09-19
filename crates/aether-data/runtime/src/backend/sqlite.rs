@@ -44,6 +44,10 @@ use crate::repository::provider_catalog::{
     ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
     SqliteProviderCatalogReadRepository,
 };
+use crate::repository::provider_ops_balance::{
+    ProviderOpsBalanceSnapshotReadRepository, ProviderOpsBalanceSnapshotWriteRepository,
+    SqliteProviderOpsBalanceSnapshotRepository,
+};
 use crate::repository::proxy_nodes::{
     ProxyNodeReadRepository, ProxyNodeWriteRepository, SqliteProxyNodeReadRepository,
 };
@@ -165,6 +169,22 @@ impl SqliteBackend {
         &self,
     ) -> Arc<dyn GeminiFileMappingWriteRepository> {
         Arc::new(SqliteGeminiFileMappingRepository::new(self.pool_clone()))
+    }
+
+    pub fn provider_ops_balance_snapshot_read_repository(
+        &self,
+    ) -> Arc<dyn ProviderOpsBalanceSnapshotReadRepository> {
+        Arc::new(SqliteProviderOpsBalanceSnapshotRepository::new(
+            self.pool_clone(),
+        ))
+    }
+
+    pub fn provider_ops_balance_snapshot_write_repository(
+        &self,
+    ) -> Arc<dyn ProviderOpsBalanceSnapshotWriteRepository> {
+        Arc::new(SqliteProviderOpsBalanceSnapshotRepository::new(
+            self.pool_clone(),
+        ))
     }
 
     pub fn global_model_read_repository(&self) -> Arc<dyn GlobalModelReadRepository> {

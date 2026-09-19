@@ -3738,38 +3738,64 @@ async fn gateway_handles_admin_provider_ops_batch_balance_locally_with_trusted_a
     ));
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(
-                GatewayDataState::with_provider_catalog_repository_for_tests(
-                    provider_catalog_repository,
-                ),
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository,
             ),
-    );
+        );
+    let refresher = Arc::clone(&state.provider_ops_balance_refresher);
+    let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+    let batch_request = || {
+        client
+            .post(format!(
+                "{gateway_url}/api/admin/provider-ops/batch/balance"
+            ))
+            .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&json!([
+                "provider-openai",
+                "provider-anyrouter",
+                "provider-missing"
+            ]))
+    };
 
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{gateway_url}/api/admin/provider-ops/batch/balance"
-        ))
-        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
-        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
-        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
-        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
-        .json(&json!([
-            "provider-openai",
-            "provider-anyrouter",
-            "provider-missing"
-        ]))
+    // The page never waits for upstreams: configured providers without a
+    // snapshot are queued for a background refresh and reported as pending.
+    let response = batch_request()
         .send()
         .await
         .expect("request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["provider-openai"]["status"], "pending");
+    assert_eq!(payload["provider-openai"]["refresh_state"], "refreshing");
+    assert_eq!(payload["provider-anyrouter"]["status"], "pending");
+    assert_eq!(payload["provider-missing"]["status"], "not_configured");
+    assert_eq!(payload["provider-missing"]["message"], "未配置操作设置");
 
+    refresher.wait_idle().await;
+
+    let response = batch_request()
+        .send()
+        .await
+        .expect("request should succeed");
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["provider-openai"]["status"], "success");
     assert_eq!(payload["provider-openai"]["data"]["total_available"], 5.0);
+    assert_eq!(payload["provider-openai"]["refresh_state"], "idle");
+    assert_eq!(payload["provider-openai"]["stale"], false);
+    assert!(payload["provider-openai"]["fetched_at"].is_string());
+    assert_eq!(
+        payload["provider-openai"]["last_error"],
+        serde_json::Value::Null
+    );
     assert_eq!(payload["provider-anyrouter"]["status"], "success");
     assert_eq!(
         payload["provider-anyrouter"]["data"]["total_available"],
@@ -4012,12 +4038,12 @@ async fn gateway_handles_admin_provider_ops_balance_cache_refresh_modes_with_red
     .expect("data state should build")
     .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository));
     let runtime_state = redis_runtime_state_for_test(&redis, "provider_ops_balance_cache").await;
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(data_state)
-            .with_runtime_state(runtime_state),
-    );
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state)
+        .with_runtime_state(runtime_state);
+    let refresher = Arc::clone(&state.provider_ops_balance_refresher);
+    let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -4038,11 +4064,13 @@ async fn gateway_handles_admin_provider_ops_balance_cache_refresh_modes_with_red
         .await
         .expect("json body should parse");
     assert_eq!(pending_payload["status"], "pending");
+    assert_eq!(pending_payload["refresh_state"], "refreshing");
 
     wait_until(5000, || {
         *balance_hits.lock().expect("mutex should lock") == 1
     })
     .await;
+    refresher.wait_idle().await;
 
     let cached_response = client
         .get(format!(
@@ -4738,12 +4766,12 @@ async fn gateway_handles_admin_provider_ops_batch_balance_with_pending_cache_hit
     .expect("data state should build")
     .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository));
     let runtime_state = redis_runtime_state_for_test(&redis, "provider_ops_batch_balance").await;
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(data_state)
-            .with_runtime_state(runtime_state),
-    );
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state)
+        .with_runtime_state(runtime_state);
+    let refresher = Arc::clone(&state.provider_ops_balance_refresher);
+    let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -4764,11 +4792,16 @@ async fn gateway_handles_admin_provider_ops_batch_balance_with_pending_cache_hit
         .await
         .expect("json body should parse");
     assert_eq!(pending_payload["provider-openai"]["status"], "pending");
+    assert_eq!(
+        pending_payload["provider-openai"]["refresh_state"],
+        "refreshing"
+    );
 
     wait_until(5000, || {
         *balance_hits.lock().expect("mutex should lock") == 1
     })
     .await;
+    refresher.wait_idle().await;
 
     let cached_response = client
         .post(format!(
@@ -4791,10 +4824,10 @@ async fn gateway_handles_admin_provider_ops_batch_balance_with_pending_cache_hit
         cached_payload["provider-openai"]["data"]["total_available"],
         3.0
     );
-    wait_until(5000, || {
-        *balance_hits.lock().expect("mutex should lock") == 2
-    })
-    .await;
+    assert_eq!(cached_payload["provider-openai"]["refresh_state"], "idle");
+    assert_eq!(cached_payload["provider-openai"]["stale"], false);
+    // A fresh snapshot is served as-is; the page does not re-query a healthy upstream.
+    assert_eq!(*balance_hits.lock().expect("mutex should lock"), 1);
 
     gateway_handle.abort();
     ops_handle.abort();

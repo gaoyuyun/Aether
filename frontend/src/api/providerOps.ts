@@ -39,6 +39,16 @@ export type ActionStatus =
   | 'already_done'
   | 'unknown_error'
 
+/** 余额快照刷新状态：idle=空闲，refreshing=后台任务进行中 */
+export type BalanceRefreshState = 'idle' | 'refreshing'
+
+/** 最近一次失败的余额查询；有值时 status/data 仍是上次成功的结果 */
+export interface BalanceLastError {
+  status: ActionStatus | string
+  message: string
+  at: string | null
+}
+
 /** 连接状态 */
 export type ConnectorStatus = 'disconnected' | 'connecting' | 'connected' | 'expired' | 'error'
 
@@ -112,6 +122,16 @@ export interface ActionResultResponse {
   executed_at: string
   response_time_ms: number | null
   cache_ttl_seconds: number
+  // ---- 以下为余额快照元数据，仅 query_balance 返回 ----
+  /** 最近一次成功查询的时间，null 表示从未成功 */
+  fetched_at?: string | null
+  /** 成功值超过新鲜阈值或从未成功 */
+  stale?: boolean
+  refresh_state?: BalanceRefreshState
+  /** 失败退避到期时间 */
+  next_retry_at?: string | null
+  consecutive_failures?: number
+  last_error?: BalanceLastError | null
 }
 
 /** 连接器配置请求 */
@@ -281,7 +301,8 @@ export async function executeAction(
 }
 
 /**
- * 获取余额（优先返回缓存，后台异步刷新）
+ * 获取余额快照。refresh=true 时会排队一次后台刷新（忽略退避），响应里的
+ * refresh_state 为 refreshing 时应继续轮询直到变为 idle。
  * @param providerId Provider ID
  * @param refresh 是否触发后台刷新（默认 true）
  */
@@ -317,7 +338,8 @@ export async function checkin(providerId: string): Promise<ActionResultResponse>
 }
 
 /**
- * 批量查询余额
+ * 批量读取余额快照。接口只读快照、不等待上游；过期或缺失的快照会被后台刷新，
+ * 对应条目的 status 为 pending 或 refresh_state 为 refreshing 时需要轮询。
  */
 export async function batchQueryBalance(
   providerIds?: string[]

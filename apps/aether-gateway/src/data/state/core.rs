@@ -415,6 +415,8 @@ impl GatewayDataState {
                 background_task_writer: None,
                 gemini_file_mapping_reader: None,
                 gemini_file_mapping_writer: None,
+                provider_ops_balance_snapshot_reader: None,
+                provider_ops_balance_snapshot_writer: None,
                 global_model_reader: None,
                 global_model_writer: None,
                 minimal_candidate_selection_reader: None,
@@ -464,6 +466,7 @@ impl GatewayDataState {
         let background_task_reader = backends.read().background_tasks();
         let background_task_writer = backends.write().background_tasks();
         let gemini_file_mapping_reader = backends.read().gemini_file_mappings();
+        let provider_ops_balance_snapshot_reader = backends.read().provider_ops_balance_snapshots();
         let global_model_reader = backends.read().global_models();
         let global_model_writer = backends.write().global_models();
         let minimal_candidate_selection_reader =
@@ -486,6 +489,8 @@ impl GatewayDataState {
         });
         let request_candidate_writer = backends.write().request_candidates();
         let gemini_file_mapping_writer = backends.write().gemini_file_mappings();
+        let provider_ops_balance_snapshot_writer =
+            backends.write().provider_ops_balance_snapshots();
         let provider_catalog_reader = backends.read().provider_catalog().map(|repository| {
             Arc::new(
                 super::provider_catalog_cache::CachedProviderCatalogReadRepository::new(repository),
@@ -532,6 +537,8 @@ impl GatewayDataState {
             background_task_writer,
             gemini_file_mapping_reader,
             gemini_file_mapping_writer,
+            provider_ops_balance_snapshot_reader,
+            provider_ops_balance_snapshot_writer,
             global_model_reader,
             global_model_writer,
             minimal_candidate_selection_reader,
@@ -652,6 +659,14 @@ impl GatewayDataState {
 
     pub(crate) fn has_gemini_file_mapping_writer(&self) -> bool {
         self.gemini_file_mapping_writer.is_some()
+    }
+
+    pub(crate) fn has_provider_ops_balance_snapshot_reader(&self) -> bool {
+        self.provider_ops_balance_snapshot_reader.is_some()
+    }
+
+    pub(crate) fn has_provider_ops_balance_snapshot_writer(&self) -> bool {
+        self.provider_ops_balance_snapshot_writer.is_some()
     }
 
     pub(crate) fn has_global_model_reader(&self) -> bool {

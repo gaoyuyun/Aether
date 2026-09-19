@@ -10,6 +10,54 @@ use std::collections::BTreeMap;
 const ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS: u64 = 30_000;
 const ADMIN_PROVIDER_OPS_RESPONSE_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Timeouts applied to every upstream request made through this module.
+///
+/// Interactive verification keeps the generous default because an operator is
+/// watching the dialog. Balance queries run in the background and must fail
+/// fast so one unreachable provider cannot hold a refresh slot for long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in super::super) struct AdminProviderOpsRequestTimeouts {
+    pub(in super::super) connect_ms: u64,
+    pub(in super::super) total_ms: u64,
+}
+
+pub(in super::super) const ADMIN_PROVIDER_OPS_VERIFY_TIMEOUTS: AdminProviderOpsRequestTimeouts =
+    AdminProviderOpsRequestTimeouts {
+        connect_ms: ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS,
+        total_ms: ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS,
+    };
+
+pub(in super::super) const ADMIN_PROVIDER_OPS_BALANCE_QUERY_TIMEOUTS:
+    AdminProviderOpsRequestTimeouts = AdminProviderOpsRequestTimeouts {
+    connect_ms: 5_000,
+    total_ms: 10_000,
+};
+
+tokio::task_local! {
+    static ADMIN_PROVIDER_OPS_REQUEST_TIMEOUTS: AdminProviderOpsRequestTimeouts;
+}
+
+/// Runs `future` so that every provider ops request it issues (including the
+/// nested sub2api token exchange, anyrouter challenge and check-in probes)
+/// uses `timeouts` instead of the verification default.
+pub(in super::super) async fn with_admin_provider_ops_request_timeouts<F>(
+    timeouts: AdminProviderOpsRequestTimeouts,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    ADMIN_PROVIDER_OPS_REQUEST_TIMEOUTS
+        .scope(timeouts, future)
+        .await
+}
+
+fn admin_provider_ops_current_request_timeouts() -> AdminProviderOpsRequestTimeouts {
+    ADMIN_PROVIDER_OPS_REQUEST_TIMEOUTS
+        .try_with(|timeouts| *timeouts)
+        .unwrap_or(ADMIN_PROVIDER_OPS_VERIFY_TIMEOUTS)
+}
+
 pub(super) struct AdminProviderOpsTextResponse {
     pub(super) body: String,
 }
@@ -180,13 +228,16 @@ async fn admin_provider_ops_execute_request(
         model_name: Some("verify-auth".to_string()),
         proxy: proxy_snapshot.cloned(),
         transport_profile: None,
-        timeouts: Some(ExecutionTimeouts {
-            connect_ms: Some(ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS),
-            read_ms: Some(ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS),
-            write_ms: Some(ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS),
-            pool_ms: Some(ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS),
-            total_ms: Some(ADMIN_PROVIDER_OPS_VERIFY_TIMEOUT_MS),
-            ..ExecutionTimeouts::default()
+        timeouts: Some({
+            let timeouts = admin_provider_ops_current_request_timeouts();
+            ExecutionTimeouts {
+                connect_ms: Some(timeouts.connect_ms),
+                read_ms: Some(timeouts.total_ms),
+                write_ms: Some(timeouts.total_ms),
+                pool_ms: Some(timeouts.total_ms),
+                total_ms: Some(timeouts.total_ms),
+                ..ExecutionTimeouts::default()
+            }
         }),
     };
     let bounded_plan = crate::execution_runtime::transport::with_upstream_response_body_limit(

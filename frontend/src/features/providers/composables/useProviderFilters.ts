@@ -8,6 +8,24 @@ export interface FilterOption {
   label: string
 }
 
+export const PROVIDER_PAGE_SIZE_CACHE_KEY = 'provider-management-page-size'
+const PROVIDER_PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
+const PROVIDER_DEFAULT_PAGE_SIZE = 20
+
+/**
+ * 分页组件挂载后会从 localStorage 恢复每页条数并触发 update:pageSize，
+ * 这里先读同一份缓存作为初值，避免首屏因 pageSize 变化而重复加载列表与余额。
+ */
+function readCachedPageSize(): number {
+  try {
+    const cached = globalThis.localStorage?.getItem(PROVIDER_PAGE_SIZE_CACHE_KEY)
+    const parsed = cached ? Number.parseInt(cached, 10) : Number.NaN
+    return PROVIDER_PAGE_SIZE_OPTIONS.includes(parsed) ? parsed : PROVIDER_DEFAULT_PAGE_SIZE
+  } catch {
+    return PROVIDER_DEFAULT_PAGE_SIZE
+  }
+}
+
 export function useProviderFilters(
   globalModels: () => { id: string; name: string }[],
 ) {
@@ -47,7 +65,7 @@ export function useProviderFilters(
 
   // 分页
   const currentPage = ref(1)
-  const pageSize = ref(20)
+  const pageSize = ref(readCachedPageSize())
   const total = ref(0)
 
   // 服务端分页查询参数

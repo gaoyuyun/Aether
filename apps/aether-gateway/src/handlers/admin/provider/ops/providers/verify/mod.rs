@@ -17,7 +17,8 @@ pub(super) use proxy::{
 };
 pub(super) use request::{
     admin_provider_ops_execute_json_request, admin_provider_ops_execute_proxy_json_request,
-    AdminProviderOpsExecuteJsonError,
+    with_admin_provider_ops_request_timeouts, AdminProviderOpsExecuteJsonError,
+    ADMIN_PROVIDER_OPS_BALANCE_QUERY_TIMEOUTS,
 };
 pub(super) use sub2api::{
     admin_provider_ops_sub2api_exchange_token, admin_provider_ops_sub2api_request_url,

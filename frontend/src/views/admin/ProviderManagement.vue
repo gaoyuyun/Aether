@@ -82,6 +82,10 @@
           :format-balance-display="formatBalanceDisplay"
           :format-reset-countdown="formatResetCountdown"
           :get-quota-used-color-class="getQuotaUsedColorClass"
+          :get-provider-balance-meta="getProviderBalanceMeta"
+          :is-balance-refreshing="isBalanceRefreshing"
+          :refresh-provider-balance="refreshProviderBalance"
+          :format-balance-fetched-at="formatBalanceFetchedAt"
           @mousedown="handleMouseDown"
           @row-click="handleRowClick"
           @view-detail="openProviderDrawer"
@@ -198,6 +202,10 @@
               :format-balance-display="formatBalanceDisplay"
               :format-reset-countdown="formatResetCountdown"
               :get-quota-used-color-class="getQuotaUsedColorClass"
+              :get-provider-balance-meta="getProviderBalanceMeta"
+              :is-balance-refreshing="isBalanceRefreshing"
+              :refresh-provider-balance="refreshProviderBalance"
+              :format-balance-fetched-at="formatBalanceFetchedAt"
               @mousedown="handleMouseDown"
               @row-click="handleRowClick"
               @view-detail="openProviderDrawer"
@@ -241,6 +249,9 @@
           :get-provider-cookie-expired="getProviderCookieExpired"
           :format-balance-display="formatBalanceDisplay"
           :get-quota-used-color-class="getQuotaUsedColorClass"
+          :get-provider-balance-meta="getProviderBalanceMeta"
+          :is-balance-refreshing="isBalanceRefreshing"
+          :refresh-provider-balance="refreshProviderBalance"
           @view-detail="openProviderDrawer"
           @edit-provider="openEditProviderDialog"
           @open-ops-config="openOpsConfigDialog"
@@ -268,7 +279,7 @@
         :current="currentPage"
         :total="total"
         :page-size="pageSize"
-        cache-key="provider-management-page-size"
+        :cache-key="PROVIDER_PAGE_SIZE_CACHE_KEY"
         @update:current="currentPage = $event"
         @update:page-size="pageSize = $event"
       />
@@ -350,7 +361,7 @@ import ProviderEmptyState from '@/features/providers/components/ProviderEmptySta
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useRowClick } from '@/composables/useRowClick'
-import { useProviderFilters } from '@/features/providers/composables/useProviderFilters'
+import { PROVIDER_PAGE_SIZE_CACHE_KEY, useProviderFilters } from '@/features/providers/composables/useProviderFilters'
 import { useProviderBalance } from '@/features/providers/composables/useProviderBalance'
 import { useProviderDisplayOrder } from '@/features/providers/composables/useProviderDisplayOrder'
 import {
@@ -540,13 +551,17 @@ const {
 const {
   loadArchitectureSchemas,
   loadBalances,
+  refreshProviderBalance,
   getProviderBalance,
   getProviderBalanceBreakdown,
   getProviderBalanceError,
+  getProviderBalanceMeta,
   isBalanceLoading,
+  isBalanceRefreshing,
   getProviderCheckin,
   getProviderCookieExpired,
   formatBalanceDisplay,
+  formatBalanceFetchedAt,
   formatResetCountdown,
   getProviderBalanceExtra,
   getQuotaUsedColorClass,

@@ -26,6 +26,8 @@ mod pending_cleanup;
 mod pool_quota_probe;
 #[path = "runtime/pool_score_rebuild.rs"]
 mod pool_score_rebuild;
+#[path = "runtime/provider_balance_monitor.rs"]
+mod provider_balance_monitor;
 #[path = "runtime/provider_checkin.rs"]
 mod provider_checkin;
 #[path = "runtime/provider_quota_alert.rs"]
@@ -91,6 +93,9 @@ pub(crate) use pool_score_rebuild::{
     perform_pool_score_rebuild_once_with_config, spawn_pool_score_rebuild_worker,
     PoolScoreRebuildRunSummary, PoolScoreRebuildWorkerConfig,
 };
+pub(crate) use provider_balance_monitor::{
+    perform_provider_balance_monitor_once, ProviderBalanceMonitorRunSummary,
+};
 pub(crate) use provider_checkin::{perform_provider_checkin_once, ProviderCheckinRunSummary};
 pub(crate) use provider_quota_alert::{
     perform_provider_quota_alert_once, ProviderQuotaAlertRunSummary,
@@ -146,8 +151,8 @@ const PROXY_NODE_STALE_MISSED_HEARTBEATS: u64 = 3;
 const POOL_MONITOR_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const OAUTH_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const PROVIDER_CHECKIN_CONCURRENCY: usize = 3;
-const PROVIDER_QUOTA_ALERT_CONCURRENCY: usize = 3;
 const PROVIDER_QUOTA_ALERT_INTERVAL: Duration = Duration::from_secs(5);
+const PROVIDER_BALANCE_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
 const PROVIDER_CHECKIN_DEFAULT_TIME: &str = "01:05";
 const REQUEST_CANDIDATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const STATS_DAILY_AGGREGATION_HOUR: u32 = 0;

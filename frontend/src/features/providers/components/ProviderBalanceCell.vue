@@ -1,5 +1,5 @@
 <template>
-  <!-- 余额正在加载中 -->
+  <!-- 余额首次加载中（尚无任何快照，后台正在查询） -->
   <div
     v-if="provider.ops_configured && isBalanceLoading(provider.id)"
     class="flex items-center gap-1.5 text-xs text-muted-foreground"
@@ -7,10 +7,11 @@
     <Loader2 class="h-3 w-3 animate-spin" />
     <span>{{ legacyT('加载中...') }}</span>
   </div>
-  <!-- 显示从上游 API 查询的余额 -->
+  <!-- 显示快照中的余额：上游暂时不可达时仍保留上次成功的值，并提示最近失败 -->
   <div
     v-else-if="provider.ops_configured && getProviderBalance(provider.id)"
     class="flex items-center gap-2 text-xs"
+    :title="freshnessTitle || undefined"
   >
     <!-- 余额文字：balance + points 分开显示，或普通余额 -->
     <template
@@ -30,7 +31,8 @@
       </div>
       <span
         v-else
-        class="font-semibold text-foreground/90 min-w-[4.5rem] tabular-nums"
+        class="font-semibold min-w-[4.5rem] tabular-nums"
+        :class="meta?.lastError || meta?.stale ? 'text-foreground/60' : 'text-foreground/90'"
       >
         {{ formatBalanceDisplay(getProviderBalance(provider.id)) }}
       </span>
@@ -94,14 +96,84 @@
         >{{ legacyT('签到失败') }}</span>
       </div>
     </div>
+    <!-- 新鲜度指示：最近失败 > 已过期 > 后台刷新中 -->
+    <div class="flex items-center gap-1 text-muted-foreground/60">
+      <span
+        v-if="meta?.lastError"
+        class="text-amber-600 dark:text-amber-500"
+        role="img"
+        :aria-label="legacyT('最近一次查询失败')"
+        data-testid="balance-last-error"
+      >
+        <TriangleAlert class="h-3 w-3" />
+      </span>
+      <span
+        v-else-if="meta?.stale"
+        role="img"
+        :aria-label="legacyT('余额数据可能已过期')"
+        data-testid="balance-stale"
+      >
+        <Clock class="h-3 w-3" />
+      </span>
+      <button
+        v-if="refreshProviderBalance"
+        type="button"
+        class="rounded p-0.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+        :title="legacyT('刷新余额')"
+        :aria-label="legacyT('刷新余额')"
+        :disabled="refreshing"
+        @click.stop="handleRefresh"
+      >
+        <RefreshCw
+          class="h-3 w-3"
+          :class="{ 'animate-spin': refreshing }"
+        />
+      </button>
+    </div>
   </div>
-  <!-- 余额查询失败时显示错误 -->
+  <!-- 余额查询失败且没有任何可用的历史值 -->
   <div
     v-else-if="provider.ops_configured && getProviderBalanceError(provider.id)"
-    class="text-xs text-destructive/80"
-    :title="getProviderBalanceError(provider.id)?.message"
+    class="flex items-center gap-1 text-xs text-destructive/80"
+    :title="freshnessTitle || getProviderBalanceError(provider.id)?.message"
   >
-    {{ getProviderBalanceError(provider.id)?.message }}
+    <span class="truncate">{{ getProviderBalanceError(provider.id)?.message }}</span>
+    <button
+      v-if="refreshProviderBalance"
+      type="button"
+      class="shrink-0 rounded p-0.5 text-muted-foreground/60 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+      :title="legacyT('刷新余额')"
+      :aria-label="legacyT('刷新余额')"
+      :disabled="refreshing"
+      @click.stop="handleRefresh"
+    >
+      <RefreshCw
+        class="h-3 w-3"
+        :class="{ 'animate-spin': refreshing }"
+      />
+    </button>
+  </div>
+  <!-- 轮询用尽仍未拿到结果：给出终态和手动刷新入口，不再无限转圈 -->
+  <div
+    v-else-if="provider.ops_configured && meta?.exhausted"
+    class="flex items-center gap-1 text-xs text-muted-foreground"
+    data-testid="balance-exhausted"
+  >
+    <span>{{ legacyT('暂未获取到余额') }}</span>
+    <button
+      v-if="refreshProviderBalance"
+      type="button"
+      class="shrink-0 rounded p-0.5 text-muted-foreground/60 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+      :title="legacyT('刷新余额')"
+      :aria-label="legacyT('刷新余额')"
+      :disabled="refreshing"
+      @click.stop="handleRefresh"
+    >
+      <RefreshCw
+        class="h-3 w-3"
+        :class="{ 'animate-spin': refreshing }"
+      />
+    </button>
   </div>
   <!-- 显示本地配置的月度配额 -->
   <div
@@ -128,14 +200,16 @@
 </template>
 
 <script setup lang="ts">
-import { Loader2 } from 'lucide-vue-next'
+import { computed } from 'vue'
+import { Clock, Loader2, RefreshCw, TriangleAlert } from 'lucide-vue-next'
 import Badge from '@/components/ui/badge.vue'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
-import { formatBillingType } from '@/utils/format'
+import { formatBillingType, formatDate } from '@/utils/format'
 import type { BalanceExtraItem } from '@/features/providers/auth-templates'
+import type { ProviderBalanceMeta } from '@/features/providers/composables/useProviderBalance'
 import { useI18n } from '@/i18n'
 
-defineProps<{
+const props = defineProps<{
   provider: ProviderWithEndpointsSummary
   isBalanceLoading: (providerId: string) => boolean
   getProviderBalance: (providerId: string) => { available: number | null; currency: string } | null
@@ -147,7 +221,38 @@ defineProps<{
   formatBalanceDisplay: (balance: { available: number | null; currency: string } | null) => string
   formatResetCountdown: (resetsAt: number) => string
   getQuotaUsedColorClass: (provider: ProviderWithEndpointsSummary) => string
+  getProviderBalanceMeta?: (providerId: string) => ProviderBalanceMeta | null
+  isBalanceRefreshing?: (providerId: string) => boolean
+  refreshProviderBalance?: (providerId: string) => void | Promise<void>
+  formatBalanceFetchedAt?: (fetchedAt: string) => string
 }>()
 
 const { legacyT } = useI18n()
+
+const meta = computed(() => props.getProviderBalanceMeta?.(props.provider.id) ?? null)
+const refreshing = computed(() => props.isBalanceRefreshing?.(props.provider.id) ?? false)
+
+// 悬停提示：上次成功时间、最近失败原因、下次自动重试
+const freshnessTitle = computed(() => {
+  const current = meta.value
+  if (!current) return ''
+  const lines: string[] = []
+  if (current.fetchedAt) {
+    const relative = props.formatBalanceFetchedAt?.(current.fetchedAt) ?? formatDate(current.fetchedAt)
+    lines.push(`${legacyT('上次成功获取')}: ${relative}`)
+  }
+  if (current.lastError) {
+    lines.push(`${legacyT('最近一次查询失败')}: ${current.lastError.message}`)
+  }
+  if (current.nextRetryAt) {
+    lines.push(`${legacyT('下次自动重试')}: ${formatDate(current.nextRetryAt)}`)
+  } else if (current.refreshState === 'refreshing') {
+    lines.push(legacyT('正在后台刷新'))
+  }
+  return lines.join('\n')
+})
+
+function handleRefresh() {
+  void props.refreshProviderBalance?.(props.provider.id)
+}
 </script>

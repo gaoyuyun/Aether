@@ -134,12 +134,18 @@
         <Loader2 class="h-3 w-3 animate-spin" />
         {{ legacyT('加载中...') }}
       </span>
-      <!-- 余额（从上游 API 查询） -->
+      <!-- 余额（快照；上游不可达时保留上次成功的值） -->
       <span
         v-else-if="provider.ops_configured && getProviderBalance(provider.id)"
         class="text-muted-foreground"
+        :title="balanceMeta?.lastError ? `${legacyT('最近一次查询失败')}: ${balanceMeta.lastError.message}` : undefined"
       >
         {{ legacyT('余额') }} <span class="font-semibold text-foreground/90">{{ formatBalanceDisplay(getProviderBalance(provider.id)) }}</span>
+        <TriangleAlert
+          v-if="balanceMeta?.lastError"
+          class="ml-1 inline-block h-3 w-3 text-amber-600 dark:text-amber-500"
+          :aria-label="legacyT('最近一次查询失败')"
+        />
         <!-- Cookie 失效警告 -->
         <span
           v-if="getProviderCookieExpired(provider.id)"
@@ -158,13 +164,33 @@
           :title="getProviderCheckin(provider.id)?.message"
         >{{ legacyT('签到失败') }}</span>
       </span>
-      <!-- 余额查询失败时显示错误 -->
+      <!-- 余额查询失败且没有历史值 -->
       <span
         v-else-if="provider.ops_configured && getProviderBalanceError(provider.id)"
         class="text-destructive/80"
         :title="getProviderBalanceError(provider.id)?.message"
       >
         {{ getProviderBalanceError(provider.id)?.message }}
+      </span>
+      <!-- 轮询用尽仍未拿到结果 -->
+      <span
+        v-else-if="provider.ops_configured && balanceMeta?.exhausted"
+        class="text-muted-foreground"
+      >
+        {{ legacyT('暂未获取到余额') }}
+        <button
+          v-if="refreshProviderBalance"
+          type="button"
+          class="ml-1 inline-flex align-middle text-muted-foreground/60 hover:text-foreground"
+          :title="legacyT('刷新余额')"
+          :aria-label="legacyT('刷新余额')"
+          @click.stop="refreshProviderBalance(provider.id)"
+        >
+          <RefreshCw
+            class="h-3 w-3"
+            :class="{ 'animate-spin': isBalanceRefreshing?.(provider.id) }"
+          />
+        </button>
       </span>
       <!-- 本地配额 -->
       <span
@@ -234,6 +260,8 @@ import {
   Check,
   X,
   Loader2,
+  RefreshCw,
+  TriangleAlert,
 } from 'lucide-vue-next'
 import Button from '@/components/ui/button.vue'
 import Badge from '@/components/ui/badge.vue'
@@ -247,6 +275,7 @@ import {
   getEndpointTooltip,
 } from '@/features/providers/composables/useEndpointStatus'
 import { isKeyManagedProviderType } from '../utils/providerTypeUtils'
+import type { ProviderBalanceMeta } from '@/features/providers/composables/useProviderBalance'
 import { useI18n } from '@/i18n'
 import { safeExternalWebUrl } from '@/utils/navigationSecurity'
 
@@ -261,6 +290,9 @@ const props = defineProps<{
   getProviderCookieExpired: (providerId: string) => { expired: boolean; message: string } | null
   formatBalanceDisplay: (balance: { available: number | null; currency: string } | null) => string
   getQuotaUsedColorClass: (provider: ProviderWithEndpointsSummary) => string
+  getProviderBalanceMeta?: (providerId: string) => ProviderBalanceMeta | null
+  isBalanceRefreshing?: (providerId: string) => boolean
+  refreshProviderBalance?: (providerId: string) => void | Promise<void>
 }>()
 
 const emit = defineEmits<{
@@ -273,6 +305,8 @@ const emit = defineEmits<{
   'saveDescription': [event: Event, provider: ProviderWithEndpointsSummary, value: string]
   'cancelEditDescription': [event?: Event]
 }>()
+
+const balanceMeta = computed(() => props.getProviderBalanceMeta?.(props.provider.id) ?? null)
 
 const vAutoFocus = {
   mounted: (el: HTMLElement) => el.focus(),

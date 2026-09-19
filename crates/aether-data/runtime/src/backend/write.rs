@@ -18,6 +18,7 @@ use crate::repository::management_tokens::ManagementTokenWriteRepository;
 use crate::repository::oauth_providers::OAuthProviderWriteRepository;
 use crate::repository::pool_scores::PoolMemberScoreWriteRepository;
 use crate::repository::provider_catalog::ProviderCatalogWriteRepository;
+use crate::repository::provider_ops_balance::ProviderOpsBalanceSnapshotWriteRepository;
 use crate::repository::proxy_nodes::ProxyNodeWriteRepository;
 use crate::repository::quota::ProviderQuotaWriteRepository;
 use crate::repository::routing_profiles::RoutingGroupWriteRepository;
@@ -34,6 +35,7 @@ pub struct DataWriteRepositories {
     background_tasks: Option<Arc<dyn BackgroundTaskWriteRepository>>,
     request_candidates: Option<Arc<dyn RequestCandidateWriteRepository>>,
     gemini_file_mappings: Option<Arc<dyn GeminiFileMappingWriteRepository>>,
+    provider_ops_balance_snapshots: Option<Arc<dyn ProviderOpsBalanceSnapshotWriteRepository>>,
     global_models: Option<Arc<dyn GlobalModelWriteRepository>>,
     management_tokens: Option<Arc<dyn ManagementTokenWriteRepository>>,
     oauth_providers: Option<Arc<dyn OAuthProviderWriteRepository>>,
@@ -59,6 +61,10 @@ impl fmt::Debug for DataWriteRepositories {
             .field(
                 "has_gemini_file_mappings",
                 &self.gemini_file_mappings.is_some(),
+            )
+            .field(
+                "has_provider_ops_balance_snapshots",
+                &self.provider_ops_balance_snapshots.is_some(),
             )
             .field("has_global_models", &self.global_models.is_some())
             .field("has_management_tokens", &self.management_tokens.is_some())
@@ -122,6 +128,10 @@ impl DataWriteRepositories {
                 PostgresBackend::gemini_file_mapping_write_repository(backend),
             );
         }
+        if self.provider_ops_balance_snapshots.is_none() {
+            self.provider_ops_balance_snapshots =
+                Some(PostgresBackend::provider_ops_balance_snapshot_write_repository(backend));
+        }
         if self.global_models.is_none() {
             self.global_models = Some(PostgresBackend::global_model_write_repository(backend));
         }
@@ -184,6 +194,10 @@ impl DataWriteRepositories {
             self.gemini_file_mappings =
                 Some(MysqlBackend::gemini_file_mapping_write_repository(backend));
         }
+        if self.provider_ops_balance_snapshots.is_none() {
+            self.provider_ops_balance_snapshots =
+                Some(MysqlBackend::provider_ops_balance_snapshot_write_repository(backend));
+        }
         if self.global_models.is_none() {
             self.global_models = Some(MysqlBackend::global_model_write_repository(backend));
         }
@@ -243,6 +257,10 @@ impl DataWriteRepositories {
         if self.gemini_file_mappings.is_none() {
             self.gemini_file_mappings =
                 Some(SqliteBackend::gemini_file_mapping_write_repository(backend));
+        }
+        if self.provider_ops_balance_snapshots.is_none() {
+            self.provider_ops_balance_snapshots =
+                Some(SqliteBackend::provider_ops_balance_snapshot_write_repository(backend));
         }
         if self.global_models.is_none() {
             self.global_models = Some(SqliteBackend::global_model_write_repository(backend));
@@ -322,6 +340,12 @@ impl DataWriteRepositories {
         self.gemini_file_mappings.clone()
     }
 
+    pub fn provider_ops_balance_snapshots(
+        &self,
+    ) -> Option<Arc<dyn ProviderOpsBalanceSnapshotWriteRepository>> {
+        self.provider_ops_balance_snapshots.clone()
+    }
+
     pub fn global_models(&self) -> Option<Arc<dyn GlobalModelWriteRepository>> {
         self.global_models.clone()
     }
@@ -373,6 +397,7 @@ impl DataWriteRepositories {
             || self.background_tasks.is_some()
             || self.request_candidates.is_some()
             || self.gemini_file_mappings.is_some()
+            || self.provider_ops_balance_snapshots.is_some()
             || self.global_models.is_some()
             || self.management_tokens.is_some()
             || self.oauth_providers.is_some()
@@ -416,6 +441,7 @@ mod tests {
         assert!(write.auth_modules().is_some());
         assert!(write.request_candidates().is_some());
         assert!(write.gemini_file_mappings().is_some());
+        assert!(write.provider_ops_balance_snapshots().is_some());
         assert!(write.global_models().is_some());
         assert!(write.management_tokens().is_some());
         assert!(write.oauth_providers().is_some());

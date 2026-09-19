@@ -336,6 +336,19 @@ CREATE INDEX IF NOT EXISTS provider_usage_tracking_window_start_idx ON provider_
 CREATE INDEX IF NOT EXISTS idx_provider_window ON provider_usage_tracking (provider_id, window_start);
 CREATE INDEX IF NOT EXISTS idx_window_time ON provider_usage_tracking (window_start, window_end);
 
+CREATE TABLE IF NOT EXISTS provider_ops_balance_snapshots (
+    provider_id TEXT PRIMARY KEY NOT NULL,
+    payload_json TEXT,
+    last_success_at INTEGER,
+    last_attempt_at INTEGER,
+    last_status TEXT,
+    last_error TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    next_refresh_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    CONSTRAINT provider_ops_balance_snapshots_provider_fkey FOREIGN KEY (provider_id) REFERENCES providers (id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS provider_quota_window_counters (
     provider_id TEXT NOT NULL,
     duration_secs INTEGER NOT NULL,

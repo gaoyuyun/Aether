@@ -2041,4 +2041,12 @@ export const legacyUiEnglishMessages: Record<string, string> = {
   'S3 访问密钥已清除': 'S3 access key cleared',
   '清除 S3 访问密钥失败': 'Failed to clear S3 access key',
   '提交 S3 备份任务失败': 'Failed to submit S3 backup task',
+
+  '暂未获取到余额': 'Balance not available yet',
+  '刷新余额': 'Refresh balance',
+  '上次成功获取': 'Last successful fetch',
+  '最近一次查询失败': 'Last query failed',
+  '下次自动重试': 'Next automatic retry',
+  '余额数据可能已过期': 'Balance data may be out of date',
+  '正在后台刷新': 'Refreshing in the background',
 }

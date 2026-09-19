@@ -2116,3 +2116,60 @@ columns = ["group_id", "version"]
 [[table.routing_group_versions.indexes]]
 name = "routing_group_versions_group_id_idx"
 columns = ["group_id"]
+
+[table.provider_ops_balance_snapshots]
+domain = "provider_catalog"
+order = 86
+primary_key = ["provider_id"]
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "provider_id"
+type = "text_id"
+length = 64
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "payload_json"
+type = "json"
+nullable = true
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "last_success_at"
+type = "int64"
+nullable = true
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "last_attempt_at"
+type = "int64"
+nullable = true
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "last_status"
+type = "text"
+length = 32
+nullable = true
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "last_error"
+type = "text"
+nullable = true
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "consecutive_failures"
+type = "int32"
+default = 0
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "next_refresh_at"
+type = "int64"
+nullable = true
+
+[[table.provider_ops_balance_snapshots.columns]]
+name = "updated_at"
+type = "int64"
+
+[[table.provider_ops_balance_snapshots.foreign_keys]]
+name = "provider_ops_balance_snapshots_provider_fkey"
+columns = ["provider_id"]
+references_table = "providers"
+references_columns = ["id"]
+on_delete = "cascade"

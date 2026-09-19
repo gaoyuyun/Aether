@@ -21,6 +21,7 @@ use crate::repository::management_tokens::ManagementTokenReadRepository;
 use crate::repository::oauth_providers::OAuthProviderReadRepository;
 use crate::repository::pool_scores::PoolScoreReadRepository;
 use crate::repository::provider_catalog::ProviderCatalogReadRepository;
+use crate::repository::provider_ops_balance::ProviderOpsBalanceSnapshotReadRepository;
 use crate::repository::proxy_nodes::ProxyNodeReadRepository;
 use crate::repository::quota::ProviderQuotaReadRepository;
 use crate::repository::routing_profiles::RoutingGroupReadRepository;
@@ -38,6 +39,7 @@ pub struct DataReadRepositories {
     background_tasks: Option<Arc<dyn BackgroundTaskReadRepository>>,
     billing: Option<Arc<dyn BillingReadRepository>>,
     gemini_file_mappings: Option<Arc<dyn GeminiFileMappingReadRepository>>,
+    provider_ops_balance_snapshots: Option<Arc<dyn ProviderOpsBalanceSnapshotReadRepository>>,
     global_models: Option<Arc<dyn GlobalModelReadRepository>>,
     management_tokens: Option<Arc<dyn ManagementTokenReadRepository>>,
     oauth_providers: Option<Arc<dyn OAuthProviderReadRepository>>,
@@ -66,6 +68,10 @@ impl fmt::Debug for DataReadRepositories {
             .field(
                 "has_gemini_file_mappings",
                 &self.gemini_file_mappings.is_some(),
+            )
+            .field(
+                "has_provider_ops_balance_snapshots",
+                &self.provider_ops_balance_snapshots.is_some(),
             )
             .field("has_global_models", &self.global_models.is_some())
             .field("has_management_tokens", &self.management_tokens.is_some())
@@ -134,6 +140,10 @@ impl DataReadRepositories {
             self.gemini_file_mappings = Some(PostgresBackend::gemini_file_mapping_read_repository(
                 backend,
             ));
+        }
+        if self.provider_ops_balance_snapshots.is_none() {
+            self.provider_ops_balance_snapshots =
+                Some(PostgresBackend::provider_ops_balance_snapshot_read_repository(backend));
         }
         if self.global_models.is_none() {
             self.global_models = Some(PostgresBackend::global_model_read_repository(backend));
@@ -207,6 +217,11 @@ impl DataReadRepositories {
             self.gemini_file_mappings =
                 Some(MysqlBackend::gemini_file_mapping_read_repository(backend));
         }
+        if self.provider_ops_balance_snapshots.is_none() {
+            self.provider_ops_balance_snapshots = Some(
+                MysqlBackend::provider_ops_balance_snapshot_read_repository(backend),
+            );
+        }
         if self.global_models.is_none() {
             self.global_models = Some(MysqlBackend::global_model_read_repository(backend));
         }
@@ -277,6 +292,10 @@ impl DataReadRepositories {
         if self.gemini_file_mappings.is_none() {
             self.gemini_file_mappings =
                 Some(SqliteBackend::gemini_file_mapping_read_repository(backend));
+        }
+        if self.provider_ops_balance_snapshots.is_none() {
+            self.provider_ops_balance_snapshots =
+                Some(SqliteBackend::provider_ops_balance_snapshot_read_repository(backend));
         }
         if self.global_models.is_none() {
             self.global_models = Some(SqliteBackend::global_model_read_repository(backend));
@@ -364,6 +383,12 @@ impl DataReadRepositories {
         self.gemini_file_mappings.clone()
     }
 
+    pub fn provider_ops_balance_snapshots(
+        &self,
+    ) -> Option<Arc<dyn ProviderOpsBalanceSnapshotReadRepository>> {
+        self.provider_ops_balance_snapshots.clone()
+    }
+
     pub fn global_models(&self) -> Option<Arc<dyn GlobalModelReadRepository>> {
         self.global_models.clone()
     }
@@ -430,6 +455,7 @@ impl DataReadRepositories {
             || self.background_tasks.is_some()
             || self.billing.is_some()
             || self.gemini_file_mappings.is_some()
+            || self.provider_ops_balance_snapshots.is_some()
             || self.global_models.is_some()
             || self.management_tokens.is_some()
             || self.oauth_providers.is_some()
@@ -476,6 +502,7 @@ mod tests {
         assert!(read.auth_modules().is_some());
         assert!(read.billing().is_some());
         assert!(read.gemini_file_mappings().is_some());
+        assert!(read.provider_ops_balance_snapshots().is_some());
         assert!(read.global_models().is_some());
         assert!(read.management_tokens().is_some());
         assert!(read.oauth_providers().is_some());

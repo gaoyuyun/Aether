@@ -1,22 +1,57 @@
 import { ref, onUnmounted } from 'vue'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
-import { batchQueryBalance, getArchitectures, type ActionResultResponse, type ArchitectureInfo } from '@/api/providerOps'
+import {
+  batchQueryBalance,
+  getArchitectures,
+  getBalance,
+  type ActionResultResponse,
+  type ArchitectureInfo,
+  type BalanceLastError,
+  type BalanceRefreshState,
+} from '@/api/providerOps'
 import { formatBalanceExtraFromSchema, type CredentialsSchema } from '@/features/providers/auth-templates/schema-utils'
 import type { BalanceExtraItem } from '@/features/providers/auth-templates'
+import { formatRelativeTime } from '@/utils/format'
 import { log } from '@/utils/logger'
 
-const MAX_BALANCE_RETRIES = 2
-const PENDING_BALANCE_RETRY_BASE_DELAY_MS = 12_000
-const PENDING_BALANCE_RETRY_MAX_DELAY_MS = 60_000
+/**
+ * 后台刷新的轮询节奏：快速开始、逐步放慢，次数用尽后进入终态而不是无限转圈。
+ * 后端把上游查询放在后台，页面只读快照，所以这里只需要等后台任务完成。
+ */
+export const BALANCE_POLL_DELAYS_MS = [2_000, 4_000, 8_000, 16_000] as const
+
+export interface ProviderBalanceMeta {
+  /** 最近一次成功查询的时间，null 表示从未成功 */
+  fetchedAt: string | null
+  /** 成功值已超过新鲜阈值，或从未成功 */
+  stale: boolean
+  refreshState: BalanceRefreshState
+  /** 退避到期时间，null 表示可随时刷新 */
+  nextRetryAt: string | null
+  consecutiveFailures: number
+  /** 最近一次失败尝试；有值时余额仍显示上次成功的结果 */
+  lastError: BalanceLastError | null
+  /** 轮询次数用尽仍没有拿到结果 */
+  exhausted: boolean
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
 }
 
+/** 后端仍在后台刷新，或尚无任何快照 */
+export function balanceNeedsPolling(result: ActionResultResponse): boolean {
+  return result.status === 'pending' || result.refresh_state === 'refreshing'
+}
+
 export function useProviderBalance() {
-  // 余额数据缓存 {providerId: ActionResultResponse}
+  // 余额快照缓存 {providerId: ActionResultResponse}，失败状态也保留以便展示原因
   const balanceCache = ref<Record<string, ActionResultResponse>>({})
-  // 余额加载请求版本计数器（用于防止竞态条件）
+  // 轮询用尽仍未拿到结果的 provider
+  const exhaustedProviderIds = ref<Record<string, true>>({})
+  // 手动刷新进行中的 provider
+  const manualRefreshingIds = ref<Record<string, true>>({})
+  // 全量加载版本号：新一轮全量加载会作废之前所有轮询
   let balanceLoadVersion = 0
 
   // 追踪待处理的定时器，用于组件卸载时清理
@@ -26,7 +61,7 @@ export function useProviderBalance() {
   const architectureSchemas = ref<Record<string, CredentialsSchema>>({})
   const architectureSchemasLoaded = ref(false)
 
-  // 用于触发倒计时更新的响应式计数器
+  // 用于触发倒计时/相对时间更新的响应式计数器
   const tickCounter = ref(0)
   let tickInterval: ReturnType<typeof setInterval> | null = null
 
@@ -62,84 +97,89 @@ export function useProviderBalance() {
     }
   }
 
-  // 异步加载余额数据（使用批量接口）
+  function storeResults(results: Record<string, ActionResultResponse>) {
+    for (const [providerId, result] of Object.entries(results)) {
+      balanceCache.value[providerId] = result
+      delete exhaustedProviderIds.value[providerId]
+    }
+  }
+
+  function pollingIds(results: Record<string, ActionResultResponse>): string[] {
+    return Object.entries(results)
+      .filter(([, result]) => balanceNeedsPolling(result))
+      .map(([providerId]) => providerId)
+  }
+
+  /**
+   * 加载余额快照（使用批量接口）。
+   * fullReload=false 只补充给定 provider，不会打断页面上其他 provider 的轮询。
+   */
   async function loadBalances(providers: Pick<ProviderWithEndpointsSummary, 'id' | 'ops_configured'>[], fullReload = true) {
     if (fullReload) {
       balanceCache.value = {}
+      exhaustedProviderIds.value = {}
     }
-    const currentVersion = ++balanceLoadVersion
+    const currentVersion = fullReload ? ++balanceLoadVersion : balanceLoadVersion
     try {
       const opsProviderIds = providers.filter(p => p.ops_configured).map(p => p.id)
       if (opsProviderIds.length === 0) return
 
       const results = await batchQueryBalance(opsProviderIds)
 
-      // 检查是否有新的请求已经开始，如果有则丢弃当前结果
+      // 检查是否有新的全量加载已经开始，如果有则丢弃当前结果
       if (currentVersion !== balanceLoadVersion) return
 
-      // 收集需要重试的 provider IDs
-      const pendingProviderIds: string[] = []
-
-      // 将结果存入缓存（包括 pending 状态）
-      for (const [providerId, result] of Object.entries(results)) {
-        // 存入缓存：success, auth_expired (带有效数据), pending
-        if (result.status === 'success' || result.status === 'auth_expired' || result.status === 'pending') {
-          balanceCache.value[providerId] = result
-        }
-        // 收集 pending 状态的 provider，稍后重试
-        if (result.status === 'pending') {
-          pendingProviderIds.push(providerId)
-        }
-      }
-
-      // 如果有 pending 状态的 provider，延后重试，避免把后台刷新队列打成高频轮询
-      if (pendingProviderIds.length > 0) {
-        const timerId = setTimeout(() => {
-          pendingTimers.delete(timerId)
-          // 检查版本号，确保没有新的加载请求
-          if (currentVersion === balanceLoadVersion) {
-            retryPendingBalances(pendingProviderIds, currentVersion, 0)
-          }
-        }, PENDING_BALANCE_RETRY_BASE_DELAY_MS)
-        pendingTimers.add(timerId)
-      }
+      storeResults(results)
+      schedulePoll(pollingIds(results), currentVersion, 0)
     } catch (e) {
       log.warn('[loadBalances] 加载余额数据失败', e)
     }
   }
 
-  // 重试加载 pending 状态的余额
-  async function retryPendingBalances(providerIds: string[], loadVersion: number, retryCount: number) {
+  function schedulePoll(providerIds: string[], loadVersion: number, attempt: number) {
+    if (providerIds.length === 0) return
+    if (attempt >= BALANCE_POLL_DELAYS_MS.length) {
+      for (const providerId of providerIds) {
+        exhaustedProviderIds.value[providerId] = true
+      }
+      return
+    }
+    const timerId = setTimeout(() => {
+      pendingTimers.delete(timerId)
+      if (loadVersion !== balanceLoadVersion) return
+      void pollBalances(providerIds, loadVersion, attempt)
+    }, BALANCE_POLL_DELAYS_MS[attempt])
+    pendingTimers.add(timerId)
+  }
+
+  // 轮询后台刷新中的余额
+  async function pollBalances(providerIds: string[], loadVersion: number, attempt: number) {
     try {
       const results = await batchQueryBalance(providerIds)
       if (loadVersion !== balanceLoadVersion) return
-      const stillPending: string[] = []
+      storeResults(results)
+      schedulePoll(pollingIds(results), loadVersion, attempt + 1)
+    } catch (e) {
+      log.warn('[pollBalances] 轮询余额失败', e)
+    }
+  }
 
-      for (const [providerId, result] of Object.entries(results)) {
-        if (result.status !== 'pending') {
-          balanceCache.value[providerId] = result
-        } else {
-          stillPending.push(providerId)
-        }
-      }
-
-      // 如果还有 pending 且未达到最大重试次数，继续重试（指数退避）
-      if (stillPending.length > 0 && retryCount < MAX_BALANCE_RETRIES) {
-        const delay = Math.min(
-          PENDING_BALANCE_RETRY_BASE_DELAY_MS * Math.pow(2, retryCount),
-          PENDING_BALANCE_RETRY_MAX_DELAY_MS,
-        )
-        const timerId = setTimeout(() => {
-          pendingTimers.delete(timerId)
-          // 检查版本号，确保没有新的加载请求
-          if (loadVersion === balanceLoadVersion) {
-            retryPendingBalances(stillPending, loadVersion, retryCount + 1)
-          }
-        }, delay)
-        pendingTimers.add(timerId)
+  /** 手动触发一次后台刷新（忽略退避），然后轮询直到后台任务结束 */
+  async function refreshProviderBalance(providerId: string) {
+    if (manualRefreshingIds.value[providerId]) return
+    manualRefreshingIds.value[providerId] = true
+    const loadVersion = balanceLoadVersion
+    try {
+      const result = await getBalance(providerId, true)
+      if (loadVersion !== balanceLoadVersion) return
+      storeResults({ [providerId]: result })
+      if (balanceNeedsPolling(result)) {
+        schedulePoll([providerId], loadVersion, 0)
       }
     } catch (e) {
-      log.warn('[retryPendingBalances] 重试加载余额失败', e)
+      log.warn('[refreshProviderBalance] 刷新余额失败', e)
+    } finally {
+      delete manualRefreshingIds.value[providerId]
     }
   }
 
@@ -189,7 +229,7 @@ export function useProviderBalance() {
     }
   }
 
-  // 获取 provider 余额查询的错误状态
+  // 获取 provider 余额查询的错误状态（没有任何可用历史值时）
   function getProviderBalanceError(providerId: string): { status: string; message: string } | null {
     const result = balanceCache.value[providerId]
     if (!result) {
@@ -216,10 +256,31 @@ export function useProviderBalance() {
     return null
   }
 
-  // 检查余额是否正在加载中
+  // 检查余额是否正在首次加载（尚无任何快照）
   function isBalanceLoading(providerId: string): boolean {
     const result = balanceCache.value[providerId]
-    return result?.status === 'pending'
+    return result?.status === 'pending' && exhaustedProviderIds.value[providerId] !== true
+  }
+
+  // 已有快照但后台正在刷新
+  function isBalanceRefreshing(providerId: string): boolean {
+    const result = balanceCache.value[providerId]
+    return manualRefreshingIds.value[providerId] === true || result?.refresh_state === 'refreshing'
+  }
+
+  // 获取快照元数据：新鲜度、最近失败、退避
+  function getProviderBalanceMeta(providerId: string): ProviderBalanceMeta | null {
+    const result = balanceCache.value[providerId]
+    if (!result) return null
+    return {
+      fetchedAt: result.fetched_at ?? null,
+      stale: result.stale ?? false,
+      refreshState: result.refresh_state ?? 'idle',
+      nextRetryAt: result.next_retry_at ?? null,
+      consecutiveFailures: result.consecutive_failures ?? 0,
+      lastError: result.last_error ?? null,
+      exhausted: exhaustedProviderIds.value[providerId] === true,
+    }
   }
 
   // 获取 provider 的签到信息（从 extra 字段）
@@ -292,6 +353,19 @@ export function useProviderBalance() {
     return `${minutes}:${pad(seconds)}`
   }
 
+  // 把成功获取时间格式化成本地化的相对时间（“3 分钟前”）
+  function formatBalanceFetchedAt(fetchedAt: string): string {
+    // 依赖 tickCounter 触发响应式更新
+    void tickCounter.value
+    const fetchedAtMs = new Date(fetchedAt).getTime()
+    if (!Number.isFinite(fetchedAtMs)) return fetchedAt
+    const diffSeconds = Math.max(0, Math.round((Date.now() - fetchedAtMs) / 1000))
+    if (diffSeconds < 60) return formatRelativeTime(-diffSeconds, 'second')
+    if (diffSeconds < 3600) return formatRelativeTime(-Math.floor(diffSeconds / 60), 'minute')
+    if (diffSeconds < 86400) return formatRelativeTime(-Math.floor(diffSeconds / 3600), 'hour')
+    return formatRelativeTime(-Math.floor(diffSeconds / 86400), 'day')
+  }
+
   // 获取 provider 余额的额外信息（如窗口限额）
   function getProviderBalanceExtra(providerId: string, architectureId?: string): BalanceExtraItem[] {
     if (!architectureId) return []
@@ -338,13 +412,17 @@ export function useProviderBalance() {
     balanceCache,
     loadArchitectureSchemas,
     loadBalances,
+    refreshProviderBalance,
     getProviderBalance,
     getProviderBalanceBreakdown,
     getProviderBalanceError,
+    getProviderBalanceMeta,
     isBalanceLoading,
+    isBalanceRefreshing,
     getProviderCheckin,
     getProviderCookieExpired,
     formatBalanceDisplay,
+    formatBalanceFetchedAt,
     formatResetCountdown,
     getProviderBalanceExtra,
     getQuotaUsedColorClass,

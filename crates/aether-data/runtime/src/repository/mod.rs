@@ -20,6 +20,7 @@ pub mod oauth_providers;
 pub mod pool_scores;
 pub mod provider_catalog;
 pub mod provider_oauth;
+pub mod provider_ops_balance;
 pub mod proxy_nodes;
 pub mod quota;
 pub mod routing_profiles;

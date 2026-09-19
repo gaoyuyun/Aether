@@ -42,7 +42,12 @@ pub(crate) use self::provider::oauth::runtime::{
 };
 pub(crate) use self::provider::ops::providers::actions::admin_provider_ops_local_action_response;
 pub(crate) use self::provider::ops::providers::admin_provider_ops_credential_snapshot;
-pub(crate) use self::provider::ops::providers::store_admin_provider_ops_balance_cache;
+pub(crate) use self::provider::ops::providers::{
+    admin_provider_ops_balance_needs_refresh, admin_provider_ops_balance_snapshot_total_available,
+    enqueue_admin_provider_ops_balance_refresh, read_admin_provider_ops_balance_snapshots,
+    AdminProviderOpsBalanceRefreshTrigger, ProviderOpsBalanceRefreshState,
+    ADMIN_PROVIDER_OPS_BALANCE_SCHEDULED_MAX_AGE_SECS,
+};
 pub(crate) use self::provider::pool::config::admin_provider_pool_config;
 pub(crate) use self::provider::pool_admin::maybe_build_local_admin_pool_response;
 pub(crate) use self::provider::shared::payloads::{

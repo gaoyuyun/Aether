@@ -111,6 +111,10 @@
           :format-balance-display="formatBalanceDisplay"
           :format-reset-countdown="formatResetCountdown"
           :get-quota-used-color-class="getQuotaUsedColorClass"
+          :get-provider-balance-meta="getProviderBalanceMeta"
+          :is-balance-refreshing="isBalanceRefreshing"
+          :refresh-provider-balance="refreshProviderBalance"
+          :format-balance-fetched-at="formatBalanceFetchedAt"
         />
       </div>
 
@@ -244,6 +248,7 @@ import Card from '@/components/ui/card.vue'
 import ProviderBalanceCell from './ProviderBalanceCell.vue'
 import { formatApiFormatShort, type ProviderWithEndpointsSummary } from '@/api/endpoints'
 import type { BalanceExtraItem } from '@/features/providers/auth-templates'
+import type { ProviderBalanceMeta } from '@/features/providers/composables/useProviderBalance'
 import {
   sortEndpoints,
   getEndpointHealthLabel,
@@ -269,6 +274,10 @@ const props = defineProps<{
   formatBalanceDisplay: (balance: { available: number | null; currency: string } | null) => string
   formatResetCountdown: (resetsAt: number) => string
   getQuotaUsedColorClass: (provider: ProviderWithEndpointsSummary) => string
+  getProviderBalanceMeta?: (providerId: string) => ProviderBalanceMeta | null
+  isBalanceRefreshing?: (providerId: string) => boolean
+  refreshProviderBalance?: (providerId: string) => void | Promise<void>
+  formatBalanceFetchedAt?: (fetchedAt: string) => string
 }>()
 
 const emit = defineEmits<{

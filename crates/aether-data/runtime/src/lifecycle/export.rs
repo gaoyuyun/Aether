@@ -181,6 +181,10 @@ const AUXILIARY_TABLES: &[AuxiliaryTable] = &[
         primary_key: &["provider_id", "quota_epoch_start"],
     },
     AuxiliaryTable {
+        name: "provider_ops_balance_snapshots",
+        primary_key: &["provider_id"],
+    },
+    AuxiliaryTable {
         name: "gemini_file_mappings",
         primary_key: &["id"],
     },

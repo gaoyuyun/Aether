@@ -449,6 +449,8 @@ pub struct AppState {
     pub(crate) fallback_metrics: Arc<fallback_metrics::GatewayFallbackMetrics>,
     pub(crate) usage_counter_flush_metrics: Arc<UsageCounterFlushRuntimeMetrics>,
     pub(crate) task_supervisor_metrics: TaskSupervisorMetrics,
+    pub(crate) provider_ops_balance_refresher:
+        Arc<crate::admin_api::ProviderOpsBalanceRefreshState>,
     pub(crate) process_resource_monitor: Arc<crate::process_metrics::GatewayProcessResourceMonitor>,
     pub(crate) metric_snapshot:
         Arc<TokioRwLock<Option<(Instant, Vec<aether_runtime::MetricSample>)>>>,

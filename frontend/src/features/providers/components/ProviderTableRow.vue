@@ -82,6 +82,10 @@
         :format-balance-display="formatBalanceDisplay"
         :format-reset-countdown="formatResetCountdown"
         :get-quota-used-color-class="getQuotaUsedColorClass"
+        :get-provider-balance-meta="getProviderBalanceMeta"
+        :is-balance-refreshing="isBalanceRefreshing"
+        :refresh-provider-balance="refreshProviderBalance"
+        :format-balance-fetched-at="formatBalanceFetchedAt"
       />
       <button v-if="provider.billing_type === 'monthly_quota'" type="button" class="mt-1 text-xs text-primary hover:underline" @click.stop="$emit('rowClick', $event, provider.id)">{{ legacyT('配额详情') }}</button>
     </TableCell>
@@ -226,6 +230,7 @@ import {
   getEndpointTooltip,
 } from '@/features/providers/composables/useEndpointStatus'
 import type { BalanceExtraItem } from '@/features/providers/auth-templates'
+import type { ProviderBalanceMeta } from '@/features/providers/composables/useProviderBalance'
 import { useI18n } from '@/i18n'
 import { safeExternalWebUrl } from '@/utils/navigationSecurity'
 
@@ -243,6 +248,10 @@ const props = defineProps<{
   formatBalanceDisplay: (balance: { available: number | null; currency: string } | null) => string
   formatResetCountdown: (resetsAt: number) => string
   getQuotaUsedColorClass: (provider: ProviderWithEndpointsSummary) => string
+  getProviderBalanceMeta?: (providerId: string) => ProviderBalanceMeta | null
+  isBalanceRefreshing?: (providerId: string) => boolean
+  refreshProviderBalance?: (providerId: string) => void | Promise<void>
+  formatBalanceFetchedAt?: (fetchedAt: string) => string
 }>()
 
 const emit = defineEmits<{

@@ -44,6 +44,10 @@ use crate::repository::provider_catalog::{
     MysqlProviderCatalogReadRepository, ProviderCatalogReadRepository,
     ProviderCatalogWriteRepository,
 };
+use crate::repository::provider_ops_balance::{
+    MysqlProviderOpsBalanceSnapshotRepository, ProviderOpsBalanceSnapshotReadRepository,
+    ProviderOpsBalanceSnapshotWriteRepository,
+};
 use crate::repository::proxy_nodes::{
     MysqlProxyNodeReadRepository, ProxyNodeReadRepository, ProxyNodeWriteRepository,
 };
@@ -164,6 +168,22 @@ impl MysqlBackend {
         &self,
     ) -> Arc<dyn GeminiFileMappingWriteRepository> {
         Arc::new(MysqlGeminiFileMappingRepository::new(self.pool_clone()))
+    }
+
+    pub fn provider_ops_balance_snapshot_read_repository(
+        &self,
+    ) -> Arc<dyn ProviderOpsBalanceSnapshotReadRepository> {
+        Arc::new(MysqlProviderOpsBalanceSnapshotRepository::new(
+            self.pool_clone(),
+        ))
+    }
+
+    pub fn provider_ops_balance_snapshot_write_repository(
+        &self,
+    ) -> Arc<dyn ProviderOpsBalanceSnapshotWriteRepository> {
+        Arc::new(MysqlProviderOpsBalanceSnapshotRepository::new(
+            self.pool_clone(),
+        ))
     }
 
     pub fn global_model_read_repository(&self) -> Arc<dyn GlobalModelReadRepository> {

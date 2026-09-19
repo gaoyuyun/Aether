@@ -1,39 +1,160 @@
-use super::actions::admin_provider_ops_local_action_response;
+//! Durable "last known balance" snapshots for provider ops.
+//!
+//! The admin page never waits for an upstream here: it reads the snapshot and
+//! the background refresher (`balance_refresh.rs`) updates it. Snapshots live
+//! in the catalog database when one is configured and fall back to the runtime
+//! KV store otherwise.
 use crate::handlers::admin::request::AdminAppState;
-use crate::task_runtime::{spawn_fire_and_forget, TASK_KEY_PROVIDER_BALANCE_REFRESH};
+use crate::handlers::shared::unix_secs_to_rfc3339;
+use aether_data_contracts::repository::provider_ops_balance::StoredProviderOpsBalanceSnapshot;
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, warn};
+use tracing::warn;
 
 const ADMIN_PROVIDER_OPS_BALANCE_CACHE_PREFIX: &str = "provider_ops:balance:";
-const ADMIN_PROVIDER_OPS_BALANCE_REFRESH_PREFIX: &str = "provider_ops:balance_refresh:";
+/// Runtime KV fallback lifetime for deployments without a catalog database.
+const ADMIN_PROVIDER_OPS_BALANCE_KV_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// Reported to clients as the nominal lifetime of a successful snapshot.
 const ADMIN_PROVIDER_OPS_BALANCE_CACHE_TTL_SECS: u64 = 86_400;
-const ADMIN_PROVIDER_OPS_BALANCE_AUTH_FAILED_CACHE_TTL_SECS: u64 = 60;
-const ADMIN_PROVIDER_OPS_BALANCE_REFRESH_CONCURRENCY: usize = 3;
+/// A successful value older than this is flagged `stale` in API responses.
+pub(crate) const ADMIN_PROVIDER_OPS_BALANCE_STALE_AFTER_SECS: u64 = 30 * 60;
+const ADMIN_PROVIDER_OPS_BALANCE_BACKOFF_BASE_SECS: u64 = 60;
+const ADMIN_PROVIDER_OPS_BALANCE_BACKOFF_MAX_SECS: u64 = 30 * 60;
+/// Credentials do not fix themselves; wait for the checkin worker or an
+/// operator before retrying.
+const ADMIN_PROVIDER_OPS_BALANCE_AUTH_FAILED_BACKOFF_SECS: u64 = 15 * 60;
+const ADMIN_PROVIDER_OPS_BALANCE_ERROR_MAX_CHARS: usize = 200;
+const ADMIN_PROVIDER_OPS_BALANCE_PENDING_MESSAGE: &str = "余额数据加载中，请稍后刷新";
 
-static ADMIN_PROVIDER_OPS_BALANCE_REFRESH_SEMAPHORE: std::sync::LazyLock<Semaphore> =
-    std::sync::LazyLock::new(|| Semaphore::new(ADMIN_PROVIDER_OPS_BALANCE_REFRESH_CONCURRENCY));
-static ADMIN_PROVIDER_OPS_REFRESHING_PROVIDERS: std::sync::LazyLock<Mutex<HashSet<String>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
-
-#[derive(Debug)]
-pub(super) enum AdminProviderOpsBalanceCacheLookup {
-    Hit(Value),
-    Miss,
-    Unavailable,
+pub(crate) fn admin_provider_ops_balance_now_unix_secs() -> u64 {
+    chrono::Utc::now().timestamp().max(0) as u64
 }
 
-pub(super) fn admin_provider_ops_batch_balance_concurrency() -> usize {
-    std::env::var("BATCH_BALANCE_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .map(|value| value.max(1))
-        .unwrap_or(3)
+pub(crate) fn admin_provider_ops_balance_status_is_success(status: &str) -> bool {
+    matches!(status, "success" | "auth_expired")
 }
 
-pub(super) fn admin_provider_ops_pending_balance_response(message: &str) -> Value {
+fn admin_provider_ops_balance_kv_key(provider_id: &str) -> String {
+    format!("{ADMIN_PROVIDER_OPS_BALANCE_CACHE_PREFIX}{provider_id}")
+}
+
+pub(crate) async fn read_admin_provider_ops_balance_snapshots(
+    state: &AdminAppState<'_>,
+    provider_ids: &[String],
+) -> HashMap<String, StoredProviderOpsBalanceSnapshot> {
+    if provider_ids.is_empty() {
+        return HashMap::new();
+    }
+    let data = &state.app().data;
+    if data.has_provider_ops_balance_snapshot_reader() {
+        return match data.list_provider_ops_balance_snapshots(provider_ids).await {
+            Ok(snapshots) => snapshots
+                .into_iter()
+                .map(|snapshot| (snapshot.provider_id.clone(), snapshot))
+                .collect(),
+            Err(err) => {
+                warn!(error = %err, "failed to read provider ops balance snapshots");
+                HashMap::new()
+            }
+        };
+    }
+    let keys = provider_ids
+        .iter()
+        .map(|provider_id| admin_provider_ops_balance_kv_key(provider_id))
+        .collect::<Vec<_>>();
+    match state.runtime_state().kv_get_many(&keys).await {
+        Ok(values) => values
+            .into_iter()
+            .zip(provider_ids)
+            .filter_map(|(raw, provider_id)| {
+                let raw = raw?;
+                match serde_json::from_str::<StoredProviderOpsBalanceSnapshot>(&raw) {
+                    Ok(snapshot) => Some((provider_id.clone(), snapshot)),
+                    Err(err) => {
+                        warn!(error = %err, provider_id, "failed to parse provider ops balance snapshot");
+                        None
+                    }
+                }
+            })
+            .collect(),
+        Err(err) => {
+            warn!(error = %err, "failed to read provider ops balance runtime cache");
+            HashMap::new()
+        }
+    }
+}
+
+pub(crate) async fn read_admin_provider_ops_balance_snapshot(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+) -> Option<StoredProviderOpsBalanceSnapshot> {
+    read_admin_provider_ops_balance_snapshots(state, std::slice::from_ref(&provider_id.to_string()))
+        .await
+        .remove(provider_id)
+}
+
+pub(crate) async fn write_admin_provider_ops_balance_snapshot(
+    state: &AdminAppState<'_>,
+    snapshot: &StoredProviderOpsBalanceSnapshot,
+) {
+    let data = &state.app().data;
+    if data.has_provider_ops_balance_snapshot_writer() {
+        if let Err(err) = data.upsert_provider_ops_balance_snapshot(snapshot).await {
+            warn!(
+                error = %err,
+                provider_id = %snapshot.provider_id,
+                "failed to store provider ops balance snapshot"
+            );
+        }
+        return;
+    }
+    let serialized = match serde_json::to_string(snapshot) {
+        Ok(serialized) => serialized,
+        Err(err) => {
+            warn!(
+                error = %err,
+                provider_id = %snapshot.provider_id,
+                "failed to serialize provider ops balance snapshot"
+            );
+            return;
+        }
+    };
+    if let Err(err) = state
+        .runtime_state()
+        .kv_set(
+            &admin_provider_ops_balance_kv_key(&snapshot.provider_id),
+            serialized,
+            Some(Duration::from_secs(ADMIN_PROVIDER_OPS_BALANCE_KV_TTL_SECS)),
+        )
+        .await
+    {
+        warn!(
+            error = %err,
+            provider_id = %snapshot.provider_id,
+            "failed to store provider ops balance runtime cache"
+        );
+    }
+}
+
+pub(crate) async fn delete_admin_provider_ops_balance_snapshot(
+    state: &AdminAppState<'_>,
+    provider_id: &str,
+) {
+    let data = &state.app().data;
+    if let Err(err) = data.delete_provider_ops_balance_snapshot(provider_id).await {
+        warn!(error = %err, provider_id, "failed to delete provider ops balance snapshot");
+    }
+    if let Err(err) = state
+        .runtime_state()
+        .kv_delete(&admin_provider_ops_balance_kv_key(provider_id))
+        .await
+    {
+        warn!(error = %err, provider_id, "failed to clear provider ops balance runtime cache");
+    }
+}
+
+pub(crate) fn admin_provider_ops_pending_balance_response(message: &str) -> Value {
     json!({
         "status": "pending",
         "action_type": "query_balance",
@@ -46,183 +167,283 @@ pub(super) fn admin_provider_ops_pending_balance_response(message: &str) -> Valu
     })
 }
 
-pub(super) async fn read_admin_provider_ops_balance_cache(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-) -> AdminProviderOpsBalanceCacheLookup {
-    let raw_key = format!("{ADMIN_PROVIDER_OPS_BALANCE_CACHE_PREFIX}{provider_id}");
-    let raw = match state.runtime_state().kv_get(&raw_key).await {
-        Ok(raw) => raw,
-        Err(err) => {
-            warn!(error = %err, provider_id, "failed to read provider ops balance runtime cache");
-            return AdminProviderOpsBalanceCacheLookup::Unavailable;
-        }
+/// Builds the API payload for one provider from its snapshot. The top-level
+/// `status`/`data` describe the last successful query so operators keep seeing
+/// a value while the upstream is unreachable; `last_error`, `stale` and
+/// `next_retry_at` describe the most recent attempt.
+pub(crate) fn build_admin_provider_ops_balance_response(
+    snapshot: Option<&StoredProviderOpsBalanceSnapshot>,
+    refresh_state: &str,
+    now_unix_secs: u64,
+) -> Value {
+    let Some(snapshot) = snapshot else {
+        let mut response =
+            admin_provider_ops_pending_balance_response(ADMIN_PROVIDER_OPS_BALANCE_PENDING_MESSAGE);
+        attach_admin_provider_ops_balance_meta(&mut response, None, refresh_state, now_unix_secs);
+        return response;
     };
-    let Some(raw) = raw else {
-        return AdminProviderOpsBalanceCacheLookup::Miss;
-    };
-    match serde_json::from_str::<Value>(&raw) {
-        Ok(payload) => AdminProviderOpsBalanceCacheLookup::Hit(payload),
-        Err(err) => {
-            warn!(error = %err, provider_id, "failed to parse provider ops balance cache payload");
-            AdminProviderOpsBalanceCacheLookup::Miss
+    let mut response = match snapshot.payload_json.as_ref().and_then(Value::as_object) {
+        Some(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("success");
+            json!({
+                "status": status,
+                "action_type": "query_balance",
+                "data": payload.get("data").cloned().unwrap_or(Value::Null),
+                "message": if status == "auth_expired" {
+                    Value::String("认证已过期".to_string())
+                } else {
+                    Value::Null
+                },
+                "executed_at": snapshot
+                    .last_success_at_unix_secs
+                    .and_then(unix_secs_to_rfc3339)
+                    .map(Value::String)
+                    .or_else(|| payload.get("executed_at").cloned())
+                    .unwrap_or(Value::Null),
+                "response_time_ms": payload.get("response_time_ms").cloned().unwrap_or(Value::Null),
+                "cache_ttl_seconds": ADMIN_PROVIDER_OPS_BALANCE_CACHE_TTL_SECS,
+            })
         }
-    }
+        None => match snapshot.last_status.as_deref() {
+            Some(status) if !admin_provider_ops_balance_status_is_success(status) => json!({
+                "status": status,
+                "action_type": "query_balance",
+                "data": Value::Null,
+                "message": snapshot
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| admin_provider_ops_balance_default_error(status).to_string()),
+                "executed_at": snapshot
+                    .last_attempt_at_unix_secs
+                    .and_then(unix_secs_to_rfc3339),
+                "response_time_ms": Value::Null,
+                "cache_ttl_seconds": 0,
+            }),
+            _ => admin_provider_ops_pending_balance_response(
+                ADMIN_PROVIDER_OPS_BALANCE_PENDING_MESSAGE,
+            ),
+        },
+    };
+    attach_admin_provider_ops_balance_meta(
+        &mut response,
+        Some(snapshot),
+        refresh_state,
+        now_unix_secs,
+    );
+    response
 }
 
-pub(crate) async fn store_admin_provider_ops_balance_cache(
-    state: &AdminAppState<'_>,
+pub(crate) fn attach_admin_provider_ops_balance_meta(
+    response: &mut Value,
+    snapshot: Option<&StoredProviderOpsBalanceSnapshot>,
+    refresh_state: &str,
+    now_unix_secs: u64,
+) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    let fetched_at = snapshot.and_then(|snapshot| snapshot.last_success_at_unix_secs);
+    let stale = fetched_at.is_none_or(|fetched_at| {
+        now_unix_secs.saturating_sub(fetched_at) > ADMIN_PROVIDER_OPS_BALANCE_STALE_AFTER_SECS
+    });
+    let last_error = snapshot.and_then(|snapshot| {
+        let status = snapshot.last_status.as_deref()?;
+        if admin_provider_ops_balance_status_is_success(status) {
+            return None;
+        }
+        Some(json!({
+            "status": status,
+            "message": snapshot
+                .last_error
+                .clone()
+                .unwrap_or_else(|| admin_provider_ops_balance_default_error(status).to_string()),
+            "at": snapshot
+                .last_attempt_at_unix_secs
+                .and_then(unix_secs_to_rfc3339),
+        }))
+    });
+    let next_retry_at = snapshot
+        .and_then(|snapshot| snapshot.next_refresh_at_unix_secs)
+        .filter(|next_refresh_at| *next_refresh_at > now_unix_secs)
+        .and_then(unix_secs_to_rfc3339);
+    object.insert(
+        "fetched_at".to_string(),
+        fetched_at
+            .and_then(unix_secs_to_rfc3339)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert("stale".to_string(), Value::Bool(stale));
+    object.insert(
+        "refresh_state".to_string(),
+        Value::String(refresh_state.to_string()),
+    );
+    object.insert(
+        "next_retry_at".to_string(),
+        next_retry_at.map(Value::String).unwrap_or(Value::Null),
+    );
+    object.insert(
+        "consecutive_failures".to_string(),
+        Value::from(snapshot.map_or(0, |snapshot| snapshot.consecutive_failures)),
+    );
+    object.insert("last_error".to_string(), last_error.unwrap_or(Value::Null));
+}
+
+/// Folds one query result into the snapshot. Successful payloads replace the
+/// stored value; failures keep the previous value and schedule a backoff.
+pub(crate) fn apply_admin_provider_ops_balance_attempt(
+    previous: Option<&StoredProviderOpsBalanceSnapshot>,
     provider_id: &str,
     payload: &Value,
-) {
-    let Some(projected) = project_admin_provider_ops_balance_cache_payload(payload) else {
-        return;
-    };
-    let Some(ttl_seconds) = balance_cache_ttl_seconds(&projected) else {
-        return;
-    };
-    let serialized = match serde_json::to_string(&projected) {
-        Ok(serialized) => serialized,
-        Err(err) => {
-            warn!(
-                error = %err,
-                provider_id,
-                "failed to serialize provider ops balance payload"
-            );
-            return;
-        }
-    };
-    if let Err(err) = state
-        .runtime_state()
-        .kv_set(
-            &format!("{ADMIN_PROVIDER_OPS_BALANCE_CACHE_PREFIX}{provider_id}"),
-            serialized,
-            Some(Duration::from_secs(ttl_seconds)),
-        )
-        .await
-    {
-        warn!(error = %err, provider_id, "failed to store provider ops balance cache");
-    }
-}
-
-pub(super) async fn clear_admin_provider_ops_balance_cache(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-) {
-    if let Err(err) = state
-        .runtime_state()
-        .kv_delete(&format!(
-            "{ADMIN_PROVIDER_OPS_BALANCE_CACHE_PREFIX}{provider_id}"
-        ))
-        .await
-    {
-        warn!(error = %err, provider_id, "failed to clear provider ops balance cache");
-    }
-}
-
-pub(super) async fn spawn_admin_provider_ops_balance_refresh(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-) {
-    let refresh_key = admin_provider_ops_balance_refresh_key(state, provider_id);
-    let mut guard = ADMIN_PROVIDER_OPS_REFRESHING_PROVIDERS.lock().await;
-    if !guard.insert(refresh_key.clone()) {
-        debug!(provider_id, "provider ops balance refresh already running");
-        return;
-    }
-    drop(guard);
-
-    let app = state.cloned_app();
-    let provider_id = provider_id.to_string();
-    spawn_fire_and_forget(TASK_KEY_PROVIDER_BALANCE_REFRESH, async move {
-        let permit = match tokio::time::timeout(
-            Duration::from_secs(5),
-            ADMIN_PROVIDER_OPS_BALANCE_REFRESH_SEMAPHORE.acquire(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(err)) => {
-                warn!(
-                    provider_id = %provider_id,
-                    error = %err,
-                    "provider ops balance refresh semaphore closed"
-                );
-                finish_refresh_provider(&refresh_key).await;
-                return;
-            }
-            Err(_) => {
-                debug!(provider_id = %provider_id, "provider ops balance refresh skipped by concurrency limit");
-                finish_refresh_provider(&refresh_key).await;
-                return;
-            }
-        };
-
-        let admin_state = AdminAppState::new(&app);
-        let provider_ids = [provider_id.clone()];
-        let providers = match admin_state
-            .read_provider_catalog_providers_by_ids(&provider_ids)
-            .await
-        {
-            Ok(providers) => providers,
-            Err(err) => {
-                warn!(
-                    provider_id = %provider_id,
-                    error = ?err,
-                    "failed to load provider for balance refresh"
-                );
-                drop(permit);
-                finish_refresh_provider(&refresh_key).await;
-                return;
-            }
-        };
-        let provider = providers.first();
-        let endpoints = if provider.is_some() {
-            match admin_state
-                .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
-                .await
-            {
-                Ok(endpoints) => endpoints,
-                Err(err) => {
-                    warn!(
-                        provider_id = %provider_id,
-                        error = ?err,
-                        "failed to load endpoints for balance refresh"
-                    );
-                    drop(permit);
-                    finish_refresh_provider(&refresh_key).await;
-                    return;
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
-        let payload = admin_provider_ops_local_action_response(
-            &admin_state,
-            &provider_id,
-            provider,
-            &endpoints,
-            "query_balance",
-            None,
-        )
-        .await;
-        store_admin_provider_ops_balance_cache(&admin_state, &provider_id, &payload).await;
-        drop(permit);
-        finish_refresh_provider(&refresh_key).await;
-    });
-}
-
-fn balance_cache_ttl_seconds(payload: &Value) -> Option<u64> {
-    match payload
+    now_unix_secs: u64,
+) -> StoredProviderOpsBalanceSnapshot {
+    let status = payload
         .get("status")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
-        "success" | "auth_expired" => Some(ADMIN_PROVIDER_OPS_BALANCE_CACHE_TTL_SECS),
-        "auth_failed" => Some(ADMIN_PROVIDER_OPS_BALANCE_AUTH_FAILED_CACHE_TTL_SECS),
-        _ => None,
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .unwrap_or("unknown_error");
+    let mut next = previous
+        .cloned()
+        .unwrap_or_else(|| StoredProviderOpsBalanceSnapshot {
+            provider_id: provider_id.to_string(),
+            payload_json: None,
+            last_success_at_unix_secs: None,
+            last_attempt_at_unix_secs: None,
+            last_status: None,
+            last_error: None,
+            consecutive_failures: 0,
+            next_refresh_at_unix_secs: None,
+            updated_at_unix_secs: now_unix_secs,
+        });
+    next.provider_id = provider_id.to_string();
+    next.last_attempt_at_unix_secs = Some(now_unix_secs);
+    next.updated_at_unix_secs = now_unix_secs;
+
+    if admin_provider_ops_balance_status_is_success(status) {
+        if let Some(projected) = project_admin_provider_ops_balance_cache_payload(payload) {
+            next.payload_json = Some(projected);
+            next.last_success_at_unix_secs = Some(now_unix_secs);
+            next.last_status = Some(status.to_string());
+            next.last_error = None;
+            next.consecutive_failures = 0;
+            next.next_refresh_at_unix_secs = None;
+            return next;
+        }
+        record_admin_provider_ops_balance_failure(
+            &mut next,
+            "parse_error",
+            Some("响应格式无效"),
+            now_unix_secs,
+        );
+        return next;
     }
+
+    record_admin_provider_ops_balance_failure(
+        &mut next,
+        status,
+        payload.get("message").and_then(Value::as_str),
+        now_unix_secs,
+    );
+    next
+}
+
+fn record_admin_provider_ops_balance_failure(
+    snapshot: &mut StoredProviderOpsBalanceSnapshot,
+    status: &str,
+    message: Option<&str>,
+    now_unix_secs: u64,
+) {
+    snapshot.consecutive_failures = snapshot.consecutive_failures.saturating_add(1);
+    snapshot.last_status = Some(status.to_string());
+    snapshot.last_error = Some(admin_provider_ops_balance_error_message(status, message));
+    snapshot.next_refresh_at_unix_secs = Some(now_unix_secs.saturating_add(
+        admin_provider_ops_balance_backoff_secs(status, snapshot.consecutive_failures),
+    ));
+}
+
+pub(crate) fn admin_provider_ops_balance_backoff_secs(
+    status: &str,
+    consecutive_failures: u32,
+) -> u64 {
+    match status {
+        "auth_failed" => ADMIN_PROVIDER_OPS_BALANCE_AUTH_FAILED_BACKOFF_SECS,
+        "not_configured" | "not_supported" | "parse_error" => {
+            ADMIN_PROVIDER_OPS_BALANCE_BACKOFF_MAX_SECS
+        }
+        _ => {
+            let exponent = consecutive_failures.saturating_sub(1).min(16);
+            ADMIN_PROVIDER_OPS_BALANCE_BACKOFF_BASE_SECS
+                .saturating_mul(1u64 << exponent)
+                .min(ADMIN_PROVIDER_OPS_BALANCE_BACKOFF_MAX_SECS)
+        }
+    }
+}
+
+fn admin_provider_ops_balance_default_error(status: &str) -> &'static str {
+    match status {
+        "auth_failed" => "认证失败",
+        "network_error" => "网络错误",
+        "rate_limited" => "请求频率限制",
+        "parse_error" => "响应解析失败",
+        "not_configured" => "未配置操作设置",
+        "not_supported" => "功能未开放",
+        _ => "查询失败",
+    }
+}
+
+/// Messages come from the gateway's own classification of an attempt, never
+/// from upstream bodies. Still refuse anything that looks like a credential
+/// echo and cap the length before it reaches storage or the UI.
+fn admin_provider_ops_balance_error_message(status: &str, message: Option<&str>) -> String {
+    let fallback = admin_provider_ops_balance_default_error(status);
+    let Some(message) = message.map(str::trim).filter(|message| !message.is_empty()) else {
+        return fallback.to_string();
+    };
+    if message.chars().any(char::is_control) {
+        return fallback.to_string();
+    }
+    let lower = message.to_ascii_lowercase();
+    if [
+        "authorization",
+        "bearer ",
+        "token=",
+        "api_key=",
+        "password=",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return fallback.to_string();
+    }
+    message
+        .chars()
+        .take(ADMIN_PROVIDER_OPS_BALANCE_ERROR_MAX_CHARS)
+        .collect()
+}
+
+/// `total_available` of the last successful query, used by the quota alert.
+pub(crate) fn admin_provider_ops_balance_snapshot_total_available(
+    snapshot: &StoredProviderOpsBalanceSnapshot,
+) -> Option<f64> {
+    let payload = snapshot.payload_json.as_ref()?;
+    if payload.get("status").and_then(Value::as_str) != Some("success") {
+        return None;
+    }
+    payload
+        .get("data")
+        .and_then(|data| data.get("total_available"))
+        .and_then(|value| {
+            value.as_f64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|raw| raw.trim().parse::<f64>().ok())
+            })
+        })
+        .filter(|value| value.is_finite())
 }
 
 const BALANCE_CACHE_EXTRA_NUMERIC_FIELDS: &[&str] = &[
@@ -268,7 +489,9 @@ const BALANCE_CACHE_MONTH_STATS_FIELDS: &[&str] = &[
     "total_requests",
 ];
 
-fn project_admin_provider_ops_balance_cache_payload(payload: &Value) -> Option<Value> {
+/// Projects a successful query result onto the allowlisted, secret-free shape
+/// that is safe to persist and return to every admin session.
+pub(crate) fn project_admin_provider_ops_balance_cache_payload(payload: &Value) -> Option<Value> {
     let source = payload.as_object()?;
     let status = source.get("status").and_then(Value::as_str)?.trim();
     if !matches!(status, "success" | "auth_expired" | "auth_failed") {
@@ -312,11 +535,7 @@ fn project_admin_provider_ops_balance_cache_payload(payload: &Value) -> Option<V
     }
     projected.insert(
         "cache_ttl_seconds".to_string(),
-        Value::from(if status == "auth_failed" {
-            ADMIN_PROVIDER_OPS_BALANCE_AUTH_FAILED_CACHE_TTL_SECS
-        } else {
-            ADMIN_PROVIDER_OPS_BALANCE_CACHE_TTL_SECS
-        }),
+        Value::from(ADMIN_PROVIDER_OPS_BALANCE_CACHE_TTL_SECS),
     );
     Some(Value::Object(projected))
 }
@@ -503,52 +722,33 @@ fn project_admin_provider_ops_safe_string(value: &Value) -> Option<String> {
     Some(value.to_string())
 }
 
-fn admin_provider_ops_balance_refresh_key(state: &AdminAppState<'_>, provider_id: &str) -> String {
-    let raw_key = format!("{ADMIN_PROVIDER_OPS_BALANCE_REFRESH_PREFIX}{provider_id}");
-    format!(
-        "{:p}:{}",
-        state.app(),
-        state.runtime_state().namespace_key(raw_key.as_str())
-    )
-}
-
-async fn finish_refresh_provider(refresh_key: &str) {
-    ADMIN_PROVIDER_OPS_REFRESHING_PROVIDERS
-        .lock()
-        .await
-        .remove(refresh_key);
-}
-
-fn admin_provider_ops_action_response(
-    total_available: f64,
-    extra: serde_json::Map<String, Value>,
-) -> Value {
-    json!({
-        "status": "success",
-        "action_type": "query_balance",
-        "data": {
-            "total_granted": Value::Null,
-            "total_used": Value::Null,
-            "total_available": total_available,
-            "expires_at": Value::Null,
-            "currency": "USD",
-            "extra": extra,
-        },
-        "message": Value::Null,
-        "executed_at": chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "response_time_ms": Value::Null,
-        "cache_ttl_seconds": ADMIN_PROVIDER_OPS_BALANCE_CACHE_TTL_SECS,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        admin_provider_ops_pending_balance_response, balance_cache_ttl_seconds,
+        admin_provider_ops_balance_backoff_secs,
+        admin_provider_ops_balance_snapshot_total_available,
+        admin_provider_ops_pending_balance_response, apply_admin_provider_ops_balance_attempt,
+        build_admin_provider_ops_balance_response,
         project_admin_provider_ops_balance_cache_payload,
+        ADMIN_PROVIDER_OPS_BALANCE_STALE_AFTER_SECS,
     };
     use serde_json::json;
+
+    fn success_payload(total_available: f64) -> serde_json::Value {
+        json!({
+            "status": "success",
+            "action_type": "query_balance",
+            "data": {
+                "total_available": total_available,
+                "currency": "USD",
+                "extra": {"balance": total_available}
+            },
+            "message": null,
+            "executed_at": "2026-09-19T00:00:00Z",
+            "response_time_ms": 120,
+            "cache_ttl_seconds": 86400
+        })
+    }
 
     #[test]
     fn pending_balance_response_uses_pending_status() {
@@ -558,22 +758,148 @@ mod tests {
     }
 
     #[test]
-    fn balance_cache_ttl_matches_status_contract() {
+    fn successful_attempt_replaces_value_and_clears_failures() {
+        let first = apply_admin_provider_ops_balance_attempt(
+            None,
+            "provider-1",
+            &json!({"status": "network_error", "message": "请求超时"}),
+            1_000,
+        );
+        assert_eq!(first.consecutive_failures, 1);
+        assert_eq!(first.last_status.as_deref(), Some("network_error"));
+        assert_eq!(first.last_error.as_deref(), Some("请求超时"));
+        assert_eq!(first.next_refresh_at_unix_secs, Some(1_060));
+        assert!(first.payload_json.is_none());
+
+        let second = apply_admin_provider_ops_balance_attempt(
+            Some(&first),
+            "provider-1",
+            &success_payload(4.5),
+            1_100,
+        );
+        assert_eq!(second.consecutive_failures, 0);
+        assert_eq!(second.last_success_at_unix_secs, Some(1_100));
+        assert_eq!(second.next_refresh_at_unix_secs, None);
+        assert_eq!(second.last_error, None);
         assert_eq!(
-            balance_cache_ttl_seconds(&json!({ "status": "success" })),
-            Some(86400)
+            second.payload_json.as_ref().unwrap()["data"]["total_available"],
+            json!(4.5)
         );
         assert_eq!(
-            balance_cache_ttl_seconds(&json!({ "status": "auth_expired" })),
-            Some(86400)
+            admin_provider_ops_balance_snapshot_total_available(&second),
+            Some(4.5)
+        );
+    }
+
+    #[test]
+    fn failed_attempt_keeps_last_value_and_backs_off_exponentially() {
+        let good = apply_admin_provider_ops_balance_attempt(
+            None,
+            "provider-1",
+            &success_payload(9.0),
+            1_000,
+        );
+        let mut snapshot = good.clone();
+        for (attempt, expected_backoff) in [(1u32, 60u64), (2, 120), (3, 240)] {
+            let now = 2_000 + u64::from(attempt) * 1_000;
+            snapshot = apply_admin_provider_ops_balance_attempt(
+                Some(&snapshot),
+                "provider-1",
+                &json!({"status": "network_error", "message": "请求超时"}),
+                now,
+            );
+            assert_eq!(snapshot.consecutive_failures, attempt);
+            assert_eq!(
+                snapshot.next_refresh_at_unix_secs,
+                Some(now + expected_backoff)
+            );
+            assert_eq!(snapshot.payload_json, good.payload_json);
+            assert_eq!(snapshot.last_success_at_unix_secs, Some(1_000));
+        }
+
+        // 25 minutes after the last success: still fresh, but the backoff from
+        // the third failure (until 5_240) is pending.
+        let response = build_admin_provider_ops_balance_response(Some(&snapshot), "idle", 2_500);
+        assert_eq!(response["status"], json!("success"));
+        assert_eq!(response["data"]["total_available"], json!(9.0));
+        assert_eq!(response["last_error"]["status"], json!("network_error"));
+        assert_eq!(response["last_error"]["message"], json!("请求超时"));
+        assert_eq!(response["consecutive_failures"], json!(3));
+        assert_eq!(response["stale"], json!(false));
+        assert!(response["next_retry_at"].is_string());
+        assert_eq!(response["fetched_at"], json!("1970-01-01T00:16:40Z"));
+
+        // Past the freshness window and past the backoff.
+        let past_backoff = snapshot.next_refresh_at_unix_secs.unwrap_or_default() + 1;
+        let much_later = past_backoff.max(1_000 + ADMIN_PROVIDER_OPS_BALANCE_STALE_AFTER_SECS + 1);
+        let stale =
+            build_admin_provider_ops_balance_response(Some(&snapshot), "queued", much_later);
+        assert_eq!(stale["stale"], json!(true));
+        assert_eq!(stale["refresh_state"], json!("queued"));
+        assert_eq!(stale["next_retry_at"], json!(null));
+    }
+
+    #[test]
+    fn failure_without_previous_value_is_reported_as_error_not_pending() {
+        let snapshot = apply_admin_provider_ops_balance_attempt(
+            None,
+            "provider-1",
+            &json!({"status": "auth_failed", "message": "认证失败，请检查凭据配置"}),
+            1_000,
+        );
+        assert_eq!(snapshot.next_refresh_at_unix_secs, Some(1_000 + 15 * 60));
+        let response = build_admin_provider_ops_balance_response(Some(&snapshot), "idle", 1_001);
+        assert_eq!(response["status"], json!("auth_failed"));
+        assert_eq!(response["message"], json!("认证失败，请检查凭据配置"));
+        assert_eq!(response["data"], json!(null));
+        assert_eq!(response["fetched_at"], json!(null));
+        assert_eq!(response["stale"], json!(true));
+
+        let missing = build_admin_provider_ops_balance_response(None, "queued", 1_001);
+        assert_eq!(missing["status"], json!("pending"));
+        assert_eq!(missing["refresh_state"], json!("queued"));
+    }
+
+    #[test]
+    fn error_messages_never_echo_credentials() {
+        let snapshot = apply_admin_provider_ops_balance_attempt(
+            None,
+            "provider-1",
+            &json!({"status": "unknown_error", "message": "HTTP 401 for Authorization: Bearer sk-secret"}),
+            1_000,
+        );
+        assert_eq!(snapshot.last_error.as_deref(), Some("查询失败"));
+        let long = "x".repeat(500);
+        let snapshot = apply_admin_provider_ops_balance_attempt(
+            None,
+            "provider-1",
+            &json!({"status": "network_error", "message": long}),
+            1_000,
+        );
+        assert_eq!(snapshot.last_error.as_ref().map(String::len), Some(200));
+    }
+
+    #[test]
+    fn backoff_schedule_matches_status_contract() {
+        assert_eq!(
+            admin_provider_ops_balance_backoff_secs("network_error", 1),
+            60
         );
         assert_eq!(
-            balance_cache_ttl_seconds(&json!({ "status": "auth_failed" })),
-            Some(60)
+            admin_provider_ops_balance_backoff_secs("network_error", 5),
+            960
         );
         assert_eq!(
-            balance_cache_ttl_seconds(&json!({ "status": "network_error" })),
-            None
+            admin_provider_ops_balance_backoff_secs("network_error", 12),
+            1_800
+        );
+        assert_eq!(
+            admin_provider_ops_balance_backoff_secs("auth_failed", 1),
+            900
+        );
+        assert_eq!(
+            admin_provider_ops_balance_backoff_secs("not_configured", 1),
+            1_800
         );
     }
 
@@ -602,7 +928,6 @@ mod tests {
         assert!(projected.to_string().find("upstream-secret").is_none());
         assert!(projected["data"]["extra"].get("access_token").is_none());
         assert!(projected["data"]["extra"].get("today_stats").is_none());
-        assert_eq!(projected["cache_ttl_seconds"], json!(60));
     }
 
     #[test]

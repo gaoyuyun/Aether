@@ -1,23 +1,19 @@
-use std::collections::HashMap;
-
-use aether_data_contracts::repository::provider_catalog::{
-    StoredProviderCatalogEndpoint, StoredProviderCatalogProvider,
-};
-use futures_util::stream::{self, StreamExt};
+use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+use aether_data_contracts::repository::provider_ops_balance::StoredProviderOpsBalanceSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::admin_api::{
-    admin_provider_ops_local_action_response, store_admin_provider_ops_balance_cache, AdminAppState,
+    admin_provider_ops_balance_snapshot_total_available,
+    enqueue_admin_provider_ops_balance_refresh, read_admin_provider_ops_balance_snapshots,
+    AdminAppState, AdminProviderOpsBalanceRefreshTrigger,
 };
 use crate::important_notification::{
     important_notification_dispatch_ready_for_item, send_important_notification_for_item,
     ImportantNotification, PROVIDER_QUOTA_ALERT_ITEM_KEY,
 };
 use crate::{AppState, GatewayError};
-
-use super::PROVIDER_QUOTA_ALERT_CONCURRENCY;
 
 const PROVIDER_QUOTA_ALERT_STATE_PREFIX: &str = "provider_ops:quota_alert:";
 const PROVIDER_QUOTA_ALERT_DEFAULT_FETCH_INTERVAL_SECS: u64 = 30;
@@ -65,6 +61,10 @@ enum ProviderQuotaAlertStatus {
     Failed,
 }
 
+/// Evaluates the quota alert against the balance snapshots. The upstream is
+/// never queried here; when a snapshot is older than the configured fetch
+/// interval a background refresh is queued and the alert uses the value on the
+/// next tick.
 pub(crate) async fn perform_provider_quota_alert_once(
     state: &AppState,
 ) -> Result<ProviderQuotaAlertRunSummary, GatewayError> {
@@ -97,31 +97,12 @@ pub(crate) async fn perform_provider_quota_alert_once(
         });
     }
 
+    let admin_state = AdminAppState::new(state);
     let provider_ids = targets
         .iter()
         .map(|target| target.provider.id.clone())
         .collect::<Vec<_>>();
-    let mut endpoints_by_provider = HashMap::<String, Vec<StoredProviderCatalogEndpoint>>::new();
-    for endpoint in state
-        .list_provider_catalog_endpoints_by_provider_ids(&provider_ids)
-        .await?
-    {
-        endpoints_by_provider
-            .entry(endpoint.provider_id.clone())
-            .or_default()
-            .push(endpoint);
-    }
-
-    let mut results = stream::iter(targets.into_iter().map(|target| {
-        let state = state.clone();
-        let provider_id = target.provider.id.clone();
-        let endpoints = endpoints_by_provider
-            .get(&provider_id)
-            .cloned()
-            .unwrap_or_default();
-        async move { run_provider_quota_alert_for_provider(&state, target, endpoints).await }
-    }))
-    .buffer_unordered(PROVIDER_QUOTA_ALERT_CONCURRENCY);
+    let snapshots = read_admin_provider_ops_balance_snapshots(&admin_state, &provider_ids).await;
 
     let mut summary = ProviderQuotaAlertRunSummary {
         checked: 0,
@@ -129,8 +110,9 @@ pub(crate) async fn perform_provider_quota_alert_once(
         skipped: 0,
         failed: 0,
     };
-    while let Some(status) = results.next().await {
-        match status {
+    for target in targets {
+        let snapshot = snapshots.get(&target.provider.id);
+        match run_provider_quota_alert_for_provider(state, &admin_state, target, snapshot).await {
             ProviderQuotaAlertStatus::Checked => summary.checked += 1,
             ProviderQuotaAlertStatus::Alerted => {
                 summary.checked += 1;
@@ -178,39 +160,36 @@ async fn select_provider_quota_alert_targets(
 
 async fn run_provider_quota_alert_for_provider(
     state: &AppState,
+    admin_state: &AdminAppState<'_>,
     target: ProviderQuotaAlertTarget,
-    endpoints: Vec<StoredProviderCatalogEndpoint>,
+    snapshot: Option<&StoredProviderOpsBalanceSnapshot>,
 ) -> ProviderQuotaAlertStatus {
     let provider_id = target.provider.id.clone();
-    let admin_state = AdminAppState::new(state);
-    let payload = admin_provider_ops_local_action_response(
-        &admin_state,
-        &provider_id,
-        Some(&target.provider),
-        &endpoints,
-        "query_balance",
-        None,
-    )
-    .await;
-    store_admin_provider_ops_balance_cache(&admin_state, &provider_id, &payload).await;
-
     let now_unix_secs = now_unix_secs();
-    let payload_status_success = payload.get("status").and_then(Value::as_str) == Some("success");
-    let Some(total_available) = extract_total_available(&payload) else {
-        warn!(
+    let snapshot_age = snapshot
+        .and_then(|snapshot| snapshot.last_success_at_unix_secs)
+        .map(|fetched_at| now_unix_secs.saturating_sub(fetched_at));
+    if snapshot_age.is_none_or(|age| age >= target.config.fetch_interval_seconds) {
+        enqueue_admin_provider_ops_balance_refresh(
+            admin_state,
+            &provider_id,
+            AdminProviderOpsBalanceRefreshTrigger::QuotaAlert,
+        );
+    }
+
+    let Some(total_available) =
+        snapshot.and_then(admin_provider_ops_balance_snapshot_total_available)
+    else {
+        let last_status = snapshot
+            .and_then(|snapshot| snapshot.last_status.as_deref())
+            .unwrap_or("missing");
+        debug!(
             provider_id = %provider_id,
-            payload_status = payload
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown"),
-            action_type = payload
-                .get("action_type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown"),
-            "provider quota alert skipped because balance payload has no total_available"
+            last_status,
+            "provider quota alert skipped because no successful balance snapshot exists yet"
         );
         write_checked_runtime_state_without_balance(state, &provider_id, now_unix_secs).await;
-        return if payload_status_success {
+        return if matches!(last_status, "missing" | "success" | "auth_expired") {
             ProviderQuotaAlertStatus::Skipped
         } else {
             ProviderQuotaAlertStatus::Failed
@@ -332,17 +311,6 @@ fn provider_quota_alert_should_notify(
         .last_notified_at
         .map(|last| now_unix_secs.saturating_sub(last) >= PROVIDER_QUOTA_ALERT_REPEAT_COOLDOWN_SECS)
         .unwrap_or(true)
-}
-
-fn extract_total_available(payload: &Value) -> Option<f64> {
-    if payload.get("status").and_then(Value::as_str) != Some("success") {
-        return None;
-    }
-    payload
-        .get("data")
-        .and_then(|data| data.get("total_available"))
-        .and_then(value_as_f64)
-        .filter(|value| value.is_finite())
 }
 
 fn value_as_f64(value: &Value) -> Option<f64> {

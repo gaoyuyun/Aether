@@ -163,6 +163,8 @@ impl GatewayDataState {
             background_task_writer: None,
             gemini_file_mapping_reader: None,
             gemini_file_mapping_writer: None,
+            provider_ops_balance_snapshot_reader: None,
+            provider_ops_balance_snapshot_writer: None,
             global_model_reader: None,
             global_model_writer: None,
             minimal_candidate_selection_reader: Some(candidate_selection_repository),

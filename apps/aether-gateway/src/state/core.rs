@@ -62,6 +62,7 @@ use crate::maintenance::spawn_pending_cleanup_worker;
 use crate::maintenance::spawn_pool_monitor_worker;
 use crate::maintenance::spawn_pool_quota_probe_worker;
 use crate::maintenance::spawn_pool_score_rebuild_worker;
+use crate::maintenance::spawn_provider_balance_monitor_worker;
 use crate::maintenance::spawn_provider_checkin_worker;
 use crate::maintenance::spawn_provider_quota_alert_worker;
 use crate::maintenance::spawn_proxy_node_metrics_cleanup_worker;
@@ -421,6 +422,9 @@ impl AppState {
                 crate::maintenance::UsageCounterFlushRuntimeMetrics::default(),
             ),
             task_supervisor_metrics: crate::task_runtime::TaskSupervisorMetrics::default(),
+            provider_ops_balance_refresher: Arc::new(
+                crate::admin_api::ProviderOpsBalanceRefreshState::default(),
+            ),
             process_resource_monitor: Arc::new(
                 crate::process_metrics::GatewayProcessResourceMonitor::new(),
             ),
@@ -2275,6 +2279,10 @@ impl AppState {
         supervise_worker(
             crate::task_runtime::TASK_KEY_PROVIDER_QUOTA_ALERT,
             spawn_provider_quota_alert_worker(background_state.clone()),
+        );
+        supervise_worker(
+            crate::task_runtime::TASK_KEY_PROVIDER_BALANCE_MONITOR,
+            spawn_provider_balance_monitor_worker(background_state.clone()),
         );
         supervise_worker(
             crate::task_runtime::TASK_KEY_OAUTH_TOKEN_REFRESH,
