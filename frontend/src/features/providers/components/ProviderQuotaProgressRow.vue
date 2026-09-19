@@ -60,6 +60,8 @@ const props = withDefaults(defineProps<{
 })
 
 function normalizePercent(value: number | null | undefined): number | null {
+  // null/undefined 表示"未提供"，不能经 Number() 变成 0，否则只传 usedPercent 的调用方会得到空进度条
+  if (value === null || value === undefined) return null
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return null
   return Math.min(Math.max(numeric, 0), 100)

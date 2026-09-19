@@ -64,6 +64,23 @@ describe('ProviderDetailDrawer loading priorities', () => {
     expect(source).toContain('v-if="open && failoverRulesDialogOpen"')
   })
 
+  it('wires a manual per-key quota refresh into every account quota section header', () => {
+    const headerCount = source.split('<ProviderQuotaSectionHeader').length - 1
+    expect(headerCount).toBeGreaterThan(0)
+    expect(source.split('@refresh="handleManualQuotaRefresh(key)"').length - 1).toBe(headerCount)
+    expect(source.match(/^\s+refreshable\n/gm)?.length).toBe(headerCount)
+
+    const handler = source
+      .split('async function handleManualQuotaRefresh(key: EndpointAPIKey) {')[1]
+      ?.split('async function openAntigravityQuotaDialog')[0]
+    expect(handler).toBeTruthy()
+    expect(handler).toContain('refreshProviderQuota(providerId, [key.id])')
+    expect(handler).toContain('applyQuotaResults(result.results)')
+    expect(handler).toContain("showSuccess(legacyT('账号额度已刷新'))")
+    expect(handler).toContain("emit('refresh')")
+    expect(handler).toContain('refreshingQuota.value = false')
+  })
+
   it('marks a transport-error stop policy as a configured failover rule', () => {
     expect(source).toContain('rules.stop_on_transport_errors === true')
   })

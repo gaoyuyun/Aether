@@ -58,6 +58,56 @@ describe('provider quota display components', () => {
     unmount()
   })
 
+  it('derives the remaining bar from usedPercent when remainingPercent is omitted', () => {
+    // Kiro 区块只传 used-percent；此前 null 被 Number() 变成 0，进度条永远是空的
+    const { root, unmount } = mount(ProviderQuotaProgressRow, {
+      label: '使用额度',
+      usedPercent: 29.738,
+      meterClass: 'text-green-600',
+      barClass: 'bg-green-500',
+    })
+
+    const bar = root.querySelector('[data-testid="provider-quota-progress-bar"]') as HTMLElement
+    expect(bar.style.width).toBe('70.262%')
+    expect(bar.className).toContain('bg-green-500')
+    expect(root.querySelector('[data-testid="provider-quota-progress-meter"]')?.textContent?.trim()).toBe('70.3%')
+
+    unmount()
+  })
+
+  it('emits refresh from the section header button and disables it while loading', async () => {
+    const onRefresh = vi.fn()
+    const Probe = defineComponent({
+      props: { loading: { type: Boolean, default: false } },
+      setup(props) {
+        return () => h(ProviderQuotaSectionHeader, {
+          title: '账号配额',
+          loading: props.loading,
+          refreshable: true,
+          onRefresh,
+        })
+      },
+    })
+
+    const { root, unmount, setProps } = mount(Probe, { loading: false })
+
+    const button = root.querySelector('[data-testid="provider-quota-header-refresh"]') as HTMLButtonElement
+    expect(button).toBeTruthy()
+    expect(button.getAttribute('title')).toBe('刷新额度')
+    expect(button.disabled).toBe(false)
+    expect(root.querySelector('[data-testid="provider-quota-header-loading"]')).toBeNull()
+
+    button.click()
+    expect(onRefresh).toHaveBeenCalledTimes(1)
+
+    setProps({ loading: true })
+    await nextTick()
+    expect(button.disabled).toBe(true)
+    expect(button.querySelector('svg')?.getAttribute('class')).toContain('animate-spin')
+
+    unmount()
+  })
+
   it('renders configured quota windows', () => {
     const { root, unmount } = mount(ProviderMonthlyQuotaCard, {
       used: 10,

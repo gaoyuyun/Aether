@@ -191,6 +191,8 @@
                         :title="legacyT('账号配额')"
                         :loading="refreshingQuota"
                         :updated-text="getCodexQuotaDisplay(key)?.updated_at ? formatCodexUpdatedAt(getCodexQuotaDisplay(key)?.updated_at || 0) : null"
+                        refreshable
+                        @refresh="handleManualQuotaRefresh(key)"
                       />
                       <!-- 普通 Codex 限额并排显示：Team/Plus/Enterprise 账号 2列, Free 账号 1列 -->
                       <div
@@ -381,6 +383,8 @@
                           :title="legacyT('模型配额')"
                           :loading="refreshingQuota"
                           :updated-text="getAntigravityQuotaUpdatedAt(key) ? formatAntigravityUpdatedAt(getAntigravityQuotaUpdatedAt(key) || 0) : null"
+                          refreshable
+                          @refresh="handleManualQuotaRefresh(key)"
                         />
                         <div class="grid grid-cols-2 gap-3">
                           <ProviderQuotaProgressRow
@@ -422,6 +426,8 @@
                         :title="legacyT('模型配额')"
                         :loading="refreshingQuota"
                         :updated-text="getGeminiCliQuotaUpdatedAt(key) ? formatUpdatedAt(getGeminiCliQuotaUpdatedAt(key) || 0) : null"
+                        refreshable
+                        @refresh="handleManualQuotaRefresh(key)"
                       />
                       <div
                         v-if="getGeminiCliAccountCreditsText(key, 'gemini_cli')"
@@ -496,6 +502,8 @@
                           :title="legacyT('账号配额')"
                           :loading="refreshingQuota"
                           :updated-text="getKiroQuotaDisplay(key)?.updated_at ? formatKiroUpdatedAt(getKiroQuotaDisplay(key)?.updated_at || 0) : null"
+                          refreshable
+                          @refresh="handleManualQuotaRefresh(key)"
                         />
                         <!-- Kiro 额度显示：使用进度 -->
                         <div>
@@ -568,6 +576,8 @@
                           :title="legacyT('账号配额')"
                           :loading="refreshingQuota"
                           :updated-text="getWindsurfQuotaDisplay(key)?.updated_at ? formatKiroUpdatedAt(getWindsurfQuotaDisplay(key)?.updated_at || 0) : null"
+                          refreshable
+                          @refresh="handleManualQuotaRefresh(key)"
                         />
                         <div class="grid grid-cols-2 gap-3">
                           <ProviderQuotaProgressRow
@@ -632,6 +642,8 @@
                         :title="legacyT('账号配额')"
                         :loading="refreshingQuota"
                         :updated-text="getChatGPTWebQuotaDisplay(key)?.updated_at ? formatKiroUpdatedAt(getChatGPTWebQuotaDisplay(key)?.updated_at || 0) : null"
+                        refreshable
+                        @refresh="handleManualQuotaRefresh(key)"
                       />
                       <div>
                         <ProviderQuotaProgressRow
@@ -2889,6 +2901,33 @@ async function autoRefreshQuotaInBackground(): Promise<boolean> {
       showError(localizedApiError(err, '后台刷新配额失败'), legacyT('错误'))
     }
     return false
+  } finally {
+    refreshingQuota.value = false
+  }
+}
+
+// 手动刷新单个 Key 的账号额度：按 key_ids 只刷新当前 Key，结果就地应用到列表
+async function handleManualQuotaRefresh(key: EndpointAPIKey) {
+  const providerId = props.providerId
+  if (!providerId || refreshingQuota.value) return
+
+  refreshingQuota.value = true
+  const isCurrent = () => props.open && props.providerId === providerId
+  try {
+    const result = await refreshProviderQuota(providerId, [key.id])
+    if (!isCurrent()) return
+    const applied = applyQuotaResults(result.results)
+    if (applied > 0) {
+      showSuccess(legacyT('账号额度已刷新'))
+      emit('refresh')
+      return
+    }
+    const item = result.results.find(r => r.key_id === key.id) ?? result.results[0]
+    showError(legacyT(item?.message?.trim() || '刷新账号额度失败'), legacyT('错误'))
+  } catch (err: unknown) {
+    if (isCurrent()) {
+      showError(localizedApiError(err, '刷新账号额度失败'), legacyT('错误'))
+    }
   } finally {
     refreshingQuota.value = false
   }

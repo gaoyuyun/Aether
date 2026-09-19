@@ -541,6 +541,8 @@ export const legacyUiEnglishMessages: Record<string, string> = {
   '熔断探测（分钟）': 'Circuit breaker probe interval (minutes)',
   '清除代理': 'Clear proxy',
   '刷新额度': 'Refresh quota',
+  '账号额度已刷新': 'Account quota refreshed',
+  '刷新账号额度失败': 'Failed to refresh account quota',
   '调用额度刷新接口，适合核对最新配额状态。': 'Refresh quota information to check the latest status.',
   '编辑配置': 'Edit configuration',
   '请先选择账号': 'Select an account first',
