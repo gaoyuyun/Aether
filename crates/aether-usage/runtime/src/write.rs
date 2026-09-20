@@ -282,6 +282,7 @@ pub fn build_lifecycle_usage_seed(
         api_format.as_deref(),
         endpoint_api_format.as_deref(),
         provider_request.as_ref(),
+        context_api_operation_request_type(context),
     );
     let api_family = api_format
         .as_deref()
@@ -836,6 +837,7 @@ pub fn build_terminal_usage_context_seed(
         Some(client_contract.as_str()),
         Some(provider_contract.as_str()),
         request_capture.provider_request.as_ref(),
+        context_api_operation_request_type(context),
     );
     let has_format_conversion = resolve_has_format_conversion(
         context,
@@ -1755,6 +1757,7 @@ fn build_usage_event_data_seed_with_detail(
             .provider_request
             .as_ref()
             .or_else(|| provider_request_body_ref_for_inference(plan, context)),
+        context_api_operation_request_type(context),
     ));
     let api_family = api_format
         .as_deref()
@@ -2617,11 +2620,30 @@ fn infer_request_type(api_format: Option<&str>) -> String {
     }
 }
 
+/// Reads the audit request type an explicit API operation forces, if any.
+///
+/// A planner report context names the operation it planned for. Without it an
+/// operation that shares both its API format and its body shape with a chat
+/// completion is indistinguishable from one, which is how Claude token counting
+/// requests came to be recorded as `chat`.
+fn context_api_operation_request_type(
+    context: Option<&Map<String, Value>>,
+) -> Option<&'static str> {
+    context_string(context, "api_operation")
+        .as_deref()
+        .and_then(aether_ai_formats::ApiOperation::from_wire_name)
+        .and_then(aether_ai_formats::ApiOperation::usage_request_type)
+}
+
 fn infer_request_type_from_contracts(
     client_api_format: Option<&str>,
     provider_api_format: Option<&str>,
     provider_request: Option<&Value>,
+    api_operation_request_type: Option<&str>,
 ) -> String {
+    if let Some(request_type) = api_operation_request_type {
+        return request_type.to_string();
+    }
     let empty_body = Value::Null;
     let provider_request = provider_request.unwrap_or(&empty_body);
     for api_format in [provider_api_format, client_api_format]
@@ -3789,6 +3811,78 @@ mod tests {
         assert!(body_size.get("client_request_body").is_some());
         assert!(body_size.get("provider_request_body").is_some());
         assert!(body_size.get("provider_over_client").is_some());
+    }
+
+    #[test]
+    fn token_counting_requests_are_recorded_under_their_own_request_type() {
+        // Token counting shares the `claude:messages` contract with a chat completion and
+        // its body is an ordinary message list, so neither the API format nor the request
+        // body can tell the two apart. Only the operation the planner recorded can, and
+        // without reading it every token counting row was written as `chat` and could not
+        // be filtered out of the records view.
+        fn claude_plan() -> ExecutionPlan {
+            ExecutionPlan {
+                request_id: "req-count-tokens-1".to_string(),
+                candidate_id: Some("cand-count-tokens-1".to_string()),
+                provider_name: Some("Anyrouter".to_string()),
+                provider_id: "provider-1".to_string(),
+                endpoint_id: "endpoint-1".to_string(),
+                key_id: "key-1".to_string(),
+                method: "POST".to_string(),
+                url: "https://example.com/v1/messages/count_tokens".to_string(),
+                headers: BTreeMap::new(),
+                content_type: Some("application/json".to_string()),
+                content_encoding: None,
+                body: RequestBody::from_json(
+                    json!({"model": "claude-fable-5-1", "messages": [{"role": "user"}]}),
+                ),
+                stream: false,
+                client_api_format: "claude:messages".to_string(),
+                provider_api_format: "claude:messages".to_string(),
+                model_name: Some("claude-fable-5-1".to_string()),
+                proxy: None,
+                transport_profile: None,
+                timeouts: None,
+            }
+        }
+
+        let counting_context = json!({"api_operation": "count_tokens"});
+        let chat_context = json!({"api_operation": "messages"});
+
+        // All three seed entry points have to agree, or a row would change type between
+        // its pending write and its terminal one.
+        assert_eq!(
+            super::build_lifecycle_usage_seed(&claude_plan(), Some(&counting_context)).request_type,
+            "count_tokens"
+        );
+        assert_eq!(
+            super::build_terminal_usage_context_seed(&claude_plan(), Some(&counting_context))
+                .request_type,
+            "count_tokens"
+        );
+        assert_eq!(
+            super::build_usage_event_data_seed(&claude_plan(), Some(&counting_context))
+                .request_type
+                .as_deref(),
+            Some("count_tokens")
+        );
+
+        // Message creation carries no distinct audit identity, so it stays derived from
+        // the contracts, and an absent or unrecognised operation must not change anything.
+        for context in [Some(&chat_context), None] {
+            assert_eq!(
+                super::build_lifecycle_usage_seed(&claude_plan(), context).request_type,
+                "chat"
+            );
+        }
+        assert_eq!(
+            super::build_lifecycle_usage_seed(
+                &claude_plan(),
+                Some(&json!({"api_operation": "nope"}))
+            )
+            .request_type,
+            "chat"
+        );
     }
 
     #[test]

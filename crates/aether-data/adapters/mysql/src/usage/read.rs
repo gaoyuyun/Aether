@@ -642,6 +642,23 @@ AND `usage`.provider_name NOT IN ('unknown', 'pending')",
     Ok(builder)
 }
 
+/// Opening terms of the predicate that hides Claude token counting rows.
+///
+/// Mirrors the SQLite and Postgres predicates. See
+/// `SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX` for why every `route_kind` source
+/// has to be consulted and why each term tolerates a NULL column. The caller
+/// appends the request path terms and closes the group.
+const MYSQL_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX: &str = r#"(
+  LOWER(TRIM(COALESCE(`usage`.request_type, ''))) <> 'count_tokens'
+  AND LOWER(TRIM(COALESCE(`usage`.route_kind, ''))) <> 'count_tokens'
+  AND LOWER(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.route_kind')), ''))) <> 'count_tokens'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage_routing_snapshots AS count_tokens_routing
+    WHERE count_tokens_routing.request_id = `usage`.request_id
+      AND LOWER(TRIM(COALESCE(count_tokens_routing.route_kind, ''))) = 'count_tokens'
+  )"#;
+
 fn push_list_filters(
     builder: &mut QueryBuilder<'_, MySql>,
     query: &UsageAuditListQuery,
@@ -693,12 +710,13 @@ AND LOWER(TRIM(COALESCE(`usage`.provider_name, ''))) NOT IN ('unknown', 'unknow'
     }
     if query.exclude_count_tokens {
         push_where(builder, has_where);
-        builder.push("COALESCE(`usage`.request_type, '') <> 'count_tokens'");
+        builder.push(MYSQL_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX);
         for key in ["request_path", "request_path_and_query"] {
             builder.push(format!(
                 " AND TRIM(TRAILING '/' FROM SUBSTRING_INDEX(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.{key}')), ''), '?', 1)) NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
             ));
         }
+        builder.push(")");
     }
     if let Some(statuses) = query
         .statuses

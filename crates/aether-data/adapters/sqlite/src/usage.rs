@@ -832,6 +832,31 @@ CASE
 END
 "#;
 
+/// Matches a usage row that names a provider key the request never reached.
+///
+/// Mirrors `usage_names_a_provider_key_that_was_never_called` in the data
+/// contracts, which is where the incremental counter path applies the same rule.
+/// A rebuild recomputes the counters straight from `usage`, so without this it
+/// would put back exactly the request and error counts that the incremental path
+/// and the repair backfill took out.
+///
+/// Both facts are required. A locally rejected request always ends in a runtime
+/// miss, but so does a genuine exhaustion whose upstream really did fail; only a
+/// candidate that was rejected before dispatch carries a skip reason.
+const SQLITE_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL: &str = r#"(
+  NULLIF(TRIM(COALESCE(json_extract("usage".request_metadata, '$.routing_candidate_skip_reason'), '')), '') IS NOT NULL
+  AND (
+    TRIM(COALESCE("usage".execution_path, '')) = 'local_execution_runtime_miss'
+    OR TRIM(COALESCE(json_extract("usage".request_metadata, '$.execution_path'), '')) = 'local_execution_runtime_miss'
+    OR EXISTS (
+      SELECT 1
+      FROM usage_routing_snapshots AS never_called_routing
+      WHERE never_called_routing.request_id = "usage".request_id
+        AND TRIM(COALESCE(never_called_routing.execution_path, '')) = 'local_execution_runtime_miss'
+    )
+  )
+)"#;
+
 const SQLITE_PROVIDER_KEY_SUCCESS_FLAG_EXPR: &str = r#"
 CASE
   WHEN status IN ('completed', 'success', 'ok', 'billed', 'settled')
@@ -878,6 +903,35 @@ fn push_sqlite_usage_where(builder: &mut QueryBuilder<'_, Sqlite>, has_where: &m
     builder.push(if *has_where { " AND " } else { " WHERE " });
     *has_where = true;
 }
+
+/// Opening terms of the predicate that hides Claude token counting rows.
+///
+/// Every `route_kind` source has to be consulted, not just one, because none of
+/// them covers every row:
+///
+/// - `request_type` only names the operation for rows written after the usage
+///   writer started carrying the planned API operation. An older row says `chat`,
+///   because token counting shares the `claude:messages` contract with a chat
+///   completion and its body is an ordinary message list.
+/// - The captured request path is absent whenever the gateway rejected the
+///   request locally, since no upstream request was ever built.
+/// - `route_kind` is the one signal the control plane always resolves, and it
+///   lives both on the usage row and on its routing snapshot.
+///
+/// Each term tolerates a NULL column on purpose. A bare `route_kind <>
+/// 'count_tokens'` evaluates to NULL for an unrouted row, and a NULL term would
+/// drop that row from every filtered view. The caller appends the request path
+/// terms and closes the group.
+const SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX: &str = r#"(
+  LOWER(TRIM(COALESCE("usage".request_type, ''))) <> 'count_tokens'
+  AND LOWER(TRIM(COALESCE("usage".route_kind, ''))) <> 'count_tokens'
+  AND LOWER(TRIM(COALESCE(json_extract("usage".request_metadata, '$.route_kind'), ''))) <> 'count_tokens'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage_routing_snapshots AS count_tokens_routing
+    WHERE count_tokens_routing.request_id = "usage".request_id
+      AND LOWER(TRIM(COALESCE(count_tokens_routing.route_kind, ''))) = 'count_tokens'
+  )"#;
 
 fn push_sqlite_usage_list_filters(
     builder: &mut QueryBuilder<'_, Sqlite>,
@@ -933,13 +987,14 @@ AND LOWER(TRIM(COALESCE(provider_name, ''))) NOT IN ('unknown', 'unknow'))",
     }
     if query.exclude_count_tokens {
         push_sqlite_usage_where(builder, has_where);
-        builder.push("COALESCE(request_type, '') <> 'count_tokens'");
+        builder.push(SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX);
         for key in ["request_path", "request_path_and_query"] {
-            let path = format!("COALESCE(json_extract(request_metadata, '$.{key}'), '')");
+            let path = format!("COALESCE(json_extract(\"usage\".request_metadata, '$.{key}'), '')");
             builder.push(format!(
                 " AND RTRIM(SUBSTR({path}, 1, INSTR({path} || '?', '?') - 1), '/') NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
             ));
         }
+        builder.push(")");
     }
     if let Some(statuses) = query.statuses.as_deref() {
         if !statuses.is_empty() {
@@ -5595,8 +5650,10 @@ LEFT JOIN usage_settlement_snapshots AS settlement
   ON settlement.request_id = "usage".request_id
 WHERE "usage".provider_api_key_id IS NOT NULL
   AND TRIM("usage".provider_api_key_id) <> ''
+  AND NOT {never_called_predicate}
 GROUP BY "usage".provider_api_key_id
 "#,
+            never_called_predicate = SQLITE_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL,
             success_flag_expr = SQLITE_PROVIDER_KEY_SUCCESS_FLAG_EXPR,
             error_flag_expr = SQLITE_PROVIDER_KEY_ERROR_FLAG_EXPR,
             total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR

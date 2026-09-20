@@ -44,15 +44,15 @@ WITH window_definitions AS (
     SELECT
         provider.id AS provider_id,
         provider.quota_last_reset_at AS quota_epoch_start,
-        (window.value ->> 'duration_secs')::bigint AS duration_secs,
+        (quota_window.value ->> 'duration_secs')::bigint AS duration_secs,
         DATE_TRUNC('minute', NOW()) AS clock_minute
     FROM public.providers AS provider
     CROSS JOIN LATERAL jsonb_array_elements(
-        COALESCE(provider.config -> 'quota_windows', '[]'::jsonb)
-    ) AS window(value)
+        COALESCE(provider.config::jsonb -> 'quota_windows', '[]'::jsonb)
+    ) AS quota_window(value)
     WHERE provider.quota_last_reset_at IS NOT NULL
-      AND (window.value ->> 'duration_secs')::bigint BETWEEN 60 AND 2592000
-      AND MOD((window.value ->> 'duration_secs')::bigint, 60) = 0
+      AND (quota_window.value ->> 'duration_secs')::bigint BETWEEN 60 AND 2592000
+      AND MOD((quota_window.value ->> 'duration_secs')::bigint, 60) = 0
 )
 INSERT INTO public.provider_quota_window_counters (
     provider_id, duration_secs, quota_epoch_start, rolling_start,

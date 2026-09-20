@@ -1622,6 +1622,125 @@ async fn mysql_usage_cleanup_executes_when_url_is_set() {
     assert_eq!(body_fields, (None, None));
 }
 
+#[tokio::test]
+async fn mysql_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_served_when_url_is_set(
+) {
+    let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!(
+            "skipping mysql never-served attribution test because AETHER_TEST_MYSQL_URL is unset"
+        );
+        return;
+    };
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("mysql test pool should connect");
+    run_migrations(&pool)
+        .await
+        .expect("mysql migrations should run");
+
+    let suffix = unique_suffix();
+    let user_id = format!("never-served-user-{suffix}");
+    let api_key_id = format!("never-served-api-key-{suffix}");
+    let provider_id = format!("never-served-provider-{suffix}");
+    let provider_key_id = format!("never-served-provider-key-{suffix}");
+    seed_stats_targets(&pool, &user_id, &api_key_id, &provider_id, &provider_key_id).await;
+    let repository = MysqlUsageWriteRepository::new(pool.clone());
+
+    repository
+        .upsert(sample_usage(
+            &format!("served-{suffix}"),
+            &user_id,
+            &api_key_id,
+            &provider_id,
+            &provider_key_id,
+            "completed",
+            "settled",
+            1_000,
+        ))
+        .await
+        .expect("served usage should upsert");
+    // A token counting request the gateway rejected locally, as rows written before
+    // the attribution fix still name a key: the candidate was skipped before dispatch,
+    // so the key never saw the request.
+    let mut never_called = sample_usage(
+        &format!("never-called-{suffix}"),
+        &user_id,
+        &api_key_id,
+        &provider_id,
+        &provider_key_id,
+        "failed",
+        "void",
+        1_001,
+    );
+    never_called.status_code = Some(503);
+    never_called.error_message = Some("no candidate could serve the request".to_string());
+    never_called.request_type = Some("chat".to_string());
+    never_called.route_kind = Some("count_tokens".to_string());
+    never_called.execution_path = Some("local_execution_runtime_miss".to_string());
+    never_called.request_metadata = Some(serde_json::json!({
+        "routing_candidate_skip_reason": "transport_operation_unsupported"
+    }));
+    repository
+        .upsert(never_called)
+        .await
+        .expect("never-called usage should upsert");
+    repository
+        .flush_usage_counter_deltas(100)
+        .await
+        .expect("usage counter deltas should flush");
+
+    let counters = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT request_count, success_count, error_count FROM provider_api_keys WHERE id = ?",
+        )
+        .bind(&provider_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("provider key counters should load")
+    };
+    // The incremental path charges only the served request.
+    assert_eq!(counters().await, (1, 1, 0));
+    // A rebuild recomputes straight from `usage`, so it must apply the same rule or it
+    // would put the never-served request and its error straight back.
+    repository
+        .rebuild_provider_api_key_usage_stats()
+        .await
+        .expect("provider key stats should rebuild");
+    assert_eq!(counters().await, (1, 1, 0));
+
+    // The same row is a token counting request that only the route kind identifies.
+    let storage = MysqlUsageStorage::new(pool.clone());
+    let mut query = UsageAuditListQuery {
+        user_id: Some(user_id.clone()),
+        exclude_count_tokens: true,
+        ..UsageAuditListQuery::default()
+    };
+    let visible = storage
+        .list_usage_audits(&query)
+        .await
+        .expect("filtered list should load");
+    assert_eq!(
+        visible
+            .iter()
+            .map(|row| row.request_id.as_str())
+            .collect::<Vec<_>>(),
+        [format!("served-{suffix}").as_str()]
+    );
+    query.exclude_count_tokens = false;
+    assert_eq!(
+        storage
+            .count_usage_audits(&query)
+            .await
+            .expect("unfiltered count should load"),
+        2
+    );
+}
+
 async fn seed_stats_targets(
     pool: &sqlx::MySqlPool,
     user_id: &str,

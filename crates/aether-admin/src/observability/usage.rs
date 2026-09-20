@@ -1334,6 +1334,11 @@ fn admin_usage_active_request_json(
         "user_agent": admin_usage_metadata_string(item, "user_agent"),
         "request_path": admin_usage_metadata_string(item, "request_path"),
         "request_path_and_query": admin_usage_metadata_string(item, "request_path_and_query"),
+        // The resolved route kind is the only signal that identifies an operation the
+        // gateway rejected locally: such a row has no captured request path, because no
+        // upstream request was ever built. The records view needs it to hide token
+        // counting requests without refetching each row's detail.
+        "route_kind": item.routing_route_kind(),
         "has_fallback": admin_usage_has_fallback(item),
     });
     value["end_to_end_time_ms"] = json!(admin_usage_metadata_u64(item, "end_to_end_time_ms"));
@@ -1515,6 +1520,9 @@ pub fn admin_usage_record_json(
         "request_path_and_query",
         admin_usage_metadata_string(item, "request_path_and_query"),
     );
+    // See the note in `admin_usage_active_request_json`: a locally rejected request
+    // carries no captured path, so the route kind is what identifies its operation.
+    maybe_insert_string_field(object, "route_kind", item.routing_route_kind());
     if let Some(reasoning_effort) = item.provider_reasoning_effort() {
         object.insert("reasoning_effort".to_string(), json!(reasoning_effort));
     }

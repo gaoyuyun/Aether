@@ -2083,14 +2083,23 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         stored_usage.user_id.as_deref(),
         Some("user-claude-cli-usage-local-miss-1")
     );
-    assert_eq!(stored_usage.provider_name, "RightCode");
+    // Every candidate was rejected before dispatch, so no provider served this request
+    // and none may be named. Naming one charged its key a request and an error, which
+    // lowered the key's success rate and cost it pool score for work it never did.
+    assert_eq!(stored_usage.provider_name, "unknown");
+    assert!(stored_usage.provider_id.is_none());
+    assert!(stored_usage.provider_endpoint_id.is_none());
+    assert!(stored_usage.provider_api_key_id.is_none());
+    assert!(stored_usage.routing_key_name().is_none());
+    assert!(stored_usage.routing_candidate_id().is_none());
+    // The planned request shape is still recorded, because a skipped candidate describes
+    // it perfectly well and it is what explains the failure.
     assert_eq!(stored_usage.model, "gpt-5.4");
     assert_eq!(stored_usage.api_format.as_deref(), Some("claude:messages"));
     assert_eq!(
         stored_usage.endpoint_api_format.as_deref(),
         Some("openai:responses")
     );
-    assert_eq!(stored_usage.routing_key_name(), Some("codex"));
     assert_eq!(stored_usage.routing_planner_kind(), Some("claude_cli_sync"));
     assert_eq!(stored_usage.routing_route_family(), Some("claude"));
     assert_eq!(stored_usage.routing_route_kind(), Some("messages"));
@@ -2149,15 +2158,9 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
             Some("key-claude-cli-usage-local-miss-1")
         );
     }
-    let routing_candidate_id = stored_usage
-        .routing_candidate_id()
-        .expect("usage should reference a skipped candidate");
-    assert!(
-        stored_candidates
-            .iter()
-            .any(|candidate| candidate.id == routing_candidate_id),
-        "usage must reference one of the skipped candidate rows"
-    );
+    // The usage row deliberately points at no candidate, but it still carries why the
+    // candidates were rejected, and the candidate rows above keep the full per-provider
+    // detail the request trace renders.
     assert_eq!(
         stored_usage.routing_candidate_skip_reason(),
         Some("format_conversion_disabled")

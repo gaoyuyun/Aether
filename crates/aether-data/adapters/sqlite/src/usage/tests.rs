@@ -622,6 +622,82 @@ WHERE request_id = 'rebuild-completed';
 }
 
 #[tokio::test]
+async fn sqlite_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_served() {
+    let pool = crate::test_support::migrated_pool().await;
+    seed_stats_targets(&pool).await;
+    let repository = SqliteUsageWriteRepository::new(pool.clone());
+
+    repository
+        .upsert(sample_usage("served", "completed", "settled", 1_000))
+        .await
+        .expect("served usage should upsert");
+    // A token counting request the gateway rejected locally, as rows written before
+    // the attribution fix still name a key: the candidate was skipped before dispatch,
+    // so the key never saw the request.
+    let mut never_called = sample_usage("never-called", "failed", "void", 1_001);
+    never_called.status_code = Some(503);
+    never_called.error_message = Some("no candidate could serve the request".to_string());
+    never_called.request_type = Some("chat".to_string());
+    never_called.route_kind = Some("count_tokens".to_string());
+    never_called.execution_path = Some("local_execution_runtime_miss".to_string());
+    never_called.request_metadata = Some(serde_json::json!({
+        "routing_candidate_skip_reason": "transport_operation_unsupported"
+    }));
+    repository
+        .upsert(never_called)
+        .await
+        .expect("never-called usage should upsert");
+    repository
+        .flush_usage_counter_deltas(100)
+        .await
+        .expect("usage counter deltas should flush");
+
+    let counters = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT request_count, success_count, error_count FROM provider_api_keys WHERE id = 'provider-key-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("provider key counters should load")
+    };
+    // The incremental path charges only the served request.
+    assert_eq!(counters().await, (1, 1, 0));
+    // A rebuild recomputes straight from `usage`, so it must apply the same rule or it
+    // would put the never-served request and its error straight back.
+    repository
+        .rebuild_provider_api_key_usage_stats()
+        .await
+        .expect("provider key stats should rebuild");
+    assert_eq!(counters().await, (1, 1, 0));
+
+    // The same row is a token counting request that only the route kind identifies.
+    let reader = SqliteUsageReadRepository::new(pool);
+    let mut query = UsageAuditListQuery {
+        exclude_count_tokens: true,
+        ..UsageAuditListQuery::default()
+    };
+    let visible = reader
+        .list_usage_audits(&query)
+        .await
+        .expect("filtered list should load");
+    assert_eq!(
+        visible
+            .iter()
+            .map(|row| row.request_id.as_str())
+            .collect::<Vec<_>>(),
+        ["served"]
+    );
+    query.exclude_count_tokens = false;
+    assert_eq!(
+        reader
+            .count_usage_audits(&query)
+            .await
+            .expect("unfiltered count should load"),
+        2
+    );
+}
+
+#[tokio::test]
 async fn sqlite_shallow_capture_preserves_legacy_refs_without_decoding_bodies() {
     use aether_data_contracts::repository::usage::{StoredUsageBodyPayload, UsageBodyField};
 
@@ -2277,6 +2353,22 @@ async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keywo
         writer.upsert(record).await.expect("usage should seed");
     }
 
+    // A request the gateway rejected locally: no upstream request was ever built, so it
+    // has no captured path, and a writer that predates the planned-operation plumbing
+    // recorded its type as `chat` because token counting shares the `claude:messages`
+    // contract with a chat completion. The resolved route kind is the only signal left.
+    let mut locally_rejected = sample_usage("route-kind-only", "failed", "void", 1_100);
+    locally_rejected.request_type = Some("chat".to_string());
+    locally_rejected.route_kind = Some("count_tokens".to_string());
+    locally_rejected.execution_path = Some("local_execution_runtime_miss".to_string());
+    locally_rejected.request_metadata = Some(serde_json::json!({
+        "routing_candidate_skip_reason": "transport_operation_unsupported"
+    }));
+    writer
+        .upsert(locally_rejected)
+        .await
+        .expect("locally rejected usage should seed");
+
     let reader = SqliteUsageReadRepository::new(pool);
     let mut query = UsageAuditListQuery {
         exclude_count_tokens: true,
@@ -2304,7 +2396,7 @@ async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keywo
             .count_usage_audits(&query)
             .await
             .expect("unfiltered count should load"),
-        7
+        8
     );
 
     let mut keyword_query = UsageAuditKeywordSearchQuery {
@@ -2334,7 +2426,7 @@ async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keywo
             .count_usage_audits_by_keyword_search(&keyword_query)
             .await
             .expect("unfiltered keyword count should load"),
-        7
+        8
     );
 }
 

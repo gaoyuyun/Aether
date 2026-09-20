@@ -44,6 +44,36 @@ impl ApiOperation {
             Self::OpenAiResponsesCompact => "compact",
         }
     }
+
+    /// Resolves an operation back from the name [`ApiOperation::as_str`] produces.
+    ///
+    /// A planner report context carries the operation as that name, so a usage
+    /// writer reading the context has only the string to work from.
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        let value = value.trim();
+        [
+            Self::ClaudeMessagesCreate,
+            Self::ClaudeCountTokens,
+            Self::OpenAiResponsesCompact,
+        ]
+        .into_iter()
+        .find(|operation| value.eq_ignore_ascii_case(operation.as_str()))
+    }
+
+    /// The usage audit `request_type` this operation has to be recorded as.
+    ///
+    /// `None` means the operation carries no distinct audit identity, so the
+    /// request type stays derived from the API format and the request body.
+    /// Token counting is the one operation whose identity cannot be recovered
+    /// from either signal: it shares the `claude:messages` format with a chat
+    /// completion and its body is an ordinary message list. Recording it as
+    /// `chat` is what made token counting rows impossible to filter out.
+    pub const fn usage_request_type(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeCountTokens => Some(Self::ClaudeCountTokens.as_str()),
+            Self::ClaudeMessagesCreate | Self::OpenAiResponsesCompact => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -55,5 +85,41 @@ mod tests {
         assert_eq!(ClientSurface::ClaudeCode.as_str(), "claude_code");
         assert_eq!(ApiOperation::ClaudeMessagesCreate.as_str(), "messages");
         assert_eq!(ApiOperation::ClaudeCountTokens.as_str(), "count_tokens");
+    }
+
+    #[test]
+    fn api_operations_round_trip_through_their_wire_name() {
+        for operation in [
+            ApiOperation::ClaudeMessagesCreate,
+            ApiOperation::ClaudeCountTokens,
+            ApiOperation::OpenAiResponsesCompact,
+        ] {
+            assert_eq!(
+                ApiOperation::from_wire_name(operation.as_str()),
+                Some(operation)
+            );
+        }
+        assert_eq!(
+            ApiOperation::from_wire_name("  COUNT_TOKENS "),
+            Some(ApiOperation::ClaudeCountTokens)
+        );
+        assert_eq!(ApiOperation::from_wire_name("chat"), None);
+        assert_eq!(ApiOperation::from_wire_name(""), None);
+    }
+
+    #[test]
+    fn only_token_counting_overrides_the_audit_request_type() {
+        assert_eq!(
+            ApiOperation::ClaudeCountTokens.usage_request_type(),
+            Some("count_tokens")
+        );
+        assert_eq!(
+            ApiOperation::ClaudeMessagesCreate.usage_request_type(),
+            None
+        );
+        assert_eq!(
+            ApiOperation::OpenAiResponsesCompact.usage_request_type(),
+            None
+        );
     }
 }

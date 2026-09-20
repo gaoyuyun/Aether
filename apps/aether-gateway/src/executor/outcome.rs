@@ -813,9 +813,24 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
         return;
     }
 
-    let selected_candidate =
+    // Two different candidates are needed here, and conflating them is what made a
+    // provider look broken when it simply does not implement the requested operation.
+    //
+    // `attributed_candidate` answers "which provider failed this request". Only a
+    // candidate that was actually dispatched can answer it, because
+    // `provider_api_key_usage_contribution` keys off `provider_api_key_id` alone: naming
+    // a never-dispatched key charges it an error, drops its success rate and costs it
+    // pool score, and naming its provider counts the request against that channel in the
+    // daily provider rollup. When every candidate was rejected before dispatch (the
+    // upstream has no `count_tokens` endpoint, quota reservation refused, pool cooldown,
+    // ...) nobody failed, so nobody is named.
+    //
+    // `routing_candidate` answers "what shape was this request planned as", and a skipped
+    // candidate answers that perfectly well. It keeps the client/provider formats, the
+    // requested model and the skip reason on the row for diagnosis.
+    let attributed_candidate =
         select_last_runtime_miss_executed_candidate(&context.candidate_contexts);
-    let routing_candidate = selected_candidate
+    let routing_candidate = attributed_candidate
         .or_else(|| select_last_runtime_miss_routing_candidate(&context.candidate_contexts));
     let api_format = routing_candidate
         .and_then(|value| value.client_api_format.clone())
@@ -825,9 +840,9 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
     let provider_api_format = routing_candidate
         .and_then(|value| value.provider_api_format.clone())
         .or_else(|| api_format.clone());
-    let provider_name = routing_candidate
+    let provider_name = attributed_candidate
         .and_then(|value| value.provider_name.clone())
-        .or_else(|| routing_candidate.and_then(|value| value.candidate.provider_id.clone()))
+        .or_else(|| attributed_candidate.and_then(|value| value.candidate.provider_id.clone()))
         .unwrap_or_else(|| "unknown".to_string());
     let model = trimmed_non_empty(diagnostic.and_then(|value| value.requested_model.as_deref()))
         .or_else(|| routing_candidate.and_then(|value| value.global_model_name.clone()))
@@ -868,11 +883,17 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
         provider_name,
         model,
         target_model,
-        provider_id: routing_candidate.and_then(|value| value.candidate.provider_id.clone()),
-        provider_endpoint_id: routing_candidate
+        provider_id: attributed_candidate.and_then(|value| value.candidate.provider_id.clone()),
+        provider_endpoint_id: attributed_candidate
             .and_then(|value| value.candidate.endpoint_id.clone()),
-        provider_api_key_id: routing_candidate.and_then(|value| value.candidate.key_id.clone()),
-        request_type: Some(infer_request_type(api_format.as_deref())),
+        provider_api_key_id: attributed_candidate.and_then(|value| value.candidate.key_id.clone()),
+        request_type: Some(
+            decision
+                .and_then(|value| value.api_operation)
+                .and_then(|operation| operation.usage_request_type())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| infer_request_type(api_format.as_deref())),
+        ),
         api_format: api_format.clone(),
         api_family: api_format
             .as_deref()
@@ -917,9 +938,9 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
         &mut data,
         &mut request_metadata,
         execution_path,
-        routing_candidate.map(|value| value.candidate.id.as_str()),
-        routing_candidate.map(|value| value.candidate.candidate_index),
-        routing_candidate.and_then(|value| value.key_name.as_deref()),
+        attributed_candidate.map(|value| value.candidate.id.as_str()),
+        attributed_candidate.map(|value| value.candidate.candidate_index),
+        attributed_candidate.and_then(|value| value.key_name.as_deref()),
         diagnostic,
         decision.and_then(|value| value.route_family.as_deref()),
         decision.and_then(|value| value.route_kind.as_deref()),

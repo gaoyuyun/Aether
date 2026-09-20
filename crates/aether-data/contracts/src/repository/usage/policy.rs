@@ -553,9 +553,33 @@ pub fn provider_api_key_usage_is_error(
         && !provider_api_key_usage_is_success(status, status_code, error_message)
 }
 
+/// Whether a usage row names a provider key that was never actually called.
+///
+/// A gateway that rejects a request locally used to attribute the row to the last
+/// candidate it looked at, even when that candidate had been skipped before
+/// dispatch. Two facts on the row prove that happened: the request ended in a
+/// local execution runtime miss, and the candidate it was attributed to carries a
+/// skip reason. A dispatched candidate never carries one.
+///
+/// Such a row must not charge the key a request or an error. Doing so lowered the
+/// key's success rate and cost it pool score for a request it never served, which
+/// is how an upstream that merely lacks an operation (no `count_tokens` endpoint)
+/// came to look like an upstream that fails.
+///
+/// The gateway no longer writes provider identity onto these rows, so this only
+/// concerns rows written before that fix. It has to live here rather than at the
+/// call sites because every counter update funnels through this function.
+fn usage_names_a_provider_key_that_was_never_called(usage: &StoredRequestUsageAudit) -> bool {
+    usage.routing_execution_path() == Some("local_execution_runtime_miss")
+        && usage.routing_candidate_skip_reason().is_some()
+}
+
 pub fn provider_api_key_usage_contribution(
     usage: &StoredRequestUsageAudit,
 ) -> Option<ProviderApiKeyUsageContribution> {
+    if usage_names_a_provider_key_that_was_never_called(usage) {
+        return None;
+    }
     let key_id = usage
         .provider_api_key_id
         .as_deref()
@@ -671,6 +695,51 @@ mod tests {
     };
     use crate::repository::usage::{UpsertUsageRecord, UsageBodyCaptureState};
 
+    /// A failed row that names a provider key, as a runtime miss would record it.
+    fn failed_usage_naming_a_provider_key() -> StoredRequestUsageAudit {
+        let mut usage = StoredRequestUsageAudit::new(
+            "usage-runtime-miss".to_string(),
+            "req-runtime-miss".to_string(),
+            None,
+            None,
+            None,
+            None,
+            "Anyrouter".to_string(),
+            "claude-fable-5-1".to_string(),
+            None,
+            Some("provider-1".to_string()),
+            Some("endpoint-1".to_string()),
+            Some("provider-key-1".to_string()),
+            Some("chat".to_string()),
+            Some("claude:messages".to_string()),
+            Some("claude".to_string()),
+            Some("messages".to_string()),
+            Some("claude:messages".to_string()),
+            Some("claude".to_string()),
+            Some("messages".to_string()),
+            false,
+            false,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            Some(503),
+            None,
+            Some("server_error".to_string()),
+            Some(18),
+            None,
+            "failed".to_string(),
+            "void".to_string(),
+            100,
+            101,
+            Some(101),
+        )
+        .expect("usage should build");
+        usage.error_message = Some("no candidate could serve the request".to_string());
+        usage
+    }
+
     fn usage_with_http_capture() -> UpsertUsageRecord {
         UpsertUsageRecord {
             request_id: "req-sensitive-capture".to_string(),
@@ -741,6 +810,61 @@ mod tests {
             created_at_unix_ms: Some(1_000),
             updated_at_unix_secs: 2,
         }
+    }
+
+    #[test]
+    fn a_provider_key_is_not_charged_for_a_request_that_never_reached_it() {
+        // A candidate rejected before dispatch used to be recorded as the provider that
+        // failed the request. Charging its key an error lowered the key's success rate
+        // and cost it pool score for a request it never served, so an upstream that
+        // merely lacks an operation looked like an upstream that fails.
+        let mut usage = failed_usage_naming_a_provider_key();
+        usage.execution_path = Some("local_execution_runtime_miss".to_string());
+        usage.request_metadata = Some(json!({
+            "routing_candidate_skip_reason": "transport_operation_unsupported"
+        }));
+        assert!(provider_api_key_usage_contribution(&usage).is_none());
+
+        // The same two facts read from request metadata rather than the typed column,
+        // which is how a row written before the routing columns existed carries them.
+        let mut legacy = failed_usage_naming_a_provider_key();
+        legacy.request_metadata = Some(json!({
+            "execution_path": "local_execution_runtime_miss",
+            "routing_candidate_skip_reason": "provider_quota_blocked"
+        }));
+        assert!(provider_api_key_usage_contribution(&legacy).is_none());
+    }
+
+    #[test]
+    fn a_provider_key_is_still_charged_when_the_request_actually_reached_it() {
+        // Only the pair of facts releases attribution. A runtime miss whose candidate
+        // was really dispatched carries no skip reason, and a plain upstream failure is
+        // not a runtime miss at all; both must keep counting against the key.
+        let mut exhausted = failed_usage_naming_a_provider_key();
+        exhausted.execution_path = Some("local_execution_runtime_miss".to_string());
+        exhausted.local_execution_runtime_miss_reason =
+            Some("execution_runtime_candidates_exhausted".to_string());
+        let contribution = provider_api_key_usage_contribution(&exhausted)
+            .expect("a dispatched candidate should still be charged");
+        assert_eq!(contribution.key_id, "provider-key-1");
+        assert_eq!(contribution.error_count, 1);
+
+        let mut upstream_failure = failed_usage_naming_a_provider_key();
+        upstream_failure.request_metadata = Some(json!({
+            "routing_candidate_skip_reason": "transport_operation_unsupported"
+        }));
+        let contribution = provider_api_key_usage_contribution(&upstream_failure)
+            .expect("a failure outside a runtime miss should still be charged");
+        assert_eq!(contribution.error_count, 1);
+
+        let mut success = failed_usage_naming_a_provider_key();
+        success.status = "completed".to_string();
+        success.status_code = Some(200);
+        success.error_message = None;
+        let contribution = provider_api_key_usage_contribution(&success)
+            .expect("a served request should still be charged");
+        assert_eq!(contribution.success_count, 1);
+        assert_eq!(contribution.error_count, 0);
     }
 
     #[test]

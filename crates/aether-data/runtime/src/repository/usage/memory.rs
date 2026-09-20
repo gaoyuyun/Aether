@@ -274,8 +274,20 @@ fn usage_has_admin_unknown_model_or_provider(item: &StoredRequestUsageAudit) -> 
     usage_admin_unknown_label(&item.model) || usage_admin_unknown_label(&item.provider_name)
 }
 
+/// Whether a usage row records a Claude token counting request.
+///
+/// Mirrors the SQL predicates in the three database adapters. Every
+/// `route_kind` source has to be consulted because none of them covers every
+/// row: `request_type` only names the operation for rows written after the usage
+/// writer started carrying the planned API operation, and the captured request
+/// path is absent whenever the gateway rejected the request locally without ever
+/// building an upstream request.
 fn usage_is_count_tokens(item: &StoredRequestUsageAudit) -> bool {
-    if item.request_type.as_deref() == Some("count_tokens") {
+    fn is_count_tokens(value: Option<&str>) -> bool {
+        value.is_some_and(|value| value.trim().eq_ignore_ascii_case("count_tokens"))
+    }
+
+    if is_count_tokens(item.request_type.as_deref()) || is_count_tokens(item.routing_route_kind()) {
         return true;
     }
     ["request_path", "request_path_and_query"]

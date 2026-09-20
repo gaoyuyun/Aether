@@ -52,6 +52,29 @@ WITH aggregated AS (
   FROM usage_billing_facts AS "usage"
   WHERE provider_api_key_id IS NOT NULL
     AND BTRIM(provider_api_key_id) <> ''
+    -- Skip a row that names a provider key the request never reached. It mirrors
+    -- `usage_names_a_provider_key_that_was_never_called` in the data contracts,
+    -- which applies the same rule on the incremental counter path; without it a
+    -- rebuild would put back the request and error counts that path took out.
+    --
+    -- Both facts are required. A locally rejected request always ends in a runtime
+    -- miss, but so does a genuine exhaustion whose upstream really did fail; only a
+    -- candidate rejected before dispatch carries a skip reason.
+    --
+    -- The billing view exposes neither the routing columns nor the request
+    -- metadata, so both have to be read back off the base tables.
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public."usage" AS never_called_usage
+      LEFT JOIN public.usage_routing_snapshots AS never_called_routing
+        ON never_called_routing.request_id = never_called_usage.request_id
+      WHERE never_called_usage.request_id = "usage".request_id
+        AND NULLIF(BTRIM(COALESCE(never_called_usage.request_metadata->>'routing_candidate_skip_reason', '')), '') IS NOT NULL
+        AND (
+          BTRIM(COALESCE(never_called_routing.execution_path, '')) = 'local_execution_runtime_miss'
+          OR BTRIM(COALESCE(never_called_usage.request_metadata->>'execution_path', '')) = 'local_execution_runtime_miss'
+        )
+    )
   GROUP BY provider_api_key_id
 )
 UPDATE provider_api_keys

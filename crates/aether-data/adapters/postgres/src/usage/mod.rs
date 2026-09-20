@@ -1735,6 +1735,27 @@ AND lower(BTRIM(COALESCE(\"usage\".provider_name, ''))) NOT IN ('unknown', 'unkn
     );
 }
 
+/// Opening terms of the predicate that hides Claude token counting rows.
+///
+/// Mirrors the SQLite and MySQL predicates, minus the base-table `route_kind`
+/// term: on Postgres the routing fields live only on `usage_routing_snapshots`
+/// and in the request metadata mirror, never as `usage` columns. See
+/// `SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX` for why every `route_kind` source
+/// has to be consulted and why each term tolerates a NULL column.
+///
+/// The snapshot is reached through `NOT EXISTS` rather than a join because the
+/// counting queries this filter also feeds select straight `FROM "usage"`. The
+/// caller appends the request path terms and closes the group.
+const POSTGRES_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX: &str = r#"(
+  LOWER(BTRIM(COALESCE("usage".request_type, ''))) <> 'count_tokens'
+  AND LOWER(BTRIM(COALESCE("usage".request_metadata->>'route_kind', ''))) <> 'count_tokens'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM usage_routing_snapshots AS count_tokens_routing
+    WHERE count_tokens_routing.request_id = "usage".request_id
+      AND LOWER(BTRIM(COALESCE(count_tokens_routing.route_kind, ''))) = 'count_tokens'
+  )"#;
+
 fn push_postgres_usage_exclude_count_tokens_filter(
     builder: &mut QueryBuilder<'_, Postgres>,
     has_where: &mut bool,
@@ -1745,12 +1766,13 @@ fn push_postgres_usage_exclude_count_tokens_filter(
     }
 
     push_postgres_usage_where(builder, has_where);
-    builder.push("COALESCE(\"usage\".request_type, '') <> 'count_tokens'");
+    builder.push(POSTGRES_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX);
     for key in ["request_path", "request_path_and_query"] {
         builder.push(format!(
             " AND RTRIM(SPLIT_PART(COALESCE(\"usage\".request_metadata->>'{key}', ''), '?', 1), '/') NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
         ));
     }
+    builder.push(")");
 }
 
 const USAGE_PROVIDER_IDENTITY_FILTER_SQL: &str = r#" AND (

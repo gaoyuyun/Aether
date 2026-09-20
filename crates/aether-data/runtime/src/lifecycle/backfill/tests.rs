@@ -11,7 +11,9 @@ use super::{
     pending_sqlite_backfills, run_backfills, run_mysql_backfills, run_sqlite_backfills,
     AppliedBackfill,
 };
-use crate::lifecycle::migrate::{prepare_database_for_startup, run_sqlite_migrations};
+use crate::lifecycle::migrate::{
+    prepare_database_for_startup, run_migrations, run_mysql_migrations, run_sqlite_migrations,
+};
 
 const LEGACY_SYNC_ENABLED_ACTIVE_FLAGS_VERSION: i64 = 20260517012000;
 const LEGACY_SYNC_ENABLED_ACTIVE_FLAGS_SQL: &str =
@@ -21,6 +23,15 @@ const SQLITE_REPAIR_RESOLVED_PROVIDER_QUOTA_ATTEMPTS_SQL: &str = include_str!(
 );
 const SQLITE_RECONCILE_LATE_PROVIDER_QUOTA_ATTEMPTS_SQL: &str = include_str!(
     "../../../backfills/sqlite/20260819000000_reconcile_late_provider_quota_attempts.sql"
+);
+const SQLITE_RELEASE_NEVER_CALLED_PROVIDER_ATTRIBUTION_SQL: &str = include_str!(
+    "../../../backfills/sqlite/20260920000000_release_never_called_provider_attribution.sql"
+);
+const MYSQL_RELEASE_NEVER_CALLED_PROVIDER_ATTRIBUTION_SQL: &str = include_str!(
+    "../../../backfills/mysql/20260920000000_release_never_called_provider_attribution.sql"
+);
+const POSTGRES_RELEASE_NEVER_CALLED_PROVIDER_ATTRIBUTION_SQL: &str = include_str!(
+    "../../../backfills/postgres/20260920000000_release_never_called_provider_attribution.sql"
 );
 
 #[test]
@@ -59,6 +70,7 @@ fn pending_backfills_from_applied_returns_all_versions_when_none_applied() {
             20260817020000,
             20260818000000,
             20260819000000,
+            20260920000000,
         ]
     );
 }
@@ -85,6 +97,7 @@ fn pending_backfills_from_applied_skips_versions_already_applied() {
             20260817020000,
             20260818000000,
             20260819000000,
+            20260920000000,
         ]
     );
 }
@@ -153,6 +166,8 @@ CREATE TABLE api_keys (
 );
 CREATE TABLE provider_api_keys (
     id VARCHAR(64) PRIMARY KEY,
+    request_count BIGINT NOT NULL DEFAULT 0,
+    error_count BIGINT NOT NULL DEFAULT 0,
     total_tokens BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE global_models (
@@ -184,10 +199,17 @@ CREATE TABLE models (
 CREATE TABLE `usage` (
     request_id VARCHAR(128) PRIMARY KEY,
     api_key_id VARCHAR(64),
+    provider_name VARCHAR(255) NOT NULL DEFAULT 'unknown',
     provider_id VARCHAR(64),
+    provider_endpoint_id VARCHAR(64),
     provider_api_key_id VARCHAR(64),
     model VARCHAR(255),
     status VARCHAR(64) NOT NULL,
+    status_code INT,
+    error_message TEXT,
+    request_metadata TEXT,
+    route_kind VARCHAR(128),
+    execution_path VARCHAR(128),
     total_tokens BIGINT NOT NULL DEFAULT 0,
     input_tokens BIGINT NOT NULL DEFAULT 0,
     output_tokens BIGINT NOT NULL DEFAULT 0,
@@ -223,7 +245,11 @@ CREATE TABLE usage_settlement_snapshots (
 );
 CREATE TABLE usage_routing_snapshots (
     request_id VARCHAR(128) PRIMARY KEY,
-    candidate_id VARCHAR(128)
+    candidate_id VARCHAR(128),
+    execution_path VARCHAR(80),
+    selected_provider_id VARCHAR(100),
+    selected_endpoint_id VARCHAR(100),
+    selected_provider_api_key_id VARCHAR(100)
 );
 CREATE TABLE request_candidates (
     id VARCHAR(64) PRIMARY KEY,
@@ -386,7 +412,8 @@ INSERT INTO usage_settlement_snapshots (
             20260817010000,
             20260817020000,
             20260818000000,
-            20260819000000
+            20260819000000,
+            20260920000000
         ]
     );
 
@@ -653,7 +680,8 @@ INSERT INTO usage_settlement_snapshots (
             20260817010000,
             20260817020000,
             20260818000000,
-            20260819000000
+            20260819000000,
+            20260920000000
         ]
     );
 
@@ -681,7 +709,8 @@ INSERT INTO usage_settlement_snapshots (
             20260817010000,
             20260817020000,
             20260818000000,
-            20260819000000
+            20260819000000,
+            20260920000000
         ]
     );
     let provider_monthly_used: f64 = query_scalar(
@@ -727,7 +756,7 @@ INSERT INTO usage_settlement_snapshots (
         .fetch_one(&pool)
         .await
         .expect("sqlite applied backfill count should load");
-    assert_eq!(applied_count, 9);
+    assert_eq!(applied_count, 10);
 
     query("UPDATE schema_backfills SET checksum = X'00' WHERE version = 20260422120000")
         .execute(&pool)
@@ -879,6 +908,578 @@ INSERT INTO usage_counter_deltas (
     );
 }
 
+/// Provider key counters after the release backfill, ordered by key id.
+///
+/// `nc-key` was charged three requests it never served (one per signal source the
+/// backfill recognises) and keeps the two it really did serve. `nc-clamp-key` shows the
+/// non-negative clamp: its counters were already rebuilt without the bad rows, so
+/// releasing them again must not drive the counts below zero. `nc-other-key` is a
+/// control that must not move at all.
+const RELEASED_PROVIDER_KEY_COUNTERS: &[(&str, i64, i64)] = &[
+    ("nc-clamp-key", 0, 0),
+    ("nc-key", 3, 1),
+    ("nc-other-key", 2, 1),
+];
+
+/// Usage identity columns after the release backfill, ordered by request id.
+///
+/// Released rows fall back to `unknown` with every identity column cleared, exactly as
+/// the gateway now writes them. Rows that were really dispatched keep their identity:
+/// a runtime miss whose candidates were exhausted carries no skip reason, and a plain
+/// upstream failure is not a runtime miss even when a skip reason is present.
+fn released_usage_identity() -> Vec<(
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    let served = |request_id: &str, key: &str| {
+        (
+            request_id.to_string(),
+            "Never Called".to_string(),
+            Some("nc-provider".to_string()),
+            Some("nc-endpoint".to_string()),
+            Some(key.to_string()),
+        )
+    };
+    let released = |request_id: &str| {
+        (
+            request_id.to_string(),
+            "unknown".to_string(),
+            None,
+            None,
+            None,
+        )
+    };
+    vec![
+        released("nc-clamped"),
+        served("nc-exhausted", "nc-key"),
+        released("nc-legacy-row"),
+        released("nc-runtime-miss"),
+        served("nc-served", "nc-other-key"),
+        released("nc-snapshot-only"),
+        served("nc-upstream-failure", "nc-key"),
+    ]
+}
+
+/// Routing snapshots after the release backfill, ordered by request id.
+///
+/// Only the selected identity is cleared. The candidate id stays because an older
+/// quota repair joins on it, and the route kind and execution path stay because they
+/// are what still explains the row and lets the records view hide token counting.
+type ReleasedRoutingSnapshot = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn released_routing_snapshots() -> Vec<ReleasedRoutingSnapshot> {
+    let cleared = |request_id: &str, execution_path: &str| {
+        (
+            request_id.to_string(),
+            Some(format!("{request_id}-candidate")),
+            Some("count_tokens".to_string()),
+            Some(execution_path.to_string()),
+            None,
+            None,
+            None,
+        )
+    };
+    let kept = |request_id: &str, execution_path: &str, key: &str| {
+        (
+            request_id.to_string(),
+            Some(format!("{request_id}-candidate")),
+            Some("messages".to_string()),
+            Some(execution_path.to_string()),
+            Some("nc-provider".to_string()),
+            Some("nc-endpoint".to_string()),
+            Some(key.to_string()),
+        )
+    };
+    vec![
+        kept("nc-exhausted", "local_execution_runtime_miss", "nc-key"),
+        cleared("nc-runtime-miss", "local_execution_runtime_miss"),
+        kept("nc-served", "remote", "nc-other-key"),
+        cleared("nc-snapshot-only", "local_execution_runtime_miss"),
+        kept("nc-upstream-failure", "remote", "nc-key"),
+    ]
+}
+
+#[tokio::test]
+async fn sqlite_release_backfill_frees_provider_keys_from_requests_they_never_served() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("sqlite backfill test pool should connect");
+    run_sqlite_migrations(&pool)
+        .await
+        .expect("sqlite schema should migrate");
+
+    sqlx::raw_sql(
+        r#"
+INSERT INTO providers (id, name, provider_type, created_at, updated_at)
+VALUES ('nc-provider', 'Never Called', 'claude', 1, 1);
+INSERT INTO provider_endpoints (id, provider_id, name, base_url, created_at, updated_at)
+VALUES ('nc-endpoint', 'nc-provider', 'Default', 'https://example.invalid', 1, 1);
+INSERT INTO provider_api_keys (
+  id, provider_id, name, request_count, error_count, created_at, updated_at
+) VALUES
+  ('nc-key', 'nc-provider', 'Charged key', 6, 4, 1, 1),
+  ('nc-other-key', 'nc-provider', 'Control key', 2, 1, 1, 1),
+  ('nc-clamp-key', 'nc-provider', 'Rebuilt key', 0, 0, 1, 1);
+
+-- The three release cases differ only in where the runtime miss is recorded: the
+-- typed column, the request metadata mirror of a row written before the column
+-- existed, or the routing snapshot alone.
+INSERT INTO "usage" (
+  request_id, provider_name, model, provider_id, provider_endpoint_id,
+  provider_api_key_id, status, status_code, request_metadata, route_kind,
+  execution_path, created_at_unix_ms, updated_at_unix_secs
+) VALUES
+  (
+    'nc-runtime-miss', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported","route_kind":"count_tokens"}',
+    'count_tokens', 'local_execution_runtime_miss', 1000, 1000
+  ),
+  (
+    'nc-legacy-row', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"provider_quota_blocked","execution_path":"local_execution_runtime_miss"}',
+    NULL, NULL, 1001, 1001
+  ),
+  (
+    'nc-snapshot-only', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"pool_cooldown"}',
+    NULL, NULL, 1002, 1002
+  ),
+  (
+    'nc-clamped', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-clamp-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported"}',
+    'count_tokens', 'local_execution_runtime_miss', 1003, 1003
+  ),
+  (
+    'nc-exhausted', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 502,
+    '{"local_execution_runtime_miss_reason":"execution_runtime_candidates_exhausted"}',
+    'messages', 'local_execution_runtime_miss', 1004, 1004
+  ),
+  (
+    'nc-upstream-failure', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 500,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported"}',
+    'messages', 'remote', 1005, 1005
+  ),
+  (
+    'nc-served', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-other-key', 'completed', 200, '{}', 'messages', 'remote', 1006, 1006
+  );
+
+INSERT INTO usage_routing_snapshots (
+  request_id, candidate_id, route_kind, execution_path,
+  selected_provider_id, selected_endpoint_id, selected_provider_api_key_id
+) VALUES
+  ('nc-runtime-miss', 'nc-runtime-miss-candidate', 'count_tokens', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-snapshot-only', 'nc-snapshot-only-candidate', 'count_tokens', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-exhausted', 'nc-exhausted-candidate', 'messages', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-upstream-failure', 'nc-upstream-failure-candidate', 'messages', 'remote',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-served', 'nc-served-candidate', 'messages', 'remote',
+   'nc-provider', 'nc-endpoint', 'nc-other-key');
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("release backfill fixtures should insert");
+
+    for pass in ["first", "second"] {
+        sqlx::raw_sql(SQLITE_RELEASE_NEVER_CALLED_PROVIDER_ATTRIBUTION_SQL)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("sqlite release backfill should run on the {pass} pass: {error}")
+            });
+
+        let counters: Vec<(String, i64, i64)> = query_as(
+            "SELECT id, request_count, error_count FROM provider_api_keys WHERE id LIKE 'nc-%' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("sqlite provider key counters should load");
+        assert_eq!(
+            counters,
+            RELEASED_PROVIDER_KEY_COUNTERS
+                .iter()
+                .map(|(id, requests, errors)| (id.to_string(), *requests, *errors))
+                .collect::<Vec<_>>(),
+            "{pass} pass: releasing must charge back exactly the never-served rows, clamp at zero and leave other keys alone"
+        );
+        let identity: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = query_as(
+            r#"SELECT request_id, provider_name, provider_id, provider_endpoint_id, provider_api_key_id
+               FROM "usage" WHERE request_id LIKE 'nc-%' ORDER BY request_id"#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("sqlite usage identity should load");
+        assert_eq!(identity, released_usage_identity(), "{pass} pass");
+        let snapshots: Vec<ReleasedRoutingSnapshot> = query_as(
+            "SELECT request_id, candidate_id, route_kind, execution_path, selected_provider_id, selected_endpoint_id, selected_provider_api_key_id FROM usage_routing_snapshots WHERE request_id LIKE 'nc-%' ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("sqlite routing snapshots should load");
+        assert_eq!(snapshots, released_routing_snapshots(), "{pass} pass");
+    }
+
+    // What explains the row survives the release: the records view still recognises
+    // the token counting request, and the trace still shows why it was rejected.
+    let explanation: (Option<String>, Option<String>, Option<String>) = query_as(
+        r#"SELECT route_kind, execution_path, json_extract(request_metadata, '$.routing_candidate_skip_reason')
+           FROM "usage" WHERE request_id = 'nc-runtime-miss'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("released sqlite usage row should load");
+    assert_eq!(
+        explanation,
+        (
+            Some("count_tokens".to_string()),
+            Some("local_execution_runtime_miss".to_string()),
+            Some("transport_operation_unsupported".to_string()),
+        )
+    );
+}
+
+#[tokio::test]
+async fn mysql_release_backfill_frees_provider_keys_from_requests_they_never_served_when_url_is_set(
+) {
+    let Some(database_url) = std::env::var("AETHER_TEST_MYSQL_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!("skipping mysql release backfill test because AETHER_TEST_MYSQL_URL is unset");
+        return;
+    };
+
+    // An isolated schema lets the test run the production SQL against the real
+    // migrations without colliding with the shared fixtures of other tests.
+    let admin_pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("mysql admin pool should connect");
+    let database_name = format!("aether_release_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE `{database_name}`"))
+        .execute(&admin_pool)
+        .await
+        .expect("mysql release backfill database should create");
+    let options: sqlx::mysql::MySqlConnectOptions = database_url.parse().expect("url should parse");
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.database(&database_name))
+        .await
+        .expect("mysql release backfill pool should connect");
+    run_mysql_migrations(&pool)
+        .await
+        .expect("mysql schema should migrate");
+
+    sqlx::raw_sql(
+        r#"
+INSERT INTO providers (id, name, provider_type, created_at, updated_at)
+VALUES ('nc-provider', 'Never Called', 'claude', 1, 1);
+INSERT INTO provider_endpoints (id, provider_id, name, base_url, created_at, updated_at)
+VALUES ('nc-endpoint', 'nc-provider', 'Default', 'https://example.invalid', 1, 1);
+INSERT INTO provider_api_keys (
+  id, provider_id, name, request_count, error_count, created_at, updated_at
+) VALUES
+  ('nc-key', 'nc-provider', 'Charged key', 6, 4, 1, 1),
+  ('nc-other-key', 'nc-provider', 'Control key', 2, 1, 1, 1),
+  ('nc-clamp-key', 'nc-provider', 'Rebuilt key', 0, 0, 1, 1);
+
+INSERT INTO `usage` (
+  request_id, provider_name, model, provider_id, provider_endpoint_id,
+  provider_api_key_id, status, status_code, request_metadata, route_kind,
+  execution_path, created_at_unix_ms, updated_at_unix_secs
+) VALUES
+  (
+    'nc-runtime-miss', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported","route_kind":"count_tokens"}',
+    'count_tokens', 'local_execution_runtime_miss', 1000, 1000
+  ),
+  (
+    'nc-legacy-row', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"provider_quota_blocked","execution_path":"local_execution_runtime_miss"}',
+    NULL, NULL, 1001, 1001
+  ),
+  (
+    'nc-snapshot-only', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"pool_cooldown"}',
+    NULL, NULL, 1002, 1002
+  ),
+  (
+    'nc-clamped', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-clamp-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported"}',
+    'count_tokens', 'local_execution_runtime_miss', 1003, 1003
+  ),
+  (
+    'nc-exhausted', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 502,
+    '{"local_execution_runtime_miss_reason":"execution_runtime_candidates_exhausted"}',
+    'messages', 'local_execution_runtime_miss', 1004, 1004
+  ),
+  (
+    'nc-upstream-failure', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-key', 'failed', 500,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported"}',
+    'messages', 'remote', 1005, 1005
+  ),
+  (
+    'nc-served', 'Never Called', 'claude-fable-5-1', 'nc-provider', 'nc-endpoint',
+    'nc-other-key', 'completed', 200, '{}', 'messages', 'remote', 1006, 1006
+  );
+
+INSERT INTO usage_routing_snapshots (
+  request_id, candidate_id, route_kind, execution_path,
+  selected_provider_id, selected_endpoint_id, selected_provider_api_key_id
+) VALUES
+  ('nc-runtime-miss', 'nc-runtime-miss-candidate', 'count_tokens', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-snapshot-only', 'nc-snapshot-only-candidate', 'count_tokens', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-exhausted', 'nc-exhausted-candidate', 'messages', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-upstream-failure', 'nc-upstream-failure-candidate', 'messages', 'remote',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-served', 'nc-served-candidate', 'messages', 'remote',
+   'nc-provider', 'nc-endpoint', 'nc-other-key');
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("mysql release backfill fixtures should insert");
+
+    for pass in ["first", "second"] {
+        sqlx::raw_sql(MYSQL_RELEASE_NEVER_CALLED_PROVIDER_ATTRIBUTION_SQL)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("mysql release backfill should run on the {pass} pass: {error}")
+            });
+
+        let counters: Vec<(String, i64, i64)> = query_as(
+            "SELECT id, request_count, error_count FROM provider_api_keys WHERE id LIKE 'nc-%' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("mysql provider key counters should load");
+        assert_eq!(
+            counters,
+            RELEASED_PROVIDER_KEY_COUNTERS
+                .iter()
+                .map(|(id, requests, errors)| (id.to_string(), *requests, *errors))
+                .collect::<Vec<_>>(),
+            "{pass} pass"
+        );
+        let identity: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = query_as(
+            "SELECT request_id, provider_name, provider_id, provider_endpoint_id, provider_api_key_id FROM `usage` WHERE request_id LIKE 'nc-%' ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("mysql usage identity should load");
+        assert_eq!(identity, released_usage_identity(), "{pass} pass");
+        let snapshots: Vec<ReleasedRoutingSnapshot> = query_as(
+            "SELECT request_id, candidate_id, route_kind, execution_path, selected_provider_id, selected_endpoint_id, selected_provider_api_key_id FROM usage_routing_snapshots WHERE request_id LIKE 'nc-%' ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("mysql routing snapshots should load");
+        assert_eq!(snapshots, released_routing_snapshots(), "{pass} pass");
+    }
+
+    let explanation: (Option<String>, Option<String>, Option<String>) = query_as(
+        "SELECT route_kind, execution_path, CAST(JSON_UNQUOTE(JSON_EXTRACT(request_metadata, '$.routing_candidate_skip_reason')) AS CHAR) FROM `usage` WHERE request_id = 'nc-runtime-miss'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("released mysql usage row should load");
+    assert_eq!(
+        explanation,
+        (
+            Some("count_tokens".to_string()),
+            Some("local_execution_runtime_miss".to_string()),
+            Some("transport_operation_unsupported".to_string()),
+        )
+    );
+
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE `{database_name}`"))
+        .execute(&admin_pool)
+        .await
+        .expect("mysql release backfill database should drop");
+    admin_pool.close().await;
+}
+
+#[tokio::test]
+async fn postgres_release_backfill_frees_provider_keys_from_requests_they_never_served() {
+    let Some(server) = ManagedPostgresServer::try_start()
+        .await
+        .expect("postgres release backfill test should start or skip")
+    else {
+        return;
+    };
+    let pool = PgPool::connect(server.database_url())
+        .await
+        .expect("postgres release backfill pool should connect");
+    prepare_database_for_startup(&pool)
+        .await
+        .expect("postgres schema should prepare");
+    run_migrations(&pool)
+        .await
+        .expect("postgres pending migrations should apply");
+
+    // On Postgres the routing fields live only on the snapshot and in the metadata
+    // mirror, so the "typed column" case from the other dialects collapses into the
+    // snapshot case; the remaining fixtures are the same rows.
+    sqlx::raw_sql(
+        r#"
+INSERT INTO public.providers (id, name, provider_type)
+VALUES ('nc-provider', 'Never Called', 'claude');
+INSERT INTO public.provider_endpoints (id, provider_id, name, base_url)
+VALUES ('nc-endpoint', 'nc-provider', 'Default', 'https://example.invalid');
+INSERT INTO public.provider_api_keys (
+  id, provider_id, name, request_count, error_count, total_tokens, total_cost_usd
+) VALUES
+  ('nc-key', 'nc-provider', 'Charged key', 6, 4, 0, 0),
+  ('nc-other-key', 'nc-provider', 'Control key', 2, 1, 0, 0),
+  ('nc-clamp-key', 'nc-provider', 'Rebuilt key', 0, 0, 0, 0);
+
+INSERT INTO public.usage (
+  id, request_id, provider_name, model, provider_id, provider_endpoint_id,
+  provider_api_key_id, status, status_code, request_metadata
+) VALUES
+  (
+    'nc-runtime-miss-id', 'nc-runtime-miss', 'Never Called', 'claude-fable-5-1', 'nc-provider',
+    'nc-endpoint', 'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported","route_kind":"count_tokens","execution_path":"local_execution_runtime_miss"}'
+  ),
+  (
+    'nc-legacy-row-id', 'nc-legacy-row', 'Never Called', 'claude-fable-5-1', 'nc-provider',
+    'nc-endpoint', 'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"provider_quota_blocked","execution_path":"local_execution_runtime_miss"}'
+  ),
+  (
+    'nc-snapshot-only-id', 'nc-snapshot-only', 'Never Called', 'claude-fable-5-1', 'nc-provider',
+    'nc-endpoint', 'nc-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"pool_cooldown"}'
+  ),
+  (
+    'nc-clamped-id', 'nc-clamped', 'Never Called', 'claude-fable-5-1', 'nc-provider',
+    'nc-endpoint', 'nc-clamp-key', 'failed', 503,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported","execution_path":"local_execution_runtime_miss"}'
+  ),
+  (
+    'nc-exhausted-id', 'nc-exhausted', 'Never Called', 'claude-fable-5-1', 'nc-provider',
+    'nc-endpoint', 'nc-key', 'failed', 502,
+    '{"local_execution_runtime_miss_reason":"execution_runtime_candidates_exhausted","execution_path":"local_execution_runtime_miss"}'
+  ),
+  (
+    'nc-upstream-failure-id', 'nc-upstream-failure', 'Never Called', 'claude-fable-5-1', 'nc-provider',
+    'nc-endpoint', 'nc-key', 'failed', 500,
+    '{"routing_candidate_skip_reason":"transport_operation_unsupported","execution_path":"remote"}'
+  ),
+  (
+    'nc-served-id', 'nc-served', 'Never Called', 'claude-fable-5-1', 'nc-provider',
+    'nc-endpoint', 'nc-other-key', 'completed', 200, '{}'
+  );
+
+INSERT INTO public.usage_routing_snapshots (
+  request_id, candidate_id, route_kind, execution_path,
+  selected_provider_id, selected_endpoint_id, selected_provider_api_key_id
+) VALUES
+  ('nc-runtime-miss', 'nc-runtime-miss-candidate', 'count_tokens', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-snapshot-only', 'nc-snapshot-only-candidate', 'count_tokens', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-exhausted', 'nc-exhausted-candidate', 'messages', 'local_execution_runtime_miss',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-upstream-failure', 'nc-upstream-failure-candidate', 'messages', 'remote',
+   'nc-provider', 'nc-endpoint', 'nc-key'),
+  ('nc-served', 'nc-served-candidate', 'messages', 'remote',
+   'nc-provider', 'nc-endpoint', 'nc-other-key');
+"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("postgres release backfill fixtures should insert");
+
+    for pass in ["first", "second"] {
+        sqlx::raw_sql(POSTGRES_RELEASE_NEVER_CALLED_PROVIDER_ATTRIBUTION_SQL)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("postgres release backfill should run on the {pass} pass: {error}")
+            });
+
+        let counters: Vec<(String, i64, i64)> = query_as(
+            "SELECT id, request_count::BIGINT, error_count::BIGINT FROM public.provider_api_keys WHERE id LIKE 'nc-%' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("postgres provider key counters should load");
+        assert_eq!(
+            counters,
+            RELEASED_PROVIDER_KEY_COUNTERS
+                .iter()
+                .map(|(id, requests, errors)| (id.to_string(), *requests, *errors))
+                .collect::<Vec<_>>(),
+            "{pass} pass"
+        );
+        let identity: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = query_as(
+            "SELECT request_id, provider_name, provider_id, provider_endpoint_id, provider_api_key_id FROM public.usage WHERE request_id LIKE 'nc-%' ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("postgres usage identity should load");
+        assert_eq!(identity, released_usage_identity(), "{pass} pass");
+        let snapshots: Vec<ReleasedRoutingSnapshot> = query_as(
+            "SELECT request_id, candidate_id, route_kind, execution_path, selected_provider_id, selected_endpoint_id, selected_provider_api_key_id FROM public.usage_routing_snapshots WHERE request_id LIKE 'nc-%' ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("postgres routing snapshots should load");
+        assert_eq!(snapshots, released_routing_snapshots(), "{pass} pass");
+    }
+
+    let explanation: (Option<String>, Option<String>) = query_as(
+        "SELECT request_metadata->>'route_kind', request_metadata->>'routing_candidate_skip_reason' FROM public.usage WHERE request_id = 'nc-runtime-miss'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("released postgres usage row should load");
+    assert_eq!(
+        explanation,
+        (
+            Some("count_tokens".to_string()),
+            Some("transport_operation_unsupported".to_string()),
+        )
+    );
+}
+
 #[tokio::test]
 async fn sqlite_backfill_sql_and_version_record_commit_atomically() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -942,7 +1543,7 @@ END
         .fetch_one(&pool)
         .await
         .expect("sqlite resumed applied backfill count should load");
-    assert_eq!(applied_count, 9);
+    assert_eq!(applied_count, 10);
 }
 
 #[derive(Debug)]
@@ -1148,6 +1749,12 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     prepare_database_for_startup(&pool)
         .await
         .expect("schema should prepare");
+    // Startup applies pending migrations before it runs backfills. The empty database
+    // snapshot deliberately leaves the fork's quota maintenance migration pending, and
+    // the quota resume backfill writes into the table that migration creates.
+    run_migrations(&pool)
+        .await
+        .expect("pending migrations should apply before backfills");
 
     query(
         r#"
@@ -1269,7 +1876,7 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     let pending_before = pending_backfills(&pool)
         .await
         .expect("pending backfills should load");
-    assert_eq!(pending_before.len(), 11);
+    assert_eq!(pending_before.len(), 12);
     assert_eq!(pending_before[0].version, 20260422110000);
     assert_eq!(pending_before[1].version, 20260422120000);
     assert_eq!(pending_before[2].version, 20260504120000);
@@ -1281,6 +1888,7 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
     assert_eq!(pending_before[8].version, 20260817020000);
     assert_eq!(pending_before[9].version, 20260818000000);
     assert_eq!(pending_before[10].version, 20260819000000);
+    assert_eq!(pending_before[11].version, 20260920000000);
 
     run_backfills(&pool)
         .await
@@ -1310,6 +1918,7 @@ async fn run_backfills_rebuilds_stats_and_records_execution() {
             20260817020000,
             20260818000000,
             20260819000000,
+            20260920000000,
         ]
     );
 
@@ -1983,5 +2592,5 @@ ORDER BY total_tokens
         .fetch_one(&pool)
         .await
         .expect("backfill count should load");
-    assert_eq!(applied_count, 11);
+    assert_eq!(applied_count, 12);
 }

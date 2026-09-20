@@ -363,6 +363,173 @@ VALUES (
         .expect("backfill fixtures should clean up");
 }
 
+#[tokio::test]
+async fn postgres_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_served_when_url_is_set(
+) {
+    let Some(database_url) = std::env::var("AETHER_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!(
+            "skipping postgres never-served attribution test because AETHER_TEST_POSTGRES_URL is unset"
+        );
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("postgres test pool should connect");
+    crate::run_migrations(&pool)
+        .await
+        .expect("postgres migrations should run");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let short = &suffix[..8];
+    let user_id = format!("never-served-user-{short}");
+    let api_key_id = format!("never-served-api-key-{short}");
+    let provider_id = format!("never-served-provider-{short}");
+    let endpoint_id = format!("never-served-endpoint-{short}");
+    let provider_key_id = format!("never-served-key-{short}");
+    sqlx::query(
+        "INSERT INTO public.users (id, username, role, auth_source, email_verified) VALUES ($1, $2, 'user', 'local', true)",
+    )
+    .bind(&user_id)
+    .bind(format!("never-served-{short}"))
+    .execute(&pool)
+    .await
+    .expect("user should seed");
+    sqlx::query("INSERT INTO public.api_keys (id, user_id, key_hash) VALUES ($1, $2, $3)")
+        .bind(&api_key_id)
+        .bind(&user_id)
+        .bind(format!("hash-{api_key_id}"))
+        .execute(&pool)
+        .await
+        .expect("api key should seed");
+    sqlx::query("INSERT INTO public.providers (id, name, provider_type) VALUES ($1, $2, 'claude')")
+        .bind(&provider_id)
+        .bind(format!("Never Served {short}"))
+        .execute(&pool)
+        .await
+        .expect("provider should seed");
+    sqlx::query(
+        "INSERT INTO public.provider_endpoints (id, provider_id, name, base_url) VALUES ($1, $2, 'Default', 'https://example.invalid')",
+    )
+    .bind(&endpoint_id)
+    .bind(&provider_id)
+    .execute(&pool)
+    .await
+    .expect("provider endpoint should seed");
+    sqlx::query(
+        "INSERT INTO public.provider_api_keys (id, provider_id, name, total_tokens, total_cost_usd) VALUES ($1, $2, 'Never served key', 0, 0)",
+    )
+    .bind(&provider_key_id)
+    .bind(&provider_id)
+    .execute(&pool)
+    .await
+    .expect("provider key should seed");
+
+    let attributed = |request_id: &str, now_unix_secs: u64| {
+        let mut record = fast_clear_usage_record(
+            request_id,
+            "Never Served",
+            now_unix_secs,
+            true,
+            UsageBodyCaptureState::None,
+            None,
+        );
+        record.user_id = Some(user_id.clone());
+        record.api_key_id = Some(api_key_id.clone());
+        record.provider_id = Some(provider_id.clone());
+        record.provider_endpoint_id = Some(endpoint_id.clone());
+        record.provider_api_key_id = Some(provider_key_id.clone());
+        record.request_metadata = None;
+        record
+    };
+    let repository = SqlxUsageReadRepository::new(pool.clone());
+    let served_id = format!("never-served-served-{short}");
+    let never_called_id = format!("never-served-rejected-{short}");
+    repository
+        .upsert(attributed(&served_id, 1_700_000_000))
+        .await
+        .expect("served usage should upsert");
+    // A token counting request the gateway rejected locally, as rows written before
+    // the attribution fix still name a key: the candidate was skipped before dispatch,
+    // so the key never saw the request.
+    let mut never_called = attributed(&never_called_id, 1_700_000_001);
+    never_called.status = "failed".to_string();
+    never_called.status_code = Some(503);
+    never_called.error_message = Some("no candidate could serve the request".to_string());
+    never_called.request_type = Some("chat".to_string());
+    never_called.route_kind = Some("count_tokens".to_string());
+    never_called.execution_path = Some("local_execution_runtime_miss".to_string());
+    never_called.request_metadata = Some(json!({
+        "routing_candidate_skip_reason": "transport_operation_unsupported"
+    }));
+    repository
+        .upsert(never_called)
+        .await
+        .expect("never-called usage should upsert");
+    repository
+        .flush_usage_counter_deltas(100)
+        .await
+        .expect("usage counter deltas should flush");
+
+    let counters = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT request_count::BIGINT, success_count::BIGINT, error_count::BIGINT FROM public.provider_api_keys WHERE id = $1",
+        )
+        .bind(&provider_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("provider key counters should load")
+    };
+    // The incremental path charges only the served request.
+    assert_eq!(counters().await, (1, 1, 0));
+    // A rebuild recomputes straight from the billing facts, so it must apply the same
+    // rule or it would put the never-served request and its error straight back.
+    repository
+        .rebuild_provider_api_key_usage_stats()
+        .await
+        .expect("provider key stats should rebuild");
+    assert_eq!(counters().await, (1, 1, 0));
+
+    // The same row is a token counting request that only the route kind identifies.
+    let mut query = UsageAuditListQuery {
+        user_id: Some(user_id.clone()),
+        exclude_count_tokens: true,
+        ..UsageAuditListQuery::default()
+    };
+    let visible = repository
+        .list_usage_audits(&query)
+        .await
+        .expect("filtered list should load");
+    assert_eq!(
+        visible
+            .iter()
+            .map(|row| row.request_id.as_str())
+            .collect::<Vec<_>>(),
+        [served_id.as_str()]
+    );
+    query.exclude_count_tokens = false;
+    assert_eq!(
+        repository
+            .count_usage_audits(&query)
+            .await
+            .expect("unfiltered count should load"),
+        2
+    );
+
+    sqlx::query("DELETE FROM public.providers WHERE id = $1")
+        .bind(&provider_id)
+        .execute(&pool)
+        .await
+        .expect("provider fixtures should clean up");
+    sqlx::query("DELETE FROM public.users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("user fixtures should clean up");
+}
+
 fn fast_clear_usage_record(
     request_id: &str,
     provider_name: &str,

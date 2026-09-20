@@ -538,6 +538,24 @@ GREATEST(
 )
 "#;
 
+/// Matches a usage row that names a provider key the request never reached.
+///
+/// Mirrors `SQLITE_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL`; see that constant for why
+/// both facts are required.
+const MYSQL_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL: &str = r#"(
+  NULLIF(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.routing_candidate_skip_reason')), '')), '') IS NOT NULL
+  AND (
+    TRIM(COALESCE(`usage`.execution_path, '')) = 'local_execution_runtime_miss'
+    OR TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.execution_path')), '')) = 'local_execution_runtime_miss'
+    OR EXISTS (
+      SELECT 1
+      FROM usage_routing_snapshots AS never_called_routing
+      WHERE never_called_routing.request_id = `usage`.request_id
+        AND TRIM(COALESCE(never_called_routing.execution_path, '')) = 'local_execution_runtime_miss'
+    )
+  )
+)"#;
+
 const MYSQL_PROVIDER_KEY_SUCCESS_FLAG_EXPR: &str = r#"
 CASE
   WHEN status IN ('completed', 'success', 'ok', 'billed', 'settled')
@@ -1554,6 +1572,7 @@ JOIN (
     ON settlement.request_id = `usage`.request_id
   WHERE provider_api_key_id IS NOT NULL
     AND TRIM(provider_api_key_id) <> ''
+    AND NOT {never_called_predicate}
   GROUP BY provider_api_key_id
 ) AS aggregated ON aggregated.provider_api_key_id = provider_api_keys.id
 SET provider_api_keys.request_count = aggregated.request_count,
@@ -1564,6 +1583,7 @@ SET provider_api_keys.request_count = aggregated.request_count,
     provider_api_keys.total_response_time_ms = aggregated.total_response_time_ms,
     provider_api_keys.last_used_at = aggregated.last_used_at
 "#,
+            never_called_predicate = MYSQL_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL,
             success_flag_expr = MYSQL_PROVIDER_KEY_SUCCESS_FLAG_EXPR,
             error_flag_expr = MYSQL_PROVIDER_KEY_ERROR_FLAG_EXPR,
             canonical_total_tokens_expr = MYSQL_USAGE_CANONICAL_TOTAL_TOKENS_EXPR,
