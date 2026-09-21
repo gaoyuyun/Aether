@@ -320,6 +320,16 @@ impl StreamingStandardTerminalObserver {
         Ok(self.latest_summary.clone())
     }
 
+    /// 传输层自己看到了生成内容但没有把增量事件喂进来（Responses WebSocket 只
+    /// 观测终态）时调用，让空 incomplete 判定与实际流保持一致。
+    pub fn note_output_content(&mut self) {
+        if let Some(TerminalStreamParser::Standard(ProviderStreamParser::OpenAIResponses(state))) =
+            self.provider.as_mut()
+        {
+            state.note_output_content();
+        }
+    }
+
     pub fn disable_with_error(&mut self, parser_error: impl Into<String>) {
         let parser_error = parser_error.into();
         if let Some(summary) = self.latest_summary.as_mut() {

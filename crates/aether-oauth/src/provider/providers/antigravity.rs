@@ -282,6 +282,7 @@ mod tests {
                 "provider-oauth:exchange-code" | "provider-oauth:refresh-token" => {
                     Ok(OAuthHttpResponse {
                         status_code: 200,
+                        retry_after_secs: None,
                         body_text: self
                             .token_payload
                             .clone()
@@ -302,6 +303,7 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| OAuthHttpResponse {
                         status_code: 200,
+                        retry_after_secs: None,
                         body_text: json!({
                             "email": "antigravity@example.com",
                             "verified_email": true
@@ -481,6 +483,7 @@ mod tests {
                     status_code,
                     body_text: profile.to_string(),
                     json_body: None,
+                    retry_after_secs: None,
                 }),
                 ..Default::default()
             };

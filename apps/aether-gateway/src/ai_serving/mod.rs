@@ -25,6 +25,10 @@ pub(crate) use self::finalize::internal::{
     maybe_build_sync_finalize_outcome, maybe_compile_sync_finalize_response,
     SyncToStreamBridgeOutcome,
 };
+pub(crate) use self::planner::claude_code_cloak::{
+    claude_code_device_profile_summary, reset_claude_code_device_profile,
+    CLAUDE_CODE_CLOAK_REPORT_FIELD, CLAUDE_CODE_DEVICE_METADATA_NAMESPACE,
+};
 pub(crate) use self::planner::openai_responses_reasoning_replay_policy;
 pub(crate) use self::planner::{
     apply_local_runtime_candidate_terminal_reason, apply_local_runtime_execution_exhausted_reason,

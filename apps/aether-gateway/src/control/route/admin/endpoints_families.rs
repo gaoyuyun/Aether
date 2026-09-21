@@ -186,6 +186,28 @@ pub(super) fn classify_admin_endpoints_family_route(
         ))
     } else if method == http::Method::POST
         && normalized_path.starts_with("/api/admin/endpoints/keys/")
+        && normalized_path.ends_with("/reset-claude-code-device")
+    {
+        Some(classified(
+            "admin_proxy",
+            "endpoints_manage",
+            "reset_claude_code_device",
+            "admin:endpoints_manage",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/endpoints/keys/")
+        && normalized_path.ends_with("/tls-probe")
+    {
+        Some(classified(
+            "admin_proxy",
+            "endpoints_manage",
+            "tls_probe",
+            "admin:endpoints_manage",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/endpoints/keys/")
         && normalized_path.ends_with("/reset-cycle-stats")
     {
         Some(classified(

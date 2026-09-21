@@ -3,6 +3,35 @@ use std::collections::BTreeMap;
 use url::form_urlencoded;
 
 pub const GEMINI_CLI_USER_AGENT: &str = "GeminiCLI/0.1.5 (Windows; AMD64)";
+/// Gemini CLI（`packages/core/src/code_assist/setup.ts` 的 `coreClientMetadata`）
+/// 在 loadCodeAssist / onboardUser 里上报的 IDE 类型。它不是 Antigravity 的
+/// `ANTIGRAVITY`：写错会让 Cloud Code 按 Antigravity 客户端评估 tier。
+pub const GEMINI_CLI_IDE_TYPE: &str = "IDE_UNSPECIFIED";
+pub const GEMINI_CLI_PLATFORM: &str = "PLATFORM_UNSPECIFIED";
+pub const GEMINI_CLI_PLUGIN_TYPE: &str = "GEMINI";
+
+/// Gemini CLI 官方客户端在 loadCodeAssist / onboardUser 请求里携带的
+/// `metadata` 对象。`duet_project` 只在已知项目时附带，与官方
+/// `{...coreClientMetadata, duetProject: projectId}` 一致。
+pub fn build_gemini_cli_client_metadata(duet_project: Option<&str>) -> serde_json::Value {
+    let mut metadata = serde_json::json!({
+        "ideType": GEMINI_CLI_IDE_TYPE,
+        "platform": GEMINI_CLI_PLATFORM,
+        "pluginType": GEMINI_CLI_PLUGIN_TYPE,
+    });
+    if let Some(project) = duet_project
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(
+                "duetProject".to_string(),
+                serde_json::Value::String(project.to_string()),
+            );
+        }
+    }
+    metadata
+}
 pub const GEMINI_CLI_V1INTERNAL_PATH_TEMPLATE: &str = "/v1internal:{action}";
 pub const GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH: &str = "/v1internal:retrieveUserQuota";
 

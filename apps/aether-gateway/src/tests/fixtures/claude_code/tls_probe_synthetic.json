@@ -1,0 +1,63 @@
+{
+  "_synthetic": true,
+  "_note": "合成的 tls.peet.ws /api/all 回显（形状按 peet.ws 公开响应固化，指纹值不是真实抓包）。用真实探针结果替换时删除 _synthetic 与 _note，并同步更新 docs/operations/tls-fingerprint-capture.md 的核对表。",
+  "ip": "203.0.113.42",
+  "http_version": "h1",
+  "method": "GET",
+  "user_agent": "claude-cli/2.1.161 (external, cli)",
+  "tls": {
+    "ciphers": [
+      "TLS_AES_128_GCM_SHA256",
+      "TLS_AES_256_GCM_SHA384",
+      "TLS_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+      "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+      "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+      "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+      "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+      "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+      "TLS_RSA_WITH_AES_128_GCM_SHA256",
+      "TLS_RSA_WITH_AES_256_GCM_SHA384",
+      "TLS_RSA_WITH_AES_128_CBC_SHA",
+      "TLS_RSA_WITH_AES_256_CBC_SHA"
+    ],
+    "extensions": [
+      { "name": "server_name (0)" },
+      { "name": "extended_master_secret (23)" },
+      { "name": "renegotiation_info (65281)" },
+      { "name": "supported_groups (10)" },
+      { "name": "ec_point_formats (11)" },
+      { "name": "session_ticket (35)" },
+      { "name": "application_layer_protocol_negotiation (16)", "protocols": ["http/1.1"] },
+      { "name": "status_request (5)" },
+      { "name": "signature_algorithms (13)" },
+      { "name": "signed_certificate_timestamp (18)" },
+      { "name": "key_share (51)" },
+      { "name": "psk_key_exchange_modes (45)" },
+      { "name": "supported_versions (43)" }
+    ],
+    "tls_version_record": "771",
+    "tls_version_negotiated": "772",
+    "ja3": "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43,29-23-24,0",
+    "ja3_hash": "3f2a1c9e8b7d6f5a4c3b2a1908f7e6d5",
+    "ja4": "t13d1716h1_5b57614c22b0_3d5db4fb5c1e",
+    "ja4_r": "t13d1716h1_002f,0035,009c,009d,1301,1302,1303,c009,c00a,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0010,0012,0017,0023,002b,002d,0033,ff01_0403,0804,0401,0503,0805,0501,0806,0601,0201",
+    "peetprint": "772-771|29-23-24|1027-2052-1025-1283-2053-1281-2054-1537-513|1|2|0-23-65281-10-11-35-16-5-13-18-51-45-43|4865-4866-4867-49195-49199-49196-49200-52393-52392-49161-49171-49162-49172-156-157-47-53",
+    "peetprint_hash": "8c1d0b7e6f5a4c3b2a190f8e7d6c5b4a",
+    "client_random": "00",
+    "session_id": "00"
+  },
+  "http1": {
+    "headers": [
+      "Host: tls.peet.ws",
+      "Accept: application/json",
+      "User-Agent: claude-cli/2.1.161 (external, cli)",
+      "Connection: keep-alive",
+      "Accept-Encoding: gzip, deflate, br"
+    ]
+  }
+}

@@ -61,6 +61,11 @@ pub(crate) const CLIENT_CANCELLED_STATUS_CODE: u16 = 499;
 /// 流式超时状态码；只有它会额外投射 pool stream timeout 效果。
 pub(crate) const STREAM_TIMEOUT_STATUS_CODE: u16 = 504;
 
+/// 供应商开始了流但没有给出终态事件（没有 `response.completed` /
+/// `message_stop`）时的记账状态码。不是超时（504），也不是网关故障（502）：
+/// 上游连接正常结束、只是没把响应写完，按 408 记并投射供应商失败。
+pub(crate) const STREAM_MISSING_TERMINAL_STATUS_CODE: u16 = 408;
+
 /// provider 侧观察到的终态。
 ///
 /// 形状刻意保持 transport 中立：HTTP 流式与 WS turn 的差异只在事实从哪来。
@@ -236,10 +241,11 @@ impl AttemptProviderEffect {
 
 /// 判定一次 attempt 结束后要投射的效果。
 ///
-/// 关键分支是「记账层判成 failed，但这一轮没有投射供应商失败」：例如合法的
-/// `response.incomplete`（写满 max_output_tokens）。共享 usage 判定目前仍会
-/// 把这类终态记成失败，但供应商本身工作正常，既不该扣健康分，也不能因为落
-/// 不到任何分支而漏掉 lease 释放。
+/// 关键分支是「记账层判成 failed，但这一轮没有投射供应商失败」。合法的
+/// `response.incomplete`（写满 max_output_tokens）如今在记账层已经是成功，
+/// 不再走到这里；仍会落到这一支的是客户端侧的解析失败一类「供应商没错、
+/// 但这条记录不能算成功」的情形，它们既不该扣健康分，也不能因为落不到任何
+/// 分支而漏掉 lease 释放。
 pub(crate) const fn classify_attempt_provider_effect(
     cancelled: bool,
     projects_provider_failure: bool,
@@ -315,9 +321,16 @@ pub(crate) const fn classify_attempt_settlement(
     } = inputs;
 
     let void = attempt_billing_is_void(facts);
-    let status_code = attempt_status_code(facts);
-    let failed = !void && report_represents_failure;
     let missing_terminal = !void && !observed_finish;
+    // 供应商给了 2xx 却没有终态事件：按 408 记账（与 HTTP 流路径一致），
+    // 供应商失败照常投射。
+    let status_code =
+        if missing_terminal && facts.provider.is_terminal() && attempt_status_code(facts) < 400 {
+            STREAM_MISSING_TERMINAL_STATUS_CODE
+        } else {
+            attempt_status_code(facts)
+        };
+    let failed = !void && (report_represents_failure || missing_terminal);
     let projects_provider_failure = !void
         && (status_code >= 400
             || facts.forced_error().is_some()
@@ -846,7 +859,7 @@ mod tests {
         classify_attempt_provider_effect, classify_attempt_settlement, AttemptBilling,
         AttemptCandidateError, AttemptCandidateStatus, AttemptClientDelivery,
         AttemptProviderEffect, AttemptProviderOutcome, AttemptSettlement, AttemptSettlementInputs,
-        AttemptTerminalFacts,
+        AttemptTerminalFacts, STREAM_MISSING_TERMINAL_STATUS_CODE,
     };
 
     fn settle(
@@ -1034,10 +1047,34 @@ mod tests {
         );
     }
 
-    /// 合法 `response.incomplete`：记账层判失败，但供应商工作正常，
-    /// 不扣健康分、只释放 lease，并且账单照记。
+    /// 合法 `response.incomplete`（写满 max_output_tokens / content_filter）：
+    /// 记账层不再判失败，供应商工作正常，账单照记、投射成功。
     #[test]
-    fn settlement_table_row_legitimate_incomplete_is_billed_without_provider_failure() {
+    fn settlement_table_row_legitimate_incomplete_is_billed_as_success() {
+        let settlement = settle(
+            terminal(200),
+            AttemptClientDelivery::Complete,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(
+            settlement,
+            AttemptSettlement {
+                status_code: 200,
+                billing: AttemptBilling::Billed,
+                candidate_status: AttemptCandidateStatus::Success,
+                candidate_error: AttemptCandidateError::None,
+                provider_effect: AttemptProviderEffect::ProviderSuccess,
+                submit_execution_report: true,
+            }
+        );
+    }
+
+    /// 记账层判失败但供应商没错（例如客户端侧解析失败）：不扣健康分、只释放
+    /// lease，账单照记。
+    #[test]
+    fn settlement_table_row_accounting_failure_without_provider_fault_only_releases_lease() {
         let settlement = settle(
             terminal(200),
             AttemptClientDelivery::Complete,
@@ -1058,11 +1095,64 @@ mod tests {
         );
     }
 
+    /// 空 incomplete（没有任何输出、output_tokens 为 0）在记账层被改写成带显式
+    /// error 的终态：状态码由供应商侧推成 502，投射供应商失败。
+    #[test]
+    fn settlement_table_row_empty_incomplete_projects_a_provider_failure() {
+        let settlement = settle(
+            terminal(502),
+            AttemptClientDelivery::Complete,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(settlement.status_code, 502);
+        assert_eq!(settlement.billing, AttemptBilling::Billed);
+        assert_eq!(settlement.candidate_status, AttemptCandidateStatus::Failed);
+        assert_eq!(
+            settlement.provider_effect,
+            AttemptProviderEffect::ProviderFailure
+        );
+    }
+
+    /// 供应商给了 2xx 终态却缺 finish（没有 completed / message_stop）：按 408
+    /// 记账并投射供应商失败。
+    #[test]
+    fn settlement_table_row_missing_terminal_on_a_2xx_is_recorded_as_408() {
+        let settlement = settle(
+            terminal(200),
+            AttemptClientDelivery::Complete,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            settlement,
+            AttemptSettlement {
+                status_code: 408,
+                billing: AttemptBilling::Billed,
+                candidate_status: AttemptCandidateStatus::Failed,
+                candidate_error: AttemptCandidateError::MissingTerminal,
+                provider_effect: AttemptProviderEffect::ProviderFailure,
+                submit_execution_report: true,
+            }
+        );
+        // 上游自己已经是错误状态时，状态码是事实，不改写。
+        let settlement = settle(
+            terminal(429),
+            AttemptClientDelivery::Complete,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(settlement.status_code, 429);
+    }
+
     #[test]
     fn settlement_table_row_provider_abort_projects_a_provider_failure() {
         let settlement = settle(
             aborted(
-                502,
+                408,
                 "upstream WebSocket closed before provider terminal event",
             ),
             AttemptClientDelivery::Complete,
@@ -1073,7 +1163,7 @@ mod tests {
         assert_eq!(
             settlement,
             AttemptSettlement {
-                status_code: 502,
+                status_code: 408,
                 billing: AttemptBilling::Billed,
                 candidate_status: AttemptCandidateStatus::Failed,
                 candidate_error: AttemptCandidateError::MissingTerminal,
@@ -1166,11 +1256,10 @@ mod tests {
         assert_eq!(settlement.candidate_error, AttemptCandidateError::Cancelled);
     }
 
-    /// 记账层判 Success，但摘要没观察到 finish：现状会写出
-    /// 「candidate=Success + error_type=stream_missing_terminal_event」，
-    /// 所以状态与错误分类必须各自独立。
+    /// 记账层判 Success，但摘要没观察到 finish：缺终态本身就是失败事实，
+    /// 候选状态记 Failed、状态码归一到 408，错误分类保持 MissingTerminal。
     #[test]
-    fn a_missing_terminal_can_coexist_with_a_successful_candidate_status() {
+    fn a_missing_terminal_overrides_a_successful_accounting_verdict() {
         let settlement = settle(
             terminal(200),
             AttemptClientDelivery::Complete,
@@ -1178,7 +1267,8 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(settlement.candidate_status, AttemptCandidateStatus::Success);
+        assert_eq!(settlement.status_code, STREAM_MISSING_TERMINAL_STATUS_CODE);
+        assert_eq!(settlement.candidate_status, AttemptCandidateStatus::Failed);
         assert_eq!(
             settlement.candidate_error,
             AttemptCandidateError::MissingTerminal
@@ -1207,10 +1297,10 @@ mod tests {
     }
 
     #[test]
-    fn a_legitimate_incomplete_still_releases_the_pool_key_lease() {
-        // 共享 usage 判定目前仍把 response.incomplete 记成终态失败，于是会出现
-        // failed=true 而 projects_provider_failure=false 的组合。这种组合必须
-        // 明确落到「只释放 lease」的分支，否则 lease 会挂到 TTL 过期。
+    fn an_accounting_failure_without_provider_fault_still_releases_the_pool_key_lease() {
+        // failed=true 而 projects_provider_failure=false 的组合（记账层判失败、
+        // 供应商没错）必须明确落到「只释放 lease」的分支，否则 lease 会挂到
+        // TTL 过期。
         let effect = classify_attempt_provider_effect(false, false, true);
 
         assert_eq!(effect, AttemptProviderEffect::ReleasePoolKeyLease);

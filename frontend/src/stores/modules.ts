@@ -30,8 +30,7 @@ export const useModuleStore = defineStore('modules', () => {
     loading.value = true
     error.value = null
     const requestGeneration = storeGeneration
-    let request!: Promise<Record<string, ModuleStatus>>
-    request = (async () => {
+    const request: Promise<Record<string, ModuleStatus>> = (async () => {
       try {
         const statuses = await modulesApi.getRuntimeStatus()
         if (requestGeneration !== storeGeneration) return modules.value
@@ -66,11 +65,11 @@ export const useModuleStore = defineStore('modules', () => {
         log.error('Failed to fetch runtime modules status', err)
         error.value = parseApiError(err, '获取模块状态失败')
         throw err
-      } finally {
-        if (requestGeneration === storeGeneration) loading.value = false
-        if (fetchRuntimeModulesPromise === request) fetchRuntimeModulesPromise = null
       }
-    })()
+    })().finally(() => {
+      if (requestGeneration === storeGeneration) loading.value = false
+      if (fetchRuntimeModulesPromise === request) fetchRuntimeModulesPromise = null
+    })
     fetchRuntimeModulesPromise = request
 
     return fetchRuntimeModulesPromise
@@ -86,8 +85,7 @@ export const useModuleStore = defineStore('modules', () => {
     error.value = null
 
     const requestGeneration = storeGeneration
-    let request!: Promise<Record<string, ModuleStatus>>
-    request = (async () => {
+    const request: Promise<Record<string, ModuleStatus>> = (async () => {
       try {
         const nextModules = await modulesApi.getAllStatus()
         if (requestGeneration !== storeGeneration) return modules.value
@@ -101,11 +99,11 @@ export const useModuleStore = defineStore('modules', () => {
         log.error('Failed to fetch modules status', err)
         error.value = parseApiError(err, '获取模块状态失败')
         throw err
-      } finally {
-        if (requestGeneration === storeGeneration) loading.value = false
-        if (fetchModulesPromise === request) fetchModulesPromise = null
       }
-    })()
+    })().finally(() => {
+      if (requestGeneration === storeGeneration) loading.value = false
+      if (fetchModulesPromise === request) fetchModulesPromise = null
+    })
     fetchModulesPromise = request
 
     return fetchModulesPromise

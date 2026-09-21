@@ -593,6 +593,7 @@ fn apply_single_import_hints(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_admin_provider_oauth_single_import_tokens(
     state: &AdminAppState<'_>,
     template: Option<AdminProviderOAuthTemplate>,
@@ -601,6 +602,7 @@ async fn resolve_admin_provider_oauth_single_import_tokens(
     access_token: Option<&str>,
     imported_expires_at: Option<u64>,
     request_proxy: Option<ProxySnapshot>,
+    provider_config: Option<serde_json::Value>,
 ) -> Result<AdminProviderOAuthSingleImportTokens, Response<Body>> {
     if let Some(refresh_token) = refresh_token
         .map(str::trim)
@@ -637,6 +639,7 @@ async fn resolve_admin_provider_oauth_single_import_tokens(
                 template,
                 refresh_token,
                 request_proxy.clone(),
+                provider_config,
             )
             .await
         {
@@ -1027,6 +1030,7 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
             access_token_input.as_deref(),
             imported_expires_at,
             request_proxy.clone(),
+            provider.config.clone(),
         )
         .await
         {

@@ -426,16 +426,6 @@ function triggerAction(event: HeaderActionEvent) {
 
 const { legacyT } = useI18n()
 
-function emitHeaderAction(event: HeaderActionEvent) {
-  switch (event) {
-    case 'import': emit('import'); break
-    case 'scheduling': emit('scheduling'); break
-    case 'viewProvider': emit('viewProvider'); break
-    case 'demandMetrics': emit('demandMetrics'); break
-    case 'advanced': emit('advanced'); break
-  }
-}
-
 const providerModel = computed({
   get: () => props.providerId,
   set: value => emit('update:providerId', value),

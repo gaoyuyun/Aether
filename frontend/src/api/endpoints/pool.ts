@@ -8,6 +8,7 @@ import type {
   UpstreamMetadata,
 } from './types/provider'
 import type { ProviderKeyStatusSnapshot } from './types/statusSnapshot'
+import type { PoolCooldownMeta, PoolModelCooldown } from '@/features/pool/utils/poolCooldown'
 
 const POOL_BATCH_ACTION_TIMEOUT_MS = 5 * 60 * 1000
 
@@ -17,6 +18,12 @@ export interface PoolKeyStatus {
   is_active: boolean
   cooldown_reason: string | null
   cooldown_ttl_seconds: number | null
+  /** 冷却截止的绝对时刻（Unix 秒），前端据此做倒计时。 */
+  cooldown_until?: number | null
+  /** 冷却决策元数据：来源、退避等级、上游重置时刻。 */
+  cooldown_meta?: PoolCooldownMeta | null
+  /** Key+模型 级冷却（供应商开启 cooldown.model_level 或上游给出模型级提示时）。 */
+  model_cooldowns?: PoolModelCooldown[]
   cost_window_usage: number
   cost_limit: number | null
   sticky_sessions: number
@@ -54,6 +61,20 @@ export async function clearPoolCooldown(
 ): Promise<{ message: string }> {
   const response = await client.post<{ message: string }>(
     `/api/admin/providers/${providerId}/pool/clear-cooldown/${keyId}`,
+  )
+  return response.data
+}
+
+/**
+ * 清除指定 Key 的推理回放缓存（Codex encrypted_content / Gemini thoughtSignature 账本）。
+ * 上游持续 400 提示签名失效时使用；清除后下一轮退回占位符行为。
+ */
+export async function clearReasoningReplayCache(
+  providerId: string,
+  keyId: string,
+): Promise<{ message: string; cleared: number }> {
+  const response = await client.post<{ message: string; cleared: number }>(
+    `/api/admin/providers/${providerId}/pool/clear-reasoning-replay/${keyId}`,
   )
   return response.data
 }
@@ -167,6 +188,9 @@ export interface PoolKeyDetail {
   account_quota: string | null  // compatibility only; UI should prefer status_snapshot.quota
   cooldown_reason: string | null
   cooldown_ttl_seconds: number | null
+  cooldown_until?: number | null
+  cooldown_meta?: PoolCooldownMeta | null
+  model_cooldowns?: PoolModelCooldown[]
   cost_window_usage: number
   cost_limit: number | null
   request_count: number

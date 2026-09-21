@@ -33,7 +33,7 @@
             class="px-4"
             :class="{ 'pt-4': index === 0, 'pb-4': !chunk.hasNext }"
           >
-            <pre class="text-xs font-mono whitespace-pre-wrap break-all">{{ chunk.text }}</pre>
+            <pre class="text-xs font-mono whitespace-pre-wrap break-all"><ZeroWidthText :text="chunk.text" /></pre>
           </div>
           <div
             v-else
@@ -100,6 +100,8 @@ import { ref, watch } from 'vue'
 import { ChevronRight, ChevronDown } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import VirtualBodyContent from './VirtualBodyContent.vue'
+import ZeroWidthText from './ZeroWidthText.vue'
+import { markZeroWidthHtml } from '../../utils/zeroWidth'
 import { deepEqual } from '@/utils/deepEqual'
 import { getRawTextChunk, JsonPageReader, JSON_SCROLL_CHUNK_SIZE, JSON_TEXT_CHUNK_SIZE, type JsonDisplayLine } from '../../utils/json-viewer'
 import type { BodyDocument } from '../../utils/body-document'
@@ -141,7 +143,9 @@ function escapeHtml(value: string): string {
 }
 
 function token(value: string, type: string): string {
-  return `<span class="token-${type}">${escapeHtml(value)}</span>`
+  // 零宽空格（敏感词混淆产物）在转义之后替换成可见占位符；
+  // 每个 token 独立处理，Worker 分段只按 UTF-16 单元切，U+200B 本身不会被切开。
+  return `<span class="token-${type}">${markZeroWidthHtml(escapeHtml(value))}</span>`
 }
 
 function getDisplayHtml(line: JsonDisplayLine): string {

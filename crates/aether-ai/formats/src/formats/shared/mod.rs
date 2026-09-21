@@ -6,6 +6,7 @@ use std::fmt;
 /// a base64 field cannot trigger an unchecked allocation before parsing.
 pub(crate) const MAX_SYNC_REPORT_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+pub mod claude_thinking_capabilities;
 pub mod error_body;
 pub mod family;
 pub mod image_bridge;

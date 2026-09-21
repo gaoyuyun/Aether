@@ -151,7 +151,7 @@ mod tests {
             ),
             AttemptTerminalFacts {
                 provider: aborted(
-                    502,
+                    408,
                     "upstream WebSocket closed before provider terminal event"
                 ),
                 delivery: AttemptClientDelivery::Complete,
@@ -184,7 +184,7 @@ mod tests {
             ResponsesWebSocketTurnOutcome::terminal_timeout(),
         );
         assert!(terminal_timeout.provider.stream_timeout());
-        // 非 504 的失败不得被当成流式超时。
+        // 非 504 的失败不得被当成流式超时（上游关闭是 408 缺终态）。
         assert!(!attempt_facts_for_outcome(
             None,
             AttemptClientDelivery::Complete,
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(
             facts.provider,
             aborted(
-                502,
+                408,
                 "upstream WebSocket closed before provider terminal event"
             )
         );

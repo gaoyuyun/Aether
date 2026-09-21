@@ -233,6 +233,16 @@
                       :requested="serviceTierFacts.requested"
                       :price-multiplier="processingTierPriceMultiplier"
                     />
+                    <SensitiveWordObfuscationFacts
+                      v-if="sensitiveWordObfuscation"
+                      class="mt-3"
+                      :report="sensitiveWordObfuscation"
+                    />
+                    <TlsTransportFacts
+                      v-if="outgoingTlsFingerprint"
+                      class="mt-3"
+                      :outgoing="outgoingTlsFingerprint"
+                    />
                   </div>
 
                   <!-- 分隔线 -->
@@ -648,10 +658,10 @@
                         <!-- cURL 复制（仅在请求头/请求体 Tab） -->
                         <template v-if="['request-headers', 'request-body'].includes(activeTab)">
                           <button
-                            :title="curlCopied ? '已复制 cURL' : '复制 cURL'"
+                            :title="curlCopied ? '已复制 cURL' : '复制 cURL（保留原始字节）'"
                             class="p-1 rounded transition-colors text-muted-foreground hover:bg-muted"
                             :disabled="curlCopying"
-                            @click="copyCurlCommand"
+                            @click="copyCurlCommand()"
                           >
                             <Check
                               v-if="curlCopied"
@@ -663,7 +673,27 @@
                               :class="{ 'animate-pulse': curlCopying }"
                             />
                           </button>
+                          <button
+                            v-if="showZeroWidthCopyActions"
+                            title="去除零宽字符后复制 cURL"
+                            data-testid="copy-curl-strip-zwsp"
+                            class="p-1 rounded transition-colors text-amber-600 hover:bg-muted dark:text-amber-400"
+                            :disabled="curlCopying"
+                            @click="copyCurlCommand(true)"
+                          >
+                            <Eraser class="w-3.5 h-3.5" />
+                          </button>
                         </template>
+                        <button
+                          v-if="showZeroWidthCopyActions && ['request-body', 'response-body'].includes(activeTab)"
+                          title="去除零宽字符后复制正文"
+                          data-testid="copy-body-strip-zwsp"
+                          class="p-1 rounded transition-colors text-amber-600 hover:bg-muted dark:text-amber-400"
+                          :disabled="viewMode === 'compare' || bodyCopying || (supportsConversationView && !hasValidConversation)"
+                          @click="copyContent(activeTab, true)"
+                        >
+                          <Eraser class="w-3.5 h-3.5" />
+                        </button>
 
                         <!-- 请求体/响应体专用：JSON/对话 视图切换 -->
                         <template v-if="supportsConversationView">
@@ -913,7 +943,7 @@ import Separator from '@/components/ui/separator.vue'
 import Skeleton from '@/components/ui/skeleton.vue'
 import Tabs from '@/components/ui/tabs.vue'
 import TabsContent from '@/components/ui/tabs-content.vue'
-import { AlertTriangle, Check, Columns2, RefreshCw, X, Monitor, Server, MessageSquareText, Code2, Terminal, Play } from 'lucide-vue-next'
+import { AlertTriangle, Check, Columns2, Eraser, RefreshCw, X, Monitor, Server, MessageSquareText, Code2, Terminal, Play } from 'lucide-vue-next'
 import { dashboardApi, type RequestBodyField, type RequestDetail } from '@/api/dashboard'
 import { formatRequestBodyLoadError, formatStoredBodyLoadError } from '../utils/body-load-error'
 import type { ImageProgress, RequestTrace } from '@/api/requestTrace'
@@ -964,6 +994,15 @@ import { useToast } from '@/composables/useToast'
 import HorizontalRequestTimeline from './HorizontalRequestTimeline.vue'
 import ReplayDialog from './ReplayDialog.vue'
 import ServiceTierFacts from './ServiceTierFacts.vue'
+import SensitiveWordObfuscationFacts from './SensitiveWordObfuscationFacts.vue'
+import TlsTransportFacts from './TlsTransportFacts.vue'
+import { resolveOutgoingTlsFingerprint } from '../utils/tlsTransport'
+import {
+  countZeroWidth,
+  formatZeroWidthCopyNotice,
+  resolveSensitiveWordObfuscation,
+  stripZeroWidth,
+} from '../utils/zeroWidth'
 import UsageModelDisplay from './UsageModelDisplay.vue'
 import {
   formatServiceTierFact,
@@ -1050,7 +1089,9 @@ const currentExpandDepth = ref(0)
 const dataSource = ref<'client' | 'provider'>('provider')
 const contentViewMode = ref<'json' | 'conversation'>('json')
 const { copyToClipboard } = useClipboard()
-const { error: showBodyError } = useToast()
+const { error: showBodyError, warning: showBodyWarning, success: showBodySuccess } = useToast()
+/** 最近一次复制里发现的零宽字符数；>0 时工具栏出现「去除零宽字符后复制」。 */
+const lastCopyZeroWidthCount = ref(0)
 const historicalPricing = ref<{
   input_price: string
   output_price: string
@@ -1622,6 +1663,11 @@ const headerModelRecord = computed(() => {
   }
 })
 const serviceTierFacts = computed(() => resolveServiceTierFacts(headerModelRecord.value))
+const sensitiveWordObfuscation = computed(() => resolveSensitiveWordObfuscation(traceRequestMetadata.value))
+const outgoingTlsFingerprint = computed(() => resolveOutgoingTlsFingerprint(traceRequestMetadata.value))
+const showZeroWidthCopyActions = computed(() => (
+  sensitiveWordObfuscation.value !== null || lastCopyZeroWidthCount.value > 0
+))
 const hasServiceTierFacts = computed(() => hasServiceTierFact(serviceTierFacts.value))
 const settlementPricingSnapshot = computed(() => resolveSettlementPricingSnapshot(detail.value))
 const processingTierLabel = computed(() => (
@@ -2592,6 +2638,7 @@ watch([() => props.isOpen, () => props.requestId], async ([isOpen, requestId]) =
   if (isOpen && requestId) {
     if (!detailMatchesRequestId(detail.value, requestId)) {
       detail.value = null
+      lastCopyZeroWidthCount.value = 0
     }
     await loadDetail(requestId)
   } else if (!isOpen) {
@@ -3003,7 +3050,11 @@ function getTierRangeText(tier: { up_to?: number | null }, index: number, tiers:
   return `> ${formatNumber(start)} tokens`
 }
 
-async function copyContent(tabName: string) {
+/**
+ * 复制正文 / 头 / 元数据。默认复制原始字节：敏感词混淆插入的 U+200B 会原样带上并弹提示；
+ * `stripZeroWidthChars` 为「去除零宽字符后复制」。
+ */
+async function copyContent(tabName: string, stripZeroWidthChars = false) {
   if (!detail.value || viewMode.value === 'compare' || bodyCopying.value) return
   const usageId = detail.value.id
   const document = tabName === 'request-body' ? currentRequestBody.value
@@ -3015,18 +3066,26 @@ async function copyContent(tabName: string) {
       text = await document.copy(contentViewMode.value === 'conversation' ? {
         kind: tabName === 'request-body' ? 'request' : 'response',
         apiFormat: tabName === 'request-body' ? currentRequestBodyApiFormat.value : currentResponseBodyApiFormat.value,
-      } : undefined)
+      } : undefined, { stripZeroWidth: stripZeroWidthChars })
   } else {
       const data = tabName === 'request-headers' ? (dataSource.value === 'provider' ? detail.value.provider_request_headers : detail.value.request_headers)
         : tabName === 'response-headers' ? currentResponseHeaderData.value
           : tabName === 'metadata' ? metadataPanelData.value : null
       if (data == null) return
       text = JSON.stringify(data, null, 2)
+      if (stripZeroWidthChars) text = stripZeroWidth(text)
     }
     if (!props.isOpen || detail.value?.id !== usageId) return
+    const zeroWidthCount = stripZeroWidthChars ? 0 : countZeroWidth(text)
     if (await copyToClipboard(text, false)) {
     copiedStates.value[tabName] = true
       setTimeout(() => { copiedStates.value[tabName] = false }, 2000)
+      if (stripZeroWidthChars) {
+        showBodySuccess('已去除零宽字符并复制')
+      } else if (zeroWidthCount > 0) {
+        lastCopyZeroWidthCount.value = zeroWidthCount
+        showBodyWarning(formatZeroWidthCopyNotice(zeroWidthCount))
+      }
     } else {
       showBodyError('复制失败，请检查剪贴板权限后重试。')
     }
@@ -3048,16 +3107,24 @@ function toggleContentView() {
   }
 }
 
-// 复制 cURL 命令
-async function copyCurlCommand() {
+// 复制 cURL 命令。默认保留原始字节（含零宽字符）并提示数量；`stripZeroWidthChars` 为去除后复制。
+async function copyCurlCommand(stripZeroWidthChars = false) {
   if (!props.requestId || curlCopying.value) return
   curlCopying.value = true
   try {
     const data = await dashboardApi.getCurlData(props.requestId)
     if (data.curl) {
-      copyToClipboard(data.curl, false)
+      const zeroWidthCount = countZeroWidth(data.curl)
+      const text = stripZeroWidthChars ? stripZeroWidth(data.curl) : data.curl
+      copyToClipboard(text, false)
       curlCopied.value = true
       setTimeout(() => { curlCopied.value = false }, 2000)
+      if (stripZeroWidthChars) {
+        if (zeroWidthCount > 0) showBodySuccess(`已去除 ${zeroWidthCount} 个零宽字符并复制 cURL`)
+      } else if (zeroWidthCount > 0) {
+        lastCopyZeroWidthCount.value = zeroWidthCount
+        showBodyWarning(formatZeroWidthCopyNotice(zeroWidthCount))
+      }
     }
   } catch (err) {
     log.error('Failed to generate cURL command:', err)

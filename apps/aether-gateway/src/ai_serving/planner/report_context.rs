@@ -260,6 +260,32 @@ pub(crate) fn insert_native_client_envelope_name(
     }
 }
 
+/// 把敏感词混淆报告写到 report_context **顶层** `sensitive_words_obfuscation`。
+///
+/// 前端 F4 徽标与落库白名单（`metadata_policy.rs`）都只认顶层字段；P2 把报告嵌在
+/// `claude_code_cloak.sensitive_words_obfuscation` 里，这里统一提升。只在 `applied == true`
+/// 时写入，词表为空或没有命中的请求不产生该字段。
+pub(crate) fn insert_sensitive_words_obfuscation_report(
+    extra_fields: &mut Map<String, Value>,
+    report: Option<&Value>,
+) {
+    let Some(report) = report else {
+        return;
+    };
+    if report.get("applied").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    extra_fields.insert(
+        crate::ai_serving::transport::SENSITIVE_WORDS_OBFUSCATION_REPORT_FIELD.to_string(),
+        report.clone(),
+    );
+}
+
+/// 从 `claude_code_cloak` 报告里取出嵌套的混淆报告（供提升到顶层）。
+pub(crate) fn nested_sensitive_words_obfuscation_report(cloak_report: &Value) -> Option<&Value> {
+    cloak_report.get(crate::ai_serving::transport::SENSITIVE_WORDS_OBFUSCATION_REPORT_FIELD)
+}
+
 fn merge_incoming_tls_fingerprint(extra_fields: &mut Map<String, Value>, incoming_tls: Value) {
     let entry = extra_fields
         .entry("tls_fingerprint".to_string())
@@ -278,11 +304,54 @@ mod tests {
 
     use super::{
         build_local_execution_report_context, collect_report_context_original_headers,
+        insert_sensitive_words_obfuscation_report, nested_sensitive_words_obfuscation_report,
         provider_stream_event_api_format_for_provider_type, LocalExecutionReportContextParts,
     };
     use crate::ai_serving::ExecutionRuntimeAuthContext;
     use crate::ai_serving::RequestOrigin;
     use crate::orchestration::ExecutionAttemptIdentity;
+
+    #[test]
+    fn sensitive_words_report_is_promoted_to_the_top_level_only_when_applied() {
+        let cloak = json!({
+            "applied": true,
+            "client": {"kind": "third_party"},
+            "sensitive_words_obfuscation": {
+                "applied": true,
+                "replaced": 2,
+                "fields": ["system[1]", "messages[0].content[0]"]
+            }
+        });
+        let mut extra_fields = Map::new();
+        insert_sensitive_words_obfuscation_report(
+            &mut extra_fields,
+            nested_sensitive_words_obfuscation_report(&cloak),
+        );
+        assert_eq!(
+            extra_fields.get("sensitive_words_obfuscation"),
+            Some(&json!({
+                "applied": true,
+                "replaced": 2,
+                "fields": ["system[1]", "messages[0].content[0]"]
+            }))
+        );
+
+        // 词表非空但没有命中：applied=false，不提升。
+        let mut untouched = Map::new();
+        insert_sensitive_words_obfuscation_report(
+            &mut untouched,
+            Some(&json!({"applied": false, "replaced": 0, "fields": []})),
+        );
+        assert!(untouched.get("sensitive_words_obfuscation").is_none());
+
+        // 原生透传或没配词表：没有嵌套报告，不提升。
+        let mut missing = Map::new();
+        insert_sensitive_words_obfuscation_report(
+            &mut missing,
+            nested_sensitive_words_obfuscation_report(&json!({"applied": false})),
+        );
+        assert!(missing.is_empty());
+    }
 
     #[test]
     fn codex_provider_uses_openai_responses_stream_event_format() {

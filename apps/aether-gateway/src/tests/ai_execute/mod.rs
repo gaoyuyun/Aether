@@ -106,12 +106,14 @@ pub(super) fn ai_execute_provider_stop_on_status_code(
     provider
 }
 
+mod claude_code_oracle;
 mod control_execute;
 mod fallback;
 mod finalize_local;
 mod finalize_local_cli;
 mod finalize_local_provider;
 mod lifecycle;
+mod sensitive_words;
 mod stream;
 mod stream_cli;
 mod stream_provider;

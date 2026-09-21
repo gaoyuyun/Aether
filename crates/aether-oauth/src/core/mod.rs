@@ -10,7 +10,8 @@ pub use flow::{
     OAuthProviderMetadata,
 };
 pub use pkce::{
-    generate_oauth_nonce, generate_pkce_verifier, parse_oauth_callback_params, pkce_s256,
+    generate_oauth_nonce, generate_pkce_verifier, is_generated_oauth_nonce,
+    parse_oauth_callback_params, pkce_s256,
 };
 pub use registry::OAuthAdapterRegistry;
 pub use token::{current_unix_secs, OAuthTokenSet};

@@ -142,7 +142,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import type { ActivityHeatmap, ActivityHeatmapDay } from '@/types/activity'
 import { formatCurrency, formatTokens } from '@/utils/format'
 import {

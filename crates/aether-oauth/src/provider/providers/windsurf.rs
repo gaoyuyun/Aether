@@ -941,12 +941,14 @@ mod tests {
                 if let Some(body_text) = self.raw_register_body.clone() {
                     return Ok(OAuthHttpResponse {
                         status_code: 200,
+                        retry_after_secs: None,
                         body_text,
                         json_body: None,
                     });
                 }
                 return Ok(OAuthHttpResponse {
                     status_code: 200,
+                    retry_after_secs: None,
                     body_text: r#"{"sessionToken":"devin-session-token$registered","name":"Alice","email":"alice@example.com","accountId":"acct-1","primaryOrgId":"org-1","planName":"Pro","apiServerUrl":"https://server.codeium.com"}"#.to_string(),
                     json_body: Some(json!({
                         "sessionToken": "devin-session-token$registered",
@@ -962,6 +964,7 @@ mod tests {
             if request.url == AUTH1_PASSWORD_LOGIN_URL {
                 return Ok(OAuthHttpResponse {
                     status_code: 200,
+                    retry_after_secs: None,
                     body_text: r#"{"token":"auth1-token"}"#.to_string(),
                     json_body: Some(json!({"token": "auth1-token"})),
                 });
@@ -970,12 +973,14 @@ mod tests {
                 if let Some(body_text) = self.raw_post_auth_body.clone() {
                     return Ok(OAuthHttpResponse {
                         status_code: 200,
+                        retry_after_secs: None,
                         body_text,
                         json_body: None,
                     });
                 }
                 return Ok(OAuthHttpResponse {
                     status_code: 200,
+                    retry_after_secs: None,
                     body_text: r#"{"sessionToken":"devin-session-token$password","accountId":"acct-password","primaryOrgId":"org-password","planName":"Pro"}"#.to_string(),
                     json_body: Some(json!({
                         "sessionToken": "devin-session-token$password",
@@ -987,6 +992,7 @@ mod tests {
             }
             Ok(OAuthHttpResponse {
                 status_code: 200,
+                retry_after_secs: None,
                 body_text: "{}".to_string(),
                 json_body: Some(json!({})),
             })

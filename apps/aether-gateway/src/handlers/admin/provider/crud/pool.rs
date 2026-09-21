@@ -1,5 +1,6 @@
 use crate::handlers::admin::provider::shared::paths::{
-    admin_provider_clear_pool_cooldown_parts, admin_provider_reset_pool_cost_parts,
+    admin_provider_clear_pool_cooldown_parts, admin_provider_clear_reasoning_replay_parts,
+    admin_provider_reset_pool_cost_parts,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::attach_admin_audit_response;
@@ -88,6 +89,46 @@ pub(crate) async fn maybe_build_local_admin_provider_pool_response(
                     .into_response(),
                     "admin_provider_pool_cooldown_cleared",
                     "clear_provider_pool_cooldown",
+                    "provider_key",
+                    &key_id,
+                )));
+            }
+        }
+    }
+
+    if route_kind == Some("clear_reasoning_replay")
+        && request_context.method() == http::Method::POST
+    {
+        let Some((provider_id, key_id)) =
+            admin_provider_clear_reasoning_replay_parts(request_context.path())
+        else {
+            return Ok(Some(build_admin_provider_not_found_response("Key 不存在")));
+        };
+        match lookup_admin_provider_pool_key_name(state, &provider_id, &key_id).await? {
+            AdminProviderPoolKeyLookup::ProviderMissing => {
+                return Ok(Some(build_admin_provider_not_found_response(format!(
+                    "Provider {provider_id} 不存在"
+                ))));
+            }
+            AdminProviderPoolKeyLookup::KeyMissing => {
+                return Ok(Some(build_admin_provider_not_found_response(format!(
+                    "Key {key_id} 不存在"
+                ))));
+            }
+            AdminProviderPoolKeyLookup::KeyName(key_name) => {
+                let cleared = crate::orchestration::clear_reasoning_replay_for_provider_key(
+                    state.app(),
+                    &key_id,
+                )
+                .await;
+                return Ok(Some(attach_admin_audit_response(
+                    Json(json!({
+                        "message": format!("已清除 Key {} 的推理回放缓存", key_name),
+                        "cleared": cleared,
+                    }))
+                    .into_response(),
+                    "admin_provider_reasoning_replay_cleared",
+                    "clear_provider_reasoning_replay",
                     "provider_key",
                     &key_id,
                 )));

@@ -346,6 +346,35 @@
                         </div>
                       </div>
                     </div>
+                    <!-- Claude Code 共享限流窗口（5h / 7d，被动采集自响应头） -->
+                    <div
+                      v-if="provider.provider_type === 'claude_code' && hasClaudeCodeQuotaDisplayData(key)"
+                      class="mt-2 p-2 bg-muted/30 rounded-md"
+                      data-testid="claude-code-quota-windows"
+                    >
+                      <ProviderQuotaSectionHeader
+                        :title="legacyT('限流窗口')"
+                        :loading="refreshingQuota"
+                        :updated-text="getClaudeCodeQuotaUpdatedAt(key) ? formatUpdatedAt(getClaudeCodeQuotaUpdatedAt(key) || 0) : null"
+                        refreshable
+                        :refresh-title="legacyT('重新物化最近一次响应头采集的窗口（不发上游请求）')"
+                        @refresh="handleManualQuotaRefresh(key)"
+                      />
+                      <div class="grid gap-3 grid-cols-2">
+                        <ProviderQuotaProgressRow
+                          v-for="window in getClaudeCodeQuotaWindows(key)"
+                          :key="window.code"
+                          :label="legacyT(getClaudeCodeWindowLabel(window))"
+                          :used-percent="getQuotaWindowUsedPercent(window) ?? 0"
+                          :remaining-percent="getQuotaWindowRemainingPercent(window) ?? 0"
+                          :meter-class="getQuotaRemainingClass(getQuotaWindowUsedPercent(window) ?? 0)"
+                          :bar-class="getQuotaRemainingBarColor(getQuotaWindowUsedPercent(window) ?? 0)"
+                          :title="window.is_exhausted ? legacyT('该窗口已拒绝请求') : null"
+                          :reset-text="getClaudeCodeWindowResetText(window, key)"
+                          :footer-class="window.is_exhausted ? 'text-red-600 dark:text-red-400' : ''"
+                        />
+                      </div>
+                    </div>
                     <!-- Antigravity 上游额度摘要（按家族分组展示关键配额） -->
                     <div
                       v-if="provider.provider_type === 'antigravity' && (hasAntigravityQuotaDisplayData(key) || isAntigravityForbiddenKey(key))"
@@ -876,6 +905,7 @@
     v-if="open && oauthKeyEditDialogOpen"
     :open="oauthKeyEditDialogOpen"
     :editing-key="editingKey"
+    :provider-type="provider?.provider_type ?? null"
     @close="oauthKeyEditDialogOpen = false"
     @saved="handleKeyChanged"
   />
@@ -2091,6 +2121,57 @@ function getCodexPrimaryQuotaLabel(key: EndpointAPIKey): string {
     label: '周',
     window_minutes: getCodexQuotaDisplay(key)?.primary_window_minutes,
   }) || '周限额'
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code：5h / 7d 共享限流窗口（P2.7）。数据来自 status_snapshot.quota.windows，
+// 由 P1 从 anthropic-ratelimit-unified-* 响应头被动采集。
+// ---------------------------------------------------------------------------
+function getClaudeCodeQuotaWindows(key: EndpointAPIKey): QuotaWindowSnapshot[] {
+  const quota = key.status_snapshot?.quota
+  if (!quota) return []
+  const providerType = String(quota.provider_type ?? '').trim().toLowerCase()
+  if (providerType && providerType !== 'claude_code') return []
+  const windows = Array.isArray(quota.windows) ? quota.windows : []
+  const order = ['5h', '7d', '7d_oi']
+  return windows
+    .filter(window => order.includes(String(window?.code ?? '')))
+    .sort((a, b) => order.indexOf(String(a.code)) - order.indexOf(String(b.code)))
+}
+
+function hasClaudeCodeQuotaDisplayData(key: EndpointAPIKey): boolean {
+  return getClaudeCodeQuotaWindows(key).length > 0
+}
+
+function getClaudeCodeQuotaUpdatedAt(key: EndpointAPIKey): number | undefined {
+  const quotaUpdatedAt = getQuotaSnapshotUpdatedAt(key.status_snapshot?.quota)
+  if (typeof quotaUpdatedAt === 'number') return quotaUpdatedAt
+  const updatedAt = Number(
+    (key.upstream_metadata as Record<string, unknown> | undefined)?.claude_code
+      && ((key.upstream_metadata as Record<string, Record<string, unknown>>).claude_code.updated_at ?? NaN),
+  )
+  return Number.isFinite(updatedAt) ? updatedAt : undefined
+}
+
+function getClaudeCodeWindowLabel(window: QuotaWindowSnapshot): string {
+  switch (String(window.code ?? '')) {
+    case '5h': return '5 小时窗口'
+    case '7d': return '7 天窗口'
+    case '7d_oi': return '7 天窗口（Fable）'
+    default: return String(window.label ?? window.code ?? '')
+  }
+}
+
+function getClaudeCodeWindowResetText(window: QuotaWindowSnapshot, key: EndpointAPIKey): string | null {
+  const resetAt = getQuotaWindowResetAt(window)
+  const resetSeconds = getQuotaWindowResetSeconds(window)
+  if (!resetAt && !resetSeconds) return null
+  return getResetCountdownText(
+    resetAt,
+    resetSeconds,
+    getClaudeCodeQuotaUpdatedAt(key),
+    getQuotaWindowUsedPercent(window),
+  )
 }
 
 function hasCodexQuotaDisplayData(key: EndpointAPIKey): boolean {

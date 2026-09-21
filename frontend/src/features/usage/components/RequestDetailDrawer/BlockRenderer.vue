@@ -9,7 +9,7 @@
         v-if="block.type === 'text'"
         class="m-0 text-sm leading-relaxed whitespace-pre-wrap break-words"
         :class="block.className"
-      >{{ block.content }}</pre>
+      ><ZeroWidthText :text="block.content" /></pre>
 
       <!-- 可折叠块 -->
       <details
@@ -41,7 +41,7 @@
         <pre
           class="m-0 p-3 font-mono text-xs max-h-[300px] overflow-auto whitespace-pre-wrap break-words"
           :style="block.maxHeight ? { maxHeight: `${block.maxHeight}px` } : {}"
-        >{{ block.code }}</pre>
+        ><ZeroWidthText :text="block.code" /></pre>
       </div>
 
       <!-- 徽章块 -->
@@ -144,7 +144,7 @@
             class="font-mono text-xs opacity-60"
           >{{ block.toolId }}</span>
         </div>
-        <pre class="m-0 p-3 bg-muted/50 font-mono text-xs max-h-[200px] overflow-y-auto whitespace-pre-wrap break-words">{{ block.input }}</pre>
+        <pre class="m-0 p-3 bg-muted/50 font-mono text-xs max-h-[200px] overflow-y-auto whitespace-pre-wrap break-words"><ZeroWidthText :text="block.input" /></pre>
       </div>
 
       <!-- 工具结果块 -->
@@ -163,7 +163,7 @@
             错误
           </Badge>
         </div>
-        <pre class="m-0 p-3 bg-muted/50 font-mono text-xs max-h-[200px] overflow-y-auto whitespace-pre-wrap break-words">{{ block.content }}</pre>
+        <pre class="m-0 p-3 bg-muted/50 font-mono text-xs max-h-[200px] overflow-y-auto whitespace-pre-wrap break-words"><ZeroWidthText :text="block.content" /></pre>
       </div>
 
       <!-- 分隔符块 -->
@@ -178,7 +178,7 @@
         class="flex gap-2 text-sm"
       >
         <span class="text-muted-foreground">{{ block.label }}:</span>
-        <span :class="block.mono ? 'font-mono' : ''">{{ block.value }}</span>
+        <span :class="block.mono ? 'font-mono' : ''"><ZeroWidthText :text="block.value" /></span>
       </div>
     </template>
   </div>
@@ -187,6 +187,7 @@
 <script setup lang="ts">
 import { User, Bot, Settings, Wrench, AlertCircle, ChevronRight, FileText, Image as ImageIcon } from 'lucide-vue-next'
 import Badge from '@/components/ui/badge.vue'
+import ZeroWidthText from './ZeroWidthText.vue'
 import type { RenderBlock } from '../../conversation'
 
 defineProps<{

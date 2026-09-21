@@ -33,6 +33,20 @@ pub(crate) fn admin_clear_oauth_invalid_key_id(request_path: &str) -> Option<Str
         .map(ToOwned::to_owned)
 }
 
+pub(crate) fn admin_reset_claude_code_device_key_id(request_path: &str) -> Option<String> {
+    request_path
+        .strip_prefix("/api/admin/endpoints/keys/")?
+        .strip_suffix("/reset-claude-code-device")
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn admin_tls_probe_key_id(request_path: &str) -> Option<String> {
+    request_path
+        .strip_prefix("/api/admin/endpoints/keys/")?
+        .strip_suffix("/tls-probe")
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn admin_reset_cycle_stats_key_id(request_path: &str) -> Option<String> {
     request_path
         .strip_prefix("/api/admin/endpoints/keys/")?

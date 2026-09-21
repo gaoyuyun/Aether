@@ -190,8 +190,7 @@ export const useAuthStore = defineStore('auth', () => {
 
     fetchCurrentUserToken = requestToken
     const requestAuthStateVersion = authStateVersion
-    let request!: Promise<User | null>
-    request = (async () => {
+    const request: Promise<User | null> = (async () => {
       try {
         const userInfo = await authApi.getCurrentUser()
         if (requestAuthStateVersion !== authStateVersion || !token.value) {
@@ -221,10 +220,10 @@ export const useAuthStore = defineStore('auth', () => {
         return null
       }
     })().finally(() => {
-        if (fetchCurrentUserPromise === request) {
-          fetchCurrentUserPromise = null
-          fetchCurrentUserToken = null
-        }
+      if (fetchCurrentUserPromise === request) {
+        fetchCurrentUserPromise = null
+        fetchCurrentUserToken = null
+      }
     })
 
     fetchCurrentUserPromise = request

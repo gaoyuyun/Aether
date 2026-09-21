@@ -20,6 +20,12 @@ pub(crate) fn admin_provider_reset_pool_cost_parts(request_path: &str) -> Option
     admin_provider_pool_key_route_parts(request_path, "/pool/reset-cost/")
 }
 
+pub(crate) fn admin_provider_clear_reasoning_replay_parts(
+    request_path: &str,
+) -> Option<(String, String)> {
+    admin_provider_pool_key_route_parts(request_path, "/pool/clear-reasoning-replay/")
+}
+
 pub(crate) fn admin_provider_delete_task_parts(request_path: &str) -> Option<(String, String)> {
     let raw = request_path.strip_prefix("/api/admin/providers/")?;
     let (provider_id, task_id) = raw.split_once("/delete-task/")?;

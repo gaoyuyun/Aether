@@ -516,9 +516,10 @@ fn build_admin_usage_records_query(
 fn parse_admin_usage_search_keywords(search: &str) -> Vec<String> {
     search
         .split_whitespace()
-        .map(str::trim)
+        // 关键词里的零宽空格（敏感词混淆产物）在进 SQL LIKE 之前剥掉，按原词搜索。
+        .map(aether_admin::observability::usage::admin_usage_strip_zero_width)
+        .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
         .collect()
 }
 
@@ -1030,6 +1031,14 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn admin_usage_search_keywords_drop_zero_width_characters() {
+        assert_eq!(
+            parse_admin_usage_search_keywords("P\u{200B}roxy  \u{200B} model"),
+            vec!["proxy".to_string(), "model".to_string()]
+        );
+    }
+
+    #[test]
     fn admin_usage_transport_statuses_are_disjoint_in_list_and_keyword_queries() {
         for status in ["websocket", "ws", "WS"] {
             let raw_query = format!("status={status}");
@@ -1125,7 +1134,8 @@ mod tests {
     }
     use super::{
         build_admin_usage_keyword_search_query, build_admin_usage_records_query,
-        latest_admin_usage_image_progress, AdminUsageSearchContext,
+        latest_admin_usage_image_progress, parse_admin_usage_search_keywords,
+        AdminUsageSearchContext,
     };
 
     fn sample_candidate(

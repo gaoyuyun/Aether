@@ -53,6 +53,7 @@ use super::super::{control::GatewayControlDecision, error::GatewayError};
 use super::super::{provider_transport, usage};
 
 use crate::maintenance::spawn_account_self_check_worker;
+use crate::maintenance::spawn_antigravity_client_version_refresh_worker;
 use crate::maintenance::spawn_audit_cleanup_worker;
 use crate::maintenance::spawn_db_maintenance_worker;
 use crate::maintenance::spawn_fixed_provider_reconciliation_task;
@@ -2303,6 +2304,10 @@ impl AppState {
         supervise_worker(
             crate::task_runtime::TASK_KEY_PRESET_CATALOG_REFRESH_WORKER,
             spawn_preset_catalog_refresh_worker(background_state.clone()),
+        );
+        supervise_worker(
+            crate::task_runtime::TASK_KEY_ANTIGRAVITY_CLIENT_VERSION_REFRESH_WORKER,
+            spawn_antigravity_client_version_refresh_worker(background_state.clone()),
         );
         supervise_worker(
             crate::task_runtime::TASK_KEY_VIDEO_TASK_POLLER,

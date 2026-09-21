@@ -1006,6 +1006,7 @@ fn oauth_error_code(error: &OAuthError) -> &'static str {
             "provider_unavailable"
         }
         OAuthError::HttpStatus { .. }
+        | OAuthError::RateLimited { .. }
         | OAuthError::InvalidResponse(_)
         | OAuthError::Transport(_) => "token_exchange_failed",
         OAuthError::Storage(_) | OAuthError::EncryptionUnavailable => "provider_unavailable",

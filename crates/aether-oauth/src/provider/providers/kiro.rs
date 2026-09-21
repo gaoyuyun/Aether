@@ -777,6 +777,7 @@ mod tests {
             *self.seen_request.lock().expect("mutex should lock") = Some(request);
             Ok(OAuthHttpResponse {
                 status_code: 200,
+                retry_after_secs: None,
                 body_text: self.response.to_string(),
                 json_body: Some(self.response.clone()),
             })

@@ -549,8 +549,8 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_request_metadata_drops_tls_fingerprint() {
-        assert!(sanitize_usage_request_metadata(Some(json!({
+    fn sanitizes_request_metadata_drops_incoming_tls_fingerprint_and_keeps_validated_outgoing() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
             "tls_fingerprint": {
                 "incoming": {
                     "source": "forwarded_header",
@@ -565,6 +565,20 @@ mod tests {
             },
             "untrusted_tls_fingerprint": {
                 "ja3": "spoofed"
+            }
+        })))
+        .expect("validated outgoing record should survive");
+        assert!(metadata.get("untrusted_tls_fingerprint").is_none());
+        let tls = &metadata["tls_fingerprint"];
+        assert!(tls.get("incoming").is_none());
+        assert_eq!(tls["outgoing"]["backend"], "reqwest_rustls");
+        assert_eq!(tls["outgoing"]["observed"], false);
+
+        // 只有 incoming 或来源不可信时整个字段被丢弃。
+        assert!(sanitize_usage_request_metadata(Some(json!({
+            "tls_fingerprint": {
+                "incoming": {"source": "forwarded_header", "ja3": "incoming-ja3"},
+                "outgoing": {"source": "client_supplied", "backend": "reqwest_rustls", "observed": false}
             }
         })))
         .is_none());

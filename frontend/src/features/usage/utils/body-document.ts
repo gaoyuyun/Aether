@@ -71,8 +71,8 @@ export class BodyDocument {
     return this.request({ action: 'conversation', options })
   }
 
-  copy(conversation?: BodyConversationOptions): Promise<string> {
-    return this.request({ action: 'copy', conversation })
+  copy(conversation?: BodyConversationOptions, options: { stripZeroWidth?: boolean } = {}): Promise<string> {
+    return this.request({ action: 'copy', conversation, stripZeroWidth: options.stripZeroWidth })
   }
 
   dispose(error: Error = new DOMException('Aborted', 'AbortError')) {

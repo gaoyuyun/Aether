@@ -44,7 +44,7 @@ export type BodyWorkerCommand =
   | { action: 'load', bytes: ArrayBuffer, encoding: BodyEncoding }
   | { action: 'json', options: BodyJsonOptions }
   | { action: 'conversation', options: BodyConversationOptions }
-  | { action: 'copy', conversation?: BodyConversationOptions }
+  | { action: 'copy', conversation?: BodyConversationOptions, stripZeroWidth?: boolean }
 
 export type BodyWorkerResult = BodyDocumentSummary | BodyJsonPage | BodyConversationPage | string
 export type BodyWorkerRequest = BodyWorkerCommand & { id: number }

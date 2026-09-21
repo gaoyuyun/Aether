@@ -116,8 +116,10 @@ crypto_box = { version = "0.9", features = ["seal"] }
 ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 flate2 = "1"
 futures-util = "0.3"
+getrandom = "0.3"
 hmac = "0.12"
 http = "1"
+httpdate = "1"
 object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 percent-encoding = "2"
@@ -142,6 +144,7 @@ uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
 webpki-roots = "0.26"
 wreq = { version = "6.0.0-rc.28", default-features = false, features = ["json", "stream", "socks", "webpki-roots", "ws"] }
 wreq-util = "3.0.0-rc.10"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 url = "2"
 zstd = "0.13"
 

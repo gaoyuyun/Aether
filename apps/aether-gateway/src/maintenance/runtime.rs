@@ -8,6 +8,8 @@ use crate::{AppState, GatewayError};
 
 #[path = "runtime/account_self_check.rs"]
 mod account_self_check;
+#[path = "runtime/antigravity_client_version.rs"]
+mod antigravity_client_version;
 #[path = "runtime/audit_cleanup.rs"]
 mod audit_cleanup;
 #[path = "runtime/cleanup_runs.rs"]
@@ -66,6 +68,10 @@ pub(crate) use account_self_check::{
 };
 pub(crate) use aether_data_contracts::repository::usage::{
     UsageCleanupSummary, UsageCleanupWindow,
+};
+pub(crate) use antigravity_client_version::{
+    perform_antigravity_client_version_refresh_once,
+    spawn_antigravity_client_version_refresh_worker,
 };
 use audit_cleanup::*;
 pub(crate) use cleanup_runs::{

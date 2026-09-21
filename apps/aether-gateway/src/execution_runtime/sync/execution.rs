@@ -1951,6 +1951,14 @@ async fn apply_sync_success_effects(
         )
         .await;
     }
+    crate::orchestration::capture_reasoning_replay_from_sync_response(
+        state,
+        plan,
+        report_context,
+        payload.body_json.as_ref(),
+        payload.body_base64.as_deref(),
+    )
+    .await;
     apply_local_execution_effect(
         state,
         LocalExecutionEffectContext {
@@ -2089,6 +2097,8 @@ async fn execute_execution_runtime_sync_impl(
     }
 
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
+    crate::orchestration::apply_reasoning_replay_to_plan(state, &mut plan, &mut report_context)
+        .await;
     let plan_request_id = plan.request_id.clone();
     let plan_request_id_for_log = short_request_id(plan_request_id.as_str());
     let plan_candidate_id = plan.candidate_id.clone();
@@ -2879,6 +2889,14 @@ async fn execute_execution_runtime_sync_impl(
         &provider_response_observation.request_order_id,
     );
     if result.status_code >= 400 {
+        crate::orchestration::clear_reasoning_replay_on_invalid_signature(
+            state,
+            &plan,
+            report_context.as_ref(),
+            result.status_code,
+            local_failover_response_text.as_deref(),
+        )
+        .await;
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {

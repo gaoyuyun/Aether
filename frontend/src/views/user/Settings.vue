@@ -677,7 +677,6 @@ import { meApi, type Profile } from '@/api/me'
 import { type UserSession, formatSessionMeta } from '@/types/session'
 import { authApi } from '@/api/auth'
 import { oauthApi, type OAuthLinkInfo, type OAuthProviderInfo } from '@/api/oauth'
-import { getClientDeviceId } from '@/utils/deviceId'
 import { getOAuthIcon, getOAuthIconUrl } from '@/utils/oauth-icons'
 import { useDarkMode, type ThemeMode } from '@/composables/useDarkMode'
 import {

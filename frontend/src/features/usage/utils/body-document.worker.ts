@@ -19,7 +19,7 @@ scope.onmessage = async ({ data: request }) => {
       switch (request.action) {
         case 'json': result = document.json(request.options); break
         case 'conversation': result = document.conversationPage(request.options); break
-        case 'copy': result = document.copy(request.conversation); break
+        case 'copy': result = document.copy(request.conversation, { stripZeroWidth: request.stripZeroWidth }); break
       }
     }
     scope.postMessage({ id: request.id, ok: true, result })

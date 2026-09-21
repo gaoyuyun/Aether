@@ -14,7 +14,8 @@ pub use request::{
     GeminiCliRequestEnvelopeSupport, GeminiCliRequestEnvelopeUnsupportedReason,
 };
 pub use url::{
-    build_gemini_cli_v1internal_url, GeminiCliRequestUrlAction,
+    build_gemini_cli_client_metadata, build_gemini_cli_v1internal_url, GeminiCliRequestUrlAction,
+    GEMINI_CLI_IDE_TYPE, GEMINI_CLI_PLATFORM, GEMINI_CLI_PLUGIN_TYPE,
     GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT,
     GEMINI_CLI_V1INTERNAL_PATH_TEMPLATE,
 };

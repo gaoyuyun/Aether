@@ -5,7 +5,8 @@ use crate::ai_serving::build_request_trace_proxy_value;
 use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision_with_websocket_mode;
 use crate::ai_serving::planner::report_context::{
     build_local_execution_report_context, insert_native_client_envelope_name,
-    insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
+    insert_provider_stream_event_api_format, insert_sensitive_words_obfuscation_report,
+    LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
 use crate::ai_serving::planner::{
@@ -127,6 +128,10 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         extra_fields.insert("envelope_name".to_string(), json!(envelope_name));
         insert_native_client_envelope_name(&mut extra_fields, envelope_name, parts.uri.path());
     }
+    insert_sensitive_words_obfuscation_report(
+        &mut extra_fields,
+        resolved.sensitive_words_obfuscation.as_ref(),
+    );
     if let Some(image_request_summary) = resolved.image_request_summary.as_ref() {
         extra_fields.insert("image_request".to_string(), image_request_summary.clone());
     }
@@ -251,6 +256,7 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         transport_profile: _,
         image_request_summary: _,
         request_redacted: _,
+        sensitive_words_obfuscation: _,
     } = resolved;
     let request_encoding = resolve_transport_request_encoding_policy(&transport);
 

@@ -1,17 +1,29 @@
 use aether_contracts::{
-    ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile, TRANSPORT_BACKEND_REQWEST_RUSTLS,
-    TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY,
+    ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile, TRANSPORT_BACKEND_BROWSER_WREQ,
+    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY,
 };
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 use tracing::warn;
 
-use crate::claude_code::current_claude_code_transport_identity_profile;
+use crate::claude_code::{
+    current_claude_code_transport_identity_profile,
+    oauth_control_plane_tls_profile_for_provider_type, resolve_claude_code_tls_emulation_spec,
+    selectable_tls_emulation_profiles_for_provider_type, CHATGPT_COM_CHROME_BROWSER_PROFILE,
+    CHATGPT_COM_CHROME_TLS_PROFILE,
+};
 use crate::grok::grok_browser_resolved_transport_profile_from_auth_config;
 
 use super::snapshot::GatewayProviderTransportSnapshot;
 
 const TUNNEL_BASE_URL_EXTRA_KEY: &str = "tunnel_base_url";
+/// `ResolvedTransportProfile.extra` 里内置 TLS 仿真 profile 的 id（P5）。
+pub const TRANSPORT_EMULATION_PROFILE_EXTRA_KEY: &str = "emulation_profile";
+/// `ResolvedTransportProfile.extra` 里附带的探针摘要（来自 Key `upstream_metadata.tls_probe`，
+/// 只在探针记录的 profile 与当前 profile 一致时附带）。
+pub const TRANSPORT_TLS_PROBE_EXTRA_KEY: &str = "tls_probe";
+/// Key `upstream_metadata` 里探针结果的命名空间。
+pub const TLS_PROBE_UPSTREAM_METADATA_NAMESPACE: &str = "tls_probe";
 const TUNNEL_OWNER_INSTANCE_ID_EXTRA_KEY: &str = "tunnel_owner_instance_id";
 const TUNNEL_OWNER_OBSERVED_AT_EXTRA_KEY: &str = "tunnel_owner_observed_at_unix_secs";
 const DEFAULT_PROVIDER_STREAM_FIRST_BYTE_TIMEOUT_SECS: f64 = 30.0;
@@ -132,16 +144,20 @@ pub fn transport_proxy_is_locally_supported(transport: &GatewayProviderTransport
         return true;
     }
 
-    snapshot
+    let has_proxy_url = snapshot
         .url
         .as_deref()
         .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-        || snapshot
-            .node_id
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
+        .is_some_and(|value| !value.is_empty());
+    let has_node_id = snapshot
+        .node_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    // Nodes validate their own backend support when receiving the profile.
+    // Keep the configured route available so an unsupported backend is reported
+    // by that node without dropping the profile or bypassing the tunnel.
+    has_proxy_url || has_node_id
 }
 
 pub fn resolve_transport_profile_id(
@@ -153,16 +169,250 @@ pub fn resolve_transport_profile_id(
 pub fn resolve_transport_profile(
     transport: &GatewayProviderTransportSnapshot,
 ) -> Option<ResolvedTransportProfile> {
-    let configured = resolve_transport_profile_from_fingerprint(transport.key.fingerprint.as_ref())
-        .or_else(|| {
-            resolve_transport_profile_from_provider_config(transport.provider.config.as_ref())
-        });
+    let configured = resolve_configured_transport_profile(
+        &transport.provider.provider_type,
+        transport.provider.config.as_ref(),
+        transport.key.fingerprint.as_ref(),
+    );
     if configured.is_some() || transport_profile_is_configured(transport) {
-        return configured;
+        return configured.map(|profile| {
+            attach_tls_probe_summary(profile, transport.key.upstream_metadata.as_ref())
+        });
     }
 
     resolve_claude_code_transport_profile(transport)
         .or_else(|| resolve_grok_browser_transport_profile(transport))
+}
+
+/// 供应商 / Key 显式选择的 TLS 仿真 profile id（只认内置的三个；未配置或配置为其它
+/// 字符串时返回 `None`）。
+pub fn configured_tls_emulation_profile_id(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<&'static str> {
+    resolve_transport_profile(transport).and_then(|profile| {
+        transport_profile_emulation_id(&profile)
+            .and_then(|id| resolve_claude_code_tls_emulation_spec(&id))
+            .map(|spec| spec.id)
+    })
+}
+
+/// 从 `fingerprint` 对象（供应商 `config.fingerprint` 或 Key `fingerprint`）里取
+/// `transport_profile` 的 id：字符串形态或 `{profile_id}` / `{id}` 对象形态。
+pub fn configured_transport_profile_id_from_fingerprint(
+    fingerprint: Option<&Value>,
+) -> Option<String> {
+    let value = fingerprint?.get("transport_profile")?;
+    value
+        .as_str()
+        .or_else(|| {
+            value
+                .get("profile_id")
+                .or_else(|| value.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// 管理端展示用的探针摘要（只读）：只从 `upstream_metadata.tls_probe` 取字符串 / 数值 /
+/// 头名数组字段，`observed != true` 时返回 `None`。
+pub fn tls_probe_summary_from_upstream_metadata(
+    upstream_metadata: Option<&Value>,
+) -> Option<Value> {
+    let probe = upstream_metadata?
+        .get(TLS_PROBE_UPSTREAM_METADATA_NAMESPACE)?
+        .as_object()?;
+    if probe.get("observed").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let mut summary = Map::new();
+    for key in [
+        "probe_url",
+        "emulation_profile",
+        "profile_id",
+        "backend",
+        "tls_stack",
+        "http_version",
+        "ja3",
+        "ja3_hash",
+        "ja4",
+        "peetprint",
+        "akamai_fingerprint",
+        "tls_version_negotiated",
+    ] {
+        if let Some(value) = probe.get(key) {
+            if value.is_string() || value.is_null() {
+                summary.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    if let Some(value) = probe.get("probed_at_unix_secs").and_then(Value::as_u64) {
+        summary.insert("probed_at_unix_secs".to_string(), json!(value));
+    }
+    if let Some(value) = probe.get("http1_header_order").and_then(Value::as_array) {
+        summary.insert(
+            "http1_header_order".to_string(),
+            Value::Array(
+                value
+                    .iter()
+                    .filter(|item| item.is_string())
+                    .cloned()
+                    .collect(),
+            ),
+        );
+    }
+    summary.insert("observed".to_string(), Value::Bool(true));
+    Some(Value::Object(summary))
+}
+
+/// 从已解析的 profile 取内置仿真 id（`extra.emulation_profile`）。
+pub fn transport_profile_emulation_id(profile: &ResolvedTransportProfile) -> Option<String> {
+    profile
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get(TRANSPORT_EMULATION_PROFILE_EXTRA_KEY))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// OAuth 控制面（token 交换 / 刷新 / profile / roles）使用的传输 profile：只有当该 Key /
+/// 供应商显式选择了 TLS 仿真 profile 时，才按供应商类型换成对应的控制面 profile
+/// （claude_code → `claude_code_oauth_control_plane`，codex → `chatgpt_com_chrome`）；
+/// 否则返回 `None`，保持 reqwest 默认行为。
+pub fn resolve_oauth_control_plane_transport_profile(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<ResolvedTransportProfile> {
+    configured_tls_emulation_profile_id(transport)?;
+    resolve_oauth_control_plane_transport_profile_for_provider_type(
+        &transport.provider.provider_type,
+    )
+}
+
+/// 与 [`resolve_oauth_control_plane_transport_profile`] 相同，但输入是原始配置（供 OAuth
+/// 交换阶段还没有 Key 快照时使用）：`provider_config.fingerprint.transport_profile` 或
+/// `key_fingerprint.transport_profile` 选了仿真 profile 才启用。
+pub fn resolve_oauth_control_plane_transport_profile_from_configs(
+    provider_type: &str,
+    provider_config: Option<&Value>,
+    key_fingerprint: Option<&Value>,
+) -> Option<ResolvedTransportProfile> {
+    let configured =
+        resolve_configured_transport_profile(provider_type, provider_config, key_fingerprint)?;
+    transport_profile_emulation_id(&configured)
+        .and_then(|id| resolve_claude_code_tls_emulation_spec(&id))?;
+    resolve_oauth_control_plane_transport_profile_for_provider_type(provider_type)
+}
+
+fn resolve_oauth_control_plane_transport_profile_for_provider_type(
+    provider_type: &str,
+) -> Option<ResolvedTransportProfile> {
+    let profile_id = oauth_control_plane_tls_profile_for_provider_type(provider_type)?;
+    builtin_tls_emulation_transport_profile(profile_id)
+}
+
+fn resolve_configured_transport_profile(
+    provider_type: &str,
+    provider_config: Option<&Value>,
+    key_fingerprint: Option<&Value>,
+) -> Option<ResolvedTransportProfile> {
+    let profile = resolve_transport_profile_from_fingerprint(key_fingerprint)
+        .or_else(|| resolve_transport_profile_from_provider_config(provider_config))?;
+    if let Some(spec) = transport_profile_emulation_id(&profile)
+        .and_then(|id| resolve_claude_code_tls_emulation_spec(&id))
+    {
+        if !selectable_tls_emulation_profiles_for_provider_type(provider_type).contains(&spec.id) {
+            return None;
+        }
+    }
+    Some(profile)
+}
+
+/// 内置 TLS 仿真 profile → `ResolvedTransportProfile`（backend=browser_wreq）。
+pub fn builtin_tls_emulation_transport_profile(
+    profile_id: &str,
+) -> Option<ResolvedTransportProfile> {
+    let spec = resolve_claude_code_tls_emulation_spec(profile_id)?;
+    let mut extra = Map::new();
+    extra.insert(
+        TRANSPORT_EMULATION_PROFILE_EXTRA_KEY.to_string(),
+        Value::String(spec.id.to_string()),
+    );
+    if spec.id == CHATGPT_COM_CHROME_TLS_PROFILE {
+        extra.insert(
+            "browser_profile".to_string(),
+            Value::String(CHATGPT_COM_CHROME_BROWSER_PROFILE.to_string()),
+        );
+    }
+    Some(ResolvedTransportProfile {
+        profile_id: spec.id.to_string(),
+        backend: TRANSPORT_BACKEND_BROWSER_WREQ.to_string(),
+        http_mode: spec.http_mode.to_string(),
+        pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
+        header_fingerprint: None,
+        extra: Some(Value::Object(extra)),
+    })
+}
+
+/// 探针结果只在其记录的 `emulation_profile` 与当前 profile 一致时才随 profile 下发，
+/// 避免换了 profile 之后旧的 JA3/JA4 被当成当前指纹。
+fn attach_tls_probe_summary(
+    mut profile: ResolvedTransportProfile,
+    upstream_metadata: Option<&Value>,
+) -> ResolvedTransportProfile {
+    let Some(emulation_id) = transport_profile_emulation_id(&profile) else {
+        return profile;
+    };
+    let Some(probe) = upstream_metadata
+        .and_then(|metadata| metadata.get(TLS_PROBE_UPSTREAM_METADATA_NAMESPACE))
+        .and_then(Value::as_object)
+    else {
+        return profile;
+    };
+    if probe.get("observed").and_then(Value::as_bool) != Some(true) {
+        return profile;
+    }
+    let probe_profile = probe
+        .get(TRANSPORT_EMULATION_PROFILE_EXTRA_KEY)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !probe_profile.eq_ignore_ascii_case(&emulation_id) {
+        return profile;
+    }
+    let mut summary = Map::new();
+    for key in [
+        "ja3",
+        "ja3_hash",
+        "ja4",
+        "peetprint",
+        "akamai_fingerprint",
+        "http_version",
+        "probe_url",
+    ] {
+        if let Some(value) = probe.get(key).and_then(Value::as_str) {
+            summary.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+    if let Some(value) = probe.get("probed_at_unix_secs").and_then(Value::as_u64) {
+        summary.insert("probed_at_unix_secs".to_string(), json!(value));
+    }
+    if summary.is_empty() {
+        return profile;
+    }
+    let mut extra = profile
+        .extra
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    extra.insert(
+        TRANSPORT_TLS_PROBE_EXTRA_KEY.to_string(),
+        Value::Object(summary),
+    );
+    profile.extra = Some(Value::Object(extra));
+    profile
 }
 
 fn resolve_claude_code_transport_profile(
@@ -255,6 +505,9 @@ fn parse_transport_profile_value(value: &Value) -> Option<ResolvedTransportProfi
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        if let Some(builtin) = builtin_tls_emulation_transport_profile(profile_id) {
+            return Some(builtin);
+        }
         return Some(ResolvedTransportProfile {
             profile_id: profile_id.to_string(),
             backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.to_string(),
@@ -270,6 +523,9 @@ fn parse_transport_profile_value(value: &Value) -> Option<ResolvedTransportProfi
         .or_else(|| json_string_field(object, "id"))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())?;
+    if let Some(builtin) = builtin_tls_emulation_transport_profile(&profile_id) {
+        return Some(builtin);
+    }
     let backend = json_string_field(object, "backend")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -412,13 +668,18 @@ mod tests {
         GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
     };
     use super::{
+        configured_tls_emulation_profile_id, resolve_oauth_control_plane_transport_profile,
+        resolve_oauth_control_plane_transport_profile_from_configs,
         resolve_transport_execution_timeouts, resolve_transport_profile,
         resolve_transport_profile_id, resolve_transport_proxy_snapshot,
         resolve_transport_proxy_snapshot_with_tunnel_affinity, transport_profile_is_configured,
         transport_proxy_is_locally_supported, TransportTunnelAffinityLookup,
         TransportTunnelAttachmentOwner,
     };
-    use aether_contracts::TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE;
+    use aether_contracts::{
+        TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE,
+        TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+    };
 
     #[derive(Default)]
     struct TestTunnelAffinityLookup {
@@ -1013,5 +1274,339 @@ mod tests {
         );
 
         assert!(resolve_transport_profile(&transport).is_none());
+    }
+
+    #[test]
+    fn unconfigured_claude_code_transport_profile_is_byte_identical_to_legacy_default() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "claude_code".to_string();
+        transport.key.fingerprint = None;
+        transport.provider.config = Some(json!({"cloak": {"mode": "auto"}}));
+
+        let profile = resolve_transport_profile(&transport).expect("typed Claude Code profile");
+        let expected = aether_contracts::ResolvedTransportProfile {
+            profile_id: "claude_code_nodejs".to_string(),
+            backend: "reqwest_rustls".to_string(),
+            http_mode: "auto".to_string(),
+            pool_scope: "key".to_string(),
+            header_fingerprint: None,
+            extra: None,
+        };
+        assert_eq!(profile, expected);
+        assert_eq!(
+            serde_json::to_string(&profile).expect("profile should serialize"),
+            serde_json::to_string(&expected).expect("expected should serialize")
+        );
+        assert_eq!(configured_tls_emulation_profile_id(&transport), None);
+        assert!(resolve_oauth_control_plane_transport_profile(&transport).is_none());
+    }
+
+    #[test]
+    fn builtin_tls_emulation_profile_switches_backend_to_browser_wreq() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "claude_code".to_string();
+        transport.provider.config = None;
+        transport.key.fingerprint = Some(json!({"transport_profile": "claude_code_node_openssl"}));
+
+        let profile = resolve_transport_profile(&transport).expect("emulation profile");
+        assert_eq!(profile.profile_id, "claude_code_node_openssl");
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+        assert_eq!(profile.http_mode, TRANSPORT_HTTP_MODE_HTTP1_ONLY);
+        assert_eq!(profile.pool_scope, "key");
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("emulation_profile")),
+            Some(&json!("claude_code_node_openssl"))
+        );
+        assert!(profile
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("tls_probe"))
+            .is_none());
+        assert_eq!(
+            configured_tls_emulation_profile_id(&transport),
+            Some("claude_code_node_openssl")
+        );
+
+        // 供应商级配置、对象形态、大小写与连字符都能命中内置表。
+        transport.key.fingerprint = None;
+        transport.provider.config = Some(json!({
+            "fingerprint": {"transport_profile": {"profile_id": "Claude-Code-Node-OpenSSL"}}
+        }));
+        let profile = resolve_transport_profile(&transport).expect("provider emulation profile");
+        assert_eq!(profile.profile_id, "claude_code_node_openssl");
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+        assert_eq!(profile.http_mode, TRANSPORT_HTTP_MODE_HTTP1_ONLY);
+
+        transport.provider.config = Some(json!({
+            "fingerprint": {"transport_profile": "chatgpt_com_chrome"}
+        }));
+        let profile = resolve_transport_profile(&transport).expect("chrome emulation profile");
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("browser_profile")),
+            Some(&json!("chrome136"))
+        );
+    }
+
+    #[test]
+    fn configured_tls_profiles_obey_provider_scope_for_both_config_sources() {
+        for (provider_type, profile_id, supported) in [
+            ("claude_code", "Claude-Code-Node-OpenSSL", true),
+            ("claude_code", "chatgpt_com_chrome", true),
+            ("claude_code", "claude_code_oauth_control_plane", false),
+            ("codex", "chatgpt_com_chrome", true),
+            ("codex", "claude_code_node_openssl", false),
+            ("gemini_cli", "chatgpt_com_chrome", false),
+            ("antigravity", "claude_code_node_openssl", false),
+        ] {
+            for value in [json!(profile_id), json!({"profile_id": profile_id})] {
+                for on_key in [false, true] {
+                    let mut transport = sample_transport();
+                    transport.provider.provider_type = provider_type.into();
+                    transport.provider.config = (!on_key).then(|| {
+                        json!({
+                            "fingerprint": {"transport_profile": value}
+                        })
+                    });
+                    transport.key.fingerprint = on_key.then(|| json!({"transport_profile": value}));
+                    assert_eq!(
+                        resolve_transport_profile(&transport).is_some(),
+                        supported,
+                        "{provider_type}: {profile_id}, key={on_key}"
+                    );
+                    assert_eq!(
+                        resolve_oauth_control_plane_transport_profile(&transport).is_some(),
+                        supported
+                    );
+                    assert_eq!(
+                        resolve_oauth_control_plane_transport_profile_from_configs(
+                            provider_type,
+                            transport.provider.config.as_ref(),
+                            transport.key.fingerprint.as_ref(),
+                        )
+                        .is_some(),
+                        supported
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browser_tls_profiles_preserve_node_and_url_proxy_routes() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "claude_code".into();
+        transport.provider.proxy = None;
+        transport.provider.config = None;
+        transport.endpoint.proxy = None;
+        transport.key.fingerprint = Some(json!({"transport_profile": "claude_code_node_openssl"}));
+        for proxy in [
+            json!({"node_id": "node-1"}),
+            json!({"mode": "tunnel", "node_id": "node-1", "url": "http://proxy.example:8080"}),
+        ] {
+            transport.key.proxy = Some(proxy);
+            assert!(transport_proxy_is_locally_supported(&transport));
+            let profile = resolve_transport_profile(&transport).expect("inference profile");
+            assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+            assert_eq!(profile.profile_id, "claude_code_node_openssl");
+            let profile = resolve_oauth_control_plane_transport_profile(&transport)
+                .expect("OAuth profile must also survive a node route");
+            assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+            assert_eq!(profile.profile_id, "claude_code_oauth_control_plane");
+        }
+        for proxy in [
+            None,
+            Some(json!({"url": "http://proxy.example:8080"})),
+            Some(
+                json!({"mode": "manual", "node_id": "node-1", "url": "socks5h://proxy.example:1080"}),
+            ),
+        ] {
+            transport.key.proxy = proxy;
+            assert!(transport_proxy_is_locally_supported(&transport));
+        }
+        transport.key.fingerprint = None;
+        transport.key.proxy = Some(json!({"node_id": "node-1"}));
+        assert!(
+            transport_proxy_is_locally_supported(&transport),
+            "default rustls still supports nodes"
+        );
+    }
+
+    #[test]
+    fn unknown_transport_profile_strings_keep_reqwest_rustls_semantics() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "claude_code".to_string();
+        transport.provider.config = None;
+        transport.key.fingerprint = Some(json!({"transport_profile": "claude_code_nodejs"}));
+
+        let profile = resolve_transport_profile(&transport).expect("explicit profile");
+        assert_eq!(profile.profile_id, "claude_code_nodejs");
+        assert_eq!(profile.backend, "reqwest_rustls");
+        assert!(profile.extra.is_none());
+        assert_eq!(configured_tls_emulation_profile_id(&transport), None);
+        assert!(resolve_oauth_control_plane_transport_profile(&transport).is_none());
+    }
+
+    #[test]
+    fn oauth_control_plane_profile_follows_provider_type_only_when_emulation_is_configured() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "claude_code".to_string();
+        transport.provider.config = None;
+        transport.key.fingerprint = Some(json!({"transport_profile": "claude_code_node_openssl"}));
+        let profile = resolve_oauth_control_plane_transport_profile(&transport)
+            .expect("claude control plane profile");
+        assert_eq!(profile.profile_id, "claude_code_oauth_control_plane");
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+
+        transport.provider.provider_type = "codex".to_string();
+        transport.key.fingerprint = Some(json!({"transport_profile": "chatgpt_com_chrome"}));
+        let profile = resolve_oauth_control_plane_transport_profile(&transport)
+            .expect("codex control plane profile");
+        assert_eq!(profile.profile_id, "chatgpt_com_chrome");
+
+        transport.provider.provider_type = "gemini_cli".to_string();
+        assert!(resolve_oauth_control_plane_transport_profile(&transport).is_none());
+
+        assert!(resolve_oauth_control_plane_transport_profile_from_configs(
+            "claude_code",
+            None,
+            None
+        )
+        .is_none());
+        assert_eq!(
+            resolve_oauth_control_plane_transport_profile_from_configs(
+                "claude_code",
+                Some(&json!({"fingerprint": {"transport_profile": "claude_code_node_openssl"}})),
+                None,
+            )
+            .map(|profile| profile.profile_id),
+            Some("claude_code_oauth_control_plane".to_string())
+        );
+        assert!(resolve_oauth_control_plane_transport_profile_from_configs(
+            "claude_code",
+            Some(&json!({"fingerprint": {"transport_profile": "chrome_136"}})),
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn tls_probe_summary_is_attached_only_for_matching_emulation_profile() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "claude_code".to_string();
+        transport.provider.config = None;
+        transport.key.fingerprint = Some(json!({"transport_profile": "claude_code_node_openssl"}));
+        transport.key.upstream_metadata = Some(json!({
+            "tls_probe": {
+                "observed": true,
+                "emulation_profile": "claude_code_node_openssl",
+                "ja3": "771,4865-4866,0-23,29-23-24,0",
+                "ja3_hash": "0123456789abcdef0123456789abcdef",
+                "ja4": "t13d1716h1_5b57614c22b0_3d5db4fb5c1e",
+                "http_version": "h1",
+                "probe_url": "https://tls.peet.ws/api/all",
+                "probed_at_unix_secs": 1_760_000_000u64,
+                "secret": "must-not-leak"
+            }
+        }));
+
+        let profile = resolve_transport_profile(&transport).expect("emulation profile");
+        let probe = profile
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("tls_probe"))
+            .and_then(Value::as_object)
+            .expect("probe summary should be attached");
+        assert_eq!(
+            probe.get("ja3_hash"),
+            Some(&json!("0123456789abcdef0123456789abcdef"))
+        );
+        assert_eq!(
+            probe.get("ja4"),
+            Some(&json!("t13d1716h1_5b57614c22b0_3d5db4fb5c1e"))
+        );
+        assert_eq!(
+            probe.get("probed_at_unix_secs"),
+            Some(&json!(1_760_000_000u64))
+        );
+        assert!(probe.get("secret").is_none());
+
+        for observed in [Value::Bool(false), Value::Null] {
+            transport.key.upstream_metadata.as_mut().unwrap()["tls_probe"]["observed"] = observed;
+            let profile = resolve_transport_profile(&transport).expect("emulation profile");
+            assert!(profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("tls_probe"))
+                .is_none());
+        }
+        transport.key.upstream_metadata.as_mut().unwrap()["tls_probe"]["observed"] =
+            Value::Bool(true);
+
+        // 探针记录的是另一个 profile：不附带。
+        transport.key.fingerprint = Some(json!({"transport_profile": "chatgpt_com_chrome"}));
+        let profile = resolve_transport_profile(&transport).expect("chrome profile");
+        assert!(profile
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("tls_probe"))
+            .is_none());
+
+        // 非仿真 profile 永远不附带。
+        transport.key.fingerprint = Some(json!({"transport_profile": "chrome_136"}));
+        let profile = resolve_transport_profile(&transport).expect("plain profile");
+        assert!(profile.extra.is_none());
+    }
+
+    #[test]
+    fn fingerprint_transport_profile_id_and_probe_summary_helpers() {
+        use super::{
+            configured_transport_profile_id_from_fingerprint,
+            tls_probe_summary_from_upstream_metadata,
+        };
+        assert_eq!(
+            configured_transport_profile_id_from_fingerprint(Some(&json!({
+                "transport_profile": " claude_code_node_openssl "
+            }))),
+            Some("claude_code_node_openssl".to_string())
+        );
+        assert_eq!(
+            configured_transport_profile_id_from_fingerprint(Some(&json!({
+                "transport_profile": {"profile_id": "chatgpt_com_chrome", "backend": "browser_wreq"}
+            }))),
+            Some("chatgpt_com_chrome".to_string())
+        );
+        assert_eq!(
+            configured_transport_profile_id_from_fingerprint(Some(&json!({"device_id": "x"}))),
+            None
+        );
+        assert_eq!(configured_transport_profile_id_from_fingerprint(None), None);
+
+        let summary = tls_probe_summary_from_upstream_metadata(Some(&json!({
+            "tls_probe": {
+                "observed": true,
+                "ja4": "t13d1716h1_5b57614c22b0_3d5db4fb5c1e",
+                "ja3_hash": "0123456789abcdef0123456789abcdef",
+                "probed_at_unix_secs": 1_760_000_000u64,
+                "http1_header_order": ["Host", 7, "Accept"],
+                "nested": {"secret": true}
+            }
+        })))
+        .expect("summary");
+        assert_eq!(summary["ja4"], "t13d1716h1_5b57614c22b0_3d5db4fb5c1e");
+        assert_eq!(summary["probed_at_unix_secs"], 1_760_000_000u64);
+        assert_eq!(summary["http1_header_order"], json!(["Host", "Accept"]));
+        assert!(summary.get("nested").is_none());
+        assert!(tls_probe_summary_from_upstream_metadata(Some(&json!({
+            "tls_probe": {"observed": false, "ja4": "x"}
+        })))
+        .is_none());
+        assert!(tls_probe_summary_from_upstream_metadata(None).is_none());
     }
 }

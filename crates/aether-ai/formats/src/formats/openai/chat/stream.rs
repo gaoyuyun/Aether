@@ -64,6 +64,9 @@ pub struct OpenAIResponsesProviderState {
     actual_service_tier: Option<String>,
     started: bool,
     finished: bool,
+    /// 这条流是否已经出现过实际生成内容。只用来区分「空 incomplete」与
+    /// 「写满输出上限的合法 incomplete」。
+    saw_output_content: bool,
     text_parts: BTreeMap<String, String>,
     reasoning: String,
     reasoning_parts: BTreeMap<usize, String>,
@@ -616,6 +619,14 @@ impl OpenAIResponsesProviderState {
             return;
         }
         if !state.started_emitted {
+            if let Some(original) =
+                crate::formats::openai::responses::codex_sanitize::restore_codex_shortened_tool_name(
+                    report_context,
+                    &state.name,
+                )
+            {
+                state.name = original;
+            }
             out.push(CanonicalStreamFrame {
                 id: id.clone(),
                 model: model.clone(),
@@ -1351,6 +1362,12 @@ impl OpenAIResponsesProviderState {
     /// 结构化入口：消费一个已经解析好的 Responses 协议事件。
     ///
     /// 取借用而不是所有权：持有结构化事件的传输不必为了调用它先克隆一份。
+    /// 传输层没有把增量事件喂进解析器（例如 Responses WebSocket 只观测终态）时，
+    /// 用这个入口告知「这条流已经有实际输出」，让空 incomplete 判定不误判。
+    pub fn note_output_content(&mut self) {
+        self.saw_output_content = true;
+    }
+
     pub fn push_event(
         &mut self,
         report_context: &Value,
@@ -1373,6 +1390,9 @@ impl OpenAIResponsesProviderState {
             {
                 self.actual_service_tier = Some(service_tier);
             }
+        }
+        if openai_responses_event_has_meaningful_output_delta(value) {
+            self.saw_output_content = true;
         }
 
         match value
@@ -1823,6 +1843,25 @@ impl OpenAIResponsesProviderState {
                 );
             }
             "response.incomplete" => {
+                // 没有可用原因 / 原因是错误 / 带显式 error 的 incomplete 是终态错误；
+                // 整条流没有任何输出、output 为空且 output_tokens 显式为 0 的
+                // incomplete 是上游静默中止，同样按终态错误处理并带上显式 error，
+                // 让客户端、记账与结算看到同一个事实。合法 incomplete 走正常 Finish。
+                if openai_stream_payload_is_terminal_error(value) {
+                    self.ensure_started(report_context, &mut out);
+                    self.finished = true;
+                    out.push(self.unknown_frame(report_context, value.clone()));
+                    return Ok(out);
+                }
+                if openai_responses_incomplete_is_empty_abort(value, self.saw_output_content) {
+                    self.ensure_started(report_context, &mut out);
+                    self.finished = true;
+                    out.push(self.unknown_frame(
+                        report_context,
+                        openai_responses_empty_incomplete_error_payload(value),
+                    ));
+                    return Ok(out);
+                }
                 let Some(response) = value.get("response").and_then(Value::as_object) else {
                     return Ok(out);
                 };

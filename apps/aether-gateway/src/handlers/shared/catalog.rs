@@ -2029,6 +2029,105 @@ fn gemini_cli_credits_status_snapshot(metadata: &Map<String, Value>) -> Option<V
     Some(Value::Object(credits))
 }
 
+/// Claude Code 没有主动额度接口；快照只来自响应头里被动采集的 5h / 7d 窗口
+/// （`upstream_metadata.claude_code.windows`）。窗口形状与其他供应商一致。
+fn build_claude_code_quota_status_snapshot(
+    upstream_metadata: Option<&Value>,
+    source: &str,
+) -> Option<Value> {
+    let metadata = provider_quota_metadata_bucket(upstream_metadata, "claude_code")?;
+    let observed_at_unix_secs = provider_quota_timestamp_unix_secs(metadata.get("updated_at"));
+    let raw_windows = metadata.get("windows").and_then(Value::as_object)?;
+    let mut windows = Vec::new();
+    for (code, label) in [
+        ("5h", "5 小时窗口"),
+        ("7d", "7 天窗口"),
+        ("7d_oi", "7 天窗口（Fable）"),
+    ] {
+        let Some(item) = raw_windows.get(code).and_then(Value::as_object) else {
+            continue;
+        };
+        let status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let utilization = item
+            .get("utilization")
+            .and_then(admin_provider_quota_pure::coerce_json_f64)
+            .map(|value| value.clamp(0.0, 1.0));
+        let reset_at = provider_quota_timestamp_unix_secs(item.get("reset_at"));
+        let reset_seconds = quota_window_reset_seconds(observed_at_unix_secs, reset_at);
+        let is_exhausted =
+            status == "rejected" || utilization.is_some_and(|value| value >= 1.0 - 1e-6);
+        let used_ratio = if is_exhausted {
+            Some(utilization.map_or(1.0, |value| value.max(1.0)))
+        } else {
+            utilization
+        };
+        windows.push(json!({
+            "code": code,
+            "label": label,
+            "scope": "account",
+            "unit": "percent",
+            "status": if status.is_empty() { Value::Null } else { json!(status) },
+            "used_ratio": used_ratio,
+            "remaining_ratio": used_ratio.map(|value| (1.0 - value).max(0.0)),
+            "reset_at": reset_at,
+            "reset_seconds": reset_seconds,
+            "is_exhausted": is_exhausted,
+        }));
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    let active_exhausted_windows = windows
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|window| {
+            window
+                .get("is_exhausted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter(|window| {
+            provider_quota_timestamp_unix_secs(window.get("reset_at"))
+                .zip(observed_at_unix_secs)
+                .map(|(reset_at, observed_at)| reset_at > observed_at)
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let exhausted = !active_exhausted_windows.is_empty();
+    let usage_ratio = quota_windows_usage_ratio(&windows);
+    // Show the next reset that can change the exhausted state. Allowed or
+    // already expired windows must not supply this deadline.
+    let reset_at = active_exhausted_windows
+        .iter()
+        .filter_map(|window| provider_quota_timestamp_unix_secs(window.get("reset_at")))
+        .min();
+    Some(json!({
+        "version": 2,
+        "provider_type": "claude_code",
+        "code": if exhausted { "exhausted" } else { "ok" },
+        "label": if exhausted { Some("额度耗尽") } else { None::<&str> },
+        "reason": if exhausted {
+            Some("Anthropic 共享限流窗口已拒绝请求")
+        } else {
+            None::<&str>
+        },
+        "freshness": "fresh",
+        "source": source,
+        "observed_at": observed_at_unix_secs,
+        "exhausted": exhausted,
+        "usage_ratio": usage_ratio,
+        "updated_at": observed_at_unix_secs,
+        "reset_at": reset_at,
+        "reset_seconds": reset_at.and_then(|value| quota_window_reset_seconds(observed_at_unix_secs, Some(value))),
+        "unified_status": metadata.get("unified_status").cloned().unwrap_or(Value::Null),
+        "windows": windows,
+    }))
+}
+
 fn build_gemini_cli_quota_status_snapshot(
     upstream_metadata: Option<&Value>,
     source: &str,
@@ -2260,6 +2359,7 @@ pub(crate) fn sync_provider_key_quota_status_snapshot(
         "antigravity" => build_antigravity_quota_status_snapshot(upstream_metadata, source),
         "grok" => build_grok_quota_status_snapshot(upstream_metadata, source),
         "gemini_cli" => build_gemini_cli_quota_status_snapshot(upstream_metadata, source),
+        "claude_code" => build_claude_code_quota_status_snapshot(upstream_metadata, source),
         _ => None,
     }?;
     if normalized_provider_type == "codex" {
@@ -2751,6 +2851,37 @@ pub(crate) fn build_admin_provider_key_response(
     );
     payload.insert("agent_identity".to_string(), json!(agent_identity));
     payload.insert(
+        "claude_code_device_profile".to_string(),
+        if provider_type.trim().eq_ignore_ascii_case("claude_code") {
+            crate::ai_serving::claude_code_device_profile_summary(
+                key.upstream_metadata.as_ref(),
+                auth_config.as_ref(),
+            )
+            .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        },
+    );
+    // P6：Key 级敏感词覆盖（只读）。null = 继承供应商词表；数组 = 覆盖（空数组 = 关闭混淆）。
+    payload.insert(
+        "cloak_sensitive_words".to_string(),
+        if crate::provider_transport::provider_type_supports_sensitive_words(provider_type) {
+            crate::provider_transport::key_sensitive_word_list_override(auth_config.as_ref())
+                .map(|list| {
+                    serde_json::Value::Array(
+                        list.words()
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        },
+    );
+    payload.insert(
         "can_refresh_oauth".to_string(),
         json!(provider_key_can_refresh_oauth(
             auth_semantics,
@@ -3023,6 +3154,22 @@ pub(crate) fn build_admin_provider_key_response(
     payload.insert(
         "fingerprint".to_string(),
         admin_secret_safe_json(key.fingerprint.as_ref()),
+    );
+    // P5：Key 级传输指纹 profile（只读，来自 `fingerprint.transport_profile`）与最近一次探针结果摘要。
+    payload.insert(
+        "transport_profile".to_string(),
+        json!(
+            crate::provider_transport::configured_transport_profile_id_from_fingerprint(
+                key.fingerprint.as_ref(),
+            )
+        ),
+    );
+    payload.insert(
+        "tls_probe".to_string(),
+        crate::provider_transport::tls_probe_summary_from_upstream_metadata(
+            key.upstream_metadata.as_ref(),
+        )
+        .unwrap_or(serde_json::Value::Null),
     );
     payload.insert(
         "last_used_at".to_string(),
@@ -4618,5 +4765,175 @@ mod tests {
         assert!(!serialized.contains("upstream-secret"));
         assert!(!serialized.contains("user:password"));
         assert!(!serialized.contains("q=secret"));
+    }
+
+    #[test]
+    fn key_response_exposes_sensitive_word_override_as_inherit_or_list() {
+        let state = AppState::new().expect("gateway should build");
+        let build = |provider_type: &str, auth_config: &str| {
+            let key = StoredProviderCatalogKey::new(
+                "key-words".to_string(),
+                "provider-words".to_string(),
+                "oauth".to_string(),
+                "oauth".to_string(),
+                None,
+                true,
+            )
+            .expect("key should build")
+            .with_transport_fields(
+                Some(json!(["claude:messages"])),
+                encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "__placeholder__")
+                    .expect("placeholder should encrypt"),
+                Some(
+                    encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, auth_config)
+                        .expect("auth config should encrypt"),
+                ),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("key transport should build");
+            build_admin_provider_key_response(
+                &state,
+                &key,
+                provider_type,
+                &["claude:messages".to_string()],
+                1_777_000_001,
+            )
+        };
+
+        assert_eq!(
+            build(
+                "claude_code",
+                r#"{"cloak_sensitive_words":["Proxy","api","proxy"]}"#
+            )["cloak_sensitive_words"],
+            json!(["proxy", "api"])
+        );
+        assert_eq!(
+            build("antigravity", r#"{"cloak_sensitive_words":[]}"#)["cloak_sensitive_words"],
+            json!([])
+        );
+        assert_eq!(
+            build("claude_code", r#"{"project_id":"p"}"#)["cloak_sensitive_words"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            build("codex", r#"{"cloak_sensitive_words":["proxy"]}"#)["cloak_sensitive_words"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn claude_code_quota_snapshot_reset_tracks_only_active_exhausted_windows() {
+        let observed_at = 1_800_000_000u64;
+        for (windows, expected_exhausted, expected_reset_at) in [
+            (
+                json!({
+                    "5h": {"status": "allowed", "utilization": 0.25, "reset_at": observed_at + 60},
+                    "7d": {"status": "rejected", "reset_at": observed_at + 86_400},
+                }),
+                true,
+                Some(observed_at + 86_400),
+            ),
+            (
+                json!({
+                    "5h": {"status": "rejected", "reset_at": observed_at},
+                    "7d": {"status": "rejected", "reset_at": observed_at + 86_400},
+                }),
+                true,
+                Some(observed_at + 86_400),
+            ),
+            (
+                json!({
+                    "5h": {"status": "allowed", "reset_at": observed_at + 60},
+                    "7d": {"status": "rejected"},
+                }),
+                true,
+                None,
+            ),
+            (
+                json!({
+                    "5h": {"status": "rejected", "reset_at": observed_at},
+                    "7d": {"status": "allowed", "reset_at": observed_at + 86_400},
+                }),
+                false,
+                None,
+            ),
+            (
+                json!({
+                    "5h": {"status": "rejected", "reset_at": observed_at + 60},
+                    "7d": {"status": "rejected", "reset_at": observed_at + 86_400},
+                }),
+                true,
+                Some(observed_at + 60),
+            ),
+        ] {
+            let metadata = json!({
+                "claude_code": { "updated_at": observed_at, "windows": windows },
+            });
+            let snapshot = sync_provider_key_quota_status_snapshot(
+                None,
+                "claude_code",
+                Some(&metadata),
+                "response_headers",
+            )
+            .expect("snapshot should build");
+            let quota = &snapshot["quota"];
+            assert_eq!(quota["exhausted"], json!(expected_exhausted), "{metadata}");
+            assert_eq!(quota["reset_at"], json!(expected_reset_at), "{metadata}");
+            assert_eq!(
+                quota["reset_seconds"],
+                json!(expected_reset_at.map(|reset_at| reset_at - observed_at)),
+                "{metadata}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_code_quota_snapshot_materializes_passive_rate_limit_windows() {
+        let metadata = json!({
+            "claude_code": {
+                "updated_at": 1_800_000_000u64,
+                "unified_status": "rejected",
+                "windows": {
+                    "5h": {"status": "rejected", "utilization": 1.0, "reset_at": 1_800_003_600u64},
+                    "7d": {"status": "allowed", "utilization": 0.3, "reset_at": 1_800_300_000u64}
+                }
+            }
+        });
+        let snapshot = sync_provider_key_quota_status_snapshot(
+            None,
+            "claude_code",
+            Some(&metadata),
+            "report_effect",
+        )
+        .expect("snapshot should build");
+        let quota = snapshot.get("quota").expect("quota");
+        assert_eq!(quota["provider_type"], json!("claude_code"));
+        assert_eq!(quota["exhausted"], json!(true));
+        assert_eq!(quota["reset_at"], json!(1_800_003_600u64));
+        let windows = quota["windows"].as_array().expect("windows");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0]["code"], json!("5h"));
+        assert_eq!(windows[0]["is_exhausted"], json!(true));
+        assert_eq!(windows[0]["reset_seconds"], json!(3_600u64));
+        assert_eq!(windows[1]["code"], json!("7d"));
+        assert_eq!(windows[1]["is_exhausted"], json!(false));
+        assert_eq!(windows[1]["used_ratio"], json!(0.3));
+
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(metadata);
+        assert!(
+            aether_provider_pool::provider_pool_key_account_quota_exhausted(
+                &StoredProviderCatalogKey {
+                    status_snapshot: Some(snapshot),
+                    ..key
+                },
+                "claude_code"
+            )
+        );
     }
 }

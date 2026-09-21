@@ -335,6 +335,23 @@ fn classifies_admin_clear_oauth_invalid_as_admin_proxy_route() {
 }
 
 #[test]
+fn classifies_admin_reset_claude_code_device_as_admin_proxy_route() {
+    let headers = http::HeaderMap::new();
+    let uri: Uri = "/api/admin/endpoints/keys/key-claude/reset-claude-code-device"
+        .parse()
+        .expect("uri should parse");
+    let decision = classify_control_route(&http::Method::POST, &uri, &headers)
+        .expect("decision should resolve");
+    assert_eq!(decision.route_class.as_deref(), Some("admin_proxy"));
+    assert_eq!(decision.route_family.as_deref(), Some("endpoints_manage"));
+    assert_eq!(
+        decision.route_kind.as_deref(),
+        Some("reset_claude_code_device")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
 fn classifies_admin_reset_key_cycle_stats_as_admin_proxy_route() {
     let headers = http::HeaderMap::new();
     let uri: Uri = "/api/admin/endpoints/keys/key-codex/reset-cycle-stats"

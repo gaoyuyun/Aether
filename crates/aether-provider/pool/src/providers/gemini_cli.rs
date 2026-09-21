@@ -9,8 +9,7 @@ use crate::provider::{
 };
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 
-pub const GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH: &str = "/v1internal:retrieveUserQuota";
-pub const GEMINI_CLI_USER_AGENT: &str = "GeminiCLI/0.1.5 (Windows; AMD64)";
+pub use aether_provider_transport::{GEMINI_CLI_RETRIEVE_USER_QUOTA_PATH, GEMINI_CLI_USER_AGENT};
 
 #[derive(Debug, Clone, Default)]
 pub struct GeminiCliProviderPoolAdapter;

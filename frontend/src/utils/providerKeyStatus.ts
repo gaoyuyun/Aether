@@ -1,7 +1,6 @@
 import type {
   AccountStatusSnapshot,
   OAuthStatusSnapshot,
-  ProviderKeyStatusSnapshot,
   QuotaStatusSnapshot,
 } from '@/api/endpoints/types/statusSnapshot'
 import { getOAuthExpiresCountdown, type OAuthStatusInfo } from '@/composables/useCountdownTimer'

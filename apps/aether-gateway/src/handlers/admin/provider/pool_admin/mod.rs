@@ -51,8 +51,8 @@ use self::support::{build_admin_pool_error_response, is_admin_pool_route};
 pub(crate) use self::{payloads as pool_payloads, selection as pool_selection};
 pub(crate) use crate::handlers::admin::provider::pool::config::admin_provider_pool_config;
 pub(crate) use crate::handlers::admin::provider::pool::runtime::{
-    read_admin_provider_pool_cooldown_counts, read_admin_provider_pool_cooldown_key_ids,
-    read_admin_provider_pool_runtime_state,
+    attach_admin_provider_pool_model_cooldowns, read_admin_provider_pool_cooldown_counts,
+    read_admin_provider_pool_cooldown_key_ids, read_admin_provider_pool_runtime_state,
 };
 pub(crate) use crate::handlers::admin::provider::shared::support::AdminProviderPoolRuntimeState;
 pub(crate) use crate::handlers::admin::shared::attach_admin_audit_response;

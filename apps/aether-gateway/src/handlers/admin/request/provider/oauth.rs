@@ -41,11 +41,7 @@ fn admin_provider_oauth_state_secret_purpose(nonce: &str) -> String {
 }
 
 fn is_generated_admin_provider_oauth_nonce(nonce: &str) -> bool {
-    let nonce = nonce.trim();
-    nonce.len() == 64
-        && nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    aether_oauth::core::is_generated_oauth_nonce(nonce)
 }
 
 fn decode_admin_provider_oauth_state(
@@ -305,6 +301,7 @@ impl<'a> AdminAppState<'a> {
         state_nonce: &str,
         pkce_verifier: Option<&str>,
         proxy: Option<ProxySnapshot>,
+        provider_config: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, Response<Body>> {
         crate::handlers::admin::provider::oauth::state::exchange_admin_provider_oauth_code(
             self,
@@ -313,6 +310,7 @@ impl<'a> AdminAppState<'a> {
             state_nonce,
             pkce_verifier,
             proxy,
+            provider_config,
         )
         .await
     }
@@ -322,12 +320,14 @@ impl<'a> AdminAppState<'a> {
         template: AdminProviderOAuthTemplate,
         refresh_token: &str,
         proxy: Option<ProxySnapshot>,
+        provider_config: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, Response<Body>> {
         crate::handlers::admin::provider::oauth::state::exchange_admin_provider_oauth_refresh_token(
             self,
             template,
             refresh_token,
             proxy,
+            provider_config,
         )
         .await
     }

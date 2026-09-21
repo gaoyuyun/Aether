@@ -665,6 +665,7 @@ mod tests {
             self.hits.fetch_add(1, Ordering::SeqCst);
             Ok(LocalOAuthHttpResponse {
                 status_code: 200,
+                retry_after_secs: None,
                 body_text: json!({
                     "access_token": "fresh-access-token",
                     "expires_in": 3600,

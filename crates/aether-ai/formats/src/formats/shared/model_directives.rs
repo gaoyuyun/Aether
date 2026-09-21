@@ -633,11 +633,7 @@ fn gemini_reasoning_effort_config(
 }
 
 pub fn claude_model_uses_adaptive_effort(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase().replace(['.', '_'], "-");
-    model.contains("mythos")
-        || model.contains("opus-4-7")
-        || model.contains("opus-4-6")
-        || model.contains("sonnet-4-6")
+    super::claude_thinking_capabilities::claude_model_uses_adaptive_effort(model)
 }
 
 pub fn gemini_model_uses_thinking_level(model: &str) -> bool {

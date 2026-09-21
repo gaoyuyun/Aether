@@ -85,6 +85,9 @@ pub use crate::formats::openai::{
         OpenAiResponsesReasoningReplayPolicy,
     },
 };
+pub use crate::formats::shared::claude_thinking_capabilities::{
+    claude_thinking_capability, ClaudeThinkingCapability, ClaudeThinkingMode,
+};
 pub use crate::formats::shared::error_body::{
     build_core_error_body_for_client_format, is_core_error_finalize_kind, LocalCoreSyncErrorKind,
 };

@@ -170,6 +170,17 @@ pub(super) fn classify_admin_model_provider_family_route(
             "admin:providers",
             false,
         ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/providers/")
+        && normalized_path.contains("/pool/clear-reasoning-replay/")
+    {
+        Some(classified(
+            "admin_proxy",
+            "providers_manage",
+            "clear_reasoning_replay",
+            "admin:providers",
+            false,
+        ))
     } else if method == http::Method::GET
         && normalized_path.starts_with("/api/admin/providers/")
         && normalized_path.ends_with("/models")

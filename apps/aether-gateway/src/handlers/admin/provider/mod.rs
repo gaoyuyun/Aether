@@ -6,6 +6,7 @@ pub(crate) mod pool;
 pub(crate) mod pool_admin;
 pub(crate) mod shared;
 pub(crate) mod summary;
+pub(crate) mod tls_probe;
 pub(crate) mod write;
 
 pub(crate) mod crud;

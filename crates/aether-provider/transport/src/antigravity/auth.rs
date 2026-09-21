@@ -3,12 +3,24 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::super::snapshot::GatewayProviderTransportSnapshot;
+use super::version::{
+    antigravity_request_user_agent_for_version, resolve_antigravity_client_version,
+};
 
 pub const ANTIGRAVITY_PROVIDER_TYPE: &str = "antigravity";
+/// 编译内嵌的 Antigravity 客户端版本；运行期由 hub manifest 刷新覆盖，
+/// 见 [`super::version`]。
 pub const ANTIGRAVITY_CLIENT_VERSION: &str = "4.3.0";
+/// 内嵌默认版本对应的 UA。生产路径统一走 [`antigravity_request_user_agent`]，
+/// 这个常量只用于把默认身份写进测试断言。
 pub const ANTIGRAVITY_REQUEST_USER_AGENT: &str = "vscode/1.X.X (Antigravity/4.3.0)";
 const ANTIGRAVITY_CLIENT_NAME: &str = "antigravity";
 const ANTIGRAVITY_GOOG_API_CLIENT: &str = "gl-node/18.18.2 fire/0.8.6 grpc/1.10.x";
+
+/// 当前进程生效的 Antigravity 请求 UA（随动态版本变化）。
+pub fn antigravity_request_user_agent() -> String {
+    antigravity_request_user_agent_for_version(&resolve_antigravity_client_version(None))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityRequestAuth {
@@ -108,10 +120,14 @@ pub fn build_antigravity_static_identity_headers(
     )
 }
 
+/// 构造 Antigravity 静态身份头。`client_version` 来自 Key 的 `auth_config` /
+/// `upstream_metadata`：只要是不低于硬下限的合法三段版本就真正生效；否则回退到
+/// 进程当前的动态版本（hub manifest 刷新值或内嵌默认）。
 pub fn build_antigravity_static_client_headers(
-    _client_version: Option<&str>,
+    client_version: Option<&str>,
     session_id: Option<&str>,
 ) -> BTreeMap<String, String> {
+    let client_version = resolve_antigravity_client_version(client_version);
     let mut headers = BTreeMap::from([
         (
             String::from("x-client-name"),
@@ -123,12 +139,9 @@ pub fn build_antigravity_static_client_headers(
         ),
         (
             String::from("user-agent"),
-            String::from(ANTIGRAVITY_REQUEST_USER_AGENT),
+            antigravity_request_user_agent_for_version(&client_version),
         ),
-        (
-            String::from("x-client-version"),
-            String::from(ANTIGRAVITY_CLIENT_VERSION),
-        ),
+        (String::from("x-client-version"), client_version),
     ]);
 
     if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) {
@@ -382,7 +395,8 @@ mod tests {
     }
 
     #[test]
-    fn static_client_headers_pin_the_known_good_antigravity_identity() {
+    fn static_client_headers_fall_back_to_the_default_identity_below_the_floor() {
+        // 1.0.16 低于硬下限 2.9.1：Cloud Code 会对这种旧版本拒绝新模型，所以不采用。
         let headers = build_antigravity_static_client_headers(Some("1.0.16"), Some("session-abc"));
 
         assert_eq!(
@@ -400,6 +414,35 @@ mod tests {
         assert_eq!(
             headers.get("x-vscode-sessionid").map(String::as_str),
             Some("session-abc")
+        );
+    }
+
+    #[test]
+    fn static_client_headers_honor_a_key_level_client_version_at_or_above_the_floor() {
+        let headers = build_antigravity_static_client_headers(Some(" 3.1.0 "), None);
+
+        assert_eq!(
+            headers.get("x-client-version").map(String::as_str),
+            Some("3.1.0")
+        );
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("vscode/1.X.X (Antigravity/3.1.0)")
+        );
+        assert!(!headers.contains_key("x-vscode-sessionid"));
+    }
+
+    #[test]
+    fn identity_headers_use_the_client_version_resolved_from_key_metadata() {
+        let auth = AntigravityRequestAuth {
+            project_id: "project-1".to_string(),
+            client_version: Some("2.9.1".to_string()),
+            session_id: None,
+        };
+        let headers = super::build_antigravity_static_identity_headers(&auth);
+        assert_eq!(
+            headers.get("x-client-version").map(String::as_str),
+            Some("2.9.1")
         );
     }
 }

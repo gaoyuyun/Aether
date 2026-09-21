@@ -1,3 +1,4 @@
+use crate::handlers::admin::provider::pool::cooldown::provider_cooldown_config_from_config_value;
 use crate::handlers::admin::provider::shared::support::{
     provider_transfer_limit_from_config, PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
     PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
@@ -229,8 +230,98 @@ pub(crate) fn build_admin_provider_summary_value(
             provider.config.as_ref(),
         ),
         "responses_websocket_enabled": responses_websocket_adapter(&provider.provider_type, provider.config.as_ref()).is_some(),
+        "cooldown": provider_cooldown_config_from_config_value(provider.config.as_ref()).to_json(),
+        "claude_code_cloak_mode": if provider.provider_type.trim().eq_ignore_ascii_case("claude_code") {
+            serde_json::Value::String(
+                crate::provider_transport::claude_code::resolve_claude_code_cloak_mode(provider.config.as_ref())
+                    .as_str()
+                    .to_string(),
+            )
+        } else {
+            serde_json::Value::Null
+        },
+        // P6：敏感词词表。claude_code / antigravity 回读数组（未配置为 []），其它类型为 null。
+        "cloak_sensitive_words": if crate::provider_transport::provider_type_supports_sensitive_words(
+            &provider.provider_type,
+        ) {
+            serde_json::Value::Array(
+                crate::provider_transport::provider_sensitive_word_list(provider.config.as_ref())
+                    .words()
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )
+        } else {
+            serde_json::Value::Null
+        },
+        // P5：供应商级传输指纹 profile（`config.fingerprint.transport_profile`）；未配置为 null。
+        "transport_profile": crate::handlers::admin::provider::write::provider::provider_transport_profile_id(
+            provider.config.as_ref(),
+        ),
+        "transport_profile_options": crate::handlers::admin::provider::write::provider::allowed_transport_profiles_for_provider_type(
+            &provider.provider_type,
+        ),
         "ops_quota_alert_enabled": ops_quota_alert_enabled,
         "created_at": endpoint_timestamp_or_now(provider.created_at_unix_ms, now_unix_secs),
         "updated_at": endpoint_timestamp_or_now(provider.updated_at_unix_secs, now_unix_secs),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_admin_provider_summary_value;
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+    use serde_json::json;
+
+    fn provider(
+        provider_type: &str,
+        config: Option<serde_json::Value>,
+    ) -> StoredProviderCatalogProvider {
+        StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            provider_type.to_string(),
+            None,
+            provider_type.to_string(),
+        )
+        .expect("provider should build")
+        .with_transport_fields(true, false, false, None, None, None, None, None, config)
+    }
+
+    fn summary(provider: &StoredProviderCatalogProvider) -> serde_json::Value {
+        build_admin_provider_summary_value(
+            provider,
+            &[],
+            &[],
+            None,
+            None,
+            Vec::new(),
+            1_700_000_000,
+        )
+    }
+
+    #[test]
+    fn summary_reads_back_sensitive_words_only_for_supported_provider_types() {
+        let claude = provider(
+            "claude_code",
+            Some(json!({"cloak": {"mode": "always", "sensitive_words": ["Proxy", "api"]}})),
+        );
+        assert_eq!(
+            summary(&claude)["cloak_sensitive_words"],
+            json!(["proxy", "api"])
+        );
+        assert_eq!(summary(&claude)["claude_code_cloak_mode"], json!("always"));
+
+        let antigravity = provider("antigravity", None);
+        assert_eq!(summary(&antigravity)["cloak_sensitive_words"], json!([]));
+
+        let codex = provider(
+            "codex",
+            Some(json!({"cloak": {"sensitive_words": ["proxy"]}})),
+        );
+        assert_eq!(
+            summary(&codex)["cloak_sensitive_words"],
+            serde_json::Value::Null
+        );
+    }
 }

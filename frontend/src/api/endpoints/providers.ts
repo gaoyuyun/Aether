@@ -3,17 +3,26 @@ import { buildCacheKey, cachedRequest, dedupedRequest } from '@/utils/cache'
 import { markAccessControlCatalogChanged } from '@/utils/accessControlCatalog'
 import type {
   ClaudeCodeAdvancedConfig,
+  ClaudeCodeCloakMode,
   FailoverRulesConfig,
   PoolAdvancedConfig,
   ProviderConfig,
+  ProviderCooldownConfig,
   ProviderQuotaReservation,
   ProviderType,
   ProviderWithEndpointsSummary,
   ProxyConfig,
+  TransportProfileId,
 } from './types'
 import {
   normalizeChatPiiRedactionProviderConfig as normalizeChatPiiRedactionProvider,
+  normalizeClaudeCodeCloakMode,
   normalizePoolAdvancedConfig as normalizePoolAdvanced,
+  normalizeProviderCooldownConfig,
+  normalizeSensitiveWordList,
+  normalizeTransportProfile,
+  providerTypeSupportsSensitiveWords,
+  providerTypeSupportsTransportProfile,
 } from './types'
 
 export type { ProviderWithEndpointsSummary } from './types'
@@ -55,10 +64,20 @@ function normalizeProviderSummary(
     chat_pii_redaction: normalizeChatPiiRedactionProvider(provider.chat_pii_redaction),
     pool_advanced: normalizePoolAdvanced(provider.pool_advanced),
     codex_fingerprint_convergence_enabled: provider.codex_fingerprint_convergence_enabled ?? false,
+    claude_code_cloak_mode: provider.provider_type === 'claude_code'
+      ? normalizeClaudeCodeCloakMode(provider.claude_code_cloak_mode)
+      : null,
+    cloak_sensitive_words: providerTypeSupportsSensitiveWords(provider.provider_type)
+      ? normalizeSensitiveWordList(provider.cloak_sensitive_words)
+      : null,
+    transport_profile: providerTypeSupportsTransportProfile(provider.provider_type)
+      ? normalizeTransportProfile(provider.transport_profile)
+      : null,
     kiro_simulated_cache_enabled: provider.kiro_simulated_cache_enabled ?? false,
     max_transfer_count: provider.max_transfer_count ?? 0,
     max_transfer_timeout_seconds: provider.max_transfer_timeout_seconds ?? 0,
     responses_websocket_enabled: provider.responses_websocket_enabled ?? false,
+    cooldown: normalizeProviderCooldownConfig(provider.cooldown),
   }
 }
 
@@ -140,16 +159,24 @@ export async function updateProvider(
     is_active: boolean
     claude_code_advanced: ClaudeCodeAdvancedConfig | null
     codex_fingerprint_convergence_enabled: boolean
+    claude_code_cloak_mode: ClaudeCodeCloakMode | null
+    // 敏感词词表（仅 claude_code / antigravity）；null 或空数组表示清空
+    cloak_sensitive_words: string[] | null
+    // P5：传输指纹 profile；null 清除，回到系统默认
+    transport_profile: TransportProfileId | null
+    // 冷却策略；null 表示清除供应商级覆盖，恢复默认
+    cooldown: ProviderCooldownConfig | null
     pool_advanced: PoolAdvancedConfig | null
     failover_rules: FailoverRulesConfig | null
     config: ProviderConfig | null
   }>,
   requestOptions?: ProviderRequestOptions,
 ): Promise<ProviderWithEndpointsSummary> {
-  const response = await client.patch<ProviderWithEndpointsSummary>(`/api/admin/providers/${providerId}`, data, requestOptions)
+  const response = await client.patch<ProviderWithEndpointsSummary & { warnings?: string[] }>(`/api/admin/providers/${providerId}`, data, requestOptions)
   markAccessControlCatalogChanged()
   return normalizeProviderSummary(response.data)
 }
+
 
 /**
  * 创建 Provider
@@ -180,12 +207,16 @@ export async function createProvider(
     proxy?: ProxyConfig | null
     claude_code_advanced?: ClaudeCodeAdvancedConfig | null
     codex_fingerprint_convergence_enabled?: boolean
+    claude_code_cloak_mode?: ClaudeCodeCloakMode | null
+    cloak_sensitive_words?: string[] | null
+    transport_profile?: TransportProfileId | null
+    cooldown?: ProviderCooldownConfig | null
     pool_advanced?: PoolAdvancedConfig | null
     failover_rules?: FailoverRulesConfig | null
     config?: ProviderConfig | null
   }
-): Promise<{ id: string; name: string; message?: string }> {
-  const response = await client.post<{ id: string; name: string; message?: string }>('/api/admin/providers/', data)
+): Promise<{ id: string; name: string; message?: string; warnings?: string[] }> {
+  const response = await client.post<{ id: string; name: string; message?: string; warnings?: string[] }>('/api/admin/providers/', data)
   markAccessControlCatalogChanged()
   return response.data
 }

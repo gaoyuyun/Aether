@@ -36,11 +36,28 @@ pub const CLAUDE_CODE_COOKIE_SCOPE: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 const CLAUDE_CODE_BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+/// 原生客户端在 token 交换成功后约 500ms 内发起的两个控制面请求。
+pub const CLAUDE_CODE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+pub const CLAUDE_CODE_ROLES_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/roles";
+/// 刷新遇到 5xx 时的最多重试次数（不含首次）。
+pub const CLAUDE_CODE_REFRESH_MAX_RETRIES: usize = 3;
+const CLAUDE_CODE_OAUTH_CONTROL_PLANE_USER_AGENT: &str = "axios/1.13.6";
 
 #[derive(Debug, Clone)]
 pub struct ClaudeCodeProviderOAuthAdapter {
     inner: GenericProviderOAuthAdapter,
     web_base_url: String,
+    profile_url: String,
+    roles_url: String,
+}
+
+fn claude_code_token_request_transport_profile(
+    ctx: &ProviderOAuthTransportContext,
+) -> Option<ResolvedTransportProfile> {
+    claude_code_control_plane_transport_profile_for_context(
+        ctx,
+        CLAUDE_CODE_CONTROL_PLANE_REQUEST_KIND_REFRESH,
+    )
 }
 
 impl Default for ClaudeCodeProviderOAuthAdapter {
@@ -49,8 +66,11 @@ impl Default for ClaudeCodeProviderOAuthAdapter {
             inner: GenericProviderOAuthAdapter::new(
                 template_for_provider_type(CLAUDE_CODE_PROVIDER_TYPE)
                     .expect("claude code oauth template should exist"),
-            ),
+            )
+            .with_token_transport_profile_resolver(claude_code_token_request_transport_profile),
             web_base_url: CLAUDE_CODE_WEB_BASE_URL.to_string(),
+            profile_url: CLAUDE_CODE_PROFILE_URL.to_string(),
+            roles_url: CLAUDE_CODE_ROLES_URL.to_string(),
         }
     }
 }
@@ -64,6 +84,114 @@ impl ClaudeCodeProviderOAuthAdapter {
         self.web_base_url = web_base_url.into();
         self.inner = self.inner.with_token_url_override(token_url);
         self
+    }
+
+    /// 覆盖 profile / roles 控制面地址（测试与私有部署用）。
+    pub fn with_control_plane_overrides(
+        mut self,
+        profile_url: impl Into<String>,
+        roles_url: impl Into<String>,
+    ) -> Self {
+        self.profile_url = profile_url.into();
+        self.roles_url = roles_url.into();
+        self
+    }
+
+    /// 交换/刷新成功后补齐账号信息：`/api/oauth/profile` 给 org/account，
+    /// `claude_cli/roles` 只记录原始 JSON。两者都是尽力而为，失败不影响令牌。
+    async fn enrich_token_set_with_account_profile(
+        &self,
+        executor: &dyn OAuthHttpExecutor,
+        ctx: &ProviderOAuthTransportContext,
+        token_set: &mut ProviderOAuthTokenSet,
+    ) {
+        let access_token = token_set.token_set.access_token.trim().to_string();
+        if access_token.is_empty() {
+            return;
+        }
+        let Some(auth_config) = token_set.auth_config.as_object_mut() else {
+            return;
+        };
+        if let Some(profile) = self
+            .fetch_control_plane_json(executor, ctx, &self.profile_url, &access_token, "profile")
+            .await
+        {
+            apply_claude_code_oauth_profile(auth_config, &profile);
+        }
+        if let Some(roles) = self
+            .fetch_control_plane_json(
+                executor,
+                ctx,
+                &self.roles_url,
+                &access_token,
+                "claude_cli roles",
+            )
+            .await
+        {
+            auth_config.insert("claude_cli_roles".to_string(), roles);
+        }
+    }
+
+    async fn fetch_control_plane_json(
+        &self,
+        executor: &dyn OAuthHttpExecutor,
+        ctx: &ProviderOAuthTransportContext,
+        url: &str,
+        access_token: &str,
+        label: &str,
+    ) -> Option<Value> {
+        let headers = BTreeMap::from([
+            (
+                "accept".to_string(),
+                "application/json, text/plain, */*".to_string(),
+            ),
+            (
+                "authorization".to_string(),
+                format!("Bearer {access_token}"),
+            ),
+            ("cache-control".to_string(), "no-cache".to_string()),
+            (
+                "user-agent".to_string(),
+                CLAUDE_CODE_OAUTH_CONTROL_PLANE_USER_AGENT.to_string(),
+            ),
+        ]);
+        let response = executor
+            .execute(OAuthHttpRequest {
+                request_id: format!("provider-oauth:claude-{}", label.replace(' ', "-")),
+                method: reqwest::Method::GET,
+                url: url.to_string(),
+                headers,
+                content_type: None,
+                json_body: None,
+                body_bytes: None,
+                network: ctx.network.clone(),
+                transport_profile: claude_code_control_plane_transport_profile_for_context(
+                    ctx,
+                    CLAUDE_CODE_CONTROL_PLANE_REQUEST_KIND_INSPECT,
+                ),
+            })
+            .await;
+        match response {
+            Ok(response) if (200..300).contains(&response.status_code) => response
+                .json_body
+                .or_else(|| serde_json::from_str::<Value>(&response.body_text).ok()),
+            Ok(response) => {
+                tracing::warn!(
+                    status_code = response.status_code,
+                    label,
+                    "claude oauth control-plane lookup returned non-2xx; continuing without it"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    label,
+                    "claude oauth control-plane lookup failed; continuing without it"
+                );
+                None
+            }
+        }
     }
 
     fn web_url(&self, path_segments: &[&str]) -> Result<String, OAuthError> {
@@ -229,9 +357,13 @@ impl ProviderOAuthAdapter for ClaudeCodeProviderOAuthAdapter {
         state: &str,
         pkce_verifier: Option<&str>,
     ) -> Result<ProviderOAuthTokenSet, OAuthError> {
-        self.inner
+        let mut token_set = self
+            .inner
             .exchange_code(executor, ctx, code, state, pkce_verifier)
-            .await
+            .await?;
+        self.enrich_token_set_with_account_profile(executor, ctx, &mut token_set)
+            .await;
+        Ok(token_set)
     }
 
     async fn authorize_with_cookie(
@@ -255,9 +387,13 @@ impl ProviderOAuthAdapter for ClaudeCodeProviderOAuthAdapter {
                 &challenge,
             )
             .await?;
-        self.inner
+        let mut token_set = self
+            .inner
             .exchange_code(executor, ctx, &code, &state, Some(&verifier))
-            .await
+            .await?;
+        self.enrich_token_set_with_account_profile(executor, ctx, &mut token_set)
+            .await;
+        Ok(token_set)
     }
 
     async fn import_credentials(
@@ -275,7 +411,32 @@ impl ProviderOAuthAdapter for ClaudeCodeProviderOAuthAdapter {
         ctx: &ProviderOAuthTransportContext,
         account: &ProviderOAuthAccount,
     ) -> Result<ProviderOAuthTokenSet, OAuthError> {
-        self.inner.refresh(executor, ctx, account).await
+        let mut attempt = 0usize;
+        let mut token_set = loop {
+            match self.inner.refresh(executor, ctx, account).await {
+                Ok(token_set) => break token_set,
+                // 429：交给调用方按 Retry-After 退避（P1 的重试提示），不在这里空转。
+                Err(error @ OAuthError::RateLimited { .. }) => return Err(error),
+                Err(OAuthError::HttpStatus {
+                    status_code,
+                    body_excerpt,
+                }) if status_code >= 500 && attempt < CLAUDE_CODE_REFRESH_MAX_RETRIES => {
+                    attempt += 1;
+                    tracing::warn!(
+                        status_code,
+                        attempt,
+                        max_retries = CLAUDE_CODE_REFRESH_MAX_RETRIES,
+                        "claude oauth refresh returned 5xx; retrying"
+                    );
+                    let _ = body_excerpt;
+                    tokio::time::sleep(claude_code_refresh_retry_delay(attempt)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        self.enrich_token_set_with_account_profile(executor, ctx, &mut token_set)
+            .await;
+        Ok(token_set)
     }
 
     fn resolve_request_auth(
@@ -299,23 +460,149 @@ impl ProviderOAuthAdapter for ClaudeCodeProviderOAuthAdapter {
     }
 }
 
-pub(super) fn claude_code_oauth_transport_profile() -> ResolvedTransportProfile {
-    ResolvedTransportProfile {
-        profile_id: "claude_oauth_chrome136".to_string(),
+fn claude_code_refresh_retry_delay(attempt: usize) -> std::time::Duration {
+    // 500ms、1s、2s；测试环境可通过环境变量压到 0。
+    if std::env::var("AETHER_OAUTH_RETRY_NO_DELAY").is_ok() {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_millis(500u64 << attempt.saturating_sub(1).min(4))
+}
+
+/// 把 `/api/oauth/profile` 的响应写进 auth_config：`account.uuid` → `account_uuid`，
+/// `account.email` / `email_address` → `email`，`organization.uuid` → `org_uuid`，
+/// `organization.name` → `org_name`；已有值不覆盖，避免与 token 响应打架。
+pub fn apply_claude_code_oauth_profile(
+    auth_config: &mut serde_json::Map<String, Value>,
+    profile: &Value,
+) {
+    if let Some(account) = profile.get("account").and_then(Value::as_object) {
+        if let Some(uuid) = account
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        {
+            auth_config
+                .entry("account_uuid".to_string())
+                .or_insert_with(|| Value::String(uuid.to_string()));
+        }
+        if let Some(email) = account
+            .get("email_address")
+            .or_else(|| account.get("email"))
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        {
+            auth_config
+                .entry("email_address".to_string())
+                .or_insert_with(|| Value::String(email.to_string()));
+            auth_config
+                .entry("email".to_string())
+                .or_insert_with(|| Value::String(email.to_string()));
+        }
+        if let Some(name) = account
+            .get("full_name")
+            .or_else(|| account.get("display_name"))
+            .and_then(Value::as_str)
+        {
+            auth_config
+                .entry("account_name".to_string())
+                .or_insert_with(|| Value::String(name.to_string()));
+        }
+    }
+    if let Some(organization) = profile.get("organization").and_then(Value::as_object) {
+        if let Some(uuid) = organization
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        {
+            auth_config
+                .entry("org_uuid".to_string())
+                .or_insert_with(|| Value::String(uuid.to_string()));
+        }
+        if let Some(name) = organization.get("name").and_then(Value::as_str) {
+            auth_config
+                .entry("org_name".to_string())
+                .or_insert_with(|| Value::String(name.to_string()));
+        }
+        if let Some(plan) = organization
+            .get("organization_type")
+            .or_else(|| organization.get("rate_limit_tier"))
+            .and_then(Value::as_str)
+        {
+            auth_config
+                .entry("plan_type".to_string())
+                .or_insert_with(|| Value::String(plan.to_string()));
+        }
+    }
+    auth_config.insert("profile".to_string(), profile.clone());
+}
+
+/// P5：当供应商 / Key 的 `fingerprint.transport_profile` 显式选了 TLS 仿真 profile 时，
+/// 原生 CLI 用 Axios 发出的控制面请求（token 交换 / 刷新、profile、claude_cli roles）
+/// 改走 `claude_code_oauth_control_plane`（BoringSSL/wreq，无 ALPN，HTTP/1.1，Axios 头顺序）。
+/// 未配置时返回 `None`，保持 reqwest 默认行为。隧道代理无法使用 browser_wreq，同样返回 `None`。
+pub const CLAUDE_CODE_OAUTH_CONTROL_PLANE_TLS_PROFILE: &str = "claude_code_oauth_control_plane";
+/// 与 transport crate `CLAUDE_CODE_TLS_EMULATION_PROFILE_IDS` 保持一致（aether-oauth 不依赖
+/// transport crate，这里镜像一份只做"是否配置了仿真 profile"的判断）。
+const CLAUDE_CODE_TLS_EMULATION_PROFILE_IDS: &[&str] = &[
+    "claude_code_node_openssl",
+    "claude_code_oauth_control_plane",
+    "chatgpt_com_chrome",
+];
+const CLAUDE_CODE_CONTROL_PLANE_REQUEST_KIND_REFRESH: &str = "oauth_refresh";
+const CLAUDE_CODE_CONTROL_PLANE_REQUEST_KIND_INSPECT: &str = "oauth_inspect";
+
+fn configured_transport_profile_id(value: Option<&Value>) -> Option<String> {
+    let transport_profile = value?
+        .get("fingerprint")
+        .or(Some(value?))?
+        .get("transport_profile")?;
+    let id = transport_profile
+        .as_str()
+        .or_else(|| {
+            transport_profile
+                .get("profile_id")
+                .or_else(|| transport_profile.get("id"))
+                .and_then(Value::as_str)
+        })?
+        .trim();
+    (!id.is_empty()).then(|| id.to_ascii_lowercase().replace(['-', ' '], "_"))
+}
+
+/// 供应商 `config.fingerprint.transport_profile` 或 Key `key_config.fingerprint.transport_profile`
+/// / `key_config.transport_profile` 选了内置 TLS 仿真 profile 时为 `true`。
+pub fn claude_code_tls_emulation_configured(ctx: &ProviderOAuthTransportContext) -> bool {
+    [ctx.key_config.as_ref(), ctx.provider_config.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| configured_transport_profile_id(Some(value)))
+        .any(|id| CLAUDE_CODE_TLS_EMULATION_PROFILE_IDS.contains(&id.as_str()))
+}
+
+pub fn claude_code_control_plane_transport_profile_for_context(
+    ctx: &ProviderOAuthTransportContext,
+    request_kind: &str,
+) -> Option<ResolvedTransportProfile> {
+    if !claude_code_tls_emulation_configured(ctx) {
+        return None;
+    }
+    if claude_code_context_uses_tunnel_only_proxy(ctx) {
+        return None;
+    }
+    Some(ResolvedTransportProfile {
+        profile_id: CLAUDE_CODE_OAUTH_CONTROL_PLANE_TLS_PROFILE.to_string(),
         backend: TRANSPORT_BACKEND_BROWSER_WREQ.to_string(),
         http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
         pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
         header_fingerprint: None,
-        extra: Some(json!({ "browser_profile": "chrome136" })),
-    }
+        extra: Some(json!({
+            "emulation_profile": CLAUDE_CODE_OAUTH_CONTROL_PLANE_TLS_PROFILE,
+            "request_kind": request_kind,
+        })),
+    })
 }
 
-fn claude_code_oauth_transport_profile_for_context(
-    ctx: &ProviderOAuthTransportContext,
-) -> Option<ResolvedTransportProfile> {
-    // Node-only proxies must execute through the tunnel runtime, which cannot use browser_wreq.
-    // The explicit browser headers still keep that fallback compatible with Claude's web flow.
-    let tunnel_only_proxy = ctx.network.proxy.as_ref().is_some_and(|proxy| {
+fn claude_code_context_uses_tunnel_only_proxy(ctx: &ProviderOAuthTransportContext) -> bool {
+    ctx.network.proxy.as_ref().is_some_and(|proxy| {
         if proxy.enabled == Some(false) {
             return false;
         }
@@ -335,8 +622,26 @@ fn claude_code_oauth_transport_profile_for_context(
             .map(str::trim)
             .is_some_and(|value| value.eq_ignore_ascii_case("tunnel"));
         has_node_id && (tunnel_mode || !has_proxy_url)
-    });
-    (!tunnel_only_proxy).then(claude_code_oauth_transport_profile)
+    })
+}
+
+pub(super) fn claude_code_oauth_transport_profile() -> ResolvedTransportProfile {
+    ResolvedTransportProfile {
+        profile_id: "claude_oauth_chrome136".to_string(),
+        backend: TRANSPORT_BACKEND_BROWSER_WREQ.to_string(),
+        http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
+        pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
+        header_fingerprint: None,
+        extra: Some(json!({ "browser_profile": "chrome136" })),
+    }
+}
+
+fn claude_code_oauth_transport_profile_for_context(
+    ctx: &ProviderOAuthTransportContext,
+) -> Option<ResolvedTransportProfile> {
+    // Node-only proxies must execute through the tunnel runtime, which cannot use browser_wreq.
+    // The explicit browser headers still keep that fallback compatible with Claude's web flow.
+    (!claude_code_context_uses_tunnel_only_proxy(ctx)).then(claude_code_oauth_transport_profile)
 }
 
 fn cookie_headers(cookie: &str, json_request: bool) -> BTreeMap<String, String> {
@@ -451,6 +756,8 @@ mod tests {
         organizations: Value,
         token_payload: Value,
         redirect_mode: RedirectMode,
+        /// token 端点前 N 次返回的 (status, retry_after) 序列，耗尽后返回 token_payload。
+        token_failures: Arc<Mutex<Vec<(u16, Option<u64>)>>>,
     }
 
     impl Default for RecordingExecutor {
@@ -472,6 +779,7 @@ mod tests {
                     }
                 }),
                 redirect_mode: RedirectMode::Matching,
+                token_failures: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -487,6 +795,42 @@ mod tests {
                 .expect("requests lock")
                 .push(request.clone());
 
+            if request.url.ends_with("/api/oauth/profile") {
+                let payload = json!({
+                    "account": {"uuid": "account-123", "email_address": "alice@example.com", "full_name": "Alice"},
+                    "organization": {"uuid": "org-team", "name": "Team Org", "organization_type": "claude_max"}
+                });
+                return Ok(OAuthHttpResponse {
+                    status_code: 200,
+                    retry_after_secs: None,
+                    body_text: payload.to_string(),
+                    json_body: Some(payload),
+                });
+            }
+            if request.url.ends_with("/api/oauth/claude_cli/roles") {
+                let payload = json!({"roles": ["claude_cli"]});
+                return Ok(OAuthHttpResponse {
+                    status_code: 200,
+                    retry_after_secs: None,
+                    body_text: payload.to_string(),
+                    json_body: Some(payload),
+                });
+            }
+            if request.url.ends_with("/v1/oauth/token") {
+                let next_failure = self
+                    .token_failures
+                    .lock()
+                    .expect("token failures lock")
+                    .pop();
+                if let Some((status_code, retry_after_secs)) = next_failure {
+                    return Ok(OAuthHttpResponse {
+                        status_code,
+                        retry_after_secs,
+                        body_text: "{\"error\":\"upstream\"}".to_string(),
+                        json_body: None,
+                    });
+                }
+            }
             let payload = if request.url.ends_with("/api/organizations") {
                 self.organizations.clone()
             } else if request.url.contains("/authorize") {
@@ -518,6 +862,7 @@ mod tests {
 
             Ok(OAuthHttpResponse {
                 status_code: 200,
+                retry_after_secs: None,
                 body_text: payload.to_string(),
                 json_body: Some(payload),
             })
@@ -609,9 +954,27 @@ mod tests {
         assert_eq!(result.auth_config["org_uuid"], "org-team");
         assert_eq!(result.auth_config["account_uuid"], "account-123");
         assert_eq!(result.auth_config["email"], "alice@example.com");
+        assert_eq!(result.auth_config["org_name"], "Team Org");
+        assert_eq!(result.auth_config["account_name"], "Alice");
+        assert_eq!(
+            result.auth_config["claude_cli_roles"],
+            json!({"roles": ["claude_cli"]})
+        );
 
         let requests = executor.requests.lock().expect("requests lock").clone();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 5, "orgs, authorize, token, profile, roles");
+        assert!(requests[3].url.ends_with("/api/oauth/profile"));
+        assert!(requests[4].url.ends_with("/api/oauth/claude_cli/roles"));
+        for request in &requests[3..] {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer sk-ant-oat01-new")
+            );
+            assert_eq!(
+                request.headers.get("user-agent").map(String::as_str),
+                Some("axios/1.13.6")
+            );
+        }
         assert_eq!(requests[0].method, reqwest::Method::GET);
         assert!(requests[0].url.ends_with("/api/organizations"));
         assert!(requests[1].url.ends_with("/v1/oauth/org-team/authorize"));
@@ -772,8 +1135,9 @@ mod tests {
             Some("sk-ant-ort01-new")
         );
         assert_eq!(refreshed.auth_config["refresh_token"], "sk-ant-ort01-new");
+        assert_eq!(refreshed.auth_config["org_name"], "Team Org");
         let requests = executor.requests.lock().expect("requests lock");
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 3, "token, profile, roles");
         let body = requests[0]
             .json_body
             .as_ref()
@@ -781,5 +1145,207 @@ mod tests {
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["refresh_token"], "sk-ant-ort01-old");
         assert!(body.get("scope").is_none());
+    }
+    #[tokio::test]
+    async fn refresh_retries_5xx_three_times_then_succeeds() {
+        std::env::set_var("AETHER_OAUTH_RETRY_NO_DELAY", "1");
+        let executor = RecordingExecutor::default();
+        *executor.token_failures.lock().expect("lock") =
+            vec![(503, None), (502, None), (500, None)];
+        let adapter = ClaudeCodeProviderOAuthAdapter::default();
+        let account = ProviderOAuthAccount {
+            provider_type: CLAUDE_CODE_PROVIDER_TYPE.to_string(),
+            access_token: "sk-ant-oat01-old".to_string(),
+            auth_config: json!({"provider_type": CLAUDE_CODE_PROVIDER_TYPE, "refresh_token": "sk-ant-ort01-old"}),
+            expires_at_unix_secs: Some(1),
+            identity: BTreeMap::new(),
+        };
+        let refreshed = adapter
+            .refresh(&executor, &context(None), &account)
+            .await
+            .expect("refresh should succeed after retries");
+        assert_eq!(refreshed.token_set.access_token, "sk-ant-oat01-new");
+        let token_calls = executor
+            .requests
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|request| request.url.ends_with("/v1/oauth/token"))
+            .count();
+        assert_eq!(token_calls, 4, "initial + 3 retries");
+
+        *executor.token_failures.lock().expect("lock") =
+            vec![(503, None), (503, None), (503, None), (503, None)];
+        executor.requests.lock().expect("lock").clear();
+        let error = adapter
+            .refresh(&executor, &context(None), &account)
+            .await
+            .expect_err("fourth 5xx must surface");
+        assert!(matches!(
+            error,
+            OAuthError::HttpStatus {
+                status_code: 503,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_429_surfaces_retry_after_without_retrying() {
+        let executor = RecordingExecutor::default();
+        *executor.token_failures.lock().expect("lock") = vec![(429, Some(17))];
+        let adapter = ClaudeCodeProviderOAuthAdapter::default();
+        let account = ProviderOAuthAccount {
+            provider_type: CLAUDE_CODE_PROVIDER_TYPE.to_string(),
+            access_token: "sk-ant-oat01-old".to_string(),
+            auth_config: json!({"provider_type": CLAUDE_CODE_PROVIDER_TYPE, "refresh_token": "sk-ant-ort01-old"}),
+            expires_at_unix_secs: Some(1),
+            identity: BTreeMap::new(),
+        };
+        let error = adapter
+            .refresh(&executor, &context(None), &account)
+            .await
+            .expect_err("429 must surface");
+        assert!(matches!(
+            error,
+            OAuthError::RateLimited {
+                retry_after_secs: Some(17),
+                ..
+            }
+        ));
+        assert_eq!(executor.requests.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn control_plane_profile_is_only_used_when_tls_emulation_is_configured() {
+        let ctx = context(None);
+        assert!(!claude_code_tls_emulation_configured(&ctx));
+        assert!(
+            claude_code_control_plane_transport_profile_for_context(&ctx, "oauth_refresh")
+                .is_none()
+        );
+        assert!(claude_code_token_request_transport_profile(&ctx).is_none());
+
+        let mut configured = context(None);
+        configured.provider_config = Some(json!({
+            "fingerprint": {"transport_profile": "claude_code_node_openssl"}
+        }));
+        assert!(claude_code_tls_emulation_configured(&configured));
+        let profile =
+            claude_code_control_plane_transport_profile_for_context(&configured, "oauth_inspect")
+                .expect("control plane profile");
+        assert_eq!(
+            profile.profile_id,
+            CLAUDE_CODE_OAUTH_CONTROL_PLANE_TLS_PROFILE
+        );
+        assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("request_kind")),
+            Some(&json!("oauth_inspect"))
+        );
+        assert_eq!(
+            claude_code_token_request_transport_profile(&configured)
+                .and_then(|profile| profile.extra)
+                .and_then(|extra| extra.get("request_kind").cloned()),
+            Some(json!("oauth_refresh"))
+        );
+
+        // Key 级配置（对象形态、连字符大小写）同样命中；非仿真 profile 不命中。
+        let mut key_level = context(None);
+        key_level.key_config = Some(json!({
+            "fingerprint": {"transport_profile": {"profile_id": "Claude-Code-OAuth-Control-Plane"}}
+        }));
+        assert!(claude_code_tls_emulation_configured(&key_level));
+        let mut plain = context(None);
+        plain.provider_config = Some(json!({"fingerprint": {"transport_profile": "chrome_136"}}));
+        assert!(!claude_code_tls_emulation_configured(&plain));
+
+        // 隧道代理无法使用 browser_wreq。
+        let tunnel = ProxySnapshot {
+            enabled: Some(true),
+            mode: Some("tunnel".to_string()),
+            node_id: Some("node-1".to_string()),
+            ..ProxySnapshot::default()
+        };
+        let mut tunnel_ctx = context(Some(tunnel));
+        tunnel_ctx.provider_config = Some(json!({
+            "fingerprint": {"transport_profile": "claude_code_node_openssl"}
+        }));
+        assert!(claude_code_control_plane_transport_profile_for_context(
+            &tunnel_ctx,
+            "oauth_refresh"
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_and_profile_lookups_use_control_plane_profile_when_configured() {
+        let executor = RecordingExecutor::default();
+        let adapter = ClaudeCodeProviderOAuthAdapter::default();
+        let mut ctx = context(None);
+        ctx.provider_config = Some(json!({
+            "fingerprint": {"transport_profile": "claude_code_node_openssl"}
+        }));
+        let account = ProviderOAuthAccount {
+            provider_type: CLAUDE_CODE_PROVIDER_TYPE.to_string(),
+            access_token: "sk-ant-oat01-old".to_string(),
+            auth_config: json!({
+                "provider_type": CLAUDE_CODE_PROVIDER_TYPE,
+                "refresh_token": "sk-ant-ort01-old"
+            }),
+            expires_at_unix_secs: Some(1),
+            identity: BTreeMap::new(),
+        };
+        adapter
+            .refresh(&executor, &ctx, &account)
+            .await
+            .expect("refresh should succeed");
+        let requests = executor.requests.lock().expect("mutex should lock");
+        let refresh = requests
+            .iter()
+            .find(|request| request.request_id == "provider-oauth:refresh-token")
+            .expect("refresh request");
+        let profile = refresh
+            .transport_profile
+            .as_ref()
+            .expect("token refresh should use the control plane profile");
+        assert_eq!(
+            profile.profile_id,
+            CLAUDE_CODE_OAUTH_CONTROL_PLANE_TLS_PROFILE
+        );
+        assert_eq!(
+            profile
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("request_kind")),
+            Some(&json!("oauth_refresh"))
+        );
+        let inspect = requests
+            .iter()
+            .find(|request| request.request_id == "provider-oauth:claude-profile")
+            .expect("profile request");
+        assert_eq!(
+            inspect
+                .transport_profile
+                .as_ref()
+                .and_then(|profile| profile.extra.as_ref())
+                .and_then(|extra| extra.get("request_kind")),
+            Some(&json!("oauth_inspect"))
+        );
+        drop(requests);
+
+        // 未配置时保持 reqwest 默认（transport_profile = None）。
+        let executor = RecordingExecutor::default();
+        adapter
+            .refresh(&executor, &context(None), &account)
+            .await
+            .expect("refresh should succeed");
+        let requests = executor.requests.lock().expect("mutex should lock");
+        assert!(requests
+            .iter()
+            .all(|request| request.transport_profile.is_none()));
     }
 }

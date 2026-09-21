@@ -188,6 +188,15 @@ impl fmt::Debug for SameFormatProviderUpstreamUrlParams<'_> {
     }
 }
 
+/// Claude Code 传输的线上策略（P2）。`None` 保持历史行为（固定身份头 + beta 合并）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeCodeWirePolicy<'a> {
+    /// 原生 Claude Code：客户端头逐字节透传（只替换凭据）。
+    NativePassthrough,
+    /// 第三方：固定身份头 + 按最终 body 组装好的 `anthropic-beta`。
+    Cloaked { beta_header: &'a str },
+}
+
 #[derive(Clone, Copy)]
 pub struct SameFormatProviderHeadersInput<'a> {
     pub headers: &'a http::HeaderMap,
@@ -201,6 +210,7 @@ pub struct SameFormatProviderHeadersInput<'a> {
     pub extra_headers: &'a BTreeMap<String, String>,
     pub kiro_auth_config: Option<&'a KiroAuthConfig>,
     pub kiro_machine_id: Option<&'a str>,
+    pub claude_code_wire: Option<ClaudeCodeWirePolicy<'a>>,
 }
 
 impl fmt::Debug for SameFormatProviderHeadersInput<'_> {
@@ -238,6 +248,7 @@ impl fmt::Debug for SameFormatProviderHeadersInput<'_> {
             )
             .field("has_kiro_auth_config", &self.kiro_auth_config.is_some())
             .field("has_kiro_machine_id", &self.kiro_machine_id.is_some())
+            .field("claude_code_wire", &self.claude_code_wire)
             .finish()
     }
 }
@@ -771,7 +782,22 @@ pub fn build_same_format_provider_headers(
 
     let auth_header = input.auth_header.unwrap_or_default();
     let auth_value = input.auth_value.unwrap_or_default();
-    let mut provider_request_headers = if input.behavior.is_claude_code_transport {
+    let claude_code_native_passthrough = input.behavior.is_claude_code_transport
+        && matches!(
+            input.claude_code_wire,
+            Some(ClaudeCodeWirePolicy::NativePassthrough)
+        );
+    let mut provider_request_headers = if claude_code_native_passthrough {
+        // 原生 Claude Code：保留客户端全部身份头（anthropic-*、x-stainless-*、x-app、
+        // user-agent），只替换凭据；不合并 beta、不改 UA。
+        build_complete_passthrough_headers_with_auth(
+            input.headers,
+            auth_header,
+            auth_value,
+            input.extra_headers,
+            Some("application/json"),
+        )
+    } else if input.behavior.is_claude_code_transport {
         build_claude_code_passthrough_headers(
             input.headers,
             auth_header,
@@ -813,16 +839,36 @@ pub fn build_same_format_provider_headers(
         replace_upstream_auth_headers(&mut provider_request_headers, "", "");
     }
     let claude_code_profile = *current_claude_code_transport_identity_profile();
-    if input.behavior.is_claude_code_transport {
+    if input.behavior.is_claude_code_transport && !claude_code_native_passthrough {
         claude_code_profile.apply_fixed_headers(
             &mut provider_request_headers,
             input.behavior.upstream_is_stream,
         );
     }
-    if input.behavior.is_claude_code_transport || input.behavior.is_claude_code {
-        claude_code_profile.apply_beta_policy(&mut provider_request_headers, input.api_operation);
+    match input.claude_code_wire {
+        Some(ClaudeCodeWirePolicy::NativePassthrough) => {}
+        Some(ClaudeCodeWirePolicy::Cloaked { beta_header }) => {
+            if beta_header.trim().is_empty() {
+                provider_request_headers.remove("anthropic-beta");
+            } else {
+                provider_request_headers
+                    .insert("anthropic-beta".to_string(), beta_header.trim().to_string());
+            }
+        }
+        None => {
+            if input.behavior.is_claude_code_transport || input.behavior.is_claude_code {
+                claude_code_profile
+                    .apply_beta_policy(&mut provider_request_headers, input.api_operation);
+            }
+        }
     }
-    if matches!(
+    if claude_code_native_passthrough {
+        // 原生 Claude Code 自己决定 accept（CLI 对流式也发 application/json）；
+        // 只强制 identity 编码，网关的流式解码依赖它。
+        if input.behavior.upstream_is_stream {
+            force_identity_accept_encoding(&mut provider_request_headers);
+        }
+    } else if matches!(
         input.api_operation,
         Some(aether_ai_formats::ApiOperation::ClaudeCountTokens)
     ) {
@@ -1226,6 +1272,7 @@ mod tests {
                     extra_headers: &empty_extra_headers,
                     kiro_auth_config: None,
                     kiro_machine_id: None,
+                    claude_code_wire: None,
                 })
                 .expect("headers should build")
             };
@@ -1390,6 +1437,7 @@ mod tests {
             extra_headers: &BTreeMap::new(),
             kiro_auth_config: None,
             kiro_machine_id: None,
+            claude_code_wire: None,
         })
         .expect("headers should build");
         assert_eq!(
@@ -2629,6 +2677,7 @@ mod tests {
             extra_headers: &BTreeMap::new(),
             kiro_auth_config: None,
             kiro_machine_id: None,
+            claude_code_wire: None,
         })
         .expect("headers should build");
 
@@ -2707,6 +2756,7 @@ mod tests {
             extra_headers: &extra_headers,
             kiro_auth_config: None,
             kiro_machine_id: None,
+            claude_code_wire: None,
         })
         .expect("headers should build");
 
@@ -2725,5 +2775,130 @@ mod tests {
             headers.get("anthropic-beta").map(String::as_str),
             Some("custom-beta")
         );
+    }
+    #[test]
+    fn claude_code_native_passthrough_keeps_client_identity_headers_verbatim() {
+        let provider_request_body = json!({"model": "claude-opus-4-6"});
+        let mut request_headers = http::HeaderMap::new();
+        for (name, value) in [
+            ("x-app", "cli"),
+            ("user-agent", "claude-cli/2.1.200 (external, cli)"),
+            (
+                "anthropic-beta",
+                "claude-code-20250219,oauth-2025-04-20,custom-native",
+            ),
+            ("anthropic-version", "2023-06-01"),
+            ("x-stainless-package-version", "0.99.0"),
+            ("x-stainless-runtime-version", "v26.3.0"),
+            ("x-stainless-os", "MacOS"),
+            ("authorization", "Bearer client-secret"),
+        ] {
+            request_headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+                http::HeaderValue::from_str(value).expect("valid header value"),
+            );
+        }
+        let behavior = SameFormatProviderRequestBehavior {
+            is_antigravity: false,
+            is_gemini_cli: false,
+            is_claude_code: true,
+            is_claude_code_transport: true,
+            anthropic_compatibility_profile: AnthropicCompatibilityProfile::ClaudeCodeLegacy,
+            is_vertex: false,
+            is_kiro: false,
+            upstream_is_stream: true,
+            force_body_stream_field: false,
+            report_kind: "claude_chat_stream_success",
+        };
+        let headers = build_same_format_provider_headers(SameFormatProviderHeadersInput {
+            headers: &request_headers,
+            provider_request_body: &provider_request_body,
+            original_request_body: &provider_request_body,
+            header_rules: None,
+            behavior,
+            api_operation: None,
+            auth_header: Some("authorization"),
+            auth_value: Some("Bearer upstream-secret"),
+            extra_headers: &BTreeMap::new(),
+            kiro_auth_config: None,
+            kiro_machine_id: None,
+            claude_code_wire: Some(ClaudeCodeWirePolicy::NativePassthrough),
+        })
+        .expect("headers should build");
+
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("claude-cli/2.1.200 (external, cli)")
+        );
+        assert_eq!(
+            headers.get("anthropic-beta").map(String::as_str),
+            Some("claude-code-20250219,oauth-2025-04-20,custom-native")
+        );
+        assert_eq!(
+            headers
+                .get("x-stainless-package-version")
+                .map(String::as_str),
+            Some("0.99.0")
+        );
+        assert_eq!(
+            headers.get("x-stainless-os").map(String::as_str),
+            Some("MacOS")
+        );
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer upstream-secret")
+        );
+        assert!(headers.get("x-stainless-helper-method").is_none());
+    }
+
+    #[test]
+    fn claude_code_cloaked_wire_uses_profile_identity_and_assembled_beta_header() {
+        let provider_request_body = json!({"model": "claude-opus-4-6"});
+        let mut request_headers = http::HeaderMap::new();
+        request_headers.insert("user-agent", "anthropic-sdk-python/0.40".parse().unwrap());
+        request_headers.insert(
+            "anthropic-beta",
+            "fast-mode-2026-02-01,custom-beta".parse().unwrap(),
+        );
+        let behavior = SameFormatProviderRequestBehavior {
+            is_antigravity: false,
+            is_gemini_cli: false,
+            is_claude_code: true,
+            is_claude_code_transport: true,
+            anthropic_compatibility_profile: AnthropicCompatibilityProfile::ClaudeCodeLegacy,
+            is_vertex: false,
+            is_kiro: false,
+            upstream_is_stream: false,
+            force_body_stream_field: false,
+            report_kind: "claude_chat_sync_success",
+        };
+        let headers = build_same_format_provider_headers(SameFormatProviderHeadersInput {
+            headers: &request_headers,
+            provider_request_body: &provider_request_body,
+            original_request_body: &provider_request_body,
+            header_rules: None,
+            behavior,
+            api_operation: None,
+            auth_header: Some("authorization"),
+            auth_value: Some("Bearer upstream-secret"),
+            extra_headers: &BTreeMap::new(),
+            kiro_auth_config: None,
+            kiro_machine_id: None,
+            claude_code_wire: Some(ClaudeCodeWirePolicy::Cloaked {
+                beta_header: "claude-code-20250219,oauth-2025-04-20,custom-beta",
+            }),
+        })
+        .expect("headers should build");
+
+        assert_eq!(
+            headers.get("anthropic-beta").map(String::as_str),
+            Some("claude-code-20250219,oauth-2025-04-20,custom-beta"),
+            "assembled header replaces the merge policy verbatim"
+        );
+        assert_eq!(
+            headers.get("user-agent").map(String::as_str),
+            Some("claude-cli/2.1.161 (external, cli)")
+        );
+        assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
     }
 }

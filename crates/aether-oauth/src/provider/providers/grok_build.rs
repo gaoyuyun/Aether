@@ -353,6 +353,7 @@ mod tests {
                     status_code,
                     body_text: body.to_string(),
                     json_body: Some(body),
+                    retry_after_secs: None,
                 },
                 requests: Mutex::new(Vec::new()),
             }
@@ -378,6 +379,7 @@ mod tests {
             self.requests.lock().expect("lock").push(request);
             Ok(OAuthHttpResponse {
                 status_code: self.response.status_code,
+                retry_after_secs: None,
                 body_text: self.response.body_text.clone(),
                 json_body: self.response.json_body.clone(),
             })

@@ -428,7 +428,7 @@
                 <TableCell class="py-3 px-2 align-top">
                   <div class="flex justify-center gap-0.5">
                     <Button
-                      v-if="key.cooldown_reason"
+                      v-if="key.cooldown_reason || (key.model_cooldowns && key.model_cooldowns.length > 0)"
                       variant="ghost"
                       size="icon"
                       class="h-7 w-7 text-muted-foreground hover:text-green-600"
@@ -581,10 +581,21 @@
                   {{ keyUiStateMap[key.key_id]?.schedulingBadgeLabel }}
                 </Badge>
                 <span
-                  v-if="key.cooldown_ttl_seconds"
+                  v-if="keyCooldownPresentations[key.key_id]"
                   class="inline-flex items-center rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium leading-4 text-red-700 dark:text-red-300"
+                  :title="keyCooldownPresentations[key.key_id]?.title"
                 >
-                  冷却 {{ formatTTL(key.cooldown_ttl_seconds) }}
+                  {{ keyCooldownPresentations[key.key_id]?.expired
+                    ? '冷却即将恢复'
+                    : `冷却至 ${keyCooldownPresentations[key.key_id]?.deadlineLabel} · 剩 ${keyCooldownPresentations[key.key_id]?.countdownLabel}` }}
+                </span>
+                <span
+                  v-for="item in keyModelCooldownPresentations[key.key_id] || []"
+                  :key="`${key.key_id}-model-cooldown-${item.model}`"
+                  class="inline-flex items-center rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium leading-4 text-amber-700 dark:text-amber-300"
+                  :title="item.presentation.title"
+                >
+                  {{ item.model }} 冷却{{ item.presentation.countdownLabel ? ` · 剩 ${item.presentation.countdownLabel}` : '' }}
                 </span>
                 <template
                   v-for="item in keyUiStateMap[key.key_id]?.mobileTagItems || []"
@@ -1014,6 +1025,7 @@
     <OAuthKeyEditDialog
       :open="oauthKeyEditDialogOpen"
       :editing-key="editingKey"
+      :provider-type="selectedProviderType || null"
       @close="closeOAuthEditDialog"
       @saved="handleDialogSaved"
     />
@@ -1147,6 +1159,13 @@ import {
 } from '@/features/pool/utils/poolStatsDisplay'
 import { resetCodexCycleUsageWindows } from '@/features/pool/utils/poolCycleStats'
 import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
+import {
+  buildPoolCooldownPresentation,
+  formatCooldownReason,
+  poolCooldownPresentationEquals,
+  resolveCooldownUntil,
+  type PoolCooldownPresentation,
+} from '@/features/pool/utils/poolCooldown'
 import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
 import {
   clearPendingCodexResetCreditIdempotencyKey,
@@ -1703,6 +1722,7 @@ const showAccountQuotaColumn = computed(() => {
     || selectedProviderType.value === 'antigravity'
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
+    || selectedProviderType.value === 'claude_code'
 })
 
 const desktopColumnWidths = computed(() => {
@@ -2114,7 +2134,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         canDownloadOrCopy: true,
         showRefreshToken: showOAuthRefreshControl,
         canResetCycleStats: canResetCycleStats(key),
-        canClearCooldown: Boolean(key.cooldown_reason),
+        canClearCooldown: Boolean(key.cooldown_reason) || (key.model_cooldowns?.length ?? 0) > 0,
         hasProxy: true,
       }).primary,
     }
@@ -2947,6 +2967,9 @@ async function clearCooldown(keyId: string) {
     if (key) {
       key.cooldown_reason = null
       key.cooldown_ttl_seconds = null
+      key.cooldown_until = null
+      key.cooldown_meta = null
+      key.model_cooldowns = []
       if (key.scheduling_reason === 'cooldown') {
         key.scheduling_reason = key.is_active ? 'available' : 'inactive'
         key.scheduling_status = key.is_active ? 'available' : 'blocked'
@@ -3165,25 +3188,89 @@ async function handleAccountDialogSaved() {
 }
 
 // --- Formatting ---
-const COOLDOWN_REASON_MAP: Record<string, string> = {
-  rate_limited_429: '429 限流',
-  forbidden_403: '403 禁止',
-  overloaded_529: '529 过载',
-  auth_failed_401: '401 认证失败',
-  payment_required_402: '402 欠费',
-  server_error_500: '500 错误',
-  request_timeout_408: '408 超时',
-  conflict_409: '409 冲突',
-  locked_423: '423 锁定',
-  too_early_425: '425 Too Early',
-  bad_gateway_502: '502 网关错误',
-  service_unavailable_503: '503 服务不可用',
-  gateway_timeout_504: '504 网关超时',
+/**
+ * 冷却展示（绝对截止时刻 + 倒计时）按内容更新：每秒重算，只替换文字变了的条目。
+ * 数据来自后端的 `cooldown_until` / `cooldown_meta`，本地时钟只做倒计时。
+ */
+const keyCooldownPresentations = ref<Record<string, PoolCooldownPresentation | null>>({})
+const keyModelCooldownPresentations = ref<Record<string, Array<{ model: string, presentation: PoolCooldownPresentation }>>>({})
+const keyPageObservedAtMs = ref(Date.now())
+let keyCooldownTicker: ReturnType<typeof setInterval> | null = null
+
+function refreshKeyCooldownPresentations() {
+  const nowMs = Date.now()
+  const seen = new Set<string>()
+  for (const key of keyPage.value.keys) {
+    seen.add(key.key_id)
+    const next = buildPoolCooldownPresentation({
+      reason: key.cooldown_reason,
+      until: resolveCooldownUntil({
+        until: key.cooldown_until,
+        ttl_seconds: key.cooldown_ttl_seconds,
+        observedAtMs: keyPageObservedAtMs.value,
+      }),
+      meta: key.cooldown_meta ?? null,
+      nowMs,
+    })
+    if (!poolCooldownPresentationEquals(keyCooldownPresentations.value[key.key_id] ?? null, next)) {
+      keyCooldownPresentations.value[key.key_id] = next
+    }
+    const models = (key.model_cooldowns ?? [])
+      .map(item => ({
+        model: item.model,
+        presentation: buildPoolCooldownPresentation({
+          reason: item.reason,
+          until: resolveCooldownUntil({
+            until: item.until,
+            ttl_seconds: item.ttl_seconds,
+            observedAtMs: keyPageObservedAtMs.value,
+          }),
+          meta: item.meta ?? null,
+          nowMs,
+        }),
+      }))
+      .filter((item): item is { model: string, presentation: PoolCooldownPresentation } => item.presentation !== null)
+    const current = keyModelCooldownPresentations.value[key.key_id] ?? []
+    const unchanged = current.length === models.length
+      && current.every((item, index) => item.model === models[index]?.model
+        && poolCooldownPresentationEquals(item.presentation, models[index]?.presentation ?? null))
+    if (!unchanged) {
+      if (models.length === 0) delete keyModelCooldownPresentations.value[key.key_id]
+      else keyModelCooldownPresentations.value[key.key_id] = models
+    }
+  }
+  for (const keyId of Object.keys(keyCooldownPresentations.value)) {
+    if (!seen.has(keyId)) {
+      delete keyCooldownPresentations.value[keyId]
+      delete keyModelCooldownPresentations.value[keyId]
+    }
+  }
 }
 
-function formatCooldownReason(reason: string): string {
-  return COOLDOWN_REASON_MAP[reason] || reason
-}
+watch(
+  () => keyPage.value.keys,
+  () => {
+    keyPageObservedAtMs.value = Date.now()
+    refreshKeyCooldownPresentations()
+    const hasCooldown = keyPage.value.keys.some(
+      key => key.cooldown_reason || (key.model_cooldowns?.length ?? 0) > 0,
+    )
+    if (hasCooldown && !keyCooldownTicker) {
+      keyCooldownTicker = setInterval(refreshKeyCooldownPresentations, 1000)
+    } else if (!hasCooldown && keyCooldownTicker) {
+      clearInterval(keyCooldownTicker)
+      keyCooldownTicker = null
+    }
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  if (keyCooldownTicker) {
+    clearInterval(keyCooldownTicker)
+    keyCooldownTicker = null
+  }
+})
 
 type PoolStatusVariant = 'default' | 'secondary' | 'destructive' | 'outline' | 'success' | 'warning' | 'dark'
 
@@ -3338,6 +3425,8 @@ function getSchedulingTitle(key: PoolKeyDetail): string {
   }
 
   if (key.cooldown_reason) {
+    const presentation = keyCooldownPresentations.value[key.key_id]
+    if (presentation) return presentation.title
     const ttl = key.cooldown_ttl_seconds ? ` (${formatTTL(key.cooldown_ttl_seconds)})` : ''
     return `${formatCooldownReason(key.cooldown_reason)}${ttl}`
   }

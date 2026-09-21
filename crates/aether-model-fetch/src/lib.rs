@@ -1,6 +1,7 @@
 mod association_sync;
 mod config;
 mod logic;
+mod onboarding;
 mod preset_catalog;
 mod strategy;
 mod transport;
@@ -21,6 +22,12 @@ pub use logic::{
     select_models_fetch_endpoint, selected_models_fetch_endpoints,
     upstream_metadata_namespace_updates, ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
 };
+pub use onboarding::{
+    classify_cloud_code_onboard_response, cloud_code_onboard_tier_id,
+    extract_cloud_code_project_id, onboard_cloud_code_user, CloudCodeOnboardPoll,
+    CloudCodeOnboardingClient, CloudCodeOnboardingOutcome, CLOUD_CODE_ONBOARD_MAX_ATTEMPTS,
+    CLOUD_CODE_ONBOARD_POLL_INTERVAL,
+};
 pub use preset_catalog::{
     apply_remote_preset_model_catalog, current_preset_model_catalog, embedded_preset_model_catalog,
     parse_preset_model_catalog, preset_model_catalog_refresh_enabled,
@@ -31,11 +38,14 @@ pub use preset_catalog::{
 pub use strategy::{
     antigravity_model_id_is_routable, fetch_models_from_transports,
     fetch_models_from_transports_for_client_version, fetch_models_from_transports_for_management,
-    ModelFetchStrategy, ModelFetchStrategyKind, ModelsFetchOutcome, SelectedModelFetchStrategy,
+    hydrate_antigravity_project, hydrate_gemini_cli_project, AntigravityProjectHydration,
+    GeminiCliProjectHydration, ModelFetchStrategy, ModelFetchStrategyKind, ModelsFetchOutcome,
+    SelectedModelFetchStrategy,
 };
 pub use transport::{
     build_antigravity_fetch_available_models_plan, build_antigravity_load_code_assist_plan,
-    build_gemini_cli_load_code_assist_plan, build_kiro_list_available_models_plan,
+    build_antigravity_onboard_user_plan, build_gemini_cli_load_code_assist_plan,
+    build_gemini_cli_onboard_user_plan, build_kiro_list_available_models_plan,
     build_models_fetch_execution_plan, build_models_fetch_execution_plan_for_client_version,
     build_standard_models_fetch_execution_plan,
     build_standard_models_fetch_execution_plan_for_client_version,

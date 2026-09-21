@@ -131,9 +131,9 @@
 
       <!-- 请求配置 -->
       <div class="space-y-3">
-          <h3 class="text-sm font-medium border-b pb-2">
-            {{ legacyT('请求配置') }}
-          </h3>
+        <h3 class="text-sm font-medium border-b pb-2">
+          {{ legacyT('请求配置') }}
+        </h3>
         <div class="grid grid-cols-2 gap-4">
           <div class="space-y-1.5">
             <Label>{{ legacyT('上游成本模式') }}</Label>
@@ -400,7 +400,9 @@
               step="60"
             />
           </div>
-          <p class="text-xs text-muted-foreground">{{ legacyT('订阅开始时间是固定的开通记录。调整周期长度和当前起点，请使用详情中的“调整周期”。') }}</p>
+          <p class="text-xs text-muted-foreground">
+            {{ legacyT('订阅开始时间是固定的开通记录。调整周期长度和当前起点，请使用详情中的“调整周期”。') }}
+          </p>
           <div class="space-y-1.5">
             <Label class="text-xs">{{ legacyT('订阅到期时间') }}</Label>
             <Input
@@ -471,6 +473,146 @@
           />
         </div>
 
+        <!-- Claude Code 客户端伪装模式（仅 claude_code） -->
+        <div
+          v-if="form.provider_type === 'claude_code'"
+          class="space-y-3 p-3 border rounded-lg bg-muted/50"
+          data-testid="claude-code-cloak-mode-setting"
+        >
+          <div class="flex items-center justify-between gap-4">
+            <div class="space-y-0.5">
+              <Label
+                for="claude-code-cloak-mode"
+                class="text-sm font-medium"
+              >
+                {{ legacyT('客户端伪装模式') }}
+              </Label>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                {{ legacyT('原生 Claude Code 请求始终逐字节透传；第三方客户端的请求按所选模式补齐身份、beta、cache_control 与 CCH 签名。') }}
+              </p>
+            </div>
+            <Select
+              :model-value="form.claude_code_cloak_mode"
+              @update:model-value="(v: string) => form.claude_code_cloak_mode = normalizeClaudeCodeCloakMode(v)"
+            >
+              <SelectTrigger
+                id="claude-code-cloak-mode"
+                class="w-40"
+                :aria-label="legacyT('客户端伪装模式')"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">
+                  {{ legacyT('自动（仅第三方）') }}
+                </SelectItem>
+                <SelectItem value="always">
+                  {{ legacyT('总是改写') }}
+                </SelectItem>
+                <SelectItem value="off">
+                  {{ legacyT('关闭') }}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <p class="text-xs text-muted-foreground leading-relaxed">
+            {{ legacyT('自动：识别为第三方才改写；总是：所有客户端都改写；关闭：只同步计费头版本。识别结果会写入请求详情的 claude_code_cloak 字段。') }}
+          </p>
+        </div>
+
+        <!-- 敏感词混淆（仅 claude_code / antigravity） -->
+        <div
+          v-if="showSensitiveWordsSetting"
+          class="space-y-2 p-3 border rounded-lg bg-muted/50"
+          data-testid="sensitive-words-setting"
+        >
+          <div class="space-y-0.5">
+            <Label
+              for="cloak-sensitive-words"
+              class="text-sm font-medium"
+            >
+              {{ legacyT('敏感词混淆') }}
+            </Label>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              {{ legacyT('每行一个词，不区分大小写；命中的词在第一个字符后插入零宽字符再发往上游。只处理系统提示与对话文本，不碰工具调用与结果。') }}
+            </p>
+          </div>
+          <Textarea
+            id="cloak-sensitive-words"
+            :model-value="form.cloak_sensitive_words_text"
+            class="min-h-[96px] font-mono text-sm"
+            :class="{ 'border-destructive': sensitiveWordsError }"
+            placeholder="proxy&#10;API"
+            :aria-invalid="sensitiveWordsError ? 'true' : undefined"
+            @update:model-value="(v: string) => form.cloak_sensitive_words_text = v"
+          />
+          <p
+            v-if="sensitiveWordsError"
+            class="text-xs text-destructive"
+            data-testid="sensitive-words-error"
+          >
+            {{ sensitiveWordsError }}
+          </p>
+          <p
+            v-else
+            class="text-xs text-muted-foreground"
+            data-testid="sensitive-words-summary"
+          >
+            {{ legacyT('已配置') }} {{ sensitiveWordsParsed.words.length }} / {{ SENSITIVE_WORD_MAX_ENTRIES }}
+            <template v-if="sensitiveWordsChanged">
+              · {{ legacyT('词表变更会使提示词缓存失效') }}
+            </template>
+          </p>
+        </div>
+
+        <!-- 传输指纹 profile（P5，仅 claude_code / codex） -->
+        <div
+          v-if="showTransportProfileSetting"
+          class="space-y-3 p-3 border rounded-lg bg-muted/50"
+          data-testid="transport-profile-setting"
+        >
+          <div class="flex items-center justify-between gap-4">
+            <div class="space-y-0.5">
+              <Label
+                for="transport-profile"
+                class="text-sm font-medium"
+              >
+                {{ legacyT('传输指纹 profile') }}
+              </Label>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                {{ legacyT('系统默认走 rustls；选择仿真 profile 后出站 TLS 改用 BoringSSL 复刻原生客户端的 ClientHello 与头顺序。Key 级设置优先。') }}
+              </p>
+            </div>
+            <Select
+              :model-value="form.transport_profile ?? TRANSPORT_PROFILE_DEFAULT_OPTION"
+              @update:model-value="(v: string) => form.transport_profile = normalizeTransportProfile(v)"
+            >
+              <SelectTrigger
+                id="transport-profile"
+                class="w-56"
+                :aria-label="legacyT('传输指纹 profile')"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem :value="TRANSPORT_PROFILE_DEFAULT_OPTION">
+                  {{ legacyT('系统默认') }}
+                </SelectItem>
+                <SelectItem
+                  v-for="option in transportProfileOptions"
+                  :key="option"
+                  :value="option"
+                >
+                  {{ transportProfileLabel(option) }}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <p class="text-xs text-muted-foreground leading-relaxed">
+            {{ legacyT('仿真参数以 CLIProxyAPI 复刻的 Claude Code 2.1.220 抓包为起点，尚未用真实抓包核对；可在 Key 编辑里「探测 TLS 指纹」查看实际 JA3/JA4。') }}
+          </p>
+        </div>
+
         <div
           class="flex items-center justify-between p-3 border rounded-lg bg-muted/50"
           data-testid="responses-websocket-setting"
@@ -492,6 +634,82 @@
             :aria-label="legacyT('Responses WebSocket 模式')"
             @update:model-value="(v: boolean) => form.responses_websocket_enabled = v"
           />
+        </div>
+
+        <!-- 冷却策略 -->
+        <div
+          class="space-y-3 p-3 border rounded-lg bg-muted/50"
+          data-testid="cooldown-policy-setting"
+        >
+          <div class="space-y-0.5">
+            <span class="text-sm font-medium">{{ legacyT('冷却策略') }}</span>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              {{ legacyT('上游给出重试提示时按提示冷却；没有提示的 429 按 30 秒起步的指数退避，最长 30 分钟。') }}
+            </p>
+          </div>
+          <div class="flex items-center justify-between gap-4">
+            <div class="space-y-0.5">
+              <Label
+                for="cooldown-disable"
+                class="text-sm font-medium"
+              >
+                {{ legacyT('禁用冷却') }}
+              </Label>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                {{ legacyT('关闭后上游失败不再让 Key 进入冷却，仅用于回滚排障。') }}
+              </p>
+            </div>
+            <Switch
+              id="cooldown-disable"
+              :model-value="form.cooldown.disable"
+              :aria-label="legacyT('禁用冷却')"
+              @update:model-value="(v: boolean) => form.cooldown.disable = v"
+            />
+          </div>
+          <div class="flex items-center justify-between gap-4">
+            <div class="space-y-0.5">
+              <Label
+                for="cooldown-transient-error-seconds"
+                class="text-sm font-medium"
+              >
+                {{ legacyT('瞬时错误冷却秒数') }}
+              </Label>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                {{ legacyT('5xx、408、520–526 等瞬时错误后的冷却时长；0 表示这类错误不冷却。') }}
+              </p>
+            </div>
+            <Input
+              id="cooldown-transient-error-seconds"
+              class="w-28"
+              :model-value="form.cooldown.transient_error_seconds"
+              type="number"
+              min="0"
+              max="86400"
+              step="1"
+              :disabled="form.cooldown.disable"
+              @update:model-value="(v) => form.cooldown.transient_error_seconds = parseNumberInput(v, { min: 0, max: 86400 }) ?? 60"
+            />
+          </div>
+          <div class="flex items-center justify-between gap-4">
+            <div class="space-y-0.5">
+              <Label
+                for="cooldown-model-level"
+                class="text-sm font-medium"
+              >
+                {{ legacyT('模型级冷却') }}
+              </Label>
+              <p class="text-xs text-muted-foreground leading-relaxed">
+                {{ legacyT('开启后只冷却出错的模型，同一把 Key 上的其他模型继续可调度。') }}
+              </p>
+            </div>
+            <Switch
+              id="cooldown-model-level"
+              :model-value="form.cooldown.model_level"
+              :aria-label="legacyT('模型级冷却')"
+              :disabled="form.cooldown.disable"
+              @update:model-value="(v: boolean) => form.cooldown.model_level = v"
+            />
+          </div>
         </div>
 
         <div class="flex items-center justify-between gap-4 p-3 border rounded-lg bg-muted/50">
@@ -537,6 +755,7 @@ import {
   SelectContent,
   SelectItem,
   Switch,
+  Textarea,
 } from '@/components/ui'
 import { Server, SquarePen } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
@@ -551,6 +770,24 @@ import {
   type ProviderType,
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
+import {
+  DEFAULT_CLAUDE_CODE_CLOAK_MODE,
+  DEFAULT_PROVIDER_COOLDOWN_CONFIG,
+  SENSITIVE_WORD_MAX_ENTRIES,
+  extractProviderWriteWarnings,
+  normalizeClaudeCodeCloakMode,
+  normalizeProviderCooldownConfig,
+  normalizeSensitiveWordList,
+  parseSensitiveWordListText,
+  providerTypeSupportsSensitiveWords,
+  providerTypeSupportsTransportProfile,
+  normalizeTransportProfile,
+  sensitiveWordListsEqual,
+  transportProfileLabel,
+  transportProfileOptionsForProviderType,
+  type ClaudeCodeCloakMode,
+  type TransportProfileId,
+} from '@/api/endpoints/types/provider'
 import { parseApiError } from '@/utils/errorParser'
 import { parseNumberInput } from '@/utils/form'
 import { dateTimeLocalToRfc3339, formatDateTimeLocalInput } from '@/utils/date'
@@ -567,7 +804,7 @@ const emit = defineEmits<{
   'providerUpdated': [provider: ProviderWithEndpointsSummary]
 }>()
 
-const { success, error: showError } = useToast()
+const { success, error: showError, warning: showWarning } = useToast()
 const { legacyT } = useI18n()
 const loading = ref(false)
 
@@ -619,12 +856,49 @@ const form = ref({
   pool_mode_enabled: false,
   // Codex 专属配置
   codex_fingerprint_convergence_enabled: false,
+  // Claude Code 客户端伪装模式
+  claude_code_cloak_mode: DEFAULT_CLAUDE_CODE_CLOAK_MODE as ClaudeCodeCloakMode,
+  // 敏感词混淆词表（逐行文本，保存时解析；仅 claude_code / antigravity）
+  cloak_sensitive_words_text: '',
+  // 传输指纹 profile（P5；null = 系统默认）
+  transport_profile: null as TransportProfileId | null,
   // Kiro 专属配置
   kiro_simulated_cache_enabled: false,
   // Responses WebSocket 配置
   responses_websocket_enabled: false,
+  // 冷却策略
+  cooldown: { ...DEFAULT_PROVIDER_COOLDOWN_CONFIG },
 })
+/** Select 组件不接受空值，用哨兵表示「系统默认」。 */
+const TRANSPORT_PROFILE_DEFAULT_OPTION = '__system_default__'
+const showTransportProfileSetting = computed(() => providerTypeSupportsTransportProfile(form.value.provider_type))
+const transportProfileOptions = computed(() => transportProfileOptionsForProviderType(form.value.provider_type))
 const initialQuotaLastResetAt = ref<string | undefined>(undefined)
+/** 编辑模式下加载时的词表，用于判断词表是否变化（变化会让提示词缓存失效）。 */
+const initialSensitiveWords = ref<string[]>([])
+
+const showSensitiveWordsSetting = computed(() => providerTypeSupportsSensitiveWords(form.value.provider_type))
+const sensitiveWordsParsed = computed(() => parseSensitiveWordListText(form.value.cloak_sensitive_words_text))
+const sensitiveWordsError = computed<string | null>(() => {
+  const parsed = sensitiveWordsParsed.value
+  if (parsed.zeroWidth.length > 0) {
+    return `${legacyT('敏感词不能包含零宽字符')}：${parsed.zeroWidth.join('、')}`
+  }
+  if (parsed.tooShort.length > 0) {
+    return `${legacyT('以下敏感词过短，每个词至少 2 个字符')}：${parsed.tooShort.join('、')}`
+  }
+  if (parsed.tooLong.length > 0) {
+    return legacyT('以下敏感词过长，每个词最多 256 个字符')
+  }
+  if (parsed.tooMany) {
+    return `${legacyT('敏感词最多 256 条')}，${legacyT('当前')} ${parsed.words.length}`
+  }
+  return null
+})
+const sensitiveWordsChanged = computed(() => {
+  if (!showSensitiveWordsSetting.value) return false
+  return !sensitiveWordListsEqual(sensitiveWordsParsed.value.words, initialSensitiveWords.value)
+})
 
 // 重置表单
 function resetForm() {
@@ -656,11 +930,20 @@ function resetForm() {
     pool_mode_enabled: false,
     // Codex 专属配置
     codex_fingerprint_convergence_enabled: false,
+    // Claude Code 客户端伪装模式
+    claude_code_cloak_mode: DEFAULT_CLAUDE_CODE_CLOAK_MODE as ClaudeCodeCloakMode,
+    // 敏感词混淆词表
+    cloak_sensitive_words_text: '',
+    // 传输指纹 profile
+    transport_profile: null,
     // Kiro 专属配置
     kiro_simulated_cache_enabled: false,
     // Responses WebSocket 配置
     responses_websocket_enabled: false,
+    // 冷却策略
+    cooldown: { ...DEFAULT_PROVIDER_COOLDOWN_CONFIG },
   }
+  initialSensitiveWords.value = []
 }
 
 // 加载提供商数据（编辑模式）
@@ -695,12 +978,21 @@ function loadProviderData() {
     pool_mode_enabled: poolAdvanced !== null,
     // Codex 专属配置
     codex_fingerprint_convergence_enabled: props.provider.codex_fingerprint_convergence_enabled ?? false,
+    // Claude Code 客户端伪装模式
+    claude_code_cloak_mode: normalizeClaudeCodeCloakMode(props.provider.claude_code_cloak_mode),
+    // 敏感词混淆词表
+    cloak_sensitive_words_text: normalizeSensitiveWordList(props.provider.cloak_sensitive_words).join('\n'),
+    // 传输指纹 profile
+    transport_profile: normalizeTransportProfile(props.provider.transport_profile),
     // Kiro 专属配置
     kiro_simulated_cache_enabled: props.provider.kiro_simulated_cache_enabled ?? false,
     // Responses WebSocket 配置
     responses_websocket_enabled: props.provider.responses_websocket_enabled ?? false,
+    // 冷却策略
+    cooldown: normalizeProviderCooldownConfig(props.provider.cooldown),
   }
   initialQuotaLastResetAt.value = dateTimeLocalToRfc3339(form.value.quota_subscription_started_at)
+  initialSensitiveWords.value = normalizeSensitiveWordList(props.provider.cloak_sensitive_words)
 }
 
 function addQuotaWindow() {
@@ -786,7 +1078,27 @@ watch(() => form.value.provider_type, () => {
   if (form.value.provider_type !== 'codex') {
     form.value.codex_fingerprint_convergence_enabled = false
   }
+  if (form.value.provider_type !== 'claude_code') {
+    form.value.claude_code_cloak_mode = DEFAULT_CLAUDE_CODE_CLOAK_MODE
+  }
+  if (!providerTypeSupportsSensitiveWords(form.value.provider_type)) {
+    form.value.cloak_sensitive_words_text = ''
+  }
+  if (!transportProfileOptionsForProviderType(form.value.provider_type).includes(form.value.transport_profile as TransportProfileId)) {
+    form.value.transport_profile = null
+  }
 })
+
+// 写入响应里的提示（词表变更会让提示词缓存失效）；后端没返回时按本地判断兜底。
+function notifyProviderWriteWarnings(payload: unknown, sensitiveWordsWillChange: boolean) {
+  const warnings = extractProviderWriteWarnings(payload)
+  if (warnings.length === 0 && sensitiveWordsWillChange) {
+    warnings.push(legacyT('敏感词词表已变更，提示词缓存将失效'))
+  }
+  for (const message of warnings) {
+    showWarning(message, legacyT('提示'))
+  }
+}
 
 // 提交表单
 const handleSubmit = async () => {
@@ -806,6 +1118,11 @@ const handleSubmit = async () => {
     showError(legacyT('过期时间必须是合法时间'), legacyT('验证失败'))
     return
   }
+  if (showSensitiveWordsSetting.value && sensitiveWordsError.value) {
+    showError(sensitiveWordsError.value, legacyT('验证失败'))
+    return
+  }
+  const sensitiveWordsWillChange = sensitiveWordsChanged.value
 
   loading.value = true
   try {
@@ -833,6 +1150,11 @@ const handleSubmit = async () => {
         ? (quotaReservationFromForm(form.value.quota_reservation) ?? (isEditMode.value ? null : undefined))
         : undefined,
       responses_websocket_enabled: form.value.responses_websocket_enabled,
+      cooldown: {
+        disable: form.value.cooldown.disable,
+        transient_error_seconds: form.value.cooldown.transient_error_seconds,
+        model_level: form.value.cooldown.model_level,
+      },
       is_active: form.value.is_active,
       // 请求配置：编辑时清空需显式发送 null，后端才会清除覆盖并回到继承调度策略
       max_retries: form.value.max_retries ?? (isEditMode.value ? null : undefined),
@@ -848,6 +1170,15 @@ const handleSubmit = async () => {
         ? {
             codex_fingerprint_convergence_enabled: form.value.codex_fingerprint_convergence_enabled,
           }
+        : {}),
+      ...(form.value.provider_type === 'claude_code'
+        ? { claude_code_cloak_mode: form.value.claude_code_cloak_mode }
+        : {}),
+      ...(showSensitiveWordsSetting.value
+        ? { cloak_sensitive_words: sensitiveWordsParsed.value.words }
+        : {}),
+      ...(showTransportProfileSetting.value
+        ? { transport_profile: form.value.transport_profile }
         : {}),
       ...(form.value.provider_type === 'kiro'
         ? {
@@ -867,11 +1198,13 @@ const handleSubmit = async () => {
         provider_priority: form.value.provider_priority,
       })
       success(legacyT('提供商更新成功'))
+      notifyProviderWriteWarnings(updated, sensitiveWordsWillChange)
       emit('providerUpdated', updated)
     } else {
       // 创建提供商（优先级由后端自动置顶）
-      await createProvider(basePayload)
+      const created = await createProvider(basePayload)
       success(legacyT('提供商已创建，请继续添加端点和密钥，或在优先级管理中调整顺序'), legacyT('创建成功'))
+      notifyProviderWriteWarnings(created, sensitiveWordsWillChange)
       emit('providerCreated')
     }
 

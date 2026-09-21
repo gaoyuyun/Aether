@@ -102,6 +102,23 @@ pub(super) async fn execute_admin_provider_oauth_refresh(
                 ),
             ));
         }
+        Err(AdminLocalOAuthRefreshError::RateLimited {
+            retry_after_secs, ..
+        }) => {
+            tracing::warn!(
+                trace_id = %trace_id,
+                key_id = %key_id,
+                provider_id = %provider.id,
+                provider_type = %provider_type,
+                retry_after_secs = ?retry_after_secs,
+                "gateway manual provider oauth refresh was rate limited"
+            );
+            return Ok(RefreshDispatch::Respond(
+                response::oauth_refresh_failed_service_unavailable_response(
+                    "Token 刷新被上游限流，请稍后重试",
+                ),
+            ));
+        }
         Err(AdminLocalOAuthRefreshError::TransportMessage { .. }) => {
             tracing::warn!(
                 trace_id = %trace_id,

@@ -12,6 +12,7 @@ mod effects;
 mod health;
 mod oauth_error;
 mod policy;
+mod reasoning_replay;
 mod recovery;
 mod report_effects;
 
@@ -22,7 +23,8 @@ pub(crate) use self::adaptive::{
 pub(crate) use self::attempt::{
     attempt_identity_from_report_context, insert_pool_key_lease_report_context_fields,
     local_execution_candidate_metadata_from_report_context, next_same_key_retry_attempt,
-    ExecutionAttemptIdentity, LocalExecutionCandidateMetadata, POOL_KEY_RETRY_INDEX_STRIDE,
+    next_same_key_retry_attempt_with_wait, ExecutionAttemptIdentity,
+    LocalExecutionCandidateMetadata, POOL_KEY_RETRY_INDEX_STRIDE,
     ROUTING_POOL_POLICY_OVERRIDE_REPORT_FIELD, SCHEDULER_AFFINITY_EPOCH_REPORT_FIELD,
 };
 pub(crate) use self::classifier::{
@@ -40,12 +42,12 @@ pub(crate) use self::codex_quota_breaker::{
 };
 pub(crate) use self::effects::{
     apply_local_execution_effect, apply_local_stream_failure_effects,
-    apply_local_stream_success_effects, release_local_pool_key_lease,
+    apply_local_stream_success_effects, pool_immediate_retry_wait, release_local_pool_key_lease,
     release_pool_key_lease_from_report_context, spawn_local_oauth_success_effect,
-    LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
-    LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
-    LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect,
-    LocalPoolErrorEffect, LocalStreamFailureEffect,
+    take_pool_immediate_retry_hint, LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect,
+    LocalAttemptFailureEffect, LocalExecutionEffect, LocalExecutionEffectContext,
+    LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
+    LocalOAuthSuccessEffect, LocalPoolErrorEffect, LocalStreamFailureEffect,
 };
 pub(crate) use self::health::{
     project_local_failure_health, project_local_key_circuit_closed,
@@ -61,6 +63,13 @@ pub(crate) use self::policy::{
     routing_execution_policy_from_report_context, LocalFailoverPolicy, LocalFailoverRegexRule,
     ResponsesWebSocketAdapter, RESPONSES_WEBSOCKET_CONFIG_KEY,
     ROUTING_EXECUTION_POLICY_REPORT_FIELD,
+};
+#[cfg(test)]
+pub(crate) use self::reasoning_replay::clear_reasoning_replay_ledger_for_tests;
+pub(crate) use self::reasoning_replay::{
+    apply_reasoning_replay_to_plan, capture_reasoning_replay_from_stream_capture,
+    capture_reasoning_replay_from_sync_response, clear_reasoning_replay_for_provider_key,
+    clear_reasoning_replay_on_invalid_signature, REASONING_REPLAY_REPORT_FIELD,
 };
 pub(crate) use self::recovery::{
     analyze_local_failover, analyze_local_transport_error, apply_provider_failure_disposition,

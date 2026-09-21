@@ -7889,6 +7889,16 @@ mod tests {
         assert_eq!(records[1].status, "completed");
         drop(records);
 
+        // The terminal barrier orders persistence; the submission worker updates its
+        // pending count only after joining the task that handed off the barrier.
+        timeout(Duration::from_secs(1), async {
+            while runtime.metrics_snapshot().lifecycle_submission_pending != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle submission bookkeeping should finish after the terminal write");
+
         let snapshot = runtime.metrics_snapshot();
         assert_eq!(snapshot.lifecycle_submission_pending, 0);
         assert_eq!(snapshot.first_byte_persistence_pending, 0);

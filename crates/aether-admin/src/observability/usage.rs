@@ -218,12 +218,23 @@ pub fn admin_usage_matches_search(
         Some(item.provider_name.as_str()),
     ];
     search.split_whitespace().all(|keyword| {
-        let keyword = keyword.to_ascii_lowercase();
-        haystack
-            .iter()
-            .flatten()
-            .any(|value| value.to_ascii_lowercase().contains(keyword.as_str()))
+        // 敏感词混淆会往正文里插零宽空格；用户复制出来的词可能带着它，
+        // 匹配前两边都剥掉，按原词比较。
+        let keyword = admin_usage_strip_zero_width(keyword).to_ascii_lowercase();
+        if keyword.is_empty() {
+            return true;
+        }
+        haystack.iter().flatten().any(|value| {
+            admin_usage_strip_zero_width(value)
+                .to_ascii_lowercase()
+                .contains(keyword.as_str())
+        })
     })
+}
+
+/// 去掉搜索文本里的 U+200B（敏感词零宽混淆插入的字符）。
+pub fn admin_usage_strip_zero_width(value: &str) -> String {
+    aether_provider_transport::strip_zero_width(value)
 }
 
 pub fn admin_usage_matches_username(
@@ -4237,6 +4248,39 @@ mod tests {
             &users_by_id,
             true
         ));
+    }
+
+    #[test]
+    fn admin_usage_search_strips_zero_width_from_keywords_and_haystack() {
+        let item = StoredRequestUsageAudit {
+            model: "p\u{200B}roxy-model".to_string(),
+            ..sample_usage("completed", Some(200), None)
+        };
+        assert!(admin_usage_matches_search(
+            &item,
+            Some("proxy"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false
+        ));
+        assert!(admin_usage_matches_search(
+            &item,
+            Some("p\u{200B}roxy-mo\u{200B}del"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false
+        ));
+        assert!(!admin_usage_matches_search(
+            &item,
+            Some("gateway"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false
+        ));
+        assert_eq!(super::admin_usage_strip_zero_width("a\u{200B}b"), "ab");
     }
 
     #[test]

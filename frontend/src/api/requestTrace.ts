@@ -70,6 +70,8 @@ export interface CandidatePoolSkip {
   type?: string
   cooldown_reason?: string | null
   cooldown_ttl?: number | null
+  /** 模型级冷却时被冷却的模型名。 */
+  model?: string | null
   cost_window_usage?: number | null
   [key: string]: unknown
 }

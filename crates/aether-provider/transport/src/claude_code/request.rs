@@ -185,21 +185,32 @@ fn keep_claude_code_block(
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
-    if matches!(block_type, "thinking" | "redacted_thinking") {
-        let signature = block_object
-            .get("signature")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        return thinking_enabled
-            && role.eq_ignore_ascii_case("assistant")
-            && !signature.is_empty()
-            && signature != DUMMY_THINKING_SIGNATURE;
+    match block_type {
+        "thinking" => {
+            let signature = block_object
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            thinking_enabled
+                && role.eq_ignore_ascii_case("assistant")
+                && !signature.is_empty()
+                && signature != DUMMY_THINKING_SIGNATURE
+        }
+        // 真实 API 返回的 redacted_thinking 块只有 `data`（加密载荷），没有
+        // `signature`；按 thinking 的签名规则过滤会把整段上下文丢掉，多轮
+        // 对话随即触发 400。这里只要求 `data` 非空。
+        "redacted_thinking" => {
+            let data = block_object
+                .get("data")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            thinking_enabled && role.eq_ignore_ascii_case("assistant") && !data.is_empty()
+        }
+        "" if block_object.contains_key("thinking") => false,
+        _ => true,
     }
-    if block_type.is_empty() && block_object.contains_key("thinking") {
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]
@@ -281,8 +292,11 @@ mod tests {
                 "content":[
                     {"type":"thinking","thinking":"keep","signature":"sig_valid"},
                     {"type":"thinking","thinking":"drop-empty","signature":""},
+                    {"type":"thinking","thinking":"drop-dummy","signature":"skip_thought_signature_validator"},
                     {"type":"redacted_thinking","data":"keep-redacted","signature":"sig_redacted"},
-                    {"type":"redacted_thinking","data":"drop-no-signature"},
+                    {"type":"redacted_thinking","data":"keep-data-only"},
+                    {"type":"redacted_thinking","data":""},
+                    {"type":"redacted_thinking"},
                     {"thinking":"drop-no-type"},
                     {"type":"text","text":"ok"}
                 ]
@@ -296,8 +310,72 @@ mod tests {
             json!([
                 {"type":"thinking","thinking":"keep","signature":"sig_valid"},
                 {"type":"redacted_thinking","data":"keep-redacted","signature":"sig_redacted"},
+                {"type":"redacted_thinking","data":"keep-data-only"},
                 {"type":"text","text":"ok"}
             ])
+        );
+    }
+
+    /// 验收用例：同一条 assistant 消息里同时有正常 thinking、空签名 thinking、
+    /// 仅带 `data` 的 redacted_thinking，输出保留第一和第三块。
+    #[test]
+    fn claude_code_body_sanitizer_keeps_data_only_redacted_thinking() {
+        let mut body = json!({
+            "thinking": {"type":"enabled"},
+            "messages": [{
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking","thinking":"first","signature":"sig_first"},
+                    {"type":"thinking","thinking":"second","signature":""},
+                    {"type":"redacted_thinking","data":"EqQBCgIYAhIM"}
+                ]
+            }]
+        });
+
+        sanitize_claude_code_request_body(&mut body);
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type":"thinking","thinking":"first","signature":"sig_first"},
+                {"type":"redacted_thinking","data":"EqQBCgIYAhIM"}
+            ])
+        );
+    }
+
+    /// redacted_thinking 只允许出现在 assistant 轮次且 thinking 开启时；
+    /// 其它情况仍按现状丢弃，避免把加密块送进不接受它的上下文。
+    #[test]
+    fn claude_code_body_sanitizer_drops_redacted_thinking_outside_assistant_or_without_thinking() {
+        let mut user_turn = json!({
+            "thinking": {"type":"enabled"},
+            "messages": [{
+                "role":"user",
+                "content":[
+                    {"type":"redacted_thinking","data":"EqQBCgIYAhIM"},
+                    {"type":"text","text":"hi"}
+                ]
+            }]
+        });
+        sanitize_claude_code_request_body(&mut user_turn);
+        assert_eq!(
+            user_turn["messages"][0]["content"],
+            json!([{"type":"text","text":"hi"}])
+        );
+
+        let mut thinking_disabled = json!({
+            "messages": [{
+                "role":"assistant",
+                "content":[
+                    {"type":"redacted_thinking","data":"EqQBCgIYAhIM"},
+                    {"type":"text","text":"done"}
+                ]
+            }]
+        });
+        sanitize_claude_code_request_body(&mut thinking_disabled);
+        assert_eq!(
+            thinking_disabled["messages"][0]["content"],
+            json!([{"type":"text","text":"done"}])
         );
     }
 

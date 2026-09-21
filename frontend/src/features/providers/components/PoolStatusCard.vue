@@ -94,23 +94,40 @@
         <div class="flex items-center justify-between gap-2">
           <div class="flex items-center gap-2 min-w-0">
             <span class="text-sm font-medium truncate">{{ key.key_name || '未命名' }}</span>
+            <template v-if="cooldownPresentations[key.key_id]">
+              <Badge
+                variant="destructive"
+                class="text-[10px] px-1.5 py-0 shrink-0"
+                :title="cooldownPresentations[key.key_id]?.title"
+                data-testid="pool-key-cooldown-reason"
+              >
+                {{ cooldownPresentations[key.key_id]?.reasonLabel }}
+              </Badge>
+              <span
+                v-if="cooldownPresentations[key.key_id]?.deadlineLabel"
+                class="text-[10px] text-destructive tabular-nums shrink-0"
+                :title="cooldownPresentations[key.key_id]?.title"
+                data-testid="pool-key-cooldown-deadline"
+              >
+                {{ cooldownPresentations[key.key_id]?.expired
+                  ? '即将恢复'
+                  : `${cooldownPresentations[key.key_id]?.deadlineLabel} 恢复 · 剩 ${cooldownPresentations[key.key_id]?.countdownLabel}` }}
+              </span>
+            </template>
             <Badge
-              v-if="key.cooldown_reason"
-              variant="destructive"
-              class="text-[10px] px-1.5 py-0 shrink-0"
+              v-for="item in modelCooldownPresentations[key.key_id] || []"
+              :key="`${key.key_id}-${item.model}`"
+              variant="outline"
+              class="text-[10px] px-1.5 py-0 shrink-0 border-amber-500/40 text-amber-700 dark:text-amber-300"
+              :title="item.presentation.title"
+              data-testid="pool-key-model-cooldown"
             >
-              {{ formatCooldownReason(key.cooldown_reason) }}
+              {{ item.model }}：{{ item.presentation.reasonLabel }}{{ item.presentation.countdownLabel ? ` · 剩 ${item.presentation.countdownLabel}` : '' }}
             </Badge>
-            <span
-              v-if="key.cooldown_ttl_seconds"
-              class="text-[10px] text-destructive tabular-nums shrink-0"
-            >
-              {{ formatTTL(key.cooldown_ttl_seconds) }}
-            </span>
           </div>
           <div class="flex items-center gap-0.5 shrink-0">
             <Button
-              v-if="key.cooldown_reason"
+              v-if="key.cooldown_reason || (key.model_cooldowns && key.model_cooldowns.length > 0)"
               variant="ghost"
               size="icon"
               class="h-7 w-7 text-muted-foreground hover:text-green-600"
@@ -199,7 +216,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RefreshCw, RotateCcw } from 'lucide-vue-next'
 
 import { getPoolStatus, clearPoolCooldown, resetPoolCost } from '@/api/endpoints/pool'
@@ -207,6 +224,12 @@ import type { PoolStatusResponse } from '@/api/endpoints/pool'
 import { parseApiError } from '@/utils/errorParser'
 import { formatTokens } from '@/utils/format'
 import { useToast } from '@/composables/useToast'
+import {
+  buildPoolCooldownPresentation,
+  poolCooldownPresentationEquals,
+  resolveCooldownUntil,
+  type PoolCooldownPresentation,
+} from '@/features/pool/utils/poolCooldown'
 
 import Card from '@/components/ui/card.vue'
 import Badge from '@/components/ui/badge.vue'
@@ -224,14 +247,104 @@ const poolStatus = ref<PoolStatusResponse | null>(null)
 const initialLoading = ref(true)
 const refreshing = ref(false)
 const actionLoading = ref<string | null>(null)
+/** 本次号池状态到达的本地时间；只有 TTL 没有绝对截止时刻时用它推算。 */
+const poolStatusObservedAtMs = ref(Date.now())
+
+/**
+ * 冷却展示按内容更新：每秒重算一次，只有文字真的变了才替换对应条目，
+ * 不整体重建对象，避免无意义的重渲染。
+ */
+const cooldownPresentations = ref<Record<string, PoolCooldownPresentation | null>>({})
+const modelCooldownPresentations = ref<Record<string, Array<{ model: string, presentation: PoolCooldownPresentation }>>>({})
+let cooldownTicker: ReturnType<typeof setInterval> | null = null
+
+function refreshCooldownPresentations() {
+  const nowMs = Date.now()
+  const keys = poolStatus.value?.keys ?? []
+  const nextKeyIds = new Set<string>()
+  for (const key of keys) {
+    nextKeyIds.add(key.key_id)
+    const until = resolveCooldownUntil({
+      until: key.cooldown_until,
+      ttl_seconds: key.cooldown_ttl_seconds,
+      observedAtMs: poolStatusObservedAtMs.value,
+    })
+    const next = buildPoolCooldownPresentation({
+      reason: key.cooldown_reason,
+      until,
+      meta: key.cooldown_meta ?? null,
+      nowMs,
+    })
+    if (!poolCooldownPresentationEquals(cooldownPresentations.value[key.key_id] ?? null, next)) {
+      cooldownPresentations.value[key.key_id] = next
+    }
+
+    const models = (key.model_cooldowns ?? [])
+      .map(item => ({
+        model: item.model,
+        presentation: buildPoolCooldownPresentation({
+          reason: item.reason,
+          until: resolveCooldownUntil({
+            until: item.until,
+            ttl_seconds: item.ttl_seconds,
+            observedAtMs: poolStatusObservedAtMs.value,
+          }),
+          meta: item.meta ?? null,
+          nowMs,
+        }),
+      }))
+      .filter((item): item is { model: string, presentation: PoolCooldownPresentation } => item.presentation !== null)
+    const current = modelCooldownPresentations.value[key.key_id] ?? []
+    const unchanged = current.length === models.length
+      && current.every((item, index) => item.model === models[index]?.model
+        && poolCooldownPresentationEquals(item.presentation, models[index]?.presentation ?? null))
+    if (!unchanged) {
+      if (models.length === 0) {
+        delete modelCooldownPresentations.value[key.key_id]
+      } else {
+        modelCooldownPresentations.value[key.key_id] = models
+      }
+    }
+  }
+  for (const keyId of Object.keys(cooldownPresentations.value)) {
+    if (!nextKeyIds.has(keyId)) {
+      delete cooldownPresentations.value[keyId]
+      delete modelCooldownPresentations.value[keyId]
+    }
+  }
+}
+
+function startCooldownTicker() {
+  if (cooldownTicker) return
+  cooldownTicker = setInterval(refreshCooldownPresentations, 1000)
+}
+
+function stopCooldownTicker() {
+  if (!cooldownTicker) return
+  clearInterval(cooldownTicker)
+  cooldownTicker = null
+}
 
 async function loadPoolStatus() {
   try {
     poolStatus.value = await getPoolStatus(props.providerId)
+    poolStatusObservedAtMs.value = Date.now()
+    refreshCooldownPresentations()
   } catch (err) {
     showError(parseApiError(err))
   }
 }
+
+watch(
+  () => (poolStatus.value?.keys ?? []).some(key => key.cooldown_reason || (key.model_cooldowns?.length ?? 0) > 0),
+  (hasCooldown) => {
+    if (hasCooldown) startCooldownTicker()
+    else stopCooldownTicker()
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(stopCooldownTicker)
 
 async function refresh() {
   refreshing.value = true
@@ -266,26 +379,6 @@ async function handleResetCost(keyId: string) {
   } finally {
     actionLoading.value = null
   }
-}
-
-const COOLDOWN_REASON_MAP: Record<string, string> = {
-  rate_limited_429: '429 限流',
-  forbidden_403: '403 禁止',
-  overloaded_529: '529 过载',
-  auth_failed_401: '401 认证失败',
-  payment_required_402: '402 欠费',
-  server_error_500: '500 错误',
-}
-
-function formatCooldownReason(reason: string): string {
-  return COOLDOWN_REASON_MAP[reason] || reason
-}
-
-function formatTTL(seconds: number): string {
-  if (seconds <= 0) return ''
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
-  return m > 0 ? `${m}m ${s}s` : `${s}s`
 }
 
 function formatEmaHeat(value: number): string {

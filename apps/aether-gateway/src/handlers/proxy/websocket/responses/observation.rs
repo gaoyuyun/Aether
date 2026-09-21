@@ -53,6 +53,12 @@ impl ResponsesStructuredTerminalObserver {
         self.inner.disable_with_error(parser_error);
     }
 
+    /// relay 看到了生成内容（增量事件不进观测器）：告诉解析器这条流不是空的，
+    /// 让 `response.incomplete` 的空响应判定与实际流一致。
+    pub(super) fn note_output_content(&mut self) {
+        self.inner.note_output_content();
+    }
+
     pub(super) fn finish(&mut self, report_context: &Value) -> ExecutionStreamTerminalSummary {
         match self.inner.finish(report_context) {
             Ok(Some(summary)) => summary,

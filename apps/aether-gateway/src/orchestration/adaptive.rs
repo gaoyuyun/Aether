@@ -27,7 +27,10 @@ const HEADER_LIMIT_SAFETY_MARGIN: f64 = 0.95;
 const OBSERVATION_LIMIT_SAFETY_MARGIN: f64 = 0.90;
 const ENFORCEMENT_CONFIDENCE_THRESHOLD: f64 = 0.6;
 const CONFIDENCE_DECAY_PER_MINUTE: f64 = 0.005;
-const COOLDOWN_AFTER_429_SECS: u64 = 5 * 60;
+/// 429 之后暂停 RPM 上探的最短时间。真正的 Key 冷却由号池按上游提示决定
+/// （`handlers/admin/provider/pool/cooldown.rs`）；这里只是自适应学习的观察窗口，
+/// 与上游给出的 `Retry-After` 取较大者。
+const ADAPTIVE_LEARNING_PAUSE_AFTER_429_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalAdaptiveRateLimitProjection {
@@ -89,6 +92,7 @@ pub(crate) fn project_local_adaptive_rate_limit(
         observed_at_unix_secs,
         current_rpm,
         upstream_limit,
+        parse_upstream_retry_after_secs(headers, observed_at_unix_secs),
     );
 
     let (evaluated_limit, confidence) = evaluate_observations(&history);
@@ -432,7 +436,13 @@ fn check_increase_conditions(
     observed_at_unix_secs: u64,
     known_boundary: Option<u32>,
 ) -> Option<&'static str> {
-    if is_in_cooldown(current_key.last_429_at_unix_secs, observed_at_unix_secs) {
+    if is_in_learning_pause(
+        current_key.last_429_at_unix_secs,
+        latest_upstream_retry_after_secs(&adaptive_history_records(
+            current_key.adjustment_history.as_ref(),
+        )),
+        observed_at_unix_secs,
+    ) {
         return None;
     }
 
@@ -478,10 +488,18 @@ fn should_probe_increase(
     average_utilization(samples) >= 0.3
 }
 
-fn is_in_cooldown(last_429_at_unix_secs: Option<u64>, now_unix_secs: u64) -> bool {
-    last_429_at_unix_secs.is_some_and(|last_429_at| {
-        now_unix_secs.saturating_sub(last_429_at) < COOLDOWN_AFTER_429_SECS
-    })
+/// 429 之后的学习暂停：至少 [`ADAPTIVE_LEARNING_PAUSE_AFTER_429_SECS`]，上游明确给了
+/// 更长的等待时长就按上游的来。
+fn is_in_learning_pause(
+    last_429_at_unix_secs: Option<u64>,
+    upstream_retry_after_secs: Option<u64>,
+    now_unix_secs: u64,
+) -> bool {
+    let pause_secs = upstream_retry_after_secs
+        .unwrap_or(0)
+        .max(ADAPTIVE_LEARNING_PAUSE_AFTER_429_SECS);
+    last_429_at_unix_secs
+        .is_some_and(|last_429_at| now_unix_secs.saturating_sub(last_429_at) < pause_secs)
 }
 
 fn increase_limit(current_limit: u32, known_boundary: Option<u32>, is_probe: bool) -> u32 {
@@ -501,6 +519,7 @@ fn record_429_observation(
     observed_at_unix_secs: u64,
     current_rpm: Option<u32>,
     upstream_limit: Option<u32>,
+    upstream_retry_after_secs: Option<u64>,
 ) {
     let mut record = Map::new();
     record.insert("type".to_string(), json!("429_observation"));
@@ -516,8 +535,34 @@ fn record_429_observation(
         "upstream_limit".to_string(),
         upstream_limit.map_or(Value::Null, |value| json!(value)),
     );
+    if let Some(retry_after_secs) = upstream_retry_after_secs {
+        record.insert("retry_after_secs".to_string(), json!(retry_after_secs));
+    }
     history.push(record);
     trim_history(history);
+}
+
+/// 最近一次 429 观测里上游给的 `Retry-After`（秒）；学习暂停据此延长。
+fn latest_upstream_retry_after_secs(history: &[Map<String, Value>]) -> Option<u64> {
+    history
+        .iter()
+        .rev()
+        .find(|record| record_type(record) == Some("429_observation"))
+        .and_then(|record| record.get("retry_after_secs"))
+        .and_then(Value::as_u64)
+}
+
+fn parse_upstream_retry_after_secs(
+    headers: Option<&BTreeMap<String, String>>,
+    observed_at_unix_secs: u64,
+) -> Option<u64> {
+    headers?
+        .iter()
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| {
+            crate::provider_transport::parse_retry_after_header(value, observed_at_unix_secs)
+        })
+        .map(|duration| duration.as_secs())
 }
 
 fn record_adjustment(
@@ -1024,6 +1069,56 @@ mod tests {
                 .and_then(Value::as_str),
             Some("high_utilization")
         );
+    }
+
+    /// 上游 429 带 `Retry-After: 600`：学习暂停按上游的来，10 分钟内即便利用率很高也不扩容。
+    #[test]
+    fn adaptive_learning_pause_honours_the_upstream_retry_after() {
+        let mut key = sample_adaptive_key();
+        key.learned_rpm_limit = Some(20);
+        key.last_rpm_peak = Some(25);
+        let headers = BTreeMap::from([("Retry-After".to_string(), "600".to_string())]);
+        let rate_limited = project_local_adaptive_rate_limit(
+            &key,
+            LocalFailoverClassification::RetryUpstreamFailure,
+            429,
+            Some(21),
+            Some(&headers),
+            1_759_999_000,
+        )
+        .expect("429 projection");
+        key.last_429_at_unix_secs = Some(rate_limited.last_429_at_unix_secs);
+        key.adjustment_history = Some(json!([
+            {
+                "timestamp": "2026-04-19T00:00:00Z",
+                "old_limit": 0,
+                "new_limit": 20,
+                "reason": "rpm_429",
+                "confidence": 0.8
+            },
+            rate_limited
+                .adjustment_history
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|items| items.last())
+                .cloned()
+                .expect("429 observation")
+        ]));
+        key.utilization_samples = Some(json!([
+            {"ts": 1759999960, "util": 0.90},
+            {"ts": 1759999970, "util": 0.95},
+            {"ts": 1759999980, "util": 0.85},
+            {"ts": 1759999990, "util": 0.80}
+        ]));
+
+        // 5 分钟后：默认 60s 暂停早已过去，但上游要求的 600s 还没到。
+        let paused = project_local_adaptive_success(&key, 19, 1_759_999_300)
+            .expect("projection should exist");
+        assert_eq!(paused.learned_rpm_limit, Some(20));
+        // 11 分钟后：暂停结束，正常扩容。
+        let resumed = project_local_adaptive_success(&key, 19, 1_759_999_000 + 660)
+            .expect("projection should exist");
+        assert_eq!(resumed.learned_rpm_limit, Some(25));
     }
 
     #[test]

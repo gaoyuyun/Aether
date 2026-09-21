@@ -1,6 +1,6 @@
 import client from '../client'
 import type { EndpointAPIKey, AllowedModels } from './types'
-import type { QuotaStatusSnapshot } from './types'
+import type { QuotaStatusSnapshot, TlsProbeSummary, TransportProfileId } from './types'
 
 // Re-export types for convenience
 export type { EndpointAPIKey, AllowedModels }
@@ -248,6 +248,10 @@ export async function updateProviderKey(
     model_include_patterns: string[]  // 模型包含规则
     model_exclude_patterns: string[]  // 模型排除规则
     proxy: import('./types').ProxyConfig | null  // Key 级别代理配置
+    // Key 级敏感词覆盖三态：缺席 = 不动；null = 继承供应商；数组 = 覆盖（空数组 = 关闭混淆）
+    cloak_sensitive_words: string[] | null
+    // P5：Key 级传输指纹 profile 三态：缺席 = 不动；null = 回到供应商 / 系统默认；字符串 = 覆盖
+    transport_profile: TransportProfileId | null
   }>,
   requestOptions?: KeyRequestOptions,
 ): Promise<EndpointAPIKey> {
@@ -280,6 +284,34 @@ export async function resetProviderKeyCycleStats(keyId: string): Promise<{
   reset_at: number
   windows: number
 }>(`/api/admin/endpoints/keys/${keyId}/reset-cycle-stats`)
+  return response.data
+}
+
+/**
+ * 重置 claude_code Key 的设备身份：清掉持久化的设备 profile，下一次第三方请求重新派生。
+ */
+export async function resetProviderKeyClaudeCodeDevice(keyId: string): Promise<{
+  message: string
+  reset: boolean
+}> {
+  const response = await client.post<{ message: string; reset: boolean }>(
+    `/api/admin/endpoints/keys/${keyId}/reset-claude-code-device`,
+  )
+  return response.data
+}
+
+/**
+ * P5：探测 Key 出站 TLS 指纹。网关按该 Key 的传输 profile 与代理向固定清单里的回显服务发一次
+ * 请求，把 JA3 / JA4 写回 `upstream_metadata.tls_probe` 并原样返回。
+ */
+export async function probeProviderKeyTlsFingerprint(keyId: string): Promise<{
+  message: string
+  key_id: string
+  probe: TlsProbeSummary
+}> {
+  const response = await client.post<{ message: string; key_id: string; probe: TlsProbeSummary }>(
+    `/api/admin/endpoints/keys/${keyId}/tls-probe`,
+  )
   return response.data
 }
 

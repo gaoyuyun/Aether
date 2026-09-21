@@ -163,6 +163,8 @@ impl fmt::Debug for LocalOAuthHttpRequest {
 pub struct LocalOAuthHttpResponse {
     pub status_code: u16,
     pub body_text: String,
+    /// 上游 `Retry-After`（秒），供刷新 429 退避使用。
+    pub retry_after_secs: Option<u64>,
 }
 
 impl fmt::Debug for LocalOAuthHttpResponse {
@@ -175,6 +177,9 @@ impl fmt::Debug for LocalOAuthHttpResponse {
     }
 }
 
+/// 刷新 429 按 `Retry-After` 退避时的封顶，避免一个错头把 Key 锁很久。
+const REFRESH_RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+
 #[derive(Error)]
 pub enum LocalOAuthRefreshError {
     #[error("{provider_type} oauth refresh request failed")]
@@ -186,6 +191,12 @@ pub enum LocalOAuthRefreshError {
     HttpStatus {
         provider_type: &'static str,
         status_code: u16,
+        body_excerpt: String,
+    },
+    #[error("{provider_type} oauth refresh returned HTTP 429")]
+    RateLimited {
+        provider_type: &'static str,
+        retry_after_secs: Option<u64>,
         body_excerpt: String,
     },
     #[error("{provider_type} oauth refresh transport failed: {message}")]
@@ -237,6 +248,16 @@ impl fmt::Debug for LocalOAuthRefreshError {
                 .debug_struct("HttpStatus")
                 .field("provider_type", provider_type)
                 .field("status_code", status_code)
+                .field("body_excerpt", &"[REDACTED]")
+                .finish(),
+            Self::RateLimited {
+                provider_type,
+                retry_after_secs,
+                ..
+            } => formatter
+                .debug_struct("RateLimited")
+                .field("provider_type", provider_type)
+                .field("retry_after_secs", retry_after_secs)
                 .field("body_excerpt", &"[REDACTED]")
                 .finish(),
             Self::TransportMessage { provider_type, .. } => formatter
@@ -307,6 +328,12 @@ impl LocalOAuthHttpExecutor for ReqwestLocalOAuthHttpExecutor {
                     error,
                 })?;
         let status_code = response.status().as_u16();
+        let retry_after_secs = OAuthHttpResponse::parse_retry_after_header(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+        );
         if response
             .content_length()
             .is_some_and(|length| length > LOCAL_OAUTH_RESPONSE_BODY_LIMIT_BYTES as u64)
@@ -332,6 +359,7 @@ impl LocalOAuthHttpExecutor for ReqwestLocalOAuthHttpExecutor {
         Ok(LocalOAuthHttpResponse {
             status_code,
             body_text,
+            retry_after_secs,
         })
     }
 }
@@ -385,6 +413,7 @@ impl OAuthHttpExecutor for ProviderOAuthLocalHttpExecutor<'_> {
         let json_body = serde_json::from_str::<Value>(&response.body_text).ok();
         Ok(OAuthHttpResponse {
             status_code: response.status_code,
+            retry_after_secs: response.retry_after_secs,
             body_text: response.body_text,
             json_body,
         })
@@ -422,6 +451,14 @@ pub(crate) fn oauth_error_to_local_refresh_error(
             status_code,
             body_excerpt,
         },
+        OAuthError::RateLimited {
+            retry_after_secs,
+            body_excerpt,
+        } => LocalOAuthRefreshError::RateLimited {
+            provider_type,
+            retry_after_secs,
+            body_excerpt,
+        },
         OAuthError::Transport(message) => LocalOAuthRefreshError::TransportMessage {
             provider_type,
             message,
@@ -456,6 +493,14 @@ fn local_refresh_error_to_oauth_error(error: LocalOAuthRefreshError) -> OAuthErr
             ..
         } => OAuthError::HttpStatus {
             status_code,
+            body_excerpt,
+        },
+        LocalOAuthRefreshError::RateLimited {
+            retry_after_secs,
+            body_excerpt,
+            ..
+        } => OAuthError::RateLimited {
+            retry_after_secs,
             body_excerpt,
         },
         LocalOAuthRefreshError::InvalidResponse { message, .. } => {
@@ -882,7 +927,18 @@ impl LocalOAuthRefreshCoordinator {
                 return Ok(None);
             }
             Err(error) => {
-                if adapter.should_backoff_after_error(&error) {
+                if let LocalOAuthRefreshError::RateLimited {
+                    retry_after_secs, ..
+                } = &error
+                {
+                    // 上游限流：按 Retry-After 退避（封顶），没有提示时走固定阶梯。
+                    self.record_refresh_failure_with_retry_after(
+                        key_id,
+                        refresh_fingerprint.as_deref(),
+                        retry_after_secs.map(Duration::from_secs),
+                    )
+                    .await;
+                } else if adapter.should_backoff_after_error(&error) {
                     self.record_refresh_failure(key_id, refresh_fingerprint.as_deref())
                         .await;
                 }
@@ -983,6 +1039,16 @@ impl LocalOAuthRefreshCoordinator {
     }
 
     async fn record_refresh_failure(&self, key_id: &str, refresh_fingerprint: Option<&str>) {
+        self.record_refresh_failure_with_retry_after(key_id, refresh_fingerprint, None)
+            .await;
+    }
+
+    async fn record_refresh_failure_with_retry_after(
+        &self,
+        key_id: &str,
+        refresh_fingerprint: Option<&str>,
+        retry_after: Option<Duration>,
+    ) {
         let mut backoff = self.refresh_backoff.lock().await;
         let state = backoff
             .entry(key_id.to_string())
@@ -997,8 +1063,13 @@ impl LocalOAuthRefreshCoordinator {
         }
         state.failures = state.failures.saturating_add(1);
         let exponent = state.failures.saturating_sub(1).min(4);
-        let delay = Duration::from_millis(500u64.saturating_mul(1u64 << exponent));
-        state.retry_after = Instant::now() + delay.min(Duration::from_secs(8));
+        let ladder = Duration::from_millis(500u64.saturating_mul(1u64 << exponent))
+            .min(Duration::from_secs(8));
+        let delay = match retry_after {
+            Some(hint) => hint.min(REFRESH_RATE_LIMIT_BACKOFF_CAP).max(ladder),
+            None => ladder,
+        };
+        state.retry_after = Instant::now() + delay;
     }
 
     async fn clear_refresh_backoff(&self, key_id: &str) {
@@ -1181,6 +1252,7 @@ mod tests {
         };
         let response = super::LocalOAuthHttpResponse {
             status_code: 401,
+            retry_after_secs: None,
             body_text: "{\"access_token\":\"response-body-canary\"}".to_string(),
         };
         let entry = super::CachedOAuthEntry {

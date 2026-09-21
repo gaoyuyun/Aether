@@ -1,3 +1,6 @@
+use crate::handlers::admin::provider::pool::cooldown::{
+    normalize_provider_cooldown_config, PROVIDER_COOLDOWN_CONFIG_KEY,
+};
 use crate::handlers::admin::provider::shared::payloads::AdminProviderUpdatePatch;
 use crate::handlers::admin::provider::shared::support::{
     normalize_provider_billing_type, normalize_provider_quota_reservation,
@@ -268,6 +271,11 @@ pub(crate) async fn build_admin_update_provider_record(
         .clone()
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
+    let sensitive_words_config_present = payload
+        .config
+        .as_ref()
+        .and_then(|config| config.pointer("/cloak/sensitive_words"))
+        .is_some();
     if fields.contains("config") {
         if fields.is_null("config") {
             config_map.clear();
@@ -312,6 +320,91 @@ pub(crate) async fn build_admin_update_provider_record(
     }
     if target_provider_type != "codex" {
         remove_codex_fingerprint_config(&mut config_map);
+    }
+    if fields.contains("claude_code_cloak_mode") {
+        if fields.is_null("claude_code_cloak_mode") {
+            remove_claude_code_cloak_mode(&mut config_map);
+        } else {
+            let mode = payload
+                .claude_code_cloak_mode
+                .as_deref()
+                .ok_or_else(|| "claude_code_cloak_mode 必须是字符串".to_string())?;
+            set_claude_code_cloak_mode(&mut config_map, &target_provider_type, mode)?;
+        }
+    }
+    if target_provider_type != "claude_code" {
+        remove_claude_code_cloak_mode(&mut config_map);
+    }
+    if fields.contains(CLOAK_SENSITIVE_WORDS_FIELD) {
+        if fields.is_null(CLOAK_SENSITIVE_WORDS_FIELD) {
+            remove_provider_cloak_sensitive_words(&mut config_map);
+        } else {
+            let words = payload
+                .cloak_sensitive_words
+                .as_deref()
+                .ok_or_else(|| "cloak_sensitive_words 必须是字符串数组".to_string())?;
+            set_provider_cloak_sensitive_words(&mut config_map, &target_provider_type, words)?;
+        }
+    } else if provider_type_supports_sensitive_words(&target_provider_type)
+        || sensitive_words_config_present
+    {
+        if let Some(raw_words) = config_map
+            .get(crate::provider_transport::CLOAK_CONFIG_NAMESPACE)
+            .and_then(|cloak| {
+                cloak.get(crate::provider_transport::CLOAK_SENSITIVE_WORDS_CONFIG_KEY)
+            })
+            .cloned()
+        {
+            // 显式写入的 config 仍需校验；切换类型时遗留词表由下面清理。
+            let words = raw_words
+                .as_array()
+                .ok_or_else(|| "config.cloak.sensitive_words 必须是字符串数组".to_string())?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| "config.cloak.sensitive_words 必须是字符串数组".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            set_provider_cloak_sensitive_words(&mut config_map, &target_provider_type, &words)?;
+        }
+    }
+    if !provider_type_supports_sensitive_words(&target_provider_type) {
+        remove_provider_cloak_sensitive_words(&mut config_map);
+    }
+    if fields.contains(PROVIDER_TRANSPORT_PROFILE_FIELD) {
+        if fields.is_null(PROVIDER_TRANSPORT_PROFILE_FIELD) {
+            remove_provider_transport_profile(&mut config_map);
+        } else {
+            let profile_id = payload
+                .transport_profile
+                .as_deref()
+                .ok_or_else(|| "transport_profile 必须是字符串".to_string())?;
+            set_provider_transport_profile(&mut config_map, &target_provider_type, profile_id)?;
+        }
+    }
+    if fields.contains(PROVIDER_COOLDOWN_CONFIG_KEY) {
+        if fields.is_null(PROVIDER_COOLDOWN_CONFIG_KEY) {
+            config_map.remove(PROVIDER_COOLDOWN_CONFIG_KEY);
+        } else {
+            let value = payload
+                .cooldown
+                .as_ref()
+                .ok_or_else(|| "cooldown 必须是 JSON 对象".to_string())?;
+            let value = normalize_provider_cooldown_config(value)?;
+            if value.as_object().is_some_and(|object| object.is_empty()) {
+                config_map.remove(PROVIDER_COOLDOWN_CONFIG_KEY);
+            } else {
+                config_map.insert(PROVIDER_COOLDOWN_CONFIG_KEY.to_string(), value);
+            }
+        }
+    } else if let Some(raw_cooldown) = config_map.get(PROVIDER_COOLDOWN_CONFIG_KEY).cloned() {
+        // `config` 整体写入时也校验形状，避免手写 JSON 把非法值带进去。
+        config_map.insert(
+            PROVIDER_COOLDOWN_CONFIG_KEY.to_string(),
+            normalize_provider_cooldown_config(&raw_cooldown)?,
+        );
     }
     if fields.contains("quota_windows") {
         if fields.is_null("quota_windows") {
@@ -487,9 +580,361 @@ fn remove_codex_fingerprint_config(config_map: &mut serde_json::Map<String, serd
     }
 }
 
+/// 管理端字段名：供应商 / Key 的传输指纹 profile。
+pub(crate) const PROVIDER_TRANSPORT_PROFILE_FIELD: &str = "transport_profile";
+
+/// 该供应商类型允许选择的内置 TLS 仿真 profile。控制面 profile 由网关按供应商类型自动选择，
+/// 不作为可选项暴露。
+pub(crate) fn allowed_transport_profiles_for_provider_type(
+    provider_type: &str,
+) -> &'static [&'static str] {
+    crate::provider_transport::claude_code::selectable_tls_emulation_profiles_for_provider_type(
+        provider_type,
+    )
+}
+
+pub(crate) fn provider_type_supports_transport_profile(provider_type: &str) -> bool {
+    !allowed_transport_profiles_for_provider_type(provider_type).is_empty()
+}
+
+/// 校验并归一化管理端提交的传输指纹 profile id。
+pub(crate) fn normalize_admin_transport_profile(
+    provider_type: &str,
+    profile_id: &str,
+) -> Result<&'static str, String> {
+    let allowed = allowed_transport_profiles_for_provider_type(provider_type);
+    if allowed.is_empty() {
+        return Err("transport_profile 仅适用于 provider_type=claude_code / codex".to_string());
+    }
+    let normalized =
+        crate::provider_transport::claude_code::normalize_claude_code_tls_profile_id(profile_id);
+    allowed
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == normalized)
+        .ok_or_else(|| format!("transport_profile 必须是 {} 之一", allowed.join(" / ")))
+}
+
+/// 写 `config.fingerprint.transport_profile`；保留 `fingerprint` 对象里其它键。
+pub(crate) fn set_provider_transport_profile(
+    config_map: &mut serde_json::Map<String, serde_json::Value>,
+    provider_type: &str,
+    profile_id: &str,
+) -> Result<(), String> {
+    let profile_id = normalize_admin_transport_profile(provider_type, profile_id)?;
+    let fingerprint = config_map
+        .entry("fingerprint".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(fingerprint) = fingerprint.as_object_mut() else {
+        return Err("config.fingerprint 必须是 JSON 对象".to_string());
+    };
+    fingerprint.insert(
+        PROVIDER_TRANSPORT_PROFILE_FIELD.to_string(),
+        json!(profile_id),
+    );
+    Ok(())
+}
+
+pub(crate) fn remove_provider_transport_profile(
+    config_map: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let remove_container = match config_map
+        .get_mut("fingerprint")
+        .and_then(|value| value.as_object_mut())
+    {
+        Some(fingerprint) => {
+            fingerprint.remove(PROVIDER_TRANSPORT_PROFILE_FIELD);
+            fingerprint.is_empty()
+        }
+        None => false,
+    };
+    if remove_container {
+        config_map.remove("fingerprint");
+    }
+}
+
+/// 回读 `config.fingerprint.transport_profile`（字符串或 `{profile_id}` 对象）。
+pub(crate) fn provider_transport_profile_id(config: Option<&serde_json::Value>) -> Option<String> {
+    transport_profile_id_from_fingerprint(config?.get("fingerprint"))
+}
+
+/// 从 `fingerprint` 对象里取 `transport_profile` 的 id。
+pub(crate) fn transport_profile_id_from_fingerprint(
+    fingerprint: Option<&serde_json::Value>,
+) -> Option<String> {
+    crate::provider_transport::configured_transport_profile_id_from_fingerprint(fingerprint)
+}
+
+/// 写 `config.cloak.mode`；只保留 `cloak` 对象里其它键（例如 P6 的 `sensitive_words`）。
+pub(crate) fn set_claude_code_cloak_mode(
+    config_map: &mut serde_json::Map<String, serde_json::Value>,
+    provider_type: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let Some(mode) = crate::provider_transport::claude_code::ClaudeCodeCloakMode::parse(mode)
+    else {
+        return Err("claude_code_cloak_mode 必须是 auto / always / off".to_string());
+    };
+    if provider_type != "claude_code" {
+        return Err("claude_code_cloak_mode 仅适用于 provider_type=claude_code".to_string());
+    }
+    let cloak = config_map
+        .entry(crate::provider_transport::claude_code::CLAUDE_CODE_CLOAK_CONFIG_KEY.to_string())
+        .or_insert_with(|| json!({}));
+    let Some(cloak) = cloak.as_object_mut() else {
+        return Err("config.cloak 必须是 JSON 对象".to_string());
+    };
+    cloak.insert(
+        crate::provider_transport::claude_code::CLAUDE_CODE_CLOAK_MODE_CONFIG_KEY.to_string(),
+        json!(mode.as_str()),
+    );
+    Ok(())
+}
+
+pub(crate) fn remove_claude_code_cloak_mode(
+    config_map: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let cloak_key = crate::provider_transport::claude_code::CLAUDE_CODE_CLOAK_CONFIG_KEY;
+    let mode_key = crate::provider_transport::claude_code::CLAUDE_CODE_CLOAK_MODE_CONFIG_KEY;
+    let remove_container = match config_map
+        .get_mut(cloak_key)
+        .and_then(|v| v.as_object_mut())
+    {
+        Some(cloak) => {
+            cloak.remove(mode_key);
+            cloak.is_empty()
+        }
+        None => false,
+    };
+    if remove_container {
+        config_map.remove(cloak_key);
+    }
+}
+
+/// 管理端字段名：供应商 `cloak_sensitive_words`，落到 `config.cloak.sensitive_words`。
+pub(crate) const CLOAK_SENSITIVE_WORDS_FIELD: &str = "cloak_sensitive_words";
+
+/// 敏感词混淆只对 claude_code 与 antigravity 有作用范围（transport crate 的 `sensitive_words.rs`）。
+pub(crate) fn provider_type_supports_sensitive_words(provider_type: &str) -> bool {
+    crate::provider_transport::provider_type_supports_sensitive_words(provider_type)
+}
+
+/// 归一化词表：去空、去重（不区分大小写）、按长度降序；每个词 2–256 个字符，
+/// 不得含零宽字符，最多 256 条。返回归一化后的数组；校验失败返回中文错误。
+pub(crate) fn normalize_cloak_sensitive_words(words: &[String]) -> Result<Vec<String>, String> {
+    use crate::provider_transport::{
+        normalize_sensitive_word, SensitiveWordList, SENSITIVE_WORD_MAX_CHARS,
+        SENSITIVE_WORD_MAX_ENTRIES, SENSITIVE_WORD_MIN_CHARS, SENSITIVE_WORD_ZERO_WIDTH,
+    };
+    for word in words {
+        let trimmed = word.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.chars().count() < SENSITIVE_WORD_MIN_CHARS {
+            return Err(format!(
+                "敏感词「{trimmed}」过短，每个词至少 {SENSITIVE_WORD_MIN_CHARS} 个字符"
+            ));
+        }
+        if trimmed.chars().count() > SENSITIVE_WORD_MAX_CHARS {
+            return Err(format!("每个敏感词最多 {SENSITIVE_WORD_MAX_CHARS} 个字符"));
+        }
+        if trimmed.contains(SENSITIVE_WORD_ZERO_WIDTH) {
+            return Err(format!("敏感词「{trimmed}」不能包含零宽字符"));
+        }
+    }
+    let list = SensitiveWordList::from_words(words.iter().map(|word| word.trim()));
+    let unique = words
+        .iter()
+        .map(|word| normalize_sensitive_word(word.trim()))
+        .filter(|word| !word.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique.len() > SENSITIVE_WORD_MAX_ENTRIES {
+        return Err(format!(
+            "敏感词最多 {SENSITIVE_WORD_MAX_ENTRIES} 条，当前 {} 条",
+            unique.len()
+        ));
+    }
+    Ok(list.words().to_vec())
+}
+
+/// 写 `config.cloak.sensitive_words`；空词表等价于删除该键，但保留 `cloak.mode`。
+pub(crate) fn set_provider_cloak_sensitive_words(
+    config_map: &mut serde_json::Map<String, serde_json::Value>,
+    provider_type: &str,
+    words: &[String],
+) -> Result<(), String> {
+    let normalized = normalize_cloak_sensitive_words(words)?;
+    if !provider_type_supports_sensitive_words(provider_type) {
+        if normalized.is_empty() {
+            remove_provider_cloak_sensitive_words(config_map);
+            return Ok(());
+        }
+        return Err(
+            "cloak_sensitive_words 仅适用于 provider_type=claude_code / antigravity".to_string(),
+        );
+    }
+    if normalized.is_empty() {
+        remove_provider_cloak_sensitive_words(config_map);
+        return Ok(());
+    }
+    let cloak = config_map
+        .entry(crate::provider_transport::CLOAK_CONFIG_NAMESPACE.to_string())
+        .or_insert_with(|| json!({}));
+    let Some(cloak) = cloak.as_object_mut() else {
+        return Err("config.cloak 必须是 JSON 对象".to_string());
+    };
+    cloak.insert(
+        crate::provider_transport::CLOAK_SENSITIVE_WORDS_CONFIG_KEY.to_string(),
+        json!(normalized),
+    );
+    Ok(())
+}
+
+pub(crate) fn remove_provider_cloak_sensitive_words(
+    config_map: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let cloak_key = crate::provider_transport::CLOAK_CONFIG_NAMESPACE;
+    let words_key = crate::provider_transport::CLOAK_SENSITIVE_WORDS_CONFIG_KEY;
+    let remove_container = match config_map
+        .get_mut(cloak_key)
+        .and_then(|v| v.as_object_mut())
+    {
+        Some(cloak) => {
+            cloak.remove(words_key);
+            cloak.is_empty()
+        }
+        None => false,
+    };
+    if remove_container {
+        config_map.remove(cloak_key);
+    }
+}
+
+/// 供应商词表是否实际变化（归一化后比较）；管理端据此返回「提示词缓存将失效」的提示。
+pub(crate) fn provider_cloak_sensitive_words_changed(
+    existing_config: Option<&serde_json::Value>,
+    updated_config: Option<&serde_json::Value>,
+) -> bool {
+    crate::provider_transport::provider_sensitive_word_list(existing_config)
+        != crate::provider_transport::provider_sensitive_word_list(updated_config)
+}
+
+/// 词表变化时附加到写入响应里的提示文案。
+pub(crate) const CLOAK_SENSITIVE_WORDS_CHANGED_WARNING: &str = "敏感词词表已变更，提示词缓存将失效";
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[tokio::test]
+    async fn changing_provider_type_removes_inherited_sensitive_words() {
+        use crate::handlers::admin::provider::shared::payloads::AdminProviderUpdatePatch;
+        use crate::handlers::admin::request::AdminAppState;
+        use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+
+        let app = crate::AppState::new().expect("gateway should build");
+        let state = AdminAppState::new(&app);
+        let mut existing = StoredProviderCatalogProvider::new(
+            "provider-cloak".to_string(),
+            "Claude Code".to_string(),
+            None,
+            "claude_code".to_string(),
+        )
+        .expect("provider should build");
+        existing.config = Some(json!({
+            "cloak": {"mode": "auto", "sensitive_words": ["proxy"]},
+            "unrelated": true,
+        }));
+        let patch = |raw: serde_json::Value| {
+            AdminProviderUpdatePatch::from_object(raw.as_object().unwrap().clone()).unwrap()
+        };
+
+        let updated = super::build_admin_update_provider_record(
+            &state,
+            &existing,
+            patch(json!({"provider_type": "codex"})),
+        )
+        .await
+        .expect("old provider-specific settings must not block a type change");
+        assert_eq!(updated.provider_type, "codex");
+        let config = updated.config.unwrap();
+        assert!(config.get("cloak").is_none());
+        assert_eq!(config["unrelated"], true);
+
+        for raw in [
+            json!({"provider_type": "codex", "cloak_sensitive_words": ["proxy"]}),
+            json!({"provider_type": "codex", "config": {"cloak": {"sensitive_words": ["proxy"]}}}),
+        ] {
+            let error = super::build_admin_update_provider_record(&state, &existing, patch(raw))
+                .await
+                .expect_err("explicit unsupported settings still need validation");
+            assert!(error.contains("仅适用于"), "{error}");
+        }
+    }
+
+    #[test]
+    fn transport_profile_setting_is_typed_and_provider_scoped() {
+        let mut config = json!({"fingerprint": {"device_id": "keep-me"}})
+            .as_object()
+            .cloned()
+            .unwrap();
+        super::set_provider_transport_profile(
+            &mut config,
+            "claude_code",
+            "Claude-Code-Node-OpenSSL",
+        )
+        .expect("claude_code may select the node profile");
+        assert_eq!(
+            config["fingerprint"],
+            json!({"device_id": "keep-me", "transport_profile": "claude_code_node_openssl"})
+        );
+        assert_eq!(
+            super::provider_transport_profile_id(Some(&serde_json::Value::Object(config.clone()))),
+            Some("claude_code_node_openssl".to_string())
+        );
+
+        assert!(super::set_provider_transport_profile(
+            &mut config,
+            "codex",
+            "claude_code_node_openssl"
+        )
+        .is_err());
+        super::set_provider_transport_profile(&mut config, "codex", "chatgpt_com_chrome")
+            .expect("codex may select chrome");
+        assert!(super::set_provider_transport_profile(
+            &mut config,
+            "gemini_cli",
+            "chatgpt_com_chrome"
+        )
+        .is_err());
+        assert!(
+            super::set_provider_transport_profile(&mut config, "claude_code", "chrome_136")
+                .is_err()
+        );
+        // 控制面 profile 由网关自动选择，不允许手工选。
+        assert!(super::set_provider_transport_profile(
+            &mut config,
+            "claude_code",
+            "claude_code_oauth_control_plane"
+        )
+        .is_err());
+
+        super::remove_provider_transport_profile(&mut config);
+        assert_eq!(config["fingerprint"], json!({"device_id": "keep-me"}));
+        let mut only_profile = json!({"fingerprint": {"transport_profile": "chatgpt_com_chrome"}})
+            .as_object()
+            .cloned()
+            .unwrap();
+        super::remove_provider_transport_profile(&mut only_profile);
+        assert!(only_profile.get("fingerprint").is_none());
+        assert_eq!(
+            super::transport_profile_id_from_fingerprint(Some(&json!({
+                "transport_profile": {"profile_id": "claude_code_node_openssl", "backend": "browser_wreq"}
+            }))),
+            Some("claude_code_node_openssl".to_string())
+        );
+    }
 
     #[test]
     fn removing_fingerprint_setting_preserves_other_codex_config() {
@@ -511,5 +956,97 @@ mod tests {
             json!({"pass_through_cyber_flag_interrupt": true})
         );
         assert_eq!(config["other"], json!({"kept": true}));
+    }
+
+    #[test]
+    fn sensitive_words_normalize_dedupe_and_keep_cloak_mode() {
+        let mut config = json!({"cloak": {"mode": "always"}})
+            .as_object()
+            .expect("config object")
+            .clone();
+        super::set_provider_cloak_sensitive_words(
+            &mut config,
+            "claude_code",
+            &[
+                "Proxy".to_string(),
+                " API ".to_string(),
+                "proxy".to_string(),
+                "".to_string(),
+            ],
+        )
+        .expect("word list should be accepted");
+        assert_eq!(
+            config["cloak"],
+            json!({"mode": "always", "sensitive_words": ["proxy", "api"]})
+        );
+
+        // 空数组 = 清空，但 mode 保留。
+        super::set_provider_cloak_sensitive_words(&mut config, "antigravity", &[])
+            .expect("empty list should clear");
+        assert_eq!(config["cloak"], json!({"mode": "always"}));
+
+        // 只剩词表时整个 cloak 对象一起移除。
+        let mut only_words = json!({"cloak": {"sensitive_words": ["proxy"]}})
+            .as_object()
+            .expect("config object")
+            .clone();
+        super::remove_provider_cloak_sensitive_words(&mut only_words);
+        assert!(only_words.get("cloak").is_none());
+    }
+
+    #[test]
+    fn sensitive_words_reject_short_words_zero_width_and_other_provider_types() {
+        let mut config = serde_json::Map::new();
+        let error = super::set_provider_cloak_sensitive_words(
+            &mut config,
+            "claude_code",
+            &["a".to_string()],
+        )
+        .expect_err("single-char word must be rejected");
+        assert!(error.contains("过短"), "{error}");
+
+        let error = super::set_provider_cloak_sensitive_words(
+            &mut config,
+            "claude_code",
+            &["p\u{200B}roxy".to_string()],
+        )
+        .expect_err("zero-width word must be rejected");
+        assert!(error.contains("零宽"), "{error}");
+
+        let error =
+            super::set_provider_cloak_sensitive_words(&mut config, "codex", &["proxy".to_string()])
+                .expect_err("codex cannot carry a word list");
+        assert!(error.contains("仅适用于"), "{error}");
+
+        let too_many = (0..257).map(|i| format!("word{i}")).collect::<Vec<_>>();
+        let error = super::normalize_cloak_sensitive_words(&too_many)
+            .expect_err("more than 256 entries must be rejected");
+        assert!(error.contains("最多"), "{error}");
+
+        let max_chars = crate::provider_transport::SENSITIVE_WORD_MAX_CHARS;
+        assert!(super::normalize_cloak_sensitive_words(&["界".repeat(max_chars)]).is_ok());
+        let error = super::normalize_cloak_sensitive_words(&["界".repeat(max_chars + 1)])
+            .expect_err("oversized words must not silently disable obfuscation");
+        assert!(error.contains("最多"), "{error}");
+    }
+
+    #[test]
+    fn sensitive_words_change_detection_compares_normalized_lists() {
+        let before = json!({"cloak": {"sensitive_words": ["Proxy", "api"]}});
+        let same = json!({"cloak": {"sensitive_words": ["api", "proxy"]}});
+        let changed = json!({"cloak": {"sensitive_words": ["proxy"]}});
+        assert!(!super::provider_cloak_sensitive_words_changed(
+            Some(&before),
+            Some(&same)
+        ));
+        assert!(super::provider_cloak_sensitive_words_changed(
+            Some(&before),
+            Some(&changed)
+        ));
+        assert!(super::provider_cloak_sensitive_words_changed(
+            Some(&before),
+            None
+        ));
+        assert!(!super::provider_cloak_sensitive_words_changed(None, None));
     }
 }

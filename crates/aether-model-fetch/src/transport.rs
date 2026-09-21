@@ -2,13 +2,16 @@ use std::collections::BTreeMap;
 
 use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot, RequestBody};
 use aether_provider_transport::antigravity::{
-    build_antigravity_static_client_headers, build_antigravity_static_identity_headers,
-    resolve_local_antigravity_request_auth, AntigravityRequestAuthSupport,
-    ANTIGRAVITY_REQUEST_USER_AGENT,
+    antigravity_request_user_agent, build_antigravity_static_client_headers,
+    build_antigravity_static_identity_headers, resolve_local_antigravity_request_auth,
+    AntigravityRequestAuthSupport,
 };
 use aether_provider_transport::auth::{
     ensure_upstream_auth_header, resolve_local_gemini_auth, resolve_local_openai_bearer_auth,
     resolve_local_standard_auth,
+};
+use aether_provider_transport::gemini_cli::{
+    build_gemini_cli_client_metadata, GEMINI_CLI_USER_AGENT,
 };
 use aether_provider_transport::kiro::{
     build_kiro_list_available_models_url, build_list_available_models_headers,
@@ -28,11 +31,31 @@ use crate::{
 };
 
 const CLAUDE_CLI_USER_AGENT: &str = "claude-code/1.0.1";
-const GEMINI_CLI_USER_AGENT: &str = "GeminiCLI/0.1.5 (Windows; AMD64)";
 const CLAUDE_VERSION_HEADER: &str = "2023-06-01";
 const ANTIGRAVITY_FETCH_PROVIDER_API_FORMAT: &str = "antigravity:fetch_available_models";
 const ANTIGRAVITY_LOAD_CODE_ASSIST_PROVIDER_API_FORMAT: &str = "antigravity:load_code_assist";
+pub(crate) const ANTIGRAVITY_ONBOARD_USER_PROVIDER_API_FORMAT: &str = "antigravity:onboard_user";
 const GEMINI_CLI_LOAD_CODE_ASSIST_PROVIDER_API_FORMAT: &str = "gemini_cli:load_code_assist";
+pub(crate) const GEMINI_CLI_ONBOARD_USER_PROVIDER_API_FORMAT: &str = "gemini_cli:onboard_user";
+/// loadCodeAssist 走生产域名，onboardUser 走 daily 域名，与 Antigravity 官方客户端及
+/// CLIProxyAPI `internal/auth/antigravity/constants.go` 一致。
+pub(crate) const ANTIGRAVITY_LOAD_CODE_ASSIST_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+pub(crate) const ANTIGRAVITY_ONBOARD_USER_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser";
+pub(crate) const GEMINI_CLI_LOAD_CODE_ASSIST_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+pub(crate) const GEMINI_CLI_ONBOARD_USER_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:onboardUser";
+
+/// Antigravity 客户端在 loadCodeAssist / onboardUser 里上报的 `metadata`。
+fn build_antigravity_client_metadata() -> serde_json::Value {
+    json!({
+        "ideType": "ANTIGRAVITY",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI",
+    })
+}
 const KIRO_LIST_AVAILABLE_MODELS_PROVIDER_API_FORMAT: &str = "kiro:list_available_models";
 const WINDSURF_MODEL_CONFIGS_PROVIDER_API_FORMAT: &str = "windsurf:model_configs";
 const WINDSURF_MODEL_CONFIGS_PATH: &str =
@@ -234,7 +257,7 @@ pub async fn build_antigravity_fetch_available_models_plan(
     headers.insert("accept".to_string(), "application/json".to_string());
     headers
         .entry("user-agent".to_string())
-        .or_insert_with(|| ANTIGRAVITY_REQUEST_USER_AGENT.to_string());
+        .or_insert_with(antigravity_request_user_agent);
     let protected_headers = vec![authorization.0];
     headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
 
@@ -276,7 +299,7 @@ pub async fn build_antigravity_load_code_assist_plan(
     headers.insert("accept".to_string(), "application/json".to_string());
     headers
         .entry("user-agent".to_string())
-        .or_insert_with(|| ANTIGRAVITY_REQUEST_USER_AGENT.to_string());
+        .or_insert_with(antigravity_request_user_agent);
     let protected_headers = vec![authorization.0];
     headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
 
@@ -285,19 +308,57 @@ pub async fn build_antigravity_load_code_assist_plan(
         transport,
         ModelFetchExecutionPlanRequest {
             method: "POST".to_string(),
-            url: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".to_string(),
+            url: ANTIGRAVITY_LOAD_CODE_ASSIST_URL.to_string(),
             headers,
             content_type: Some("application/json".to_string()),
             body: RequestBody::from_json(json!({
-                "metadata": {
-                    "ideType": "ANTIGRAVITY",
-                    "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI",
-                }
+                "metadata": build_antigravity_client_metadata(),
             })),
             client_api_format: "gemini:generate_content".to_string(),
             provider_api_format: ANTIGRAVITY_LOAD_CODE_ASSIST_PROVIDER_API_FORMAT.to_string(),
             model_name: Some("loadCodeAssist".to_string()),
+        },
+    )
+    .await
+}
+
+/// Antigravity onboardUser：免费 tier 的新账号在 loadCodeAssist 里没有
+/// `cloudaicompanionProject`，要先用默认 tier 走一次 onboarding 才有 project。
+/// 参考 CLIProxyAPI `internal/auth/antigravity/auth.go` `OnboardUser`。
+pub async fn build_antigravity_onboard_user_plan(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+    tier_id: &str,
+) -> Result<ExecutionPlan, String> {
+    let authorization = resolve_oauth_header_auth(runtime, transport)
+        .await?
+        .ok_or_else(|| "Antigravity onboardUser requires OAuth authorization header".to_string())?;
+
+    let mut headers = build_antigravity_static_client_headers(None, None);
+    headers.insert(authorization.0.clone(), authorization.1.clone());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept".to_string(), "application/json".to_string());
+    headers
+        .entry("user-agent".to_string())
+        .or_insert_with(antigravity_request_user_agent);
+    let protected_headers = vec![authorization.0];
+    headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
+
+    build_execution_plan(
+        runtime,
+        transport,
+        ModelFetchExecutionPlanRequest {
+            method: "POST".to_string(),
+            url: ANTIGRAVITY_ONBOARD_USER_URL.to_string(),
+            headers,
+            content_type: Some("application/json".to_string()),
+            body: RequestBody::from_json(json!({
+                "tierId": tier_id,
+                "metadata": build_antigravity_client_metadata(),
+            })),
+            client_api_format: "gemini:generate_content".to_string(),
+            provider_api_format: ANTIGRAVITY_ONBOARD_USER_PROVIDER_API_FORMAT.to_string(),
+            model_name: Some("onboardUser".to_string()),
         },
     )
     .await
@@ -331,19 +392,64 @@ pub async fn build_gemini_cli_load_code_assist_plan(
         transport,
         ModelFetchExecutionPlanRequest {
             method: "POST".to_string(),
-            url: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".to_string(),
+            url: GEMINI_CLI_LOAD_CODE_ASSIST_URL.to_string(),
             headers,
             content_type: Some("application/json".to_string()),
+            // 与 Gemini CLI 官方 `coreClientMetadata` 一致；`ANTIGRAVITY` 是另一个
+            // 客户端的 ideType，与 `GeminiCLI/…` UA 不一致会让 tier 判定走错分支。
             body: RequestBody::from_json(json!({
-                "metadata": {
-                    "ideType": "ANTIGRAVITY",
-                    "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI",
-                }
+                "metadata": build_gemini_cli_client_metadata(None)
             })),
             client_api_format: "gemini:generate_content".to_string(),
             provider_api_format: GEMINI_CLI_LOAD_CODE_ASSIST_PROVIDER_API_FORMAT.to_string(),
             model_name: Some("loadCodeAssist".to_string()),
+        },
+    )
+    .await
+}
+
+/// Gemini CLI onboardUser，与官方 `packages/core/src/code_assist/setup.ts` 的
+/// `OnboardUserRequest { tierId, metadata }` 一致：免费 tier 不带
+/// `cloudaicompanionProject`，由服务端分配。
+pub async fn build_gemini_cli_onboard_user_plan(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+    tier_id: &str,
+) -> Result<ExecutionPlan, String> {
+    let authorization = resolve_bearer_or_oauth_header_auth(runtime, transport)
+        .await?
+        .filter(|(_, value)| !value.trim().is_empty())
+        .ok_or_else(|| "GeminiCLI onboardUser requires bearer or OAuth auth".to_string())?;
+
+    let mut headers = BTreeMap::from([
+        ("user-agent".to_string(), GEMINI_CLI_USER_AGENT.to_string()),
+        ("accept-encoding".to_string(), "identity".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+    ]);
+    let mut protected_headers = Vec::new();
+    insert_non_empty_auth_header(
+        &mut headers,
+        &mut protected_headers,
+        &authorization.0,
+        &authorization.1,
+    );
+    headers = apply_fetch_header_rules(transport, headers, &protected_headers)?;
+
+    build_execution_plan(
+        runtime,
+        transport,
+        ModelFetchExecutionPlanRequest {
+            method: "POST".to_string(),
+            url: GEMINI_CLI_ONBOARD_USER_URL.to_string(),
+            headers,
+            content_type: Some("application/json".to_string()),
+            body: RequestBody::from_json(json!({
+                "tierId": tier_id,
+                "metadata": build_gemini_cli_client_metadata(None),
+            })),
+            client_api_format: "gemini:generate_content".to_string(),
+            provider_api_format: GEMINI_CLI_ONBOARD_USER_PROVIDER_API_FORMAT.to_string(),
+            model_name: Some("onboardUser".to_string()),
         },
     )
     .await
@@ -776,13 +882,16 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
+    use aether_provider_transport::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT;
+
     use super::{
         append_query_param, build_antigravity_fetch_available_models_plan,
-        build_antigravity_load_code_assist_plan, build_gemini_cli_load_code_assist_plan,
+        build_antigravity_load_code_assist_plan, build_antigravity_onboard_user_plan,
+        build_gemini_cli_load_code_assist_plan, build_gemini_cli_onboard_user_plan,
         build_kiro_list_available_models_plan, build_models_fetch_execution_plan,
         build_models_fetch_execution_plan_for_client_version,
         build_standard_models_fetch_execution_plan, build_vertex_models_fetch_execution_plan,
-        ModelFetchTransportRuntime, ANTIGRAVITY_REQUEST_USER_AGENT,
+        ModelFetchTransportRuntime,
     };
 
     struct TestRuntime {
@@ -1265,6 +1374,79 @@ mod tests {
             plan.headers.get("user-agent").map(String::as_str),
             Some("GeminiCLI/0.1.5 (Windows; AMD64)")
         );
+    }
+
+    #[tokio::test]
+    async fn builds_antigravity_onboard_user_plan_against_the_daily_endpoint() {
+        let runtime = TestRuntime {
+            oauth_auth: Some(
+                aether_provider_transport::LocalResolvedOAuthRequestAuth::Header {
+                    name: "authorization".to_string(),
+                    value: "Bearer oauth-token".to_string(),
+                },
+            ),
+            proxy: None,
+        };
+        let transport = sample_transport("antigravity", "gemini:generate_content", "oauth");
+        let plan = build_antigravity_onboard_user_plan(&runtime, &transport, "free-tier")
+            .await
+            .expect("plan");
+
+        assert_eq!(plan.method, "POST");
+        assert_eq!(
+            plan.url,
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser"
+        );
+        assert_eq!(plan.provider_api_format, "antigravity:onboard_user");
+        assert_eq!(
+            plan.headers.get("authorization").map(String::as_str),
+            Some("Bearer oauth-token")
+        );
+        assert_eq!(
+            plan.headers.get("x-client-name").map(String::as_str),
+            Some("antigravity")
+        );
+        assert_eq!(
+            plan.headers.get("user-agent").map(String::as_str),
+            Some(ANTIGRAVITY_REQUEST_USER_AGENT)
+        );
+        let body = plan.body.json_body.expect("json body");
+        assert_eq!(body["tierId"], "free-tier");
+        assert_eq!(body["metadata"]["ideType"], "ANTIGRAVITY");
+        assert_eq!(body["metadata"]["pluginType"], "GEMINI");
+        assert!(body.get("cloudaicompanionProject").is_none());
+    }
+
+    #[tokio::test]
+    async fn builds_gemini_cli_onboard_user_plan_with_core_client_metadata() {
+        let runtime = TestRuntime {
+            oauth_auth: Some(
+                aether_provider_transport::LocalResolvedOAuthRequestAuth::Header {
+                    name: "authorization".to_string(),
+                    value: "Bearer oauth-token".to_string(),
+                },
+            ),
+            proxy: None,
+        };
+        let transport = sample_transport("gemini_cli", "gemini:generate_content", "oauth");
+        let plan = build_gemini_cli_onboard_user_plan(&runtime, &transport, "legacy-tier")
+            .await
+            .expect("plan");
+
+        assert_eq!(
+            plan.url,
+            "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
+        );
+        assert_eq!(plan.provider_api_format, "gemini_cli:onboard_user");
+        assert_eq!(
+            plan.headers.get("user-agent").map(String::as_str),
+            Some("GeminiCLI/0.1.5 (Windows; AMD64)")
+        );
+        let body = plan.body.json_body.expect("json body");
+        assert_eq!(body["tierId"], "legacy-tier");
+        assert_eq!(body["metadata"]["ideType"], "IDE_UNSPECIFIED");
+        assert_eq!(body["metadata"]["platform"], "PLATFORM_UNSPECIFIED");
+        assert_eq!(body["metadata"]["pluginType"], "GEMINI");
     }
 
     #[tokio::test]

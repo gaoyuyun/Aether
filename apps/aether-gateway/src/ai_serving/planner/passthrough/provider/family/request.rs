@@ -120,6 +120,10 @@ pub(crate) struct LocalSameFormatProviderCandidatePayloadParts {
     pub(super) transport_profile: Option<ResolvedTransportProfile>,
     pub(super) compatibility_edits: Vec<SameFormatProviderCompatibilityEdit>,
     pub(super) request_redacted: bool,
+    /// P2：Claude Code 客户端策略的结果，写入 `report_context.claude_code_cloak`。
+    pub(super) claude_code_cloak_report: Option<Value>,
+    /// P6：Antigravity 信封的敏感词混淆报告（Claude Code 的报告嵌在 `claude_code_cloak` 里）。
+    pub(super) sensitive_words_obfuscation: Option<Value>,
 }
 
 pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
@@ -207,6 +211,18 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     let body_json = redaction.body_json.as_ref();
     let mut transport = Arc::clone(&prepared.transport);
 
+    // P2：先识别客户端。原生 Claude Code 连历史的 body 清洗都要跳过，保证逐字节透传。
+    let claude_code_policy =
+        crate::ai_serving::planner::claude_code_cloak::resolve_claude_code_client_policy(
+            &transport,
+            effective_headers,
+            Some(body_json),
+            spec.operation,
+        );
+    let claude_code_native_passthrough = claude_code_policy
+        .as_ref()
+        .is_some_and(|policy| policy.native_passthrough());
+
     let Some(base_provider_request) =
         super::super::request::build_same_format_provider_request_body_with_compatibility_report(
             body_json,
@@ -218,7 +234,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             prepared.upstream_is_stream,
             prepared.force_body_stream_field,
             prepared.kiro_auth.as_ref(),
-            prepared.is_claude_code,
+            prepared.is_claude_code && !claude_code_native_passthrough,
             false,
             reasoning_replay_policy,
         )
@@ -480,6 +496,15 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     } else {
         base_provider_request_body
     };
+    // P6：Antigravity 信封构建成功后做敏感词混淆（只碰 systemInstruction 文本）。
+    let antigravity_sensitive_words = if antigravity_auth.is_some() {
+        crate::ai_serving::planner::antigravity_sensitive_words::apply_antigravity_sensitive_words(
+            &transport,
+            &mut provider_request_body,
+        )
+    } else {
+        None
+    };
     if crate::ai_serving::transport::enforce_same_format_provider_api_operation_body_policy(
         &mut provider_request_body,
         spec.operation,
@@ -490,6 +515,47 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
             detail: "removed stream field for non-streaming API operation".to_string(),
         });
     }
+
+    // P2：Claude Code 客户端策略。body 到这里已经是最终形状（模型映射、body_rules、操作
+    // 不变量都已应用），流水线在此对第三方请求做混淆 → 身份 → cache_control → CCH 签名，
+    // 之后 body 不再改动；原生 Claude Code 请求原样通过。
+    let claude_code_cloak = claude_code_policy.as_ref().map(|policy| {
+        crate::ai_serving::planner::claude_code_cloak::apply_claude_code_client_policy(
+            policy,
+            &transport,
+            effective_headers,
+            &mut provider_request_body,
+            spec.operation,
+            input
+                .client_session_affinity
+                .as_ref()
+                .and_then(|affinity| affinity.session_key.as_deref()),
+        )
+    });
+    if let Some(profile) = claude_code_cloak
+        .as_ref()
+        .and_then(|outcome| outcome.device_profile_update.clone())
+    {
+        crate::ai_serving::planner::claude_code_cloak::spawn_persist_claude_code_device_profile(
+            state,
+            &transport.key.id,
+            profile,
+        );
+    }
+    if claude_code_cloak
+        .as_ref()
+        .is_some_and(|outcome| !outcome.native_passthrough)
+    {
+        compatibility_edits.push(SameFormatProviderCompatibilityEdit {
+            field: "claude_code_cloak".to_string(),
+            action: SameFormatProviderCompatibilityEditAction::ProviderCompatibilityRewrite,
+            detail: "applied Claude Code client cloak pipeline (identity, cache_control, cch)"
+                .to_string(),
+        });
+    }
+    let claude_code_wire = claude_code_cloak
+        .as_ref()
+        .and_then(|outcome| outcome.wire_policy());
 
     let is_grok = prepared
         .transport
@@ -565,6 +631,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
                 .kiro_auth
                 .as_ref()
                 .map(|auth| auth.machine_id.as_str()),
+            claude_code_wire,
         })
     }) else {
         mark_skipped_local_same_format_provider_candidate_with_failure_diagnostic(
@@ -628,6 +695,8 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         transport_profile,
         compatibility_edits,
         request_redacted: redaction.redacted,
+        claude_code_cloak_report: claude_code_cloak.map(|outcome| outcome.report),
+        sensitive_words_obfuscation: antigravity_sensitive_words,
     }))
 }
 

@@ -23,7 +23,7 @@
       </div>
       <Select
         :model-value="modelValue"
-        @update:model-value="($event === 'user' || $event === 'admin' || $event === 'audit_admin') && $emit('update:modelValue', $event)"
+        @update:model-value="handleModelValueUpdate"
       >
         <SelectTrigger class="h-10 w-full">
           <SelectValue />
@@ -54,13 +54,13 @@ import { UserCog } from 'lucide-vue-next'
 import { useI18n } from '@/i18n'
 import type { UserRole } from '@/api/users'
 
-const emit = defineEmits<{
-  'update:modelValue': [value: UserRole]
-}>()
-
 defineProps<{
   modelValue: UserRole
   warningText: string
+}>()
+
+const emit = defineEmits<{
+  'update:modelValue': [value: UserRole]
 }>()
 
 function handleModelValueUpdate(value: string): void {

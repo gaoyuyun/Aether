@@ -5094,7 +5094,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
+    // Keep the gateway deadline ahead of Hyper's header timeout under CPU contention.
+    #[tokio::test(start_paused = true)]
     async fn first_request_deadline_covers_partial_http1_and_h2_preface() {
         let prefixes: &[&[u8]] = &[
             b"G",

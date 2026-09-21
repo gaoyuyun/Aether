@@ -15,6 +15,11 @@ pub enum OAuthError {
         status_code: u16,
         body_excerpt: String,
     },
+    /// 上游 429：`retry_after_secs` 来自 `Retry-After`，调用方按它退避而不是固定阶梯。
+    RateLimited {
+        retry_after_secs: Option<u64>,
+        body_excerpt: String,
+    },
     InvalidResponse(String),
     Transport(String),
     Storage(String),
@@ -38,6 +43,15 @@ impl std::fmt::Display for OAuthError {
             Self::HttpStatus { status_code, .. } => {
                 write!(formatter, "oauth provider returned HTTP {status_code}")
             }
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => match retry_after_secs {
+                Some(seconds) => write!(
+                    formatter,
+                    "oauth provider returned HTTP 429 (retry after {seconds}s)"
+                ),
+                None => formatter.write_str("oauth provider returned HTTP 429"),
+            },
             Self::InvalidResponse(detail) => write!(
                 formatter,
                 "oauth provider returned invalid response: {}",
@@ -75,6 +89,13 @@ impl std::fmt::Debug for OAuthError {
             Self::HttpStatus { status_code, .. } => formatter
                 .debug_struct("HttpStatus")
                 .field("status_code", status_code)
+                .field("body_excerpt", &"[REDACTED]")
+                .finish(),
+            Self::RateLimited {
+                retry_after_secs, ..
+            } => formatter
+                .debug_struct("RateLimited")
+                .field("retry_after_secs", retry_after_secs)
                 .field("body_excerpt", &"[REDACTED]")
                 .finish(),
             Self::InvalidResponse(_) => formatter

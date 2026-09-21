@@ -11,7 +11,7 @@ use aether_data_contracts::repository::pool_scores::{
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdaptiveState, ProviderCatalogKeyAdaptiveStateUpdate,
-    ProviderCatalogKeyHealthStateUpdate,
+    ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
 };
 use aether_routing_core::RoutingPoolPolicyOverride;
 use aether_scheduler_core::{
@@ -44,6 +44,11 @@ use crate::handlers::shared::provider_pool::{
     record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
     release_admin_provider_pool_key_lease, AdminProviderPoolConfig,
     AdminProviderPoolSchedulingPreset,
+};
+use crate::handlers::shared::provider_pool::{
+    apply_key_cooldown_override_from_raw, provider_cooldown_config_from_config_value,
+    record_admin_provider_pool_error_with_context, AdminProviderPoolErrorContext, CooldownAction,
+    CooldownDecision,
 };
 use crate::orchestration::{
     local_execution_candidate_metadata_from_report_context,
@@ -364,6 +369,8 @@ impl<'a> LocalStreamFailureEffect<'a> {
 struct PoolFeedbackContext {
     pool_config: AdminProviderPoolConfig,
     sticky_session_token: Option<String>,
+    /// 供应商类型、冷却策略与本次请求的上游模型，供池错误记录做冷却决策。
+    error_context: AdminProviderPoolErrorContext,
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +446,13 @@ pub(crate) async fn apply_local_stream_success_effects(
     context: LocalExecutionEffectContext<'_>,
     payload: &GatewayStreamReportRequest,
 ) {
+    super::capture_reasoning_replay_from_stream_capture(
+        state,
+        context.plan,
+        context.report_context,
+        payload.provider_body_base64.as_deref(),
+    )
+    .await;
     apply_local_execution_effect(
         state,
         context,
@@ -469,6 +483,14 @@ pub(crate) async fn apply_local_stream_failure_effects(
     effect: LocalStreamFailureEffect<'_>,
 ) -> LocalFailoverAnalysis {
     let analysis = resolve_local_failover_analysis_for_attempt(
+        state,
+        context.plan,
+        context.report_context,
+        effect.status_code,
+        effect.response_text,
+    )
+    .await;
+    super::clear_reasoning_replay_on_invalid_signature(
         state,
         context.plan,
         context.report_context,
@@ -867,11 +889,120 @@ async fn resolve_pool_feedback_context(
 
     let sticky_session_token = pool_feedback_request_body(plan, context.report_context)
         .and_then(extract_pool_sticky_session_token);
+    let cooldown = apply_key_cooldown_override_from_raw(
+        provider_cooldown_config_from_config_value(transport.provider.config.as_ref()),
+        transport.key.decrypted_auth_config.as_deref(),
+    );
+    let provider_model_name = report_context_string_field(context.report_context, "mapped_model")
+        .map(ToOwned::to_owned)
+        .or_else(|| plan.model_name.clone())
+        .filter(|model| !model.trim().is_empty());
 
     Some(PoolFeedbackContext {
         pool_config,
         sticky_session_token,
+        error_context: AdminProviderPoolErrorContext {
+            provider_type: transport.provider.provider_type.trim().to_ascii_lowercase(),
+            cooldown,
+            provider_model_name,
+        },
     })
+}
+
+/// 最近一次池错误对同一 (request, provider, key) 做出「同 Key 立即重试」决策的记录。
+/// 候选循环在派生下一次尝试时读一次即清，跨进程不共享（同一次请求总在同一进程内）。
+///
+/// 每个 (request, provider, key) 的提示**只发放一次**：第一次写入后同键再来的失败不会
+/// 重置它，否则上游持续返回「2 秒后再来」时会在同一把 Key 上无间隔地无限重试。
+/// 已消费的键在 [`POOL_IMMEDIATE_RETRY_HINT_TTL`] 内留下一个「已用」标记，同样阻止重发。
+static POOL_IMMEDIATE_RETRY_HINTS: LazyLock<ExpiringMap<String, PoolImmediateRetryHint>> =
+    LazyLock::new(ExpiringMap::new);
+const POOL_IMMEDIATE_RETRY_HINT_TTL: Duration = Duration::from_secs(30);
+const POOL_IMMEDIATE_RETRY_HINT_MAX_ENTRIES: usize = 10_000;
+/// 立即重试前最多等待上游提示的这么久；提示本身已经 < 3s，这里只是兜底。
+pub(crate) const POOL_IMMEDIATE_RETRY_MAX_WAIT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolImmediateRetryHint {
+    /// 尚未消费的提示（秒）。
+    Granted { retry_after_secs: u64 },
+    /// 本次请求在这把 Key 上已经用过一次提示。
+    Consumed,
+}
+
+fn pool_immediate_retry_hint_key(plan: &ExecutionPlan) -> String {
+    format!("{}:{}:{}", plan.request_id, plan.provider_id, plan.key_id)
+}
+
+/// 只在同键没有任何记录（未发放、未消费）时写入；返回是否真的发放了。
+fn remember_pool_immediate_retry_hint(plan: &ExecutionPlan, retry_after_secs: u64) -> bool {
+    POOL_IMMEDIATE_RETRY_HINTS.insert_if_absent_fresh(
+        pool_immediate_retry_hint_key(plan),
+        PoolImmediateRetryHint::Granted { retry_after_secs },
+        POOL_IMMEDIATE_RETRY_HINT_TTL,
+        POOL_IMMEDIATE_RETRY_HINT_MAX_ENTRIES,
+    )
+}
+
+async fn remember_immediate_retry_hint_without_pool(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    effect: &LocalPoolErrorEffect<'_>,
+) {
+    let provider_type = match state
+        .read_provider_transport_snapshot(
+            &context.plan.provider_id,
+            &context.plan.endpoint_id,
+            &context.plan.key_id,
+        )
+        .await
+    {
+        Ok(Some(transport)) => transport.provider.provider_type.trim().to_ascii_lowercase(),
+        _ => return,
+    };
+    let hint = crate::provider_transport::extract_upstream_retry_hint(
+        &provider_type,
+        effect.status_code,
+        Some(effect.headers),
+        effect.error_body,
+        current_unix_secs(),
+    );
+    if hint.is_immediate_retry() && matches!(effect.status_code, 408 | 409 | 425 | 429 | 500..=599)
+    {
+        let _ = remember_pool_immediate_retry_hint(
+            context.plan,
+            hint.retry_after.map(|value| value.as_secs()).unwrap_or(0),
+        );
+    }
+}
+
+/// 取走这次请求在这把 Key 上的「立即重试」提示（秒），只能取一次；取走后留下
+/// 「已消费」标记，同一 (request, provider, key) 之后的失败不再获得额外重试。
+pub(crate) fn take_pool_immediate_retry_hint(plan: &ExecutionPlan) -> Option<u64> {
+    let key = pool_immediate_retry_hint_key(plan);
+    match POOL_IMMEDIATE_RETRY_HINTS.get_fresh(&key, POOL_IMMEDIATE_RETRY_HINT_TTL) {
+        Some(PoolImmediateRetryHint::Granted { retry_after_secs }) => {
+            POOL_IMMEDIATE_RETRY_HINTS.remove(&key);
+            POOL_IMMEDIATE_RETRY_HINTS.insert(
+                key,
+                PoolImmediateRetryHint::Consumed,
+                POOL_IMMEDIATE_RETRY_HINT_TTL,
+                POOL_IMMEDIATE_RETRY_HINT_MAX_ENTRIES,
+            );
+            Some(retry_after_secs)
+        }
+        Some(PoolImmediateRetryHint::Consumed) | None => None,
+    }
+}
+
+/// 立即重试前应当等待的时长：按上游提示等待，封顶 [`POOL_IMMEDIATE_RETRY_MAX_WAIT`]。
+pub(crate) fn pool_immediate_retry_wait(retry_after_secs: u64) -> Duration {
+    Duration::from_secs(retry_after_secs).min(POOL_IMMEDIATE_RETRY_MAX_WAIT)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_pool_immediate_retry_hints_for_tests() {
+    POOL_IMMEDIATE_RETRY_HINTS.clear();
 }
 
 fn total_tokens_used(outcome: &TerminalUsageOutcome) -> u64 {
@@ -1548,6 +1679,8 @@ async fn record_pool_error_effect(
     }
 
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        // 非号池 Key 没有冷却 KV，但上游「几秒后再来」的提示仍然值得同 Key 立即重试一次。
+        remember_immediate_retry_hint_without_pool(state, context, &effect).await;
         return;
     };
 
@@ -1558,7 +1691,7 @@ async fn record_pool_error_effect(
     {
         return;
     }
-    record_admin_provider_pool_error(
+    let decision = record_admin_provider_pool_error_with_context(
         state.runtime_state.as_ref(),
         &context.plan.provider_id,
         &context.plan.key_id,
@@ -1566,23 +1699,140 @@ async fn record_pool_error_effect(
         effect.status_code,
         effect.error_body,
         Some(effect.headers),
+        &pool_context.error_context,
     )
     .await;
+    if let Some(decision) = decision.as_ref() {
+        if decision.action == CooldownAction::ImmediateRetry {
+            let _ = remember_pool_immediate_retry_hint(
+                context.plan,
+                decision
+                    .hint
+                    .retry_after
+                    .map(|value| value.as_secs())
+                    .unwrap_or(0),
+            );
+        }
+        if decision.action == CooldownAction::QuotaExhausted {
+            record_pool_quota_exhaustion_from_decision(state, context, decision).await;
+        }
+    }
+    let hard_state = pool_score_hard_state_for_decision(
+        effect.status_code,
+        effect.error_body,
+        decision.as_ref(),
+    );
+    let mut feedback = serde_json::json!({
+        "last_request_feedback": {
+            "source": "pool_error",
+            "status_code": effect.status_code,
+            "classification": format!("{:?}", effect.classification)
+        }
+    });
+    if let Some(decision) = decision.as_ref() {
+        feedback["last_request_feedback"]["cooldown"] = decision.to_meta_json(current_unix_secs());
+    }
     record_pool_score_schedule_feedback(
         state,
         context,
         Some(false),
-        pool_score_hard_state_for_status(effect.status_code, effect.error_body),
+        hard_state,
         Some(pool_score_delta_for_status(effect.status_code)),
-        serde_json::json!({
-            "last_request_feedback": {
-                "source": "pool_error",
-                "status_code": effect.status_code,
-                "classification": format!("{:?}", effect.classification)
-            }
-        }),
+        feedback,
     )
     .await;
+}
+
+/// 上游明确给出 ≥5 分钟的重置时刻：把它写进 Key 的 quota 元数据，调度层按 `reset_at`
+/// 过期而不是靠 32 分钟封顶的 KV 冷却反复撞。
+async fn record_pool_quota_exhaustion_from_decision(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    decision: &CooldownDecision,
+) {
+    let Some(reset_at) = decision.hint.reset_at_unix_secs else {
+        return;
+    };
+    let now_unix_secs = current_unix_secs();
+    if reset_at <= now_unix_secs {
+        return;
+    }
+    let model = report_context_string_field(context.report_context, "mapped_model")
+        .map(ToOwned::to_owned)
+        .or_else(|| context.plan.model_name.clone())
+        .filter(|model| !model.trim().is_empty());
+    let window = serde_json::json!({
+        "code": format!("upstream_{}", decision.hint.source.as_str()),
+        "label": "上游限流窗口",
+        "scope": if decision.hint.scope == crate::provider_transport::RetryHintScope::KeyModel { "model" } else { "account" },
+        "model": if decision.hint.scope == crate::provider_transport::RetryHintScope::KeyModel { model.clone() } else { None },
+        "source": decision.hint.source.as_str(),
+        "is_exhausted": true,
+        "used_ratio": 1.0,
+        "reset_at": reset_at,
+        "reset_seconds": reset_at.saturating_sub(now_unix_secs),
+        "observed_at": now_unix_secs,
+        "rejected_windows": decision.hint.rejected_windows,
+    });
+    let quota = serde_json::json!({
+        "version": 2,
+        "code": "exhausted",
+        "label": "额度耗尽",
+        "reason": format!("上游返回 {}，预计 {} 秒后重置", decision.hint.source.as_str(), reset_at.saturating_sub(now_unix_secs)),
+        "freshness": "fresh",
+        "source": "upstream_retry_hint",
+        "observed_at": now_unix_secs,
+        "updated_at": now_unix_secs,
+        "exhausted": decision.hint.scope != crate::provider_transport::RetryHintScope::KeyModel,
+        "usage_ratio": 1.0,
+        "reset_at": reset_at,
+        "reset_seconds": reset_at.saturating_sub(now_unix_secs),
+        "windows": [window],
+    });
+    let update = ProviderCatalogKeyStatusSnapshotUpdate {
+        key_id: context.plan.key_id.clone(),
+        status_snapshot_patch: serde_json::json!({ "quota": quota }),
+        updated_at_unix_secs: Some(now_unix_secs),
+    };
+    if let Err(err) = state
+        .update_provider_catalog_key_status_snapshot(&update)
+        .await
+    {
+        warn!(
+            provider_id = %context.plan.provider_id,
+            key_id = %context.plan.key_id,
+            error = ?err,
+            "gateway orchestration effects: failed to persist upstream quota reset into key status snapshot"
+        );
+    }
+}
+
+/// 有冷却决策时，池分硬状态跟着决策走：配额耗尽 → `QuotaExhausted`，冷却 → `Cooldown`，
+/// 立即重试 / 不冷却 → 不改硬状态。没有决策（账号级终态）时沿用状态码表。
+fn pool_score_hard_state_for_decision(
+    status_code: u16,
+    error_body: Option<&str>,
+    decision: Option<&CooldownDecision>,
+) -> Option<PoolMemberHardState> {
+    if let Some(reason) = admin_provider_pool_key_terminal_error_reason(status_code, error_body) {
+        return Some(pool_score_hard_state_for_terminal_error_reason(&reason));
+    }
+    match decision.map(|decision| decision.action) {
+        Some(CooldownAction::QuotaExhausted) => Some(PoolMemberHardState::QuotaExhausted),
+        Some(CooldownAction::Cooldown) => {
+            if status_code == 429 && error_body_indicates_quota_exhaustion(error_body) {
+                Some(PoolMemberHardState::QuotaExhausted)
+            } else if matches!(status_code, 401 | 403) {
+                // 软 403 会写 30 分钟池冷却，但池分硬状态沿用历史的 AuthInvalid：
+                // 管理端与评分对「认证类失败」的展示与处理不因决策层的引入而改变。
+                Some(PoolMemberHardState::AuthInvalid)
+            } else {
+                Some(PoolMemberHardState::Cooldown)
+            }
+        }
+        Some(CooldownAction::ImmediateRetry | CooldownAction::None) => None,
+        None => pool_score_hard_state_for_status(status_code, error_body),
+    }
 }
 
 async fn clear_pool_key_circuit_breaker(
@@ -3739,6 +3989,195 @@ mod tests {
             pool_score_hard_state_for_status(
                 429,
                 Some(r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"quota exhausted"}}"#),
+            ),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+    }
+
+    /// 验收：上游 429 带 `Retry-After: 2` → 号池不冷却这把 Key，候选循环在预算为 0 时
+    /// 仍派生一次同 Key 重试；提示只能消费一次。
+    #[tokio::test]
+    async fn short_retry_after_skips_cooldown_and_grants_one_same_key_retry() {
+        super::clear_pool_immediate_retry_hints_for_tests();
+        let state = codex_state();
+        let plan = sample_codex_plan();
+        let report_context = json!({
+            "candidate_id": "cand-codex-1",
+            "candidate_index": 0,
+            "retry_index": 0,
+            "key_id": plan.key_id,
+        });
+        let headers = BTreeMap::from([("Retry-After".to_string(), "2".to_string())]);
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 429,
+                classification: LocalFailoverClassification::RetryUpstreamFailure,
+                headers: &headers,
+                error_body: Some(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#),
+            }),
+        )
+        .await;
+
+        let cooldown =
+            crate::handlers::shared::provider_pool::read_admin_provider_pool_key_cooldown_reason(
+                state.runtime_state.as_ref(),
+                &plan.provider_id,
+                &plan.key_id,
+            )
+            .await
+            .expect("cooldown lookup should succeed");
+        assert_eq!(cooldown, None, "a 2s hint must not cool the key down");
+
+        let attempt = aether_ai_serving::AiSyncAttempt {
+            plan: plan.clone(),
+            report_kind: None,
+            report_context: Some(report_context.clone()),
+        };
+        let retry = crate::orchestration::next_same_key_retry_attempt(&attempt)
+            .expect("the upstream hint grants one same-key retry beyond the zero budget");
+        assert_eq!(retry.plan.key_id, plan.key_id);
+        assert_eq!(
+            retry
+                .report_context
+                .as_ref()
+                .and_then(|context| context.get("retry_index")),
+            Some(&json!(1))
+        );
+        assert!(
+            crate::orchestration::next_same_key_retry_attempt(&retry).is_none(),
+            "the hint is consumed once; the second failure fails over"
+        );
+        // 上游持续返回短 Retry-After：同一次请求在同一把 Key 上不再获得第二次额外重试，
+        // 否则会无间隔地无限循环。
+        let retry_context = retry.report_context.clone().expect("retry report context");
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &retry.plan,
+                report_context: Some(&retry_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 429,
+                classification: LocalFailoverClassification::RetryUpstreamFailure,
+                headers: &headers,
+                error_body: Some(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#),
+            }),
+        )
+        .await;
+        assert!(
+            crate::orchestration::next_same_key_retry_attempt(&retry).is_none(),
+            "a repeated short Retry-After must not grant another same-key retry"
+        );
+        assert_eq!(
+            super::pool_immediate_retry_wait(2),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            super::pool_immediate_retry_wait(30),
+            super::POOL_IMMEDIATE_RETRY_MAX_WAIT
+        );
+
+        // 没有提示的 429：走退避冷却，不给额外重试。
+        let plain_plan = ExecutionPlan {
+            key_id: "key-codex-cli-local-1".to_string(),
+            request_id: "req-codex-2".to_string(),
+            ..sample_codex_plan()
+        };
+        let plain_context = json!({
+            "candidate_id": "cand-codex-2",
+            "candidate_index": 0,
+            "retry_index": 0,
+        });
+        apply_local_execution_effect(
+            &state,
+            LocalExecutionEffectContext {
+                plan: &plain_plan,
+                report_context: Some(&plain_context),
+            },
+            LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                status_code: 429,
+                classification: LocalFailoverClassification::RetryUpstreamFailure,
+                headers: &BTreeMap::new(),
+                error_body: Some(r#"{"error":{"message":"rate limited"}}"#),
+            }),
+        )
+        .await;
+        let cooldown =
+            crate::handlers::shared::provider_pool::read_admin_provider_pool_key_cooldown_reason(
+                state.runtime_state.as_ref(),
+                &plain_plan.provider_id,
+                &plain_plan.key_id,
+            )
+            .await
+            .expect("cooldown lookup should succeed");
+        assert_eq!(cooldown.as_deref(), Some("backoff_level_0"));
+        let plain_attempt = aether_ai_serving::AiSyncAttempt {
+            plan: plain_plan,
+            report_kind: None,
+            report_context: Some(plain_context),
+        };
+        assert!(crate::orchestration::next_same_key_retry_attempt(&plain_attempt).is_none());
+    }
+
+    #[test]
+    fn cooldown_decisions_drive_pool_hard_state() {
+        use super::pool_score_hard_state_for_decision;
+        use crate::handlers::shared::provider_pool::{
+            decide_provider_cooldown, CooldownDecisionInput, ProviderCooldownConfig,
+        };
+        let decide =
+            |status: u16, headers: Option<&BTreeMap<String, String>>, body: Option<&str>| {
+                decide_provider_cooldown(CooldownDecisionInput {
+                    provider_type: "custom",
+                    status_code: status,
+                    headers,
+                    error_body: body,
+                    now_unix_secs: 1_800_000_000,
+                    config: ProviderCooldownConfig::default(),
+                    rate_limit_cooldown_enabled: true,
+                    overload_cooldown_seconds: 30,
+                    previous_backoff_level: None,
+                    active_cooldown_ttl_seconds: None,
+                })
+            };
+        let long = BTreeMap::from([("Retry-After".to_string(), "3600".to_string())]);
+        assert_eq!(
+            pool_score_hard_state_for_decision(429, None, Some(&decide(429, Some(&long), None))),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+        assert_eq!(
+            pool_score_hard_state_for_decision(429, None, Some(&decide(429, None, None))),
+            Some(PoolMemberHardState::Cooldown)
+        );
+        let short = BTreeMap::from([("Retry-After".to_string(), "1".to_string())]);
+        assert_eq!(
+            pool_score_hard_state_for_decision(429, None, Some(&decide(429, Some(&short), None))),
+            None
+        );
+        assert_eq!(
+            pool_score_hard_state_for_decision(503, None, Some(&decide(503, None, None))),
+            Some(PoolMemberHardState::Cooldown)
+        );
+        // 软 403：写冷却，但硬状态保持 AuthInvalid（与决策层引入前一致）。
+        assert_eq!(
+            pool_score_hard_state_for_decision(
+                403,
+                Some(r#"{"error":{"message":"temporarily forbidden"}}"#),
+                Some(&decide(403, None, None))
+            ),
+            Some(PoolMemberHardState::AuthInvalid)
+        );
+        // 账号级终态不看决策。
+        assert_eq!(
+            pool_score_hard_state_for_decision(
+                402,
+                Some(r#"{"error":{"message":"payment required"}}"#),
+                None
             ),
             Some(PoolMemberHardState::QuotaExhausted)
         );

@@ -1,4 +1,7 @@
 use crate::handlers::admin::provider::oauth::provisioning::rotate_codex_credential_generation;
+use crate::handlers::admin::provider::pool::cooldown::{
+    normalize_provider_cooldown_config, PROVIDER_COOLDOWN_CONFIG_KEY,
+};
 use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRequest;
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
@@ -46,7 +49,8 @@ pub(crate) async fn build_admin_create_provider_key_record(
     };
 
     let api_key = payload.api_key.unwrap_or_default().trim().to_string();
-    let auth_config = normalize_json_object(payload.auth_config, "auth_config")?;
+    let mut auth_config = normalize_json_object(payload.auth_config, "auth_config")?;
+    super::normalize_auth_config_sensitive_words(&mut auth_config, &provider.provider_type)?;
     let auth_config_object = auth_config
         .as_ref()
         .and_then(serde_json::Value::as_object)
@@ -60,6 +64,14 @@ pub(crate) async fn build_admin_create_provider_key_record(
             "Agent Identity 凭据必须通过专属创建或导入接口管理，不能通过通用 Key 接口写入"
                 .to_string(),
         );
+    }
+    if let Some(cooldown) = auth_config_object
+        .as_ref()
+        .and_then(|config| config.get(PROVIDER_COOLDOWN_CONFIG_KEY))
+        .filter(|value| !value.is_null())
+    {
+        // Key 级冷却覆盖与供应商级共用一套字段与校验。
+        normalize_provider_cooldown_config(cooldown).map_err(|err| format!("auth_config.{err}"))?;
     }
 
     match auth_type.as_str() {
@@ -186,7 +198,16 @@ pub(crate) async fn build_admin_create_provider_key_record(
         normalize_string_list(payload.allowed_models).map(|value| json!(value)),
         None,
         None,
-        normalize_json_object(payload.fingerprint, "fingerprint")?,
+        match payload.transport_profile.as_deref() {
+            // P5：提交了 transport_profile 才写入 `fingerprint.transport_profile`；
+            // 未提交时保持原始 fingerprint 不动。
+            Some(profile_id) => super::update::apply_key_transport_profile(
+                normalize_json_object(payload.fingerprint, "fingerprint")?,
+                &provider.provider_type,
+                Some(profile_id),
+            )?,
+            None => normalize_json_object(payload.fingerprint, "fingerprint")?,
+        },
     )
     .map_err(|err| err.to_string())?;
     key.note = payload

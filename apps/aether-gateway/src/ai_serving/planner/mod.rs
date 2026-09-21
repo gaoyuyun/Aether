@@ -2,6 +2,7 @@ use crate::ai_serving::{AiExecutionDecision, AiExecutionPlanPayload, GatewayCont
 use crate::{AppState, GatewayError};
 
 mod antigravity;
+pub(crate) mod antigravity_sensitive_words;
 mod candidate_affinity_cache;
 mod candidate_materialization;
 mod candidate_metadata;
@@ -10,6 +11,7 @@ mod candidate_ranking;
 mod candidate_resolution;
 mod candidate_source;
 mod candidate_transport_ranking_facts;
+pub(crate) mod claude_code_cloak;
 mod common;
 mod decision;
 mod decision_input;

@@ -201,13 +201,168 @@ pub fn canonical_usage_from_openai_usage(value: Option<&Value>) -> Option<Canoni
     })
 }
 
+/// 上游用 `response.incomplete` 结束、但既没有产生任何输出也没有给出可用原因时，
+/// 对外记录的错误信息与错误码（对齐 CLIProxyAPI 的 `CodexEmptyIncompleteStreamMessage`）。
+pub const OPENAI_RESPONSES_EMPTY_INCOMPLETE_MESSAGE: &str =
+    "upstream terminated with an incomplete empty response (0 output tokens)";
+pub const OPENAI_RESPONSES_EMPTY_INCOMPLETE_CODE: &str = "empty_incomplete_response";
+
+/// `response.incomplete` 携带的 `incomplete_details.reason`。
+///
+/// 标准位置是 `response.incomplete_details.reason`；批量封装偶尔把
+/// `incomplete_details` 直接放在事件顶层，两处都要看，否则合法终态会被漏判。
+pub fn openai_responses_incomplete_reason(payload: &Value) -> Option<&str> {
+    [
+        payload.pointer("/response/incomplete_details/reason"),
+        payload.pointer("/incomplete_details/reason"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .map(str::trim)
+    .find(|reason| !reason.is_empty())
+}
+
+/// 没有原因、或原因本身就是错误的 incomplete 不是合法终态。
+///
+/// 非空原因是供应商拥有的协议数据：把它当固定白名单会把未来每一个合法原因都
+/// 变成合成的 502 并误扣供应商健康分，所以只把明确的错误原因判成失败。
+pub fn openai_responses_incomplete_reason_is_failure(reason: Option<&str>) -> bool {
+    match reason.map(str::trim) {
+        None | Some("") => true,
+        Some(reason) => {
+            reason.eq_ignore_ascii_case("error") || reason.eq_ignore_ascii_case("server_error")
+        }
+    }
+}
+
+/// 事件是否是 `response.incomplete` 终态（含只带 `status: incomplete` /
+/// `incomplete_details` 的非流式响应体）。
+pub fn openai_responses_payload_is_incomplete(payload: &Value) -> bool {
+    if payload
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type == "response.incomplete")
+    {
+        return true;
+    }
+    let response = payload.get("response").and_then(Value::as_object);
+    response
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "incomplete")
+        || response
+            .and_then(|response| response.get("incomplete_details"))
+            .is_some_and(|details| !details.is_null())
+        || payload
+            .get("incomplete_details")
+            .is_some_and(|details| !details.is_null())
+}
+
+fn openai_responses_payload_has_explicit_error(payload: &Value) -> bool {
+    [payload.get("error"), payload.pointer("/response/error")]
+        .into_iter()
+        .flatten()
+        .any(|error| !error.is_null())
+}
+
+/// incomplete 终态本身就是失败：没有可用原因，或原因是错误，或事件带了显式
+/// `error` 对象。
+pub fn openai_responses_incomplete_is_failure(payload: &Value) -> bool {
+    openai_responses_payload_is_incomplete(payload)
+        && (openai_responses_incomplete_reason_is_failure(openai_responses_incomplete_reason(
+            payload,
+        )) || openai_responses_payload_has_explicit_error(payload))
+}
+
+/// 事件是否携带了实际生成内容（文本 / 推理 / 工具参数增量，或完整的输出项）。
+///
+/// 用来区分「上游静默中止的空 incomplete」和「写满输出上限的合法 incomplete」：
+/// Codex 偶尔在 `response.incomplete.response.output` 留空，但前面已经流过
+/// `output_item.done`，那不是空响应。
+pub fn openai_responses_event_has_meaningful_output_delta(payload: &Value) -> bool {
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "response.output_text.delta"
+        | "response.outtext.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta"
+        | "response.function_call_arguments.delta"
+        | "response.custom_tool_call_input.delta"
+        | "response.refusal.delta" => payload.get("delta").is_some_and(|delta| match delta {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Object(object) => !object.is_empty(),
+            _ => false,
+        }),
+        "response.output_item.added" | "response.output_item.done" => {
+            payload.get("item").is_some_and(Value::is_object)
+        }
+        _ => false,
+    }
+}
+
+/// 合法原因的 incomplete 是否其实是上游的静默中止：整条流没有任何生成内容，
+/// `response.output` 为空，且 `usage.output_tokens` 明确为数字 0。
+///
+/// 三个条件缺一不可：缺 usage 或 output_tokens 不是显式的 0 时，宁可按合法
+/// 终态处理，也不把一次真实消耗记成供应商失败。
+pub fn openai_responses_incomplete_is_empty_abort(
+    payload: &Value,
+    saw_output_content: bool,
+) -> bool {
+    if saw_output_content || !openai_responses_payload_is_incomplete(payload) {
+        return false;
+    }
+    if openai_responses_incomplete_is_failure(payload) {
+        return false;
+    }
+    let response = payload.get("response").and_then(Value::as_object);
+    let output_is_empty = response
+        .and_then(|response| response.get("output"))
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if !output_is_empty {
+        return false;
+    }
+    response
+        .and_then(|response| response.get("usage"))
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        == Some(0)
+}
+
+/// 把空 incomplete 改写成带显式 `error` 的同类事件，让下游的终态错误判定、
+/// 客户端投递与记账看到同一个事实。
+pub fn openai_responses_empty_incomplete_error_payload(payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    let error = json!({
+        "type": "incomplete",
+        "code": OPENAI_RESPONSES_EMPTY_INCOMPLETE_CODE,
+        "message": OPENAI_RESPONSES_EMPTY_INCOMPLETE_MESSAGE,
+    });
+    match payload
+        .as_object_mut()
+        .and_then(|object| object.get_mut("response"))
+        .and_then(Value::as_object_mut)
+    {
+        Some(response) => {
+            response.insert("error".to_string(), error);
+        }
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("error".to_string(), error);
+            }
+        }
+    }
+    payload
+}
+
 pub fn openai_stream_payload_is_terminal_error(payload: &Value) -> bool {
     let response = payload.get("response").and_then(Value::as_object);
-    if payload.get("error").is_some_and(|error| !error.is_null())
-        || response
-            .and_then(|response| response.get("error"))
-            .is_some_and(|error| !error.is_null())
-    {
+    if openai_responses_payload_has_explicit_error(payload) {
         return true;
     }
 
@@ -216,6 +371,9 @@ pub fn openai_stream_payload_is_terminal_error(payload: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or_default();
     if matches!(event_type, "error" | "response.failed") {
+        return true;
+    }
+    if openai_responses_incomplete_is_failure(payload) {
         return true;
     }
 
@@ -808,6 +966,119 @@ mod tests {
         openai_stream_payload_is_terminal_error, openai_stream_terminal_error_body,
         openai_stream_terminal_error_message,
     };
+
+    #[test]
+    fn legitimate_incomplete_is_not_a_terminal_error() {
+        for reason in ["max_output_tokens", "content_filter", "future_reason"] {
+            let payload = json!({
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": reason},
+                    "output": [{"type": "message"}],
+                    "usage": {"output_tokens": 7}
+                }
+            });
+            assert!(
+                !openai_stream_payload_is_terminal_error(&payload),
+                "{reason}"
+            );
+            assert!(!super::openai_responses_incomplete_is_failure(&payload));
+            assert!(!super::openai_responses_incomplete_is_empty_abort(
+                &payload, false
+            ));
+        }
+    }
+
+    #[test]
+    fn incomplete_without_a_usable_reason_or_with_an_error_reason_is_a_terminal_error() {
+        for payload in [
+            json!({"type": "response.incomplete"}),
+            json!({"type": "response.incomplete", "response": {"incomplete_details": null}}),
+            json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": ""}}}),
+            json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "error"}}}),
+            json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "server_error"}}}),
+            json!({"type": "response.incomplete", "response": {"error": {"code": "x"}, "incomplete_details": {"reason": "max_output_tokens"}}}),
+        ] {
+            assert!(
+                openai_stream_payload_is_terminal_error(&payload),
+                "{payload}"
+            );
+            let body = openai_stream_terminal_error_body(&payload).expect("error body");
+            assert_eq!(body["error"]["type"], "incomplete");
+        }
+    }
+
+    #[test]
+    fn empty_incomplete_requires_no_output_no_deltas_and_explicit_zero_output_tokens() {
+        let empty = json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+                "usage": {"input_tokens": 3, "output_tokens": 0}
+            }
+        });
+        assert!(super::openai_responses_incomplete_is_empty_abort(
+            &empty, false
+        ));
+        // 前面流过内容：不是空响应。
+        assert!(!super::openai_responses_incomplete_is_empty_abort(
+            &empty, true
+        ));
+        // output_tokens 缺失或不是显式 0：按合法终态处理。
+        let mut no_usage = empty.clone();
+        no_usage["response"]
+            .as_object_mut()
+            .unwrap()
+            .remove("usage");
+        assert!(!super::openai_responses_incomplete_is_empty_abort(
+            &no_usage, false
+        ));
+        let mut with_output = empty.clone();
+        with_output["response"]["output"] = json!([{"type": "message"}]);
+        assert!(!super::openai_responses_incomplete_is_empty_abort(
+            &with_output,
+            false
+        ));
+
+        let rewritten = super::openai_responses_empty_incomplete_error_payload(&empty);
+        assert!(openai_stream_payload_is_terminal_error(&rewritten));
+        assert_eq!(
+            openai_stream_terminal_error_message(&rewritten).as_deref(),
+            Some(super::OPENAI_RESPONSES_EMPTY_INCOMPLETE_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn meaningful_output_deltas_are_recognized() {
+        assert!(super::openai_responses_event_has_meaningful_output_delta(
+            &json!({
+                "type": "response.output_text.delta", "delta": "hi"
+            })
+        ));
+        assert!(super::openai_responses_event_has_meaningful_output_delta(
+            &json!({
+                "type": "response.function_call_arguments.delta", "delta": "{"
+            })
+        ));
+        assert!(super::openai_responses_event_has_meaningful_output_delta(
+            &json!({
+                "type": "response.output_item.done", "item": {"type": "function_call"}
+            })
+        ));
+        assert!(!super::openai_responses_event_has_meaningful_output_delta(
+            &json!({
+                "type": "response.output_text.delta", "delta": "   "
+            })
+        ));
+        assert!(!super::openai_responses_event_has_meaningful_output_delta(
+            &json!({
+                "type": "response.in_progress"
+            })
+        ));
+    }
 
     #[test]
     fn completed_openai_responses_payload_with_null_error_is_not_terminal_error() {

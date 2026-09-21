@@ -343,7 +343,6 @@ import { Button, Dialog, Popover, PopoverContent, PopoverTrigger } from '@/compo
 import { normalizeReleaseNotesForDisplay } from '@/utils/releaseNotes'
 import { formatDisplayVersion } from '@/utils/version'
 import { describeUpdateStatus } from '@/utils/updateStatus'
-import { sanitizeMarkdown } from '@/utils/sanitize'
 import { safeExternalHttpsUrl } from '@/utils/navigationSecurity'
 import { useI18n } from '@/i18n'
 import { ChevronRight, ExternalLink, Info, RefreshCw } from 'lucide-vue-next'

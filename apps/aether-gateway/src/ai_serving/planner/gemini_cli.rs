@@ -144,3 +144,274 @@ async fn build_gemini_cli_v1internal_payload(
         body,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use super::{
+        build_gemini_cli_v1internal_provider_request, GeminiCliV1InternalRequestError,
+        GeminiCliV1InternalRequestInput,
+    };
+    use crate::ai_serving::transport::snapshot::{
+        GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
+        GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
+    };
+    use crate::ai_serving::transport::GEMINI_CLI_USER_AGENT;
+    use crate::AppState;
+
+    fn sample_transport(auth_config: Option<&str>) -> GatewayProviderTransportSnapshot {
+        GatewayProviderTransportSnapshot {
+            provider: GatewayProviderTransportProvider {
+                id: "provider-1".to_string(),
+                name: "Gemini CLI".to_string(),
+                provider_type: "gemini_cli".to_string(),
+                website: None,
+                is_active: true,
+                keep_priority_on_conversion: false,
+                enable_format_conversion: true,
+                concurrent_limit: None,
+                max_retries: None,
+                proxy: None,
+                request_timeout_secs: None,
+                stream_first_byte_timeout_secs: None,
+                config: None,
+            },
+            endpoint: GatewayProviderTransportEndpoint {
+                id: "endpoint-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                api_format: "gemini:generate_content".to_string(),
+                api_family: Some("gemini".to_string()),
+                endpoint_kind: Some("generate_content".to_string()),
+                is_active: true,
+                base_url: "https://cloudcode-pa.googleapis.com".to_string(),
+                header_rules: None,
+                body_rules: None,
+                max_retries: None,
+                custom_path: None,
+                config: None,
+                format_acceptance_config: None,
+                proxy: None,
+            },
+            key: GatewayProviderTransportKey {
+                id: "key-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                name: "key".to_string(),
+                auth_type: "oauth".to_string(),
+                is_active: true,
+                api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                auth_type_by_format: None,
+                allow_auth_channel_mismatch_formats: None,
+                allowed_models: None,
+                capabilities: None,
+                rate_multipliers: None,
+                global_priority_by_format: None,
+                expires_at_unix_secs: None,
+                proxy: None,
+                fingerprint: None,
+                upstream_metadata: None,
+                decrypted_api_key: "gemini-cli-access-token".to_string(),
+                decrypted_auth_config: auth_config.map(ToOwned::to_owned),
+            },
+        }
+    }
+
+    fn sample_parts(uri: &str) -> http::request::Parts {
+        let (parts, _) = http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(())
+            .expect("request should build")
+            .into_parts();
+        parts
+    }
+
+    fn sample_headers() -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().expect("header"));
+        headers.insert("x-goog-api-key", "client-secret".parse().expect("header"));
+        headers
+    }
+
+    async fn build(
+        transport: GatewayProviderTransportSnapshot,
+        gemini_request_body: &Value,
+        upstream_is_stream: bool,
+    ) -> Result<super::GeminiCliV1InternalRequest, GeminiCliV1InternalRequestError> {
+        let state = AppState::new().expect("gateway state should build");
+        let parts = if upstream_is_stream {
+            sample_parts(
+                "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=client-secret",
+            )
+        } else {
+            sample_parts("/v1beta/models/gemini-2.5-pro:generateContent?key=client-secret")
+        };
+        let request_headers = sample_headers();
+        let original_request_body = json!({ "contents": [], "stream": true });
+        let transport = Arc::new(transport);
+        build_gemini_cli_v1internal_provider_request(GeminiCliV1InternalRequestInput {
+            state: &state,
+            parts: &parts,
+            transport: &transport,
+            trace_id: "trace-gemini-cli-1",
+            mapped_model: "gemini-2.5-pro",
+            provider_api_format: "gemini:generate_content",
+            auth_header: "authorization",
+            auth_value: "Bearer gemini-cli-access-token",
+            request_headers: &request_headers,
+            original_request_body: &original_request_body,
+            gemini_request_body,
+            upstream_is_stream,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn wraps_the_gemini_body_into_a_v1internal_envelope_with_the_key_project() {
+        let request_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }],
+            "generationConfig": { "temperature": 0.2 }
+        });
+
+        let request = build(
+            sample_transport(Some(
+                r#"{"project_id":"project-from-auth","refresh_token":"rt"}"#,
+            )),
+            &request_body,
+            true,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("request should build: {}", error_label(&error)));
+
+        assert_eq!(request.body["project"], "project-from-auth");
+        assert_eq!(request.body["model"], "gemini-2.5-pro");
+        assert_eq!(request.body["user_prompt_id"], "trace-gemini-cli-1");
+        assert_eq!(
+            request.body["request"]["contents"][0]["parts"][0]["text"],
+            "hello"
+        );
+        assert_eq!(
+            request.body["request"]["generationConfig"]["temperature"],
+            0.2
+        );
+        assert!(request.body.get("contents").is_none());
+
+        assert_eq!(
+            request.upstream_url,
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            request
+                .headers
+                .headers
+                .get("user-agent")
+                .map(String::as_str),
+            Some(GEMINI_CLI_USER_AGENT)
+        );
+        assert_eq!(
+            request
+                .headers
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer gemini-cli-access-token")
+        );
+        assert_eq!(
+            request.headers.headers.get("accept").map(String::as_str),
+            Some("text/event-stream")
+        );
+        // 客户端自带的 Google API key 不得带到 Cloud Code。
+        assert!(!request.headers.headers.contains_key("x-goog-api-key"));
+        assert_eq!(request.transport.key.id, "key-1");
+    }
+
+    #[tokio::test]
+    async fn non_stream_requests_target_generate_content() {
+        let request_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hello" }] }]
+        });
+
+        let request = build(
+            sample_transport(Some(r#"{"project_id":"project-from-auth"}"#)),
+            &request_body,
+            false,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("request should build: {}", error_label(&error)));
+
+        assert_eq!(
+            request.upstream_url,
+            "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        );
+        assert!(request
+            .headers
+            .headers
+            .get("accept")
+            .is_none_or(|accept| accept != "text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn bodies_without_contents_are_rejected_as_unsupported_envelopes() {
+        let error = build(
+            sample_transport(Some(r#"{"project_id":"project-from-auth"}"#)),
+            &json!({ "prompt": "not a gemini body" }),
+            true,
+        )
+        .await
+        .err()
+        .expect("body without contents must not be wrapped");
+
+        assert!(matches!(
+            error,
+            GeminiCliV1InternalRequestError::EnvelopeUnsupported
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_config_json_makes_the_project_unavailable() {
+        let error = build(
+            sample_transport(Some("{not json")),
+            &json!({ "contents": [] }),
+            true,
+        )
+        .await
+        .err()
+        .expect("invalid auth config must not produce a request");
+
+        assert!(matches!(
+            error,
+            GeminiCliV1InternalRequestError::ProjectUnavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn metadata_project_wins_over_auth_config_and_session_id_is_forwarded() {
+        let mut transport = sample_transport(Some(
+            r#"{"project_id":"project-from-auth","session_id":"session-from-auth"}"#,
+        ));
+        transport.key.upstream_metadata = Some(json!({
+            "gemini_cli": { "project_id": "project-from-metadata" }
+        }));
+        let request = build(
+            transport,
+            &json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }),
+            true,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("request should build: {}", error_label(&error)));
+
+        assert_eq!(request.body["project"], "project-from-metadata");
+        assert_eq!(request.body["request"]["session_id"], "session-from-auth");
+    }
+
+    fn error_label(error: &GeminiCliV1InternalRequestError) -> &'static str {
+        match error {
+            GeminiCliV1InternalRequestError::ProjectUnavailable => "project unavailable",
+            GeminiCliV1InternalRequestError::EnvelopeUnsupported => "envelope unsupported",
+            GeminiCliV1InternalRequestError::UpstreamUrlUnavailable => "upstream url unavailable",
+            GeminiCliV1InternalRequestError::HeaderRulesApplyFailed => "header rules apply failed",
+        }
+    }
+}

@@ -35,6 +35,16 @@ pub(crate) use self::template::{
     reconcile_admin_fixed_provider_template_endpoints_after_update,
 };
 pub(crate) use self::update::build_admin_update_provider_record;
+pub(crate) use self::update::{
+    allowed_transport_profiles_for_provider_type, normalize_admin_transport_profile,
+    provider_transport_profile_id, provider_type_supports_transport_profile,
+    transport_profile_id_from_fingerprint, PROVIDER_TRANSPORT_PROFILE_FIELD,
+};
+pub(crate) use self::update::{
+    normalize_cloak_sensitive_words, provider_cloak_sensitive_words_changed,
+    provider_type_supports_sensitive_words, CLOAK_SENSITIVE_WORDS_CHANGED_WARNING,
+    CLOAK_SENSITIVE_WORDS_FIELD,
+};
 
 #[cfg(test)]
 mod tests {

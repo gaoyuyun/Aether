@@ -132,6 +132,18 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
         target.insert("billing_dimensions".to_string(), dimensions);
     }
     insert_routing_skip_reason(source, &mut target);
+    if let Some(report) = source
+        .get(SENSITIVE_WORDS_OBFUSCATION_METADATA_KEY)
+        .and_then(project_sensitive_words_obfuscation)
+    {
+        target.insert(SENSITIVE_WORDS_OBFUSCATION_METADATA_KEY.to_string(), report);
+    }
+    if let Some(tls_fingerprint) = source
+        .get(TLS_FINGERPRINT_METADATA_KEY)
+        .and_then(project_tls_fingerprint)
+    {
+        target.insert(TLS_FINGERPRINT_METADATA_KEY.to_string(), tls_fingerprint);
+    }
     if let Some(diagnostic) = source
         .get(ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY)
         .and_then(project_routing_failure_diagnostic)
@@ -627,6 +639,203 @@ fn insert_transport_error_type(source: &Map<String, Value>, target: &mut Map<Str
         _ => "other_transport_error".to_string(),
     };
     target.insert("transport_error_type".to_string(), Value::String(value));
+}
+
+/// 敏感词零宽混淆的落库形状：`{applied, replaced, fields[]}`。字段路径只允许
+/// `system[0]` / `messages[3].content[0]` 这类结构路径，不带任何正文。
+pub const SENSITIVE_WORDS_OBFUSCATION_METADATA_KEY: &str = "sensitive_words_obfuscation";
+const SENSITIVE_WORDS_OBFUSCATION_MAX_FIELDS: usize = 256;
+const SENSITIVE_WORDS_OBFUSCATION_MAX_FIELD_CHARS: usize = 96;
+
+fn project_sensitive_words_obfuscation(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let applied = object.get("applied").and_then(Value::as_bool)?;
+    let replaced = object
+        .get("replaced")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(1_000_000);
+    let fields = object
+        .get("fields")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|path| {
+            !path.is_empty()
+                && path.chars().count() <= SENSITIVE_WORDS_OBFUSCATION_MAX_FIELD_CHARS
+                && path
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '[' | ']' | '.' | '_'))
+        })
+        .take(SENSITIVE_WORDS_OBFUSCATION_MAX_FIELDS)
+        .map(|path| Value::String(path.to_string()))
+        .collect::<Vec<_>>();
+    Some(serde_json::json!({
+        "applied": applied,
+        "replaced": replaced,
+        "fields": fields,
+    }))
+}
+
+/// 出站 TLS 记录（P5）。只投影网关自己生成的 `tls_fingerprint.outgoing`：每个字段都有
+/// 枚举 / 字符集 / 长度约束；`incoming`（来自反代头或客户端）继续丢弃，避免把不可信的
+/// 指纹字符串落库。
+pub const TLS_FINGERPRINT_METADATA_KEY: &str = "tls_fingerprint";
+const TLS_FINGERPRINT_OUTGOING_KEY: &str = "outgoing";
+const TLS_FINGERPRINT_OUTGOING_SOURCE: &str = "aether_transport_config";
+const TLS_FINGERPRINT_BACKENDS: &[&str] = &["reqwest_rustls", "hyper_rustls", "browser_wreq"];
+const TLS_FINGERPRINT_HTTP_MODES: &[&str] = &["auto", "http1_only", "h2c_prior_knowledge"];
+const TLS_FINGERPRINT_TLS_STACKS: &[&str] = &["rustls", "boringssl_wreq"];
+const TLS_FINGERPRINT_TRANSPORT_PATHS: &[&str] =
+    &["direct", "direct_with_proxy", "aether_proxy_tunnel"];
+const TLS_FINGERPRINT_MAX_PROFILE_CHARS: usize = 64;
+const TLS_FINGERPRINT_MAX_JA3_CHARS: usize = 512;
+const TLS_FINGERPRINT_JA3_HASH_CHARS: usize = 32;
+const TLS_FINGERPRINT_MAX_JA4_CHARS: usize = 64;
+const TLS_FINGERPRINT_MAX_EXTENDED_CHARS: usize = 512;
+const TLS_FINGERPRINT_MAX_PROBE_URL_CHARS: usize = 256;
+const TLS_FINGERPRINT_MAX_LIST_ITEMS: usize = 4;
+const TLS_FINGERPRINT_MAX_LIST_ITEM_CHARS: usize = 16;
+
+fn project_tls_fingerprint(value: &Value) -> Option<Value> {
+    let outgoing = value
+        .as_object()?
+        .get(TLS_FINGERPRINT_OUTGOING_KEY)?
+        .as_object()?;
+    let source = outgoing.get("source").and_then(Value::as_str)?.trim();
+    if source != TLS_FINGERPRINT_OUTGOING_SOURCE {
+        return None;
+    }
+    let observed = outgoing.get("observed").and_then(Value::as_bool)?;
+    let backend = outgoing
+        .get("backend")
+        .and_then(Value::as_str)
+        .and_then(|value| known_lowercase(value, TLS_FINGERPRINT_BACKENDS))?;
+    let mut target = Map::new();
+    target.insert(
+        "source".to_string(),
+        Value::String(TLS_FINGERPRINT_OUTGOING_SOURCE.to_string()),
+    );
+    target.insert("observed".to_string(), Value::Bool(observed));
+    target.insert("backend".to_string(), Value::String(backend));
+    for (key, allowed) in [
+        ("http_mode", TLS_FINGERPRINT_HTTP_MODES),
+        ("tls_stack", TLS_FINGERPRINT_TLS_STACKS),
+        ("transport_path", TLS_FINGERPRINT_TRANSPORT_PATHS),
+    ] {
+        if let Some(value) = outgoing
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|value| known_lowercase(value, allowed))
+        {
+            target.insert(key.to_string(), Value::String(value));
+        }
+    }
+    for key in ["emulation_profile", "profile_id"] {
+        if let Some(value) = outgoing.get(key).and_then(Value::as_str).and_then(|value| {
+            sanitize_charset_token(value, TLS_FINGERPRINT_MAX_PROFILE_CHARS, |ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-')
+            })
+        }) {
+            target.insert(key.to_string(), Value::String(value));
+        }
+    }
+    if let Some(value) = outgoing
+        .get("pool_scope")
+        .and_then(Value::as_str)
+        .and_then(|value| known_lowercase(value, &["key", "provider", "endpoint", "global"]))
+    {
+        target.insert("pool_scope".to_string(), Value::String(value));
+    }
+    for key in ["alpn_offered", "tls_versions_offered"] {
+        if let Some(items) = outgoing.get(key).and_then(Value::as_array) {
+            let items = items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|value| {
+                    sanitize_charset_token(value, TLS_FINGERPRINT_MAX_LIST_ITEM_CHARS, |ch| {
+                        ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_')
+                    })
+                })
+                .take(TLS_FINGERPRINT_MAX_LIST_ITEMS)
+                .map(Value::String)
+                .collect::<Vec<_>>();
+            target.insert(key.to_string(), Value::Array(items));
+        }
+    }
+    if observed {
+        if let Some(value) = outgoing
+            .get("ja3")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                sanitize_charset_token(value, TLS_FINGERPRINT_MAX_JA3_CHARS, |ch| {
+                    ch.is_ascii_digit() || matches!(ch, ',' | '-')
+                })
+            })
+        {
+            target.insert("ja3".to_string(), Value::String(value));
+        }
+        if let Some(value) = outgoing
+            .get("ja3_hash")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| {
+                value.len() == TLS_FINGERPRINT_JA3_HASH_CHARS
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            target.insert("ja3_hash".to_string(), Value::String(value.to_string()));
+        }
+        for (key, max_chars) in [
+            ("ja4", TLS_FINGERPRINT_MAX_JA4_CHARS),
+            ("peetprint", TLS_FINGERPRINT_MAX_EXTENDED_CHARS),
+            ("akamai_fingerprint", TLS_FINGERPRINT_MAX_EXTENDED_CHARS),
+        ] {
+            if let Some(value) = outgoing.get(key).and_then(Value::as_str).and_then(|value| {
+                sanitize_charset_token(value, max_chars, |ch| {
+                    ch.is_ascii_alphanumeric()
+                        || matches!(ch, '_' | '|' | ',' | ':' | ';' | '-')
+                        || (key == "peetprint" && ch == '.')
+                })
+            }) {
+                target.insert(key.to_string(), Value::String(value));
+            }
+        }
+        if let Some(value) = outgoing.get("probed_at_unix_secs").and_then(Value::as_u64) {
+            target.insert("probed_at_unix_secs".to_string(), Value::from(value));
+        }
+        if let Some(value) = outgoing
+            .get("probe_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| {
+                value.len() <= TLS_FINGERPRINT_MAX_PROBE_URL_CHARS
+                    && value.starts_with("https://")
+                    && !value.contains('@')
+                    && value.chars().all(|ch| ch.is_ascii_graphic())
+            })
+        {
+            target.insert("probe_url".to_string(), Value::String(value.to_string()));
+        }
+    }
+    Some(Value::Object(Map::from_iter([(
+        TLS_FINGERPRINT_OUTGOING_KEY.to_string(),
+        Value::Object(target),
+    )])))
+}
+
+fn sanitize_charset_token(
+    value: &str,
+    max_chars: usize,
+    allowed: impl Fn(char) -> bool,
+) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.chars().count() <= max_chars && value.chars().all(allowed))
+        .then(|| value.to_string())
 }
 
 fn insert_routing_skip_reason(source: &Map<String, Value>, target: &mut Map<String, Value>) {
@@ -1231,6 +1440,176 @@ mod tests {
     use serde_json::json;
 
     use super::{sanitize_usage_request_metadata, sanitize_usage_request_metadata_ref};
+
+    #[test]
+    fn persistence_projection_keeps_sensitive_words_obfuscation_report_shape_only() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "trace_id": "trace-1",
+            "sensitive_words_obfuscation": {
+                "applied": true,
+                "replaced": 3,
+                "fields": ["system[1]", "messages[0].content[0]", "bad path with text", "x".repeat(200)],
+                "words": ["proxy"]
+            }
+        })))
+        .expect("metadata should project");
+        assert_eq!(
+            metadata["sensitive_words_obfuscation"],
+            json!({
+                "applied": true,
+                "replaced": 3,
+                "fields": ["system[1]", "messages[0].content[0]"]
+            })
+        );
+        let missing = sanitize_usage_request_metadata(Some(json!({
+            "sensitive_words_obfuscation": {"replaced": 1}
+        })));
+        assert!(missing
+            .as_ref()
+            .and_then(|value| value.get("sensitive_words_obfuscation"))
+            .is_none());
+    }
+
+    #[test]
+    fn persistence_projection_keeps_validated_outgoing_tls_fingerprint_and_drops_incoming() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "trace_id": "trace-1",
+            "tls_fingerprint": {
+                "incoming": {"source": "forwarded_header", "ja3": "incoming-ja3", "ja4": "x"},
+                "outgoing": {
+                    "source": "aether_transport_config",
+                    "observed": true,
+                    "transport_path": "direct",
+                    "backend": "browser_wreq",
+                    "http_mode": "http1_only",
+                    "tls_stack": "boringssl_wreq",
+                    "tls_versions_offered": ["TLS1.3", "TLS1.2"],
+                    "alpn_offered": ["http/1.1"],
+                    "emulation_profile": "claude_code_node_openssl",
+                    "profile_id": "claude_code_node_openssl",
+                    "pool_scope": "key",
+                    "ja3": "771,4865-4866-4867,0-23-65281,29-23-24,0",
+                    "ja3_hash": "0123456789abcdef0123456789abcdef",
+                    "ja4": "t13d1716h1_5b57614c22b0_3d5db4fb5c1e",
+                    "peetprint": "GREASE-772-771|2-1.1|GREASE-4588",
+                    "akamai_fingerprint": "1:65536;2:0;4:6291456|15663105|0|m,a,s,p",
+                    "probed_at_unix_secs": 1_760_000_000u64,
+                    "probe_url": "https://tls.peet.ws/api/all",
+                    "raw_client_hello": "16030100"
+                }
+            }
+        })))
+        .expect("metadata should project");
+        let tls = &metadata["tls_fingerprint"];
+        assert!(
+            tls.get("incoming").is_none(),
+            "incoming must not be persisted"
+        );
+        let outgoing = &tls["outgoing"];
+        assert_eq!(outgoing["source"], "aether_transport_config");
+        assert_eq!(outgoing["observed"], true);
+        assert_eq!(outgoing["backend"], "browser_wreq");
+        assert_eq!(outgoing["http_mode"], "http1_only");
+        assert_eq!(outgoing["tls_stack"], "boringssl_wreq");
+        assert_eq!(outgoing["transport_path"], "direct");
+        assert_eq!(outgoing["emulation_profile"], "claude_code_node_openssl");
+        assert_eq!(outgoing["alpn_offered"], json!(["http/1.1"]));
+        assert_eq!(
+            outgoing["tls_versions_offered"],
+            json!(["TLS1.3", "TLS1.2"])
+        );
+        assert_eq!(outgoing["ja3_hash"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(outgoing["ja4"], "t13d1716h1_5b57614c22b0_3d5db4fb5c1e");
+        assert_eq!(outgoing["peetprint"], "GREASE-772-771|2-1.1|GREASE-4588");
+        assert_eq!(
+            outgoing["akamai_fingerprint"],
+            "1:65536;2:0;4:6291456|15663105|0|m,a,s,p"
+        );
+        assert_eq!(outgoing["probed_at_unix_secs"], 1_760_000_000u64);
+        assert_eq!(outgoing["probe_url"], "https://tls.peet.ws/api/all");
+        assert!(outgoing.get("raw_client_hello").is_none());
+
+        // 不受信的来源、未知 backend、坏 hash、未 observed 的探针字段都被剥掉。
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "tls_fingerprint": {
+                "outgoing": {
+                    "source": "aether_transport_config",
+                    "observed": false,
+                    "backend": "reqwest_rustls",
+                    "tls_stack": "openssl",
+                    "http_mode": "weird mode",
+                    "ja3_hash": "0123456789abcdef0123456789abcdef",
+                    "ja4": "t13d1716h1_5b57614c22b0_3d5db4fb5c1e",
+                    "emulation_profile": "bad profile with spaces"
+                }
+            }
+        })))
+        .expect("metadata should project");
+        let outgoing = &metadata["tls_fingerprint"]["outgoing"];
+        assert_eq!(outgoing["backend"], "reqwest_rustls");
+        assert!(outgoing.get("tls_stack").is_none());
+        assert!(outgoing.get("http_mode").is_none());
+        assert!(outgoing.get("ja3_hash").is_none());
+        assert!(outgoing.get("ja4").is_none());
+        assert!(outgoing.get("emulation_profile").is_none());
+
+        for bad in [
+            json!({"tls_fingerprint": {"outgoing": {"source": "client", "observed": true, "backend": "browser_wreq"}}}),
+            json!({"tls_fingerprint": {"outgoing": {"source": "aether_transport_config", "observed": true, "backend": "curl"}}}),
+            json!({"tls_fingerprint": {"outgoing": {"source": "aether_transport_config", "backend": "browser_wreq"}}}),
+            json!({"tls_fingerprint": {"ja3": "fingerprint"}}),
+        ] {
+            let metadata = sanitize_usage_request_metadata(Some(bad));
+            assert!(
+                metadata
+                    .as_ref()
+                    .and_then(|value| value.get("tls_fingerprint"))
+                    .is_none(),
+                "invalid outgoing record must be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn persistence_projection_keeps_full_extended_tls_fingerprints() {
+        let peetprint = "GREASE-772-771|2-1.1|GREASE-29-23-24|1027-2052-1025-1283-2053-1281-2054-1537|GREASE-4865-4866-4867-49195-49199|1|1|GREASE-0-23-65281-10-11-35-16-5-13-18-51-45-43";
+        let akamai = "1:65536;2:0;3:1000;4:6291456;6:262144|15663105|3:0:0:201,5:0:0:101|m,a,s,p";
+        assert!(peetprint.len() > 64 && akamai.len() > 64);
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "tls_fingerprint": {"outgoing": {
+                "source": "aether_transport_config",
+                "observed": true,
+                "backend": "browser_wreq",
+                "peetprint": peetprint,
+                "akamai_fingerprint": akamai,
+                "ja4": "x".repeat(65)
+            }}
+        })))
+        .expect("TLS metadata");
+        let outgoing = &metadata["tls_fingerprint"]["outgoing"];
+        assert_eq!(outgoing["peetprint"], peetprint);
+        assert_eq!(outgoing["akamai_fingerprint"], akamai);
+        assert!(
+            outgoing.get("ja4").is_none(),
+            "JA4 retains its own short bound"
+        );
+
+        for invalid in [
+            "x".repeat(513),
+            "GREASE-772|2-1.1\nAuthorization: secret".into(),
+        ] {
+            let metadata = sanitize_usage_request_metadata(Some(json!({
+                "tls_fingerprint": {"outgoing": {
+                    "source": "aether_transport_config", "observed": true,
+                    "backend": "browser_wreq", "peetprint": invalid
+                }}
+            })))
+            .expect("TLS metadata");
+            assert!(metadata["tls_fingerprint"]["outgoing"]
+                .get("peetprint")
+                .is_none());
+        }
+    }
 
     #[test]
     fn persistence_projection_drops_credentials_and_free_diagnostics() {

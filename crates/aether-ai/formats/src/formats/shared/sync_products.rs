@@ -862,8 +862,15 @@ fn maybe_build_openai_responses_same_family_sync_body(
         return None;
     }
 
+    let mut client_body = body_json.clone();
+    if let Some(output) = client_body.get_mut("output") {
+        crate::formats::openai::responses::codex_sanitize::restore_codex_shortened_tool_names_in_output(
+            report_context,
+            output,
+        );
+    }
     Some(client_body_with_report_context_model(
-        body_json.clone(),
+        client_body,
         report_context,
         &client_api_format,
     ))
@@ -1506,6 +1513,10 @@ fn project_validated_openai_responses_stream_to_openai_chat(
     if canonical_response_unknown_block_count(&canonical) > 0 {
         return None;
     }
+    crate::formats::openai::responses::codex_sanitize::restore_codex_shortened_tool_names_in_canonical_response(
+        report_context,
+        &mut canonical,
+    );
 
     apply_report_context_model_fallback(&mut canonical.model, report_context);
     Some(canonical_to_openai_chat_response(&canonical))

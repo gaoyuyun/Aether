@@ -1,5 +1,6 @@
 use super::{
-    admin_pool_provider_id_from_path, admin_provider_pool_config, build_admin_pool_error_response,
+    admin_pool_provider_id_from_path, admin_provider_pool_config,
+    attach_admin_provider_pool_model_cooldowns, build_admin_pool_error_response,
     parse_admin_pool_key_sort, parse_admin_pool_page, parse_admin_pool_page_size,
     parse_admin_pool_quick_selectors, parse_admin_pool_search, parse_admin_pool_status_filter,
     pool_payloads, pool_selection, read_admin_provider_pool_runtime_state, AdminPoolKeySort,
@@ -726,14 +727,22 @@ pub(super) async fn build_admin_pool_list_keys_response(
         .await?;
     let runtime = match pool_config.as_ref() {
         Some(pool_config) if !key_ids.is_empty() => {
-            read_admin_provider_pool_runtime_state(
+            let mut runtime = read_admin_provider_pool_runtime_state(
                 state.runtime_state(),
                 &provider.id,
                 &key_ids,
                 pool_config,
                 None,
             )
-            .await
+            .await;
+            attach_admin_provider_pool_model_cooldowns(
+                state.runtime_state(),
+                &provider.id,
+                &key_ids,
+                &mut runtime,
+            )
+            .await;
+            runtime
         }
         _ => AdminProviderPoolRuntimeState::default(),
     };

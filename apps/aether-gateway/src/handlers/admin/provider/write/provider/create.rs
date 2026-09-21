@@ -1,3 +1,6 @@
+use crate::handlers::admin::provider::pool::cooldown::{
+    normalize_provider_cooldown_config, PROVIDER_COOLDOWN_CONFIG_KEY,
+};
 use crate::handlers::admin::provider::shared::payloads::AdminProviderCreateRequest;
 use crate::handlers::admin::provider::shared::support::{
     normalize_provider_billing_type, normalize_provider_quota_reservation,
@@ -169,6 +172,23 @@ pub(crate) async fn build_admin_create_provider_record(
     if provider_type != "codex" {
         remove_codex_fingerprint_config(&mut config_map);
     }
+    if let Some(cooldown) = payload.cooldown.as_ref() {
+        if cooldown.is_null() {
+            config_map.remove(PROVIDER_COOLDOWN_CONFIG_KEY);
+        } else {
+            let value = normalize_provider_cooldown_config(cooldown)?;
+            if value.as_object().is_some_and(|object| object.is_empty()) {
+                config_map.remove(PROVIDER_COOLDOWN_CONFIG_KEY);
+            } else {
+                config_map.insert(PROVIDER_COOLDOWN_CONFIG_KEY.to_string(), value);
+            }
+        }
+    } else if let Some(raw_cooldown) = config_map.get(PROVIDER_COOLDOWN_CONFIG_KEY).cloned() {
+        config_map.insert(
+            PROVIDER_COOLDOWN_CONFIG_KEY.to_string(),
+            normalize_provider_cooldown_config(&raw_cooldown)?,
+        );
+    }
     if let Some(quota_windows) = payload.quota_windows.as_ref() {
         let value = serde_json::to_value(quota_windows)
             .map_err(|err| format!("quota_windows 无法解析: {err}"))?;
@@ -218,6 +238,38 @@ pub(crate) async fn build_admin_create_provider_record(
             return Err("claude_code_advanced 仅适用于 provider_type=claude_code".to_string());
         }
         config_map.insert("claude_code_advanced".to_string(), value);
+    }
+    if let Some(mode) = payload.claude_code_cloak_mode.as_deref() {
+        super::update::set_claude_code_cloak_mode(&mut config_map, &provider_type, mode)?;
+    }
+    if provider_type != "claude_code" {
+        super::update::remove_claude_code_cloak_mode(&mut config_map);
+    }
+    if let Some(words) = payload.cloak_sensitive_words.as_deref() {
+        super::update::set_provider_cloak_sensitive_words(&mut config_map, &provider_type, words)?;
+    } else if let Some(raw_words) = config_map
+        .get(crate::provider_transport::CLOAK_CONFIG_NAMESPACE)
+        .and_then(|cloak| cloak.get(crate::provider_transport::CLOAK_SENSITIVE_WORDS_CONFIG_KEY))
+        .cloned()
+    {
+        let words = raw_words
+            .as_array()
+            .ok_or_else(|| "config.cloak.sensitive_words 必须是字符串数组".to_string())?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| "config.cloak.sensitive_words 必须是字符串数组".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        super::update::set_provider_cloak_sensitive_words(&mut config_map, &provider_type, &words)?;
+    }
+    if !super::update::provider_type_supports_sensitive_words(&provider_type) {
+        super::update::remove_provider_cloak_sensitive_words(&mut config_map);
+    }
+    if let Some(profile_id) = payload.transport_profile.as_deref() {
+        super::update::set_provider_transport_profile(&mut config_map, &provider_type, profile_id)?;
     }
     if config_map.contains_key("chat_pii_redaction") {
         let value = normalize_chat_pii_redaction_config(config_map.remove("chat_pii_redaction"))?;

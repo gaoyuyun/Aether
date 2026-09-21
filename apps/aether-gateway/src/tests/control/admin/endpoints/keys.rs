@@ -1867,6 +1867,98 @@ async fn gateway_noops_admin_provider_key_oauth_invalid_clear_when_marker_absent
 }
 
 #[tokio::test]
+async fn gateway_sensitive_word_edits_preserve_oauth_failure_state() {
+    let provider_id = "provider-cloak-state";
+    let key_id = "key-cloak-state";
+    let mut provider = sample_provider(provider_id, "Claude Code", 10);
+    provider.provider_type = "claude_code".to_string();
+    provider.config = Some(json!({"cloak": {"sensitive_words": ["proxy"]}}));
+    let mut key = sample_bound_key(key_id, provider_id, "claude:messages", "access-token");
+    key.auth_type = "oauth".to_string();
+    key.auto_fetch_models = false;
+    key.encrypted_auth_config = Some(sample_bound_auth_config(
+        provider_id,
+        key_id,
+        r#"{"provider_type":"claude_code","refresh_token":"old-refresh-token"}"#,
+    ));
+    key.oauth_invalid_at_unix_secs = Some(1_800_000_000);
+    key.oauth_invalid_reason = Some("refresh token expired".to_string());
+    key.error_count = Some(7);
+    key.status_snapshot = Some(json!({
+        "oauth": {"code": "invalid", "requires_reauth": true},
+    }));
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![],
+        vec![key],
+    ));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository.clone())
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    for (patch, warn, credentials_changed) in [
+        (json!({"cloak_sensitive_words": ["gateway"]}), true, false),
+        (json!({"cloak_sensitive_words": ["GATEWAY"]}), false, false),
+        (json!({"cloak_sensitive_words": []}), true, false),
+        (json!({"cloak_sensitive_words": null}), true, false),
+        (json!({"cloak_sensitive_words": ["proxy"]}), false, false),
+        (
+            json!({"auth_config": {
+                "provider_type": "claude_code",
+                "refresh_token": "new-refresh-token",
+                "cloak_sensitive_words": ["proxy"],
+            }}),
+            false,
+            true,
+        ),
+    ] {
+        let response = client
+            .put(format!("{gateway_url}/api/admin/endpoints/keys/{key_id}"))
+            .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&patch)
+            .send()
+            .await
+            .expect("key update should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.expect("JSON response");
+        assert_eq!(body.get("warnings").is_some(), warn);
+        let stored = repository
+            .list_keys_by_ids(&[key_id.to_string()])
+            .await
+            .expect("key should reload")
+            .pop()
+            .expect("key should exist");
+        if credentials_changed {
+            assert_eq!(stored.oauth_invalid_reason, None);
+            assert_eq!(stored.oauth_invalid_at_unix_secs, None);
+            assert_eq!(stored.error_count, Some(0));
+        } else {
+            assert_eq!(
+                stored.oauth_invalid_reason.as_deref(),
+                Some("refresh token expired")
+            );
+            assert_eq!(stored.oauth_invalid_at_unix_secs, Some(1_800_000_000));
+            assert_eq!(stored.error_count, Some(7));
+            assert_eq!(
+                stored.status_snapshot.unwrap()["oauth"]["requires_reauth"],
+                true
+            );
+        }
+    }
+    gateway_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_updates_admin_provider_key_locally_with_trusted_admin_principal() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);

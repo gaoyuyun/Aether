@@ -9,6 +9,7 @@ use std::sync::{
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::execution_runtime::attempt_lifecycle::STREAM_MISSING_TERMINAL_STATUS_CODE;
 use aether_ai_serving::{AiAttemptExecutionOutcome, AiAttemptRetryScope};
 use aether_contracts::{
     ExecutionPlan, ExecutionResponseObservation, ExecutionStreamTerminalSummary,
@@ -27,6 +28,7 @@ use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
     build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed, LifecycleUsageSeed,
     SyncTerminalUsagePayloadSeed, TerminalUsageContextSeed, UsageRequestRecordLevel,
+    STREAM_MISSING_TERMINAL_EVENT_MESSAGE,
 };
 use async_stream::stream;
 use axum::body::{Body, Bytes};
@@ -121,13 +123,14 @@ use crate::execution_runtime::{
 };
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
-    apply_local_execution_effect, build_local_error_flow_metadata, classify_failure_disposition,
+    apply_local_execution_effect, apply_local_stream_failure_effects,
+    build_local_error_flow_metadata, classify_failure_disposition,
     spawn_local_oauth_success_effect, trace_upstream_response_body, with_error_flow_report_context,
     with_upstream_response_report_context, FailureDisposition, FailureTokenAction,
     LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
     LocalExecutionEffect, LocalExecutionEffectContext, LocalFailoverAnalysis,
     LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
-    LocalOAuthSuccessEffect, LocalPoolErrorEffect,
+    LocalOAuthSuccessEffect, LocalPoolErrorEffect, LocalStreamFailureEffect,
 };
 use crate::provider_pool_demand::{
     acquire_provider_pool_execution_guard, ProviderPoolInFlightAdmission, ProviderPoolInFlightGuard,
@@ -1239,6 +1242,33 @@ fn stream_terminal_summary_represents_failure_with_requirement(
                 requires_observed_terminal_event,
             )
     })
+}
+
+/// 供应商在 2xx 状态下开始了流，却没有给出终态事件：按 408 记账。
+///
+/// 只改写 2xx：上游已经返回错误状态时状态码本身就是事实，不能被覆盖。
+pub(crate) const fn stream_terminal_status_code_for_missing_terminal(
+    status_code: u16,
+    missing_observed_finish: bool,
+) -> u16 {
+    if missing_observed_finish && status_code >= 200 && status_code < 300 {
+        STREAM_MISSING_TERMINAL_STATUS_CODE
+    } else {
+        status_code
+    }
+}
+
+/// 缺终态时投射供应商失败所用的错误体：让失败转移分类器与池冷却看到一个
+/// 与 HTTP 408 一致的 JSON 错误。
+fn missing_terminal_stream_failure_error_body(message: Option<&str>) -> String {
+    serde_json::json!({
+        "error": {
+            "type": "stream_missing_terminal_event",
+            "code": "stream_missing_terminal_event",
+            "message": message.unwrap_or(STREAM_MISSING_TERMINAL_EVENT_MESSAGE),
+        }
+    })
+    .to_string()
 }
 
 async fn execute_in_process_stream(
@@ -2390,6 +2420,10 @@ impl DirectPassthroughFinalizerCore {
                     "execution runtime stream ended before provider terminal event".to_string()
                 })
             });
+        // 流结束了但没有 `response.completed` / `message_stop` 一类终态：这是供应商
+        // 没有完成响应，按 408 记账并投射供应商失败，而不是留在「200 + 失败」。
+        let status_code =
+            stream_terminal_status_code_for_missing_terminal(status_code, missing_observed_finish);
         let should_submit_report = report_kind.is_some();
         let terminal_telemetry = Some(build_terminal_stream_telemetry(
             stream_started_at,
@@ -2433,7 +2467,32 @@ impl DirectPassthroughFinalizerCore {
                 error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
                 "gateway direct passthrough stream ended with a failed terminal state"
             );
+            if missing_observed_finish {
+                let error_body = missing_terminal_stream_failure_error_body(
+                    stream_terminal_error_message.as_deref(),
+                );
+                apply_local_stream_failure_effects(
+                    &state,
+                    LocalExecutionEffectContext {
+                        plan: &plan,
+                        report_context: usage_payload.report_context.as_ref(),
+                    },
+                    LocalStreamFailureEffect::new(
+                        status_code,
+                        &usage_payload.headers,
+                        Some(error_body.as_str()),
+                    ),
+                )
+                .await;
+            }
         } else {
+            crate::orchestration::capture_reasoning_replay_from_stream_capture(
+                &state,
+                &plan,
+                usage_payload.report_context.as_ref(),
+                usage_payload.provider_body_base64.as_deref(),
+            )
+            .await;
             apply_local_execution_effect(
                 &state,
                 LocalExecutionEffectContext {
@@ -3572,6 +3631,10 @@ async fn execute_stream_from_direct_passthrough(
                     "execution runtime stream ended before provider terminal event".to_string()
                 })
             });
+        // 流结束了但没有 `response.completed` / `message_stop` 一类终态：这是供应商
+        // 没有完成响应，按 408 记账并投射供应商失败，而不是留在「200 + 失败」。
+        let status_code =
+            stream_terminal_status_code_for_missing_terminal(status_code, missing_observed_finish);
         let should_submit_report = report_kind_owned.is_some();
         let terminal_telemetry = Some(build_terminal_stream_telemetry(
             stream_started_at_for_report,
@@ -3615,7 +3678,32 @@ async fn execute_stream_from_direct_passthrough(
                 error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
                 "gateway direct passthrough stream ended with a failed terminal state"
             );
+            if missing_observed_finish {
+                let error_body = missing_terminal_stream_failure_error_body(
+                    stream_terminal_error_message.as_deref(),
+                );
+                apply_local_stream_failure_effects(
+                    &state_for_report,
+                    LocalExecutionEffectContext {
+                        plan: &plan_for_report,
+                        report_context: usage_payload.report_context.as_ref(),
+                    },
+                    LocalStreamFailureEffect::new(
+                        status_code,
+                        &usage_payload.headers,
+                        Some(error_body.as_str()),
+                    ),
+                )
+                .await;
+            }
         } else {
+            crate::orchestration::capture_reasoning_replay_from_stream_capture(
+                &state_for_report,
+                &plan_for_report,
+                usage_payload.report_context.as_ref(),
+                usage_payload.provider_body_base64.as_deref(),
+            )
+            .await;
             apply_local_execution_effect(
                 &state_for_report,
                 LocalExecutionEffectContext {
@@ -3864,6 +3952,8 @@ async fn execute_execution_runtime_stream_inner(
     let mut stage_trace = RequestStageTrace::from_env();
     let candidate_slot_started_at = Instant::now();
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
+    crate::orchestration::apply_reasoning_replay_to_plan(state, &mut plan, &mut report_context)
+        .await;
     observe_gateway_stage_trace_ms(
         &mut stage_trace,
         "stream_candidate_slot",
@@ -8322,6 +8412,10 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     "execution runtime stream ended before provider terminal event".to_string()
                 })
             });
+        // 流结束了但没有 `response.completed` / `message_stop` 一类终态：这是供应商
+        // 没有完成响应，按 408 记账并投射供应商失败，而不是留在「200 + 失败」。
+        let status_code =
+            stream_terminal_status_code_for_missing_terminal(status_code, missing_observed_finish);
         let report_context_for_payload = report_context_with_stage_trace(
             report_context_owned,
             stage_trace_for_report,
@@ -8358,7 +8452,32 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                 error_message = stream_terminal_error_message.as_deref().unwrap_or_default(),
                 "gateway stream ended with a failed terminal state"
             );
+            if missing_observed_finish {
+                let error_body = missing_terminal_stream_failure_error_body(
+                    stream_terminal_error_message.as_deref(),
+                );
+                apply_local_stream_failure_effects(
+                    &state_for_report,
+                    LocalExecutionEffectContext {
+                        plan: &plan_for_report,
+                        report_context: usage_payload.report_context.as_ref(),
+                    },
+                    LocalStreamFailureEffect::new(
+                        status_code,
+                        &usage_payload.headers,
+                        Some(error_body.as_str()),
+                    ),
+                )
+                .await;
+            }
         } else {
+            crate::orchestration::capture_reasoning_replay_from_stream_capture(
+                &state_for_report,
+                &plan_for_report,
+                usage_payload.report_context.as_ref(),
+                usage_payload.provider_body_base64.as_deref(),
+            )
+            .await;
             apply_local_execution_effect(
                 &state_for_report,
                 LocalExecutionEffectContext {

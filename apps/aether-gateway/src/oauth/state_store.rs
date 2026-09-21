@@ -109,11 +109,7 @@ fn legacy_identity_oauth_state_storage_key(nonce: &str) -> String {
 }
 
 fn is_generated_oauth_nonce(nonce: &str) -> bool {
-    let nonce = nonce.trim();
-    nonce.len() == 64
-        && nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    aether_oauth::core::is_generated_oauth_nonce(nonce)
 }
 
 pub(crate) async fn save_identity_oauth_state(

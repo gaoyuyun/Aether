@@ -46,6 +46,8 @@ pub(crate) struct AntigravityV1InternalRequest {
     pub(crate) body: Value,
     pub(crate) headers: StandardProviderRequestHeaders,
     pub(crate) upstream_url: String,
+    /// P6：敏感词混淆报告（词表为空时为 `None`），写入 report_context 顶层。
+    pub(crate) sensitive_words_obfuscation: Option<Value>,
 }
 
 pub(crate) async fn build_antigravity_v1internal_provider_request(
@@ -98,6 +100,7 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
         body: payload.body,
         headers,
         upstream_url,
+        sensitive_words_obfuscation: payload.sensitive_words_obfuscation,
     })
 }
 
@@ -105,6 +108,7 @@ struct AntigravityV1InternalPayload {
     transport: Arc<GatewayProviderTransportSnapshot>,
     auth: AntigravityRequestAuth,
     body: Value,
+    sensitive_words_obfuscation: Option<Value>,
 }
 
 async fn build_antigravity_v1internal_payload(
@@ -149,7 +153,7 @@ async fn build_antigravity_v1internal_payload(
         }
     };
 
-    let body = match build_antigravity_safe_v1internal_request(
+    let mut body = match build_antigravity_safe_v1internal_request(
         &auth,
         trace_id,
         mapped_model,
@@ -161,10 +165,17 @@ async fn build_antigravity_v1internal_payload(
             return Err(AntigravityV1InternalRequestError::EnvelopeUnsupported);
         }
     };
+    // P6：信封构建成功后做敏感词混淆（只碰 systemInstruction 文本）。
+    let sensitive_words_obfuscation =
+        super::antigravity_sensitive_words::apply_antigravity_sensitive_words(
+            &resolved_transport,
+            &mut body,
+        );
 
     Ok(AntigravityV1InternalPayload {
         transport: resolved_transport,
         auth,
         body,
+        sensitive_words_obfuscation,
     })
 }

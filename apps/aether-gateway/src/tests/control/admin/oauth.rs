@@ -424,6 +424,12 @@ async fn gateway_authorizes_claude_cookie_without_persisting_cookie_impl() {
                             "email_address": "claude@example.com"
                         }
                     }),
+                    // P2.6：交换成功后原生客户端会再查 profile 与 claude_cli roles。
+                    "provider-oauth:claude-profile" => json!({
+                        "account": {"uuid": "account-claude-123", "email_address": "claude@example.com", "full_name": "Claude Tester"},
+                        "organization": {"uuid": "org-team", "name": "Team Org"}
+                    }),
+                    "provider-oauth:claude-claude_cli-roles" => json!({"roles": ["claude_cli"]}),
                     unexpected => panic!("unexpected execution plan: {unexpected}"),
                 };
                 Json(json!({
@@ -526,12 +532,29 @@ async fn gateway_authorizes_claude_cookie_without_persisting_cookie_impl() {
     assert_eq!(auth_config["org_uuid"], "org-team");
     assert_eq!(auth_config["account_uuid"], "account-claude-123");
     assert_eq!(auth_config["email"], "claude@example.com");
+    assert_eq!(
+        auth_config["org_name"], "Team Org",
+        "profile lookup enriches auth_config"
+    );
+    assert_eq!(
+        auth_config["claude_cli_roles"],
+        json!({"roles": ["claude_cli"]})
+    );
     assert!(!decrypted_auth_config.contains("sk-ant-sid01-secret"));
     assert!(!decrypted_auth_config.contains("sessionKey"));
     assert!(auth_config.get("cookie").is_none());
 
     let plans = execution_plans.lock().expect("mutex should lock");
-    assert_eq!(plans.len(), 3);
+    assert_eq!(
+        plans.len(),
+        5,
+        "orgs + authorize + exchange + profile + roles"
+    );
+    assert_eq!(plans[3].request_id, "provider-oauth:claude-profile");
+    assert_eq!(
+        plans[4].request_id,
+        "provider-oauth:claude-claude_cli-roles"
+    );
     for plan in &plans[..2] {
         assert_eq!(
             plan.headers.get("cookie").map(String::as_str),
@@ -634,6 +657,20 @@ async fn gateway_batch_authorizes_claude_cookies_as_redacted_task_impl() {
                             }
                         })
                     }
+                    // P2.6：每个账号交换成功后各追加一次 profile 与 claude_cli roles 查询。
+                    "provider-oauth:claude-profile" => {
+                        let label = plan
+                            .headers
+                            .get("authorization")
+                            .and_then(|value| value.strip_prefix("Bearer sk-ant-oat01-"))
+                            .expect("profile plan should carry the freshly issued access token")
+                            .to_string();
+                        json!({
+                            "account": {"uuid": format!("account-{label}"), "email_address": format!("{label}@example.com")},
+                            "organization": {"uuid": "org-team", "name": "Team Org"}
+                        })
+                    }
+                    "provider-oauth:claude-claude_cli-roles" => json!({"roles": ["claude_cli"]}),
                     unexpected => panic!("unexpected execution plan: {unexpected}"),
                 };
                 Json(json!({
@@ -827,7 +864,25 @@ async fn gateway_batch_authorizes_claude_cookies_as_redacted_task_impl() {
     }
 
     let plans = execution_plans.lock().expect("mutex should lock");
-    assert_eq!(plans.len(), 6);
+    assert_eq!(
+        plans.len(),
+        10,
+        "orgs + authorize + exchange + profile + roles, twice"
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .filter(|plan| plan.request_id == "provider-oauth:claude-profile")
+            .count(),
+        2
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .filter(|plan| plan.request_id == "provider-oauth:claude-claude_cli-roles")
+            .count(),
+        2
+    );
     assert_eq!(
         plans
             .iter()

@@ -157,12 +157,18 @@
                     <span class="w-3 h-3 shrink-0" />
                     <span class="font-medium">Body</span>
                   </div>
+                  <p
+                    class="px-4 pb-2 text-[11px] leading-relaxed text-muted-foreground/80"
+                    data-testid="replay-obfuscation-note"
+                  >
+                    重放请求会再次经过网关：若目标供应商配置了敏感词混淆，请求体将按当前词表重新混淆（混淆是幂等的，已含零宽字符的词不会重复插入）。
+                  </p>
                 </div>
                 <div class="px-4 py-3">
                   <pre
                     v-if="formattedRequestBody"
                     class="text-xs font-mono whitespace-pre-wrap break-all leading-relaxed"
-                  >{{ formattedRequestBody }}</pre>
+                  ><ZeroWidthText :text="formattedRequestBody" /></pre>
                   <div
                     v-else
                     class="text-xs text-muted-foreground/50 italic"
@@ -328,6 +334,7 @@ import { getProviderKeys } from '@/api/endpoints/keys'
 import type { EndpointAPIKey } from '@/api/endpoints/types'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { useClipboard } from '@/composables/useClipboard'
+import ZeroWidthText from './RequestDetailDrawer/ZeroWidthText.vue'
 import { useEscapeKey } from '@/composables/useEscapeKey'
 import Card from '@/components/ui/card.vue'
 import Badge from '@/components/ui/badge.vue'

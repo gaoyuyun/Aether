@@ -22,6 +22,7 @@
             id="usage-records-search"
             v-model="localSearch"
             :placeholder="isAdmin ? '搜索用户/密钥' : (showProvider ? '搜索密钥/模型/Provider' : '搜索密钥/模型')"
+            title="混淆后的词按原词搜索：服务端匹配前会去掉零宽字符，输入 proxy 即可命中含零宽字符的 proxy"
             class="h-8 w-full text-xs border-border/60 pl-8"
           />
         </div>

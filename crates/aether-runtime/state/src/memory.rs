@@ -226,6 +226,7 @@ struct MemoryQueueStream {
 trait MemoryExpiringKey {
     fn is_expired(&self, now: Instant) -> bool;
     fn set_expires_at(&mut self, expires_at: Instant);
+    fn expires_at(&self) -> Option<Instant>;
 }
 
 impl MemoryExpiringKey for MemorySetEntry {
@@ -235,6 +236,10 @@ impl MemoryExpiringKey for MemorySetEntry {
 
     fn set_expires_at(&mut self, expires_at: Instant) {
         self.expires_at = Some(expires_at);
+    }
+
+    fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
     }
 }
 
@@ -246,6 +251,10 @@ impl MemoryExpiringKey for MemoryScoreEntry {
     fn set_expires_at(&mut self, expires_at: Instant) {
         self.expires_at = Some(expires_at);
     }
+
+    fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
+    }
 }
 
 impl MemoryExpiringKey for MemoryQueueStream {
@@ -255,6 +264,10 @@ impl MemoryExpiringKey for MemoryQueueStream {
 
     fn set_expires_at(&mut self, expires_at: Instant) {
         self.expires_at = Some(expires_at);
+    }
+
+    fn expires_at(&self) -> Option<Instant> {
+        self.expires_at
     }
 }
 
@@ -479,6 +492,22 @@ impl MemoryRuntimeBackend {
                 })
                 .unwrap_or(-1),
         )
+    }
+
+    /// 任意类型键（kv / set / score / queue）的剩余 TTL：Redis 的 `TTL` 语义，
+    /// `-1` 表示没有过期时间，不存在返回 `None`。
+    pub(crate) async fn key_ttl_seconds(&self, key: &str) -> Option<i64> {
+        if let Some(ttl) = self.kv_ttl_seconds(key).await {
+            return Some(ttl);
+        }
+        let now = Instant::now();
+        if let Some(ttl) = memory_key_ttl_seconds(&self.sets, key, now).await {
+            return Some(ttl);
+        }
+        if let Some(ttl) = memory_key_ttl_seconds(&self.scores, key, now).await {
+            return Some(ttl);
+        }
+        memory_key_ttl_seconds(&self.queues, key, now).await
     }
 
     pub(crate) async fn key_expire(&self, key: &str, ttl: Duration) -> bool {
@@ -1356,6 +1385,31 @@ where
     T: MemoryExpiringKey,
 {
     values.retain(|_, entry| !entry.is_expired(now));
+}
+
+async fn memory_key_ttl_seconds<T>(
+    values: &Mutex<HashMap<String, T>>,
+    key: &str,
+    now: Instant,
+) -> Option<i64>
+where
+    T: MemoryExpiringKey,
+{
+    let mut values = values.lock().await;
+    prune_memory_key(&mut values, key, now);
+    let entry = values.get(key)?;
+    Some(
+        entry
+            .expires_at()
+            .map(|expires_at| {
+                expires_at
+                    .saturating_duration_since(now)
+                    .as_secs()
+                    .try_into()
+                    .unwrap_or(i64::MAX)
+            })
+            .unwrap_or(-1),
+    )
 }
 
 async fn set_memory_key_expiry<T>(

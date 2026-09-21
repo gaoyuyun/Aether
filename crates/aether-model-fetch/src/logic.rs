@@ -1788,10 +1788,13 @@ mod tests {
         assert_eq!(
             model_ids,
             vec![
+                "gpt-6-astra",
+                "gpt-reserve",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
                 "gpt-5.5",
+                "gpt-5.3-codex-spark",
                 "gpt-5.4",
                 "gpt-5.4-mini",
                 "gpt-5.2",
@@ -1814,7 +1817,8 @@ mod tests {
         );
         assert_eq!(sol["multi_agent_version"], "v2");
         assert_eq!(sol["supports_image_detail_original"], true);
-        assert_eq!(sol["context_window"], 372_000);
+        assert_eq!(sol["context_window"], 272_000);
+        assert_eq!(sol["max_context_window"], 872_000);
 
         for model_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let model = models
@@ -1826,7 +1830,6 @@ mod tests {
             assert_eq!(model["experimental_supported_tools"], json!([]));
             assert_eq!(model["tool_mode"], "code_mode_only");
             assert_eq!(model["prefer_websockets"], true);
-            assert_eq!(model["reasoning_summary_format"], "experimental");
             assert_eq!(model["truncation_policy"]["limit"], 10_000);
             assert_eq!(model["minimal_client_version"], "0.144.0");
             assert!(model.get("effective_context_window_percent").is_none());
@@ -1852,7 +1855,17 @@ mod tests {
         assert_eq!(auto_review["supported_in_api"], true);
         assert_eq!(auto_review["default_reasoning_level"], "medium");
         assert_eq!(auto_review["default_reasoning_summary"], "none");
-        assert_eq!(auto_review["use_responses_lite"], false);
+        assert_eq!(auto_review["use_responses_lite"], true);
+
+        // 拉取失败兜底时，目录元数据里必须能投射出每一张卡的能力。
+        let metadata =
+            super::model_catalog_upstream_metadata("codex", &models).expect("codex metadata");
+        for model_id in ["gpt-6-astra", "gpt-5.3-codex-spark", "gpt-5.4-mini"] {
+            assert!(
+                metadata["codex_models"]["cards"][model_id].is_object(),
+                "{model_id} card should be projected"
+            );
+        }
     }
 
     #[test]

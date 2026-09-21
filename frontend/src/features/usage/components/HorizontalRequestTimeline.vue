@@ -326,7 +326,10 @@
                         v-if="currentAttempt.extra_data.pool_skip.cooldown_reason"
                         class="text-xs text-muted-foreground"
                       >
-                        {{ currentAttempt.extra_data.pool_skip.cooldown_reason }}
+                        {{ formatCooldownReason(currentAttempt.extra_data.pool_skip.cooldown_reason) }}
+                        <template v-if="currentAttempt.extra_data.pool_skip.model">
+                          · {{ currentAttempt.extra_data.pool_skip.model }}
+                        </template>
                         <template v-if="currentAttempt.extra_data.pool_skip.cooldown_ttl != null">
                           ({{ currentAttempt.extra_data.pool_skip.cooldown_ttl }}s)
                         </template>
@@ -578,6 +581,7 @@ import { log } from '@/utils/logger'
 import { safeExternalWebUrl } from '@/utils/navigationSecurity'
 import { parseApiError } from '@/utils/errorParser'
 import { formatTokens } from '@/utils/format'
+import { formatCooldownReason } from '@/features/pool/utils/poolCooldown'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { resolveTimelineFinalStatus } from '../utils/status'
@@ -1996,6 +2000,8 @@ const poolSkipLabel = (type: string | undefined): string => {
   if (!type) return ""
   const labels: Record<string, string> = {
     cooldown: '冷却中',
+    pool_cooldown: '冷却中',
+    pool_model_cooldown: '模型冷却中',
     cost_exhausted: '额度耗尽',
     upstream: '上游跳过',
   }

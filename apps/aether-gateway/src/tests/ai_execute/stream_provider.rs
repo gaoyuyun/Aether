@@ -1532,7 +1532,8 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
                         {"type":"thinking","thinking":"keep","signature":"sig_valid"},
                         {"type":"thinking","thinking":"drop-empty-signature","signature":""},
                         {"type":"redacted_thinking","data":"keep-redacted","signature":"sig_redacted"},
-                        {"type":"redacted_thinking","data":"drop-no-signature"},
+                        {"type":"redacted_thinking","data":"keep-data-only-redacted"},
+                        {"type":"redacted_thinking","data":""},
                         {"type":"text","text":"ok"}
                     ]
                 }],
@@ -1579,7 +1580,8 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     );
     assert_eq!(
         seen_execution_runtime_request.anthropic_beta,
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11,context-1m-2025-08-07,custom-beta"
+        // P2.2 有序组装：原生 CLI 把 context-1m 紧跟在 oauth 之后，客户端自定义 beta 追加在末尾。
+        "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11,custom-beta"
     );
     assert_eq!(seen_execution_runtime_request.x_app, "cli");
     assert_eq!(
@@ -1604,7 +1606,9 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
         json!([
             {"type":"thinking","thinking":"keep","signature":"sig_valid"},
             {"type":"redacted_thinking","data":"keep-redacted","signature":"sig_redacted"},
-            {"type":"text","text":"ok"}
+            {"type":"redacted_thinking","data":"keep-data-only-redacted"},
+            // P2.5：第三方客户端（UA 非原生 CLI）经伪装流水线补 cache_control，OAuth 凭据升到 1h。
+            {"type":"text","text":"ok","cache_control":{"type":"ephemeral","ttl":"1h"}}
         ])
     );
     assert_eq!(

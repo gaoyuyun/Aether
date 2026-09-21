@@ -130,6 +130,202 @@
         </div>
       </div>
 
+      <!-- 推理回放缓存（仅 Codex / Google 系渠道） -->
+      <div
+        v-if="showReasoningReplayAction"
+        class="flex items-center justify-between gap-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        data-testid="reasoning-replay-section"
+      >
+        <div class="space-y-0.5">
+          <Label class="text-sm font-medium">推理回放缓存</Label>
+          <p class="text-xs text-muted-foreground">
+            跨格式多轮工具调用时，网关会缓存上一轮的推理签名并在下一轮回放。上游持续报签名无效时可手动清除。
+          </p>
+          <p
+            v-if="reasoningReplayClearedCount !== null"
+            class="text-xs text-muted-foreground"
+          >
+            已清除 {{ reasoningReplayClearedCount }} 条本机缓存
+          </p>
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          :disabled="clearingReasoningReplay"
+          data-testid="clear-reasoning-replay"
+          @click="handleClearReasoningReplay"
+        >
+          {{ clearingReasoningReplay ? '清除中...' : '清除缓存' }}
+        </Button>
+      </div>
+
+      <!-- Claude Code 设备身份（仅 claude_code；只读摘要 + 重置） -->
+      <div
+        v-if="showClaudeCodeDeviceSection"
+        class="flex items-center justify-between gap-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        data-testid="claude-code-device-section"
+      >
+        <div class="space-y-0.5">
+          <Label class="text-sm font-medium">设备身份</Label>
+          <p class="text-xs text-muted-foreground">
+            第三方客户端经此 Key 上游时，网关以固定的设备标识与软件版本冒充原生 Claude Code；7 天内只升不降。
+          </p>
+          <p
+            v-if="claudeCodeDeviceProfile"
+            class="text-xs text-muted-foreground font-mono"
+            data-testid="claude-code-device-summary"
+          >
+            {{ claudeCodeDeviceProfile.device_id_prefix }}… · CLI {{ claudeCodeDeviceProfile.cli_version }} · SDK {{ claudeCodeDeviceProfile.package_version }} · Node {{ claudeCodeDeviceProfile.runtime_version }} · {{ claudeCodeDeviceProfile.os }}/{{ claudeCodeDeviceProfile.arch }}
+          </p>
+          <p
+            v-else
+            class="text-xs text-muted-foreground"
+            data-testid="claude-code-device-summary"
+          >
+            尚未生成（首个第三方请求到达时派生）
+          </p>
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          :disabled="resettingClaudeCodeDevice || !claudeCodeDeviceProfile"
+          data-testid="reset-claude-code-device"
+          @click="handleResetClaudeCodeDevice"
+        >
+          {{ resettingClaudeCodeDevice ? '重置中...' : '重置设备身份' }}
+        </Button>
+      </div>
+
+      <!-- 敏感词混淆（仅 claude_code / antigravity；Key 级覆盖供应商词表） -->
+      <div
+        v-if="showSensitiveWordsSection"
+        class="space-y-2 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        data-testid="sensitive-words-section"
+      >
+        <div class="flex items-center justify-between gap-3">
+          <div class="space-y-0.5">
+            <Label class="text-sm font-medium">敏感词混淆</Label>
+            <p class="text-xs text-muted-foreground">
+              默认继承供应商词表；选择「覆盖」后本 Key 只用这里的词表（留空即关闭混淆）。
+            </p>
+          </div>
+          <div
+            class="flex items-center gap-3 text-xs"
+            role="radiogroup"
+            aria-label="敏感词来源"
+          >
+            <label class="inline-flex items-center gap-1 cursor-pointer">
+              <input
+                v-model="form.cloak_sensitive_words_mode"
+                type="radio"
+                value="inherit"
+                data-testid="sensitive-words-inherit"
+              >
+              继承供应商
+            </label>
+            <label class="inline-flex items-center gap-1 cursor-pointer">
+              <input
+                v-model="form.cloak_sensitive_words_mode"
+                type="radio"
+                value="override"
+                data-testid="sensitive-words-override"
+              >
+              覆盖
+            </label>
+          </div>
+        </div>
+        <template v-if="form.cloak_sensitive_words_mode === 'override'">
+          <Textarea
+            id="key-cloak-sensitive-words"
+            :model-value="form.cloak_sensitive_words_text"
+            class="min-h-[80px] font-mono text-sm"
+            :class="{ 'border-destructive': sensitiveWordsError }"
+            placeholder="proxy&#10;API"
+            :aria-invalid="sensitiveWordsError ? 'true' : undefined"
+            data-testid="sensitive-words-textarea"
+            @update:model-value="(v: string) => form.cloak_sensitive_words_text = v"
+          />
+          <p
+            v-if="sensitiveWordsError"
+            class="text-xs text-destructive"
+            data-testid="sensitive-words-error"
+          >
+            {{ sensitiveWordsError }}
+          </p>
+          <p
+            v-else
+            class="text-xs text-muted-foreground"
+            data-testid="sensitive-words-summary"
+          >
+            每行一个词，不区分大小写；已配置 {{ sensitiveWordsParsed.words.length }} / {{ SENSITIVE_WORD_MAX_ENTRIES }}。词表变更会使提示词缓存失效。
+          </p>
+        </template>
+      </div>
+
+      <!-- 传输指纹 profile（P5，仅 claude_code / codex；Key 级覆盖供应商设置） -->
+      <div
+        v-if="showTransportProfileSection"
+        class="space-y-2 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        data-testid="transport-profile-section"
+      >
+        <div class="flex items-center justify-between gap-3">
+          <div class="space-y-0.5">
+            <Label
+              for="key-transport-profile"
+              class="text-sm font-medium"
+            >传输指纹 profile</Label>
+            <p class="text-xs text-muted-foreground">
+              留空继承供应商设置；选择仿真 profile 后本 Key 的出站 TLS 改用 BoringSSL 复刻原生客户端的 ClientHello。
+            </p>
+          </div>
+          <select
+            id="key-transport-profile"
+            v-model="form.transport_profile"
+            class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+            data-testid="transport-profile-select"
+          >
+            <option :value="null">
+              继承供应商 / 系统默认
+            </option>
+            <option
+              v-for="option in transportProfileOptions"
+              :key="option"
+              :value="option"
+            >
+              {{ transportProfileLabel(option) }}
+            </option>
+          </select>
+        </div>
+        <div class="flex items-center justify-between gap-3">
+          <p
+            v-if="tlsProbe"
+            class="text-xs text-muted-foreground font-mono break-all"
+            data-testid="tls-probe-summary"
+          >
+            JA3 {{ tlsProbe.ja3_hash ?? '-' }} · JA4 {{ tlsProbe.ja4 ?? '-' }} · {{ tlsProbe.tls_stack ?? '-' }} · {{ tlsProbe.http_version ?? '-' }} · {{ formatProbedAt(tlsProbe.probed_at_unix_secs) }}
+          </p>
+          <p
+            v-else
+            class="text-xs text-muted-foreground"
+            data-testid="tls-probe-summary"
+          >
+            尚未探测；探测会按当前保存的 profile 与代理向 tls.peet.ws 发一次请求。
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            :disabled="probingTls"
+            data-testid="probe-tls-fingerprint"
+            @click="handleProbeTlsFingerprint"
+          >
+            {{ probingTls ? '探测中...' : '探测 TLS 指纹' }}
+          </Button>
+        </div>
+      </div>
+
       <!-- 自动获取模型 -->
       <div class="space-y-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30">
         <div class="flex items-center justify-between">
@@ -197,7 +393,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { Dialog, Button, Input, Label, Switch } from '@/components/ui'
+import { Dialog, Button, Input, Label, Switch, Textarea } from '@/components/ui'
 import { SquarePen } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
@@ -205,14 +401,36 @@ import { useFormDialog } from '@/composables/useFormDialog'
 import { parseApiError } from '@/utils/errorParser'
 import { parseNumberInput, parseNullableNumberInput } from '@/utils/form'
 import {
+  probeProviderKeyTlsFingerprint,
+  resetProviderKeyClaudeCodeDevice,
   updateProviderKey,
   type EndpointAPIKey,
   type EndpointAPIKeyUpdate,
 } from '@/api/endpoints'
+import {
+  extractProviderWriteWarnings,
+  SENSITIVE_WORD_MAX_CHARS,
+  SENSITIVE_WORD_MAX_ENTRIES,
+  SENSITIVE_WORD_MIN_CHARS,
+  normalizeSensitiveWordList,
+  normalizeTlsProbeSummary,
+  normalizeTransportProfile,
+  parseSensitiveWordListText,
+  providerTypeSupportsSensitiveWords,
+  providerTypeSupportsTransportProfile,
+  transportProfileLabel,
+  transportProfileOptionsForProviderType,
+  type ClaudeCodeDeviceProfileSummary,
+  type TlsProbeSummary,
+  type TransportProfileId,
+} from '@/api/endpoints/types/provider'
+import { clearReasoningReplayCache } from '@/api/endpoints/pool'
 
 const props = defineProps<{
   open: boolean
   editingKey: EndpointAPIKey | null
+  /** 所属渠道类型；只有会跨格式回放推理签名的渠道才显示「清除推理回放缓存」。 */
+  providerType?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -220,7 +438,7 @@ const emit = defineEmits<{
   saved: [key: EndpointAPIKey]
 }>()
 
-const { success, error: showError } = useToast()
+const { success, error: showError, warning } = useToast()
 const { confirmWarning } = useConfirm()
 
 // 显示自动获取模型警告：编辑模式下，原本未启用但现在启用，且已有 allowed_models
@@ -251,11 +469,127 @@ const autoFetchWarningMessage = computed(() => {
 const canSave = computed(() => {
   // 必须填写名称
   if (!form.value.name.trim()) return false
+  if (showSensitiveWordsSection.value && sensitiveWordsError.value) return false
   return true
 })
 
 const isOpen = computed(() => props.open)
 const saving = ref(false)
+
+// 推理回放缓存：只有会跨格式回放签名的渠道类型才展示清理入口。
+const REASONING_REPLAY_PROVIDER_TYPES = new Set(['codex', 'antigravity', 'gemini_cli', 'vertex_ai'])
+const clearingReasoningReplay = ref(false)
+const reasoningReplayClearedCount = ref<number | null>(null)
+const showReasoningReplayAction = computed(() => {
+  if (!props.editingKey) return false
+  const providerType = String(props.providerType ?? '').trim().toLowerCase()
+  return REASONING_REPLAY_PROVIDER_TYPES.has(providerType)
+})
+
+async function handleClearReasoningReplay() {
+  if (!props.editingKey) return
+  const confirmed = await confirmWarning(
+    '清除后，该账号下所有会话缓存的推理签名都会丢失，下一轮跨格式工具调用将退回占位符。确定继续？',
+    '清除推理回放缓存',
+  )
+  if (!confirmed) return
+  clearingReasoningReplay.value = true
+  try {
+    const result = await clearReasoningReplayCache(props.editingKey.provider_id, props.editingKey.id)
+    reasoningReplayClearedCount.value = result.cleared
+    success(result.message, '成功')
+  } catch (err: unknown) {
+    showError(parseApiError(err, '清除失败'), '错误')
+  } finally {
+    clearingReasoningReplay.value = false
+  }
+}
+
+// Claude Code 设备身份：只读摘要 + 重置（P2.7）。
+const resettingClaudeCodeDevice = ref(false)
+const claudeCodeDeviceProfileOverride = ref<ClaudeCodeDeviceProfileSummary | null | undefined>(undefined)
+const showClaudeCodeDeviceSection = computed(() => {
+  if (!props.editingKey) return false
+  return String(props.providerType ?? '').trim().toLowerCase() === 'claude_code'
+})
+const claudeCodeDeviceProfile = computed<ClaudeCodeDeviceProfileSummary | null>(() => {
+  if (claudeCodeDeviceProfileOverride.value !== undefined) return claudeCodeDeviceProfileOverride.value
+  return props.editingKey?.claude_code_device_profile ?? null
+})
+
+async function handleResetClaudeCodeDevice() {
+  if (!props.editingKey) return
+  const confirmed = await confirmWarning(
+    '重置后该 Key 会派生新的设备标识，上游会把后续请求视为一台新设备。确定继续？',
+    '重置设备身份',
+  )
+  if (!confirmed) return
+  resettingClaudeCodeDevice.value = true
+  try {
+    const result = await resetProviderKeyClaudeCodeDevice(props.editingKey.id)
+    if (result.reset) {
+      claudeCodeDeviceProfileOverride.value = null
+    }
+    success(result.message, '成功')
+  } catch (err: unknown) {
+    showError(parseApiError(err, '重置失败'), '错误')
+  } finally {
+    resettingClaudeCodeDevice.value = false
+  }
+}
+
+// 敏感词混淆（P6 F2）：Key 级覆盖三态。inherit → 发 null（删除覆盖）；override → 发数组（空数组 = 关闭）。
+type SensitiveWordsMode = 'inherit' | 'override'
+const showSensitiveWordsSection = computed(() => {
+  if (!props.editingKey) return false
+  return providerTypeSupportsSensitiveWords(props.providerType)
+})
+const sensitiveWordsParsed = computed(() => parseSensitiveWordListText(form.value.cloak_sensitive_words_text))
+const sensitiveWordsError = computed<string | null>(() => {
+  if (form.value.cloak_sensitive_words_mode !== 'override') return null
+  const parsed = sensitiveWordsParsed.value
+  if (parsed.zeroWidth.length > 0) return `敏感词不能包含零宽字符：${parsed.zeroWidth.join('、')}`
+  if (parsed.tooShort.length > 0) {
+    return `以下敏感词过短，每个词至少 ${SENSITIVE_WORD_MIN_CHARS} 个字符：${parsed.tooShort.join('、')}`
+  }
+  if (parsed.tooLong.length > 0) {
+    return `以下敏感词过长，每个词最多 ${SENSITIVE_WORD_MAX_CHARS} 个字符`
+  }
+  if (parsed.tooMany) return `敏感词最多 ${SENSITIVE_WORD_MAX_ENTRIES} 条，当前 ${parsed.words.length}`
+  return null
+})
+
+// 传输指纹 profile（P5）：Key 级覆盖三态。null → 发 null（回到供应商 / 系统默认）；字符串 → 覆盖。
+const showTransportProfileSection = computed(() => {
+  if (!props.editingKey) return false
+  return providerTypeSupportsTransportProfile(props.providerType)
+})
+const transportProfileOptions = computed(() => transportProfileOptionsForProviderType(props.providerType))
+const probingTls = ref(false)
+const tlsProbeOverride = ref<TlsProbeSummary | null | undefined>(undefined)
+const tlsProbe = computed<TlsProbeSummary | null>(() => {
+  if (tlsProbeOverride.value !== undefined) return tlsProbeOverride.value
+  return normalizeTlsProbeSummary(props.editingKey?.tls_probe)
+})
+
+function formatProbedAt(unixSecs: number | null | undefined): string {
+  if (!unixSecs) return '-'
+  return new Date(unixSecs * 1000).toLocaleString()
+}
+
+async function handleProbeTlsFingerprint() {
+  if (!props.editingKey) return
+  probingTls.value = true
+  try {
+    const result = await probeProviderKeyTlsFingerprint(props.editingKey.id)
+    tlsProbeOverride.value = normalizeTlsProbeSummary(result.probe)
+    success(result.message, '成功')
+  } catch (err: unknown) {
+    showError(parseApiError(err, '探测失败'), '错误')
+  } finally {
+    probingTls.value = false
+  }
+}
 
 const form = ref({
   name: '',
@@ -267,7 +601,10 @@ const form = ref({
   note: '',
   auto_fetch_models: false,
   model_include_patterns_text: '',
-  model_exclude_patterns_text: ''
+  model_exclude_patterns_text: '',
+  cloak_sensitive_words_mode: 'inherit' as SensitiveWordsMode,
+  cloak_sensitive_words_text: '',
+  transport_profile: null as TransportProfileId | null,
 })
 
 // ---------------------------------------------------------------------------
@@ -288,6 +625,8 @@ const isDirty = computed(() => {
 watch(isOpen, (val) => {
   if (!val) {
     formSnapshot.value = ''
+    claudeCodeDeviceProfileOverride.value = undefined
+    tlsProbeOverride.value = undefined
   }
 })
 
@@ -303,7 +642,10 @@ function resetForm() {
     note: '',
     auto_fetch_models: false,
     model_include_patterns_text: '',
-    model_exclude_patterns_text: ''
+    model_exclude_patterns_text: '',
+    cloak_sensitive_words_mode: 'inherit',
+    cloak_sensitive_words_text: '',
+    transport_profile: null,
   }
   formSnapshot.value = ''
 }
@@ -321,7 +663,10 @@ function loadKeyData() {
     note: props.editingKey.note || '',
     auto_fetch_models: props.editingKey.auto_fetch_models ?? false,
     model_include_patterns_text: (props.editingKey.model_include_patterns || []).join(', '),
-    model_exclude_patterns_text: (props.editingKey.model_exclude_patterns || []).join(', ')
+    model_exclude_patterns_text: (props.editingKey.model_exclude_patterns || []).join(', '),
+    cloak_sensitive_words_mode: Array.isArray(props.editingKey.cloak_sensitive_words) ? 'override' : 'inherit',
+    cloak_sensitive_words_text: normalizeSensitiveWordList(props.editingKey.cloak_sensitive_words).join('\n'),
+    transport_profile: normalizeTransportProfile(props.editingKey.transport_profile),
   }
   // 数据加载完成后拍快照，作为 dirty 判断的基准
   takeSnapshot()
@@ -389,9 +734,24 @@ async function handleSave() {
       model_include_patterns: parsePatternText(form.value.model_include_patterns_text),
       model_exclude_patterns: parsePatternText(form.value.model_exclude_patterns_text)
     }
+    if (showSensitiveWordsSection.value) {
+      if (sensitiveWordsError.value) {
+        showError(sensitiveWordsError.value, '验证失败')
+        return
+      }
+      // 三态：继承 → null（删除覆盖）；覆盖 → 数组（空数组 = 关闭混淆）
+      updateData.cloak_sensitive_words = form.value.cloak_sensitive_words_mode === 'override'
+        ? sensitiveWordsParsed.value.words
+        : null
+    }
+    if (showTransportProfileSection.value) {
+      // 三态：null → 回到供应商 / 系统默认；字符串 → Key 级覆盖
+      updateData.transport_profile = form.value.transport_profile
+    }
 
     const updatedKey = await updateProviderKey(props.editingKey.id, updateData)
     success('账号已更新', '成功')
+    for (const message of extractProviderWriteWarnings(updatedKey)) warning(message, '提示')
     emit('saved', updatedKey)
     emit('close')
   } catch (err: unknown) {

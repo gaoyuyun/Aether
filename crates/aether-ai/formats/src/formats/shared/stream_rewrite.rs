@@ -738,6 +738,10 @@ fn rewrite_openai_responses_compat_stream_line(
         Err(_) => return Ok(line),
     };
     let mut changed = rewrite_stream_payload_model_from_context(report_context, &mut value);
+    changed |= crate::formats::openai::responses::codex_sanitize::restore_codex_shortened_tool_names_in_stream_event(
+        report_context,
+        &mut value,
+    ) > 0;
     let event_type = value
         .get("type")
         .and_then(Value::as_str)

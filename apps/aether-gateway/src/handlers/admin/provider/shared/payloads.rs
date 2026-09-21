@@ -69,6 +69,9 @@ pub(crate) struct AdminProviderKeyCreateRequest {
     pub(crate) model_exclude_patterns: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) fingerprint: Option<serde_json::Value>,
+    /// P5：Key 级传输指纹 profile（`fingerprint.transport_profile`），只接受内置 TLS 仿真 profile。
+    #[serde(default)]
+    pub(crate) transport_profile: Option<String>,
 }
 
 impl std::fmt::Debug for AdminProviderKeyCreateRequest {
@@ -145,6 +148,14 @@ pub(crate) struct AdminProviderKeyUpdateRequest {
     pub(crate) proxy: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) fingerprint: Option<serde_json::Value>,
+    /// Key 级敏感词覆盖，写入加密的 `auth_config.cloak_sensitive_words`（仅 claude_code / antigravity）。
+    /// 三态：字段缺席 = 不动；`null` = 删除覆盖（继承供应商）；数组（含空数组 = 关闭混淆）= 覆盖。
+    #[serde(default)]
+    pub(crate) cloak_sensitive_words: Option<Vec<String>>,
+    /// P5：Key 级传输指纹 profile（`fingerprint.transport_profile`）。三态：缺席 = 不动；
+    /// `null` = 删除（回到供应商 / 系统默认）；字符串 = 内置 TLS 仿真 profile id。
+    #[serde(default)]
+    pub(crate) transport_profile: Option<String>,
 }
 
 impl std::fmt::Debug for AdminProviderKeyUpdateRequest {
@@ -232,6 +243,19 @@ pub(crate) struct AdminProviderCreateRequest {
     pub(crate) keep_priority_on_conversion: Option<bool>,
     #[serde(default)]
     pub(crate) codex_fingerprint_convergence_enabled: Option<bool>,
+    /// Claude Code 客户端伪装模式 `auto | always | off`，写入 `config.cloak.mode`（仅 claude_code）。
+    #[serde(default)]
+    pub(crate) claude_code_cloak_mode: Option<String>,
+    /// 敏感词词表，写入 `config.cloak.sensitive_words`（仅 claude_code / antigravity）；
+    /// `null` 或空数组表示清空。
+    #[serde(default)]
+    pub(crate) cloak_sensitive_words: Option<Vec<String>>,
+    /// P5：供应商级传输指纹 profile，写入 `config.fingerprint.transport_profile`（仅 claude_code / codex）。
+    #[serde(default)]
+    pub(crate) transport_profile: Option<String>,
+    /// 供应商级冷却策略 `{ disable, transient_error_seconds, model_level }`，写入 `config.cooldown`。
+    #[serde(default)]
+    pub(crate) cooldown: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) responses_websocket_enabled: Option<bool>,
     #[serde(default)]
@@ -301,6 +325,19 @@ pub(crate) struct AdminProviderUpdateRequest {
     pub(crate) keep_priority_on_conversion: Option<bool>,
     #[serde(default)]
     pub(crate) codex_fingerprint_convergence_enabled: Option<bool>,
+    /// Claude Code 客户端伪装模式 `auto | always | off`，写入 `config.cloak.mode`（仅 claude_code）。
+    #[serde(default)]
+    pub(crate) claude_code_cloak_mode: Option<String>,
+    /// 敏感词词表，写入 `config.cloak.sensitive_words`（仅 claude_code / antigravity）；
+    /// `null` 或空数组表示清空。
+    #[serde(default)]
+    pub(crate) cloak_sensitive_words: Option<Vec<String>>,
+    /// P5：供应商级传输指纹 profile，写入 `config.fingerprint.transport_profile`（仅 claude_code / codex）。
+    #[serde(default)]
+    pub(crate) transport_profile: Option<String>,
+    /// 供应商级冷却策略 `{ disable, transient_error_seconds, model_level }`，写入 `config.cooldown`。
+    #[serde(default)]
+    pub(crate) cooldown: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) responses_websocket_enabled: Option<bool>,
     #[serde(default)]

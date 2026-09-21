@@ -299,7 +299,15 @@ where
     }
 
     async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
-        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
+        let Some(derivation) = crate::orchestration::next_same_key_retry_attempt_with_wait(attempt)
+        else {
+            return Ok(None);
+        };
+        if let Some(wait) = derivation.wait_before_retry {
+            // 上游说「几秒后再来」：按它说的等（封顶 3s），别无间隔地撞同一把 Key。
+            tokio::time::sleep(wait).await;
+        }
+        Ok(Some(derivation.attempt))
     }
 
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {
@@ -1277,7 +1285,15 @@ where
     }
 
     async fn next_same_key_retry(&self, attempt: &T) -> Result<Option<T>, Self::Error> {
-        Ok(crate::orchestration::next_same_key_retry_attempt(attempt))
+        let Some(derivation) = crate::orchestration::next_same_key_retry_attempt_with_wait(attempt)
+        else {
+            return Ok(None);
+        };
+        if let Some(wait) = derivation.wait_before_retry {
+            // 上游说「几秒后再来」：按它说的等（封顶 3s），别无间隔地撞同一把 Key。
+            tokio::time::sleep(wait).await;
+        }
+        Ok(Some(derivation.attempt))
     }
 
     async fn record_attempt_failed(&self, attempt: &T) -> Result<(), Self::Error> {

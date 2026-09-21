@@ -26,8 +26,15 @@ use crate::{
 
 const AETHER_RESPONSES_RAW_OUTPUT_KEY: &str = "openai_responses_raw_output";
 
-pub fn from(body: &Value, _ctx: &FormatContext) -> Option<CanonicalResponse> {
-    from_raw(body)
+pub fn from(body: &Value, ctx: &FormatContext) -> Option<CanonicalResponse> {
+    let mut response = from_raw(body)?;
+    if let Some(report_context) = ctx.report_context.as_ref() {
+        super::codex_sanitize::restore_codex_shortened_tool_names_in_canonical_response(
+            report_context,
+            &mut response,
+        );
+    }
+    Some(response)
 }
 
 pub fn to(response: &CanonicalResponse, ctx: &FormatContext) -> Option<Value> {

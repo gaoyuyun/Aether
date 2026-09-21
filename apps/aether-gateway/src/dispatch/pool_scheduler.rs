@@ -41,7 +41,8 @@ use crate::handlers::shared::provider_pool::{
 };
 use crate::handlers::shared::provider_pool::{
     admin_provider_pool_quota_probe_active_members_key,
-    read_admin_provider_pool_key_cooldown_reason, AdminProviderPoolConfig,
+    read_admin_provider_pool_key_cooldown_reason,
+    read_admin_provider_pool_key_model_cooldown_reason, AdminProviderPoolConfig,
     AdminProviderPoolRuntimeState, AdminProviderPoolSchedulingPreset,
 };
 use crate::handlers::shared::{parse_catalog_auth_config_json, provider_key_health_summary};
@@ -1127,22 +1128,43 @@ impl<'a> PoolKeyCursor<'a> {
         &mut self,
         candidate: &EligibleLocalExecutionCandidate,
     ) -> bool {
-        match read_admin_provider_pool_key_cooldown_reason(
-            self.state.app().runtime_state.as_ref(),
-            candidate.candidate.provider_id.as_str(),
-            candidate.candidate.key_id.as_str(),
-        )
-        .await
-        {
-            Ok(Some(_)) => {
-                self.record_skip_reason("pool_cooldown");
+        let runtime = self.state.app().runtime_state.as_ref();
+        let provider_id = candidate.candidate.provider_id.as_str();
+        let key_id = candidate.candidate.key_id.as_str();
+        let key_cooldown =
+            read_admin_provider_pool_key_cooldown_reason(runtime, provider_id, key_id).await;
+        let cooldown = match key_cooldown {
+            Ok(Some(reason)) => Ok(Some(("pool_cooldown", reason))),
+            Ok(None) => {
+                // Key 本身可用时再看 Key+模型 级冷却；模型级冷却只挡住这个模型。
+                read_admin_provider_pool_key_model_cooldown_reason(
+                    runtime,
+                    provider_id,
+                    key_id,
+                    candidate.candidate.selected_provider_model_name.as_str(),
+                )
+                .await
+                .map(|reason| reason.map(|reason| (POOL_MODEL_COOLDOWN_SKIP_REASON, reason)))
+            }
+            Err(err) => Err(err),
+        };
+        match cooldown {
+            Ok(Some((skip_reason, cooldown_reason))) => {
+                self.record_skip_reason(skip_reason);
                 self.skipped_candidates
                     .push(SkippedLocalExecutionCandidate {
                         candidate: candidate.candidate.clone(),
-                        skip_reason: "pool_cooldown",
+                        skip_reason,
                         transport: Some(candidate.transport.clone()),
                         ranking: candidate.ranking.clone(),
-                        extra_data: None,
+                        extra_data: Some(serde_json::json!({
+                            "pool_skip": {
+                                "type": skip_reason,
+                                "cooldown_reason": cooldown_reason,
+                                "model": (skip_reason == POOL_MODEL_COOLDOWN_SKIP_REASON)
+                                    .then(|| candidate.candidate.selected_provider_model_name.clone()),
+                            }
+                        })),
                     });
                 self.spawn_active_probe_member_eviction_and_replenish(candidate);
                 true
@@ -1375,6 +1397,9 @@ impl<'a> PoolKeyCursor<'a> {
             .saturating_sub(u32::try_from(prefiltered_count).unwrap_or(u32::MAX));
     }
 }
+
+/// 只有请求的模型在这把 Key 上被冷却，其他模型继续可用。
+pub(crate) const POOL_MODEL_COOLDOWN_SKIP_REASON: &str = "pool_model_cooldown";
 
 fn pool_skip_reason_releases_scan_budget(skip_reason: &str) -> bool {
     matches!(

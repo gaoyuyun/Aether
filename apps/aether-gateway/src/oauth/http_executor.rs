@@ -448,6 +448,12 @@ async fn execute_direct_identity_oauth(
         .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
+    let retry_after_secs = OAuthHttpResponse::parse_retry_after_header(
+        response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+    );
     let body_bytes = collect_identity_oauth_response_body(response).await?;
     let decoded = decode_response_bytes_with_limit(
         &body_bytes,
@@ -459,6 +465,7 @@ async fn execute_direct_identity_oauth(
         status_code,
         body_text: String::from_utf8_lossy(&decoded).to_string(),
         json_body: serde_json::from_slice(&decoded).ok(),
+        retry_after_secs,
     })
 }
 
@@ -494,6 +501,13 @@ fn oauth_response_too_large() -> OAuthError {
 fn execution_result_to_oauth_response(result: &ExecutionResult) -> OAuthHttpResponse {
     OAuthHttpResponse {
         status_code: result.status_code,
+        retry_after_secs: OAuthHttpResponse::parse_retry_after_header(
+            result
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, value)| value.as_str()),
+        ),
         body_text: execution_body_text(result),
         json_body: execution_json_body(result),
     }

@@ -6,8 +6,9 @@ use crate::handlers::admin::provider::shared::payloads::{
     AdminProviderCreateRequest, AdminProviderUpdatePatch,
 };
 use crate::handlers::admin::provider::write::provider::{
-    reconcile_admin_fixed_provider_template_endpoints,
+    provider_cloak_sensitive_words_changed, reconcile_admin_fixed_provider_template_endpoints,
     reconcile_admin_fixed_provider_template_endpoints_after_update,
+    CLOAK_SENSITIVE_WORDS_CHANGED_WARNING,
 };
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::attach_admin_audit_response;
@@ -26,6 +27,30 @@ fn build_admin_provider_bad_request_response(detail: impl Into<String>) -> Respo
         Json(json!({ "detail": detail.into() })),
     )
         .into_response()
+}
+
+/// 写入后需要提醒管理员的事项（目前只有 P6 的「词表变更会让提示词缓存失效」）。
+/// 只在实际变化时才产生，避免每次保存都弹提示。
+fn provider_write_warnings(
+    existing_config: Option<&serde_json::Value>,
+    updated_config: Option<&serde_json::Value>,
+) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if provider_cloak_sensitive_words_changed(existing_config, updated_config) {
+        warnings.push(CLOAK_SENSITIVE_WORDS_CHANGED_WARNING);
+    }
+    warnings
+}
+
+/// 把提示并列挂在响应 JSON 顶层的 `warnings` 数组里；没有提示时不加字段，
+/// 保持既有响应形状不变。
+fn attach_provider_write_warnings(payload: &mut serde_json::Value, warnings: Vec<&'static str>) {
+    if warnings.is_empty() {
+        return;
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("warnings".to_string(), json!(warnings));
+    }
 }
 
 fn build_admin_provider_not_found_response(detail: impl Into<String>) -> Response<Body> {
@@ -82,13 +107,17 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
         {
             reconcile_admin_fixed_provider_template_endpoints(state, &created_provider).await?;
         }
+        let mut created_payload = json!({
+            "id": created_provider.id,
+            "name": created_provider.name,
+            "message": "提供商创建成功",
+        });
+        attach_provider_write_warnings(
+            &mut created_payload,
+            provider_write_warnings(None, created_provider.config.as_ref()),
+        );
         return Ok(Some(attach_admin_audit_response(
-            Json(json!({
-                "id": created_provider.id,
-                "name": created_provider.name,
-                "message": "提供商创建成功",
-            }))
-            .into_response(),
+            Json(created_payload).into_response(),
             "admin_provider_created",
             "create_provider",
             "provider",
@@ -176,18 +205,25 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
             )
             .await?;
         }
+        let warnings = provider_write_warnings(
+            existing_provider.config.as_ref(),
+            updated_record.config.as_ref(),
+        );
         return Ok(Some(
             match state
                 .build_admin_provider_summary_payload(&provider_id)
                 .await
             {
-                Some(payload) => attach_admin_audit_response(
-                    Json(payload).into_response(),
-                    "admin_provider_updated",
-                    "update_provider",
-                    "provider",
-                    &provider_id,
-                ),
+                Some(mut payload) => {
+                    attach_provider_write_warnings(&mut payload, warnings);
+                    attach_admin_audit_response(
+                        Json(payload).into_response(),
+                        "admin_provider_updated",
+                        "update_provider",
+                        "provider",
+                        &provider_id,
+                    )
+                }
                 None => build_admin_provider_not_found_response(format!(
                     "Provider {provider_id} 不存在"
                 )),
@@ -196,4 +232,41 @@ pub(crate) async fn maybe_build_local_admin_provider_writes_response(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{attach_provider_write_warnings, provider_write_warnings};
+    use serde_json::json;
+
+    #[test]
+    fn sensitive_word_changes_produce_a_prompt_cache_warning_only_when_the_list_changed() {
+        let before = json!({"cloak": {"sensitive_words": ["proxy"]}});
+        let after = json!({"cloak": {"sensitive_words": ["proxy", "api"]}});
+        assert_eq!(
+            provider_write_warnings(Some(&before), Some(&after)),
+            vec!["敏感词词表已变更，提示词缓存将失效"]
+        );
+        assert!(provider_write_warnings(Some(&before), Some(&before)).is_empty());
+        assert!(provider_write_warnings(None, None).is_empty());
+        // 新建时带词表也提示。
+        assert_eq!(
+            provider_write_warnings(None, Some(&after)),
+            vec!["敏感词词表已变更，提示词缓存将失效"]
+        );
+    }
+
+    #[test]
+    fn warnings_are_attached_as_a_sibling_array_without_touching_the_rest() {
+        let mut payload = json!({"id": "provider-1", "name": "claude"});
+        attach_provider_write_warnings(&mut payload, Vec::new());
+        assert!(payload.get("warnings").is_none());
+
+        attach_provider_write_warnings(&mut payload, vec!["敏感词词表已变更，提示词缓存将失效"]);
+        assert_eq!(payload["id"], "provider-1");
+        assert_eq!(
+            payload["warnings"],
+            json!(["敏感词词表已变更，提示词缓存将失效"])
+        );
+    }
 }

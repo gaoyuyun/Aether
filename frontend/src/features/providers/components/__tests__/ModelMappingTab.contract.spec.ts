@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, createSSRApp, h, nextTick, type App } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 
-import type { ProviderMappingPreviewResponse, ProviderWithEndpointsSummary } from '@/api/endpoints'
+import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
 import type { EndpointAPIKey } from '@/api/endpoints/keys'
 import ModelMappingTab from '../provider-tabs/ModelMappingTab.vue'
 

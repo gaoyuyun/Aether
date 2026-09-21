@@ -6138,6 +6138,7 @@ impl<'a> AdminAppState<'a> {
                                 "fingerprint",
                             ));
                             let admin_update = build_provider_catalog_key_admin_cas_update(
+                                self.as_ref(),
                                 &existing_key,
                                 updated.clone(),
                                 &provider.provider_type,

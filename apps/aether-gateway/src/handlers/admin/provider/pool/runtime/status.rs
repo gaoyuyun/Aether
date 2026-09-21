@@ -1,4 +1,6 @@
-use super::reads::read_admin_provider_pool_runtime_state;
+use super::reads::{
+    attach_admin_provider_pool_model_cooldowns, read_admin_provider_pool_runtime_state,
+};
 use crate::handlers::admin::provider::pool::config::admin_provider_pool_config;
 use crate::handlers::admin::request::AdminAppState;
 use serde_json::json;
@@ -38,7 +40,11 @@ pub(crate) async fn build_admin_provider_pool_status_payload(
         .ok()
         .unwrap_or_default();
     let key_ids = keys.iter().map(|key| key.id.clone()).collect::<Vec<_>>();
-    let runtime = read_admin_provider_pool_runtime_state(
+    let now_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut runtime = read_admin_provider_pool_runtime_state(
         state.runtime_state(),
         &provider.id,
         &key_ids,
@@ -46,18 +52,42 @@ pub(crate) async fn build_admin_provider_pool_status_payload(
         None,
     )
     .await;
+    attach_admin_provider_pool_model_cooldowns(
+        state.runtime_state(),
+        &provider.id,
+        &key_ids,
+        &mut runtime,
+    )
+    .await;
     let key_payloads = keys
         .into_iter()
         .map(|key| {
             let cooldown_reason = runtime.cooldown_reason_by_key.get(&key.id).cloned();
+            let cooldown_ttl_seconds = cooldown_reason
+                .as_ref()
+                .and_then(|_| runtime.cooldown_ttl_by_key.get(&key.id).copied());
             json!({
                 "key_id": key.id,
                 "key_name": key.name,
                 "is_active": key.is_active,
                 "cooldown_reason": cooldown_reason,
-                "cooldown_ttl_seconds": cooldown_reason
-                    .as_ref()
-                    .and_then(|_| runtime.cooldown_ttl_by_key.get(&key.id).copied()),
+                "cooldown_ttl_seconds": cooldown_ttl_seconds,
+                "cooldown_until": cooldown_ttl_seconds.map(|ttl| now_unix_secs.saturating_add(ttl)),
+                "cooldown_meta": runtime.cooldown_meta_by_key.get(&key.id).cloned(),
+                "model_cooldowns": runtime
+                    .model_cooldowns_by_key
+                    .get(&key.id)
+                    .map(|cooldowns| cooldowns
+                        .iter()
+                        .map(|cooldown| json!({
+                            "model": cooldown.model,
+                            "reason": cooldown.reason,
+                            "ttl_seconds": cooldown.ttl_seconds,
+                            "until": now_unix_secs.saturating_add(cooldown.ttl_seconds),
+                            "meta": cooldown.meta,
+                        }))
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default(),
                 "cost_window_usage": runtime.cost_window_usage_by_key.get(&key.id).copied().unwrap_or(0),
                 "cost_limit": pool_config.cost_limit_per_key_tokens,
                 "sticky_sessions": runtime.sticky_sessions_by_key.get(&key.id).copied().unwrap_or(0),

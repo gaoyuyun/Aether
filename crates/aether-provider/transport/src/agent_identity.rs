@@ -1004,7 +1004,8 @@ impl LocalOAuthRefreshAdapter for CodexAgentIdentityRefreshAdapter {
             LocalOAuthRefreshError::HttpStatus { status_code, .. } => {
                 *status_code == 429 || *status_code >= 500
             }
-            LocalOAuthRefreshError::Transport { .. }
+            LocalOAuthRefreshError::RateLimited { .. }
+            | LocalOAuthRefreshError::Transport { .. }
             | LocalOAuthRefreshError::TransportMessage { .. }
             | LocalOAuthRefreshError::InvalidResponse { .. } => true,
         }
@@ -1422,6 +1423,7 @@ mod tests {
                 .push(request.clone());
             Ok(LocalOAuthHttpResponse {
                 status_code: 200,
+                retry_after_secs: None,
                 body_text: r#"{"task_id":"task-registered"}"#.to_string(),
             })
         }
@@ -1461,11 +1463,13 @@ mod tests {
             responses: Arc::new(Mutex::new(vec![
                 OAuthHttpResponse {
                     status_code: 200,
+                    retry_after_secs: None,
                     body_text: r#"{"agent_runtime_id":"runtime-enrolled"}"#.to_string(),
                     json_body: None,
                 },
                 OAuthHttpResponse {
                     status_code: 200,
+                    retry_after_secs: None,
                     body_text: r#"{"task_id":"task-enrolled"}"#.to_string(),
                     json_body: None,
                 },
@@ -1547,6 +1551,7 @@ mod tests {
             requests: Arc::clone(&requests),
             responses: Arc::new(Mutex::new(vec![OAuthHttpResponse {
                 status_code: 200,
+                retry_after_secs: None,
                 body_text: r#"{"agent_runtime_id":"runtime-pending"}"#.to_string(),
                 json_body: None,
             }])),
@@ -1595,6 +1600,7 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(vec![OAuthHttpResponse {
                 status_code: 403,
+                retry_after_secs: None,
                 body_text: r#"{"detail":"session-token-for-test-only"}"#.to_string(),
                 json_body: None,
             }])),

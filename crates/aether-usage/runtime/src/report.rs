@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 
+use aether_ai_formats::api::{
+    openai_responses_incomplete_is_failure, openai_responses_payload_is_incomplete,
+};
 use aether_contracts::{ExecutionStreamTerminalSummary, ExecutionTelemetry};
 use aether_data_contracts::repository::{
     gemini_file_mappings::{
@@ -656,8 +659,18 @@ fn openai_response_terminal_state(value: &Value) -> Option<StreamCapturedTermina
         .unwrap_or_default();
     match event_type {
         "response.completed" => return Some(StreamCapturedTerminalState::Completed),
-        "response.failed" | "response.incomplete" | "error" => {
+        "response.failed" | "error" => {
             return Some(StreamCapturedTerminalState::Failed);
+        }
+        // 合法 `response.incomplete`（写满 max_output_tokens / content_filter /
+        // 未来的合法原因）是可计费的终态；只有没有可用原因、原因是错误或带显式
+        // error 的 incomplete 才是失败。
+        "response.incomplete" => {
+            return Some(if openai_responses_incomplete_is_failure(value) {
+                StreamCapturedTerminalState::Failed
+            } else {
+                StreamCapturedTerminalState::Completed
+            });
         }
         _ => {}
     }
@@ -666,11 +679,15 @@ fn openai_response_terminal_state(value: &Value) -> Option<StreamCapturedTermina
     if response
         .and_then(|response| response.get("error"))
         .is_some_and(|error| !error.is_null())
-        || response
-            .and_then(|response| response.get("incomplete_details"))
-            .is_some_and(|details| !details.is_null())
     {
         return Some(StreamCapturedTerminalState::Failed);
+    }
+    if openai_responses_payload_is_incomplete(value) {
+        return Some(if openai_responses_incomplete_is_failure(value) {
+            StreamCapturedTerminalState::Failed
+        } else {
+            StreamCapturedTerminalState::Completed
+        });
     }
 
     match response
@@ -679,7 +696,7 @@ fn openai_response_terminal_state(value: &Value) -> Option<StreamCapturedTermina
         .map(str::trim)
     {
         Some("completed") => Some(StreamCapturedTerminalState::Completed),
-        Some("failed" | "incomplete" | "cancelled") => Some(StreamCapturedTerminalState::Failed),
+        Some("failed" | "cancelled") => Some(StreamCapturedTerminalState::Failed),
         _ => None,
     }
 }
@@ -1030,6 +1047,50 @@ mod tests {
 
         assert!(stream_report_represents_failure(&payload));
         assert!(super::stream_report_missing_terminal_event(&payload));
+    }
+
+    #[test]
+    fn accepts_legitimate_openai_responses_incomplete_from_captured_sse() {
+        let provider_sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"message\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":9}}}\n\n"
+        );
+        let mut payload = sample_stream_report("openai_responses_stream_success", 200);
+        payload.report_context = Some(json!({
+            "client_api_format": "openai:responses",
+            "provider_api_format": "openai:responses"
+        }));
+        payload.provider_body_base64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(provider_sse.as_bytes()));
+        payload.provider_body_state = Some(UsageBodyCaptureState::Inline);
+
+        assert!(!stream_report_represents_failure(&payload));
+        assert!(!super::stream_report_missing_terminal_event(&payload));
+    }
+
+    #[test]
+    fn rejects_openai_responses_incomplete_without_a_usable_reason_from_captured_sse() {
+        for terminal in [
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"error\"}}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"error\":{\"code\":\"x\"},\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        ] {
+            let mut payload = sample_stream_report("openai_responses_stream_success", 200);
+            payload.report_context = Some(json!({
+                "client_api_format": "openai:responses",
+                "provider_api_format": "openai:responses"
+            }));
+            payload.provider_body_base64 =
+                Some(base64::engine::general_purpose::STANDARD.encode(terminal.as_bytes()));
+            payload.provider_body_state = Some(UsageBodyCaptureState::Inline);
+
+            assert!(stream_report_represents_failure(&payload), "{terminal}");
+            assert!(!super::stream_report_missing_terminal_event(&payload));
+        }
     }
 
     #[test]

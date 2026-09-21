@@ -25,6 +25,9 @@ use crate::logic::{
     parse_models_response_page, parse_windsurf_model_configs_response, preset_models_for_provider,
     project_codex_models_for_legacy_cache,
 };
+use crate::onboarding::{
+    extract_cloud_code_project_id, onboard_cloud_code_user, CloudCodeOnboardingClient,
+};
 use crate::transport::{
     build_antigravity_fetch_available_models_plan, build_antigravity_load_code_assist_plan,
     build_gemini_cli_load_code_assist_plan, build_kiro_list_available_models_plan,
@@ -519,15 +522,21 @@ async fn fetch_antigravity_models(
     })
 }
 
-async fn resolve_or_hydrate_antigravity_project(
+/// Antigravity project 补全的结果。`onboarded` 表示 project 来自 onboardUser
+/// 而不是 loadCodeAssist 直接返回，调用方据此决定是否把它写回 Key 凭据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntigravityProjectHydration {
+    pub project_id: String,
+    pub upstream_metadata: Value,
+    pub onboarded: bool,
+}
+
+/// 通过 loadCodeAssist（必要时再走 onboardUser）拿到 Antigravity project，
+/// 不读取 transport 上已有的 project。
+pub async fn hydrate_antigravity_project(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,
-) -> Result<(String, GatewayProviderTransportSnapshot, Option<Value>), String> {
-    if let Some(project_id) = resolve_antigravity_project_id_from_transport(transport) {
-        let metadata = Some(build_antigravity_project_metadata(&project_id));
-        return Ok((project_id, transport.clone(), metadata));
-    }
-
+) -> Result<AntigravityProjectHydration, String> {
     let plan = build_antigravity_load_code_assist_plan(runtime, transport)
         .await
         .map_err(|error| sanitize_model_fetch_error(&error))?;
@@ -542,13 +551,57 @@ async fn resolve_or_hydrate_antigravity_project(
         ));
     }
     let body_json = execution_result_json_body_allow_empty(&result)?;
-    let project_id = extract_cloud_ai_companion_project_id(&body_json)
-        .ok_or_else(|| "antigravity: loadCodeAssist response missing project_id".to_string())?;
-    let metadata = build_antigravity_project_metadata(&project_id);
-    let mut hydrated_transport = transport.clone();
-    hydrated_transport.key.upstream_metadata = Some(metadata.clone());
+    let (project_id, onboarded) = match extract_cloud_ai_companion_project_id(&body_json) {
+        Some(project_id) => (project_id, false),
+        None => {
+            // onboarding 的错误文本都是本地生成的固定句式，不含上游内容，不需要脱敏。
+            let outcome = onboard_cloud_code_user(
+                runtime,
+                transport,
+                CloudCodeOnboardingClient::Antigravity,
+                &body_json,
+            )
+            .await?;
+            (outcome.project_id, true)
+        }
+    };
+    let mut upstream_metadata = build_antigravity_project_metadata(&project_id);
+    if onboarded {
+        if let Some(antigravity) = upstream_metadata
+            .get_mut("antigravity")
+            .and_then(Value::as_object_mut)
+        {
+            antigravity.insert(
+                "project_source".to_string(),
+                Value::String("onboard_user".to_string()),
+            );
+        }
+    }
+    Ok(AntigravityProjectHydration {
+        project_id,
+        upstream_metadata,
+        onboarded,
+    })
+}
 
-    Ok((project_id, hydrated_transport, Some(metadata)))
+async fn resolve_or_hydrate_antigravity_project(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<(String, GatewayProviderTransportSnapshot, Option<Value>), String> {
+    if let Some(project_id) = resolve_antigravity_project_id_from_transport(transport) {
+        let metadata = Some(build_antigravity_project_metadata(&project_id));
+        return Ok((project_id, transport.clone(), metadata));
+    }
+
+    let hydration = hydrate_antigravity_project(runtime, transport).await?;
+    let mut hydrated_transport = transport.clone();
+    hydrated_transport.key.upstream_metadata = Some(hydration.upstream_metadata.clone());
+
+    Ok((
+        hydration.project_id,
+        hydrated_transport,
+        Some(hydration.upstream_metadata),
+    ))
 }
 
 fn resolve_antigravity_project_id_from_transport(
@@ -592,6 +645,80 @@ fn attach_antigravity_project_metadata(mut metadata: Value, project_id: &str) ->
     metadata
 }
 
+/// Gemini CLI project 补全的结果，字段含义同 [`AntigravityProjectHydration`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiCliProjectHydration {
+    pub project_id: String,
+    pub upstream_metadata: Value,
+    pub onboarded: bool,
+}
+
+/// 通过 loadCodeAssist（必要时再走 onboardUser）拿到 Gemini CLI project，并把
+/// tier / plan 元数据一起带回。不读取 transport 上已有的 project。
+pub async fn hydrate_gemini_cli_project(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<GeminiCliProjectHydration, String> {
+    let plan = build_gemini_cli_load_code_assist_plan(runtime, transport)
+        .await
+        .map_err(|error| sanitize_model_fetch_error(&error))?;
+    let result = runtime
+        .execute_model_fetch_execution_plan(&plan)
+        .await
+        .map_err(|error| sanitize_model_fetch_error(&error))?;
+    if !(200..300).contains(&result.status_code) {
+        return Err(format!(
+            "gemini_cli: loadCodeAssist failed: {}",
+            execution_result_error_message(&result)
+        ));
+    }
+    let body_json = execution_result_json_body_allow_empty(&result)?;
+    let mut provider_meta = gemini_cli_load_code_assist_metadata(&body_json);
+    let (project_id, onboarded) = match extract_cloud_ai_companion_project_id(&body_json) {
+        Some(project_id) => (project_id, false),
+        None => {
+            let outcome = onboard_cloud_code_user(
+                runtime,
+                transport,
+                CloudCodeOnboardingClient::GeminiCli,
+                &body_json,
+            )
+            .await?;
+            (outcome.project_id, true)
+        }
+    };
+    provider_meta.insert("project_id".to_string(), Value::String(project_id.clone()));
+    if onboarded {
+        provider_meta.insert(
+            "project_source".to_string(),
+            Value::String("onboard_user".to_string()),
+        );
+    }
+    Ok(GeminiCliProjectHydration {
+        project_id,
+        upstream_metadata: Value::Object(
+            [("gemini_cli".to_string(), Value::Object(provider_meta))]
+                .into_iter()
+                .collect(),
+        ),
+        onboarded,
+    })
+}
+
+fn gemini_cli_load_code_assist_metadata(body_json: &Value) -> serde_json::Map<String, Value> {
+    let mut provider_meta = serde_json::Map::new();
+    provider_meta.insert("updated_at".to_string(), Value::from(now_unix_secs()));
+    if let Some(plan_type) = extract_gemini_cli_plan_type(body_json) {
+        provider_meta.insert("plan_type".to_string(), Value::String(plan_type));
+    }
+    for key in ["paidTier", "currentTier"] {
+        if let Some(value) = extract_gemini_cli_tier_metadata(body_json, key) {
+            provider_meta.insert(key.to_string(), value);
+        }
+    }
+    provider_meta
+}
+
 async fn fetch_gemini_cli_models(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transport: &GatewayProviderTransportSnapshot,
@@ -604,21 +731,36 @@ async fn fetch_gemini_cli_models(
         if let Ok(result) = runtime.execute_model_fetch_execution_plan(&plan).await {
             if (200..300).contains(&result.status_code) {
                 if let Ok(body_json) = execution_result_json_body_allow_empty(&result) {
-                    if let Some(plan_type) = extract_gemini_cli_plan_type(&body_json) {
-                        provider_meta.insert("plan_type".to_string(), Value::String(plan_type));
-                    }
-                    for key in ["paidTier", "currentTier"] {
-                        if let Some(value) = extract_gemini_cli_tier_metadata(&body_json, key) {
-                            provider_meta.insert(key.to_string(), value);
-                        }
-                    }
-                    if let Some(project_id) = extract_cloud_ai_companion_project_id(&body_json)
-                        .or_else(|| {
-                            transport_auth_config(transport)
-                                .and_then(|value| value.get("project_id").cloned())
-                                .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                        })
+                    provider_meta = gemini_cli_load_code_assist_metadata(&body_json);
+                    let configured_project_id = transport_auth_config(transport)
+                        .and_then(|value| value.get("project_id").cloned())
+                        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+                    let project_id = match extract_cloud_ai_companion_project_id(&body_json)
+                        .or(configured_project_id)
                     {
+                        Some(project_id) => Some(project_id),
+                        None => {
+                            // 免费 tier 新账号：loadCodeAssist 没有 project，也没有配置
+                            // 过，走一次 onboardUser。模型拉取本身是尽力而为，onboarding
+                            // 失败只是少一个 project 字段，不让整次拉取失败。
+                            let onboarded = onboard_cloud_code_user(
+                                runtime,
+                                transport,
+                                CloudCodeOnboardingClient::GeminiCli,
+                                &body_json,
+                            )
+                            .await
+                            .ok();
+                            if onboarded.is_some() {
+                                provider_meta.insert(
+                                    "project_source".to_string(),
+                                    Value::String("onboard_user".to_string()),
+                                );
+                            }
+                            onboarded.map(|outcome| outcome.project_id)
+                        }
+                    };
+                    if let Some(project_id) = project_id {
                         provider_meta.insert("project_id".to_string(), Value::String(project_id));
                     }
                 }
@@ -1961,21 +2103,7 @@ fn extract_gemini_cli_tier_metadata(body: &Value, key: &str) -> Option<Value> {
 }
 
 fn extract_cloud_ai_companion_project_id(body: &Value) -> Option<String> {
-    let raw = body
-        .get("cloudaicompanionProject")
-        .or_else(|| body.get("cloudAiCompanionProject"))?;
-    if let Some(value) = raw.as_str() {
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    raw.as_object()
-        .and_then(|object| object.get("id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    extract_cloud_code_project_id(body)
 }
 
 fn now_unix_secs() -> u64 {
@@ -2031,7 +2159,8 @@ mod tests {
 
     use super::{
         build_vertex_google_list_url, build_vertex_service_account_assertion,
-        build_vertex_service_account_list_url, parse_antigravity_models_response,
+        build_vertex_service_account_list_url, hydrate_antigravity_project,
+        hydrate_gemini_cli_project, parse_antigravity_models_response,
         parse_codex_models_response_for_request, select_model_fetch_strategy, ModelFetchStrategy,
         ModelFetchStrategyKind,
     };
@@ -2040,6 +2169,112 @@ mod tests {
 
     type RouteResult = Result<(u16, Value), String>;
     type ModelFetchRoute = (String, RouteResult);
+
+    /// 按 URL 片段路由，同一 URL 的多次调用依次消费预设响应（最后一个响应重复使用），
+    /// 用来模拟 onboardUser 这类要轮询的长时操作。
+    struct SequencedRoutingTestRuntime {
+        executed_urls: Arc<Mutex<Vec<String>>>,
+        executed_bodies: Arc<Mutex<Vec<Value>>>,
+        routes: Mutex<Vec<(String, std::collections::VecDeque<RouteResult>)>>,
+    }
+
+    impl SequencedRoutingTestRuntime {
+        fn new(routes: Vec<(&str, Vec<RouteResult>)>) -> Self {
+            Self {
+                executed_urls: Arc::new(Mutex::new(Vec::new())),
+                executed_bodies: Arc::new(Mutex::new(Vec::new())),
+                routes: Mutex::new(
+                    routes
+                        .into_iter()
+                        .map(|(url, responses)| (url.to_string(), responses.into_iter().collect()))
+                        .collect(),
+                ),
+            }
+        }
+
+        fn executed_urls(&self) -> Vec<String> {
+            self.executed_urls
+                .lock()
+                .expect("executed_urls lock")
+                .clone()
+        }
+
+        fn executed_bodies(&self) -> Vec<Value> {
+            self.executed_bodies
+                .lock()
+                .expect("executed_bodies lock")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelFetchTransportRuntime for SequencedRoutingTestRuntime {
+        async fn resolve_local_oauth_request_auth(
+            &self,
+            _transport: &GatewayProviderTransportSnapshot,
+        ) -> Result<Option<aether_provider_transport::LocalResolvedOAuthRequestAuth>, String>
+        {
+            Ok(Some(
+                aether_provider_transport::LocalResolvedOAuthRequestAuth::Header {
+                    name: "authorization".to_string(),
+                    value: "Bearer oauth-token".to_string(),
+                },
+            ))
+        }
+
+        async fn resolve_model_fetch_proxy(
+            &self,
+            _transport: &GatewayProviderTransportSnapshot,
+        ) -> Option<aether_contracts::ProxySnapshot> {
+            None
+        }
+
+        async fn execute_model_fetch_execution_plan(
+            &self,
+            plan: &aether_contracts::ExecutionPlan,
+        ) -> Result<ExecutionResult, String> {
+            self.executed_urls
+                .lock()
+                .expect("executed_urls lock")
+                .push(plan.url.clone());
+            self.executed_bodies
+                .lock()
+                .expect("executed_bodies lock")
+                .push(plan.body.json_body.clone().unwrap_or(Value::Null));
+            let mut routes = self.routes.lock().expect("routes lock");
+            let Some((_, responses)) = routes
+                .iter_mut()
+                .find(|(url_part, _)| plan.url.contains(url_part.as_str()))
+            else {
+                return Err(format!(
+                    "unexpected models fetch URL {}",
+                    redact_url_for_debug(&plan.url)
+                ));
+            };
+            let route_result = if responses.len() > 1 {
+                responses.pop_front().expect("queued response")
+            } else {
+                responses
+                    .front()
+                    .cloned()
+                    .expect("at least one response per route")
+            };
+            let (status_code, response_body) = route_result?;
+            Ok(ExecutionResult {
+                request_id: plan.request_id.clone(),
+                candidate_id: plan.candidate_id.clone(),
+                status_code,
+                headers: BTreeMap::new(),
+                response_observation: None,
+                body: Some(ResponseBody {
+                    json_body: Some(response_body),
+                    body_bytes_b64: None,
+                }),
+                telemetry: None,
+                error: None,
+            })
+        }
+    }
 
     #[test]
     fn vertex_assertion_accepts_bare_base64_pkcs8_and_verifies() {
@@ -3499,6 +3734,327 @@ mod tests {
                     .and_then(|value| value.get("allowed_models_count"))
             }),
             Some(&json!(2))
+        );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn antigravity_project_hydration_onboards_a_free_tier_account_after_two_polls() {
+        let runtime = SequencedRoutingTestRuntime::new(vec![
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                vec![Ok((
+                    200,
+                    json!({
+                        "allowedTiers": [
+                            { "id": "standard-tier", "isDefault": false },
+                            { "id": "free-tier", "isDefault": true, "userDefinedCloudaicompanionProject": false }
+                        ]
+                    }),
+                ))],
+            ),
+            (
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                vec![
+                    Ok((
+                        200,
+                        json!({ "name": "operations/onboard-1", "done": false }),
+                    )),
+                    Ok((
+                        200,
+                        json!({
+                            "name": "operations/onboard-1",
+                            "done": true,
+                            "response": {
+                                "cloudaicompanionProject": { "id": "project-from-onboarding" }
+                            }
+                        }),
+                    )),
+                ],
+            ),
+        ]);
+
+        let hydration =
+            hydrate_antigravity_project(&runtime, &sample_antigravity_transport_without_project())
+                .await
+                .expect("onboarding should yield a project");
+
+        assert_eq!(hydration.project_id, "project-from-onboarding");
+        assert!(hydration.onboarded);
+        assert_eq!(
+            hydration
+                .upstream_metadata
+                .pointer("/antigravity/project_id"),
+            Some(&json!("project-from-onboarding"))
+        );
+        assert_eq!(
+            hydration
+                .upstream_metadata
+                .pointer("/antigravity/project_source"),
+            Some(&json!("onboard_user"))
+        );
+        assert_eq!(
+            runtime.executed_urls(),
+            vec![
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".to_string(),
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser".to_string(),
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser".to_string(),
+            ]
+        );
+        let bodies = runtime.executed_bodies();
+        assert_eq!(bodies[1]["tierId"], "free-tier");
+        assert_eq!(bodies[1]["metadata"]["ideType"], "ANTIGRAVITY");
+        assert_eq!(bodies[2], bodies[1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn antigravity_model_fetch_runs_onboarding_before_fetching_models() {
+        let runtime = SequencedRoutingTestRuntime::new(vec![
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                vec![Ok((200, json!({ "currentTier": { "id": "free-tier" } })))],
+            ),
+            (
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                vec![
+                    Ok((200, json!({ "done": false }))),
+                    Ok((
+                        200,
+                        json!({
+                            "done": true,
+                            "response": { "cloudaicompanionProject": "project-onboarded" }
+                        }),
+                    )),
+                ],
+            ),
+            (
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                vec![Ok((
+                    200,
+                    json!({ "models": { "chat_12345": { "displayName": "Antigravity Chat" } } }),
+                ))],
+            ),
+        ]);
+
+        let outcome = fetch_models_from_transports(
+            &runtime,
+            &[sample_antigravity_transport_without_project()],
+        )
+        .await
+        .expect("antigravity models fetch should onboard and succeed");
+
+        assert_eq!(outcome.fetched_model_ids, vec!["chat_12345"]);
+        assert_eq!(
+            outcome
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.pointer("/antigravity/project_id")),
+            Some(&json!("project-onboarded"))
+        );
+        let urls = runtime.executed_urls();
+        assert_eq!(urls.len(), 4);
+        assert!(urls[0].ends_with(":loadCodeAssist"));
+        assert!(urls[1].ends_with(":onboardUser"));
+        assert!(urls[2].ends_with(":onboardUser"));
+        assert!(urls[3].ends_with(":fetchAvailableModels"));
+        assert_eq!(
+            runtime.executed_bodies()[3]["project"],
+            json!("project-onboarded")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn antigravity_onboarding_gives_up_after_five_pending_polls() {
+        let runtime = SequencedRoutingTestRuntime::new(vec![
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                vec![Ok((200, json!({})))],
+            ),
+            (
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                vec![Ok((200, json!({ "done": false })))],
+            ),
+        ]);
+
+        let error =
+            hydrate_antigravity_project(&runtime, &sample_antigravity_transport_without_project())
+                .await
+                .expect_err("pending onboarding must not hang forever");
+
+        assert!(
+            error.contains("did not complete after 5 attempts"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime
+                .executed_urls()
+                .iter()
+                .filter(|url| url.ends_with(":onboardUser"))
+                .count(),
+            5
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn antigravity_onboarding_stops_on_an_upstream_error_status() {
+        let runtime = SequencedRoutingTestRuntime::new(vec![
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                vec![Ok((200, json!({})))],
+            ),
+            (
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                vec![Ok((403, json!({ "error": { "message": "forbidden" } })))],
+            ),
+        ]);
+
+        let error =
+            hydrate_antigravity_project(&runtime, &sample_antigravity_transport_without_project())
+                .await
+                .expect_err("403 should fail fast");
+
+        assert!(
+            error.contains("onboardUser failed with status 403"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime
+                .executed_urls()
+                .iter()
+                .filter(|url| url.ends_with(":onboardUser"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gemini_cli_project_hydration_onboards_with_the_gemini_cli_identity() {
+        let runtime = SequencedRoutingTestRuntime::new(vec![
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                vec![Ok((
+                    200,
+                    json!({
+                        "allowedTiers": [{ "id": "free-tier", "isDefault": true }],
+                        "currentTier": { "id": "free-tier" }
+                    }),
+                ))],
+            ),
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                vec![
+                    Ok((200, json!({ "done": false }))),
+                    Ok((
+                        200,
+                        json!({
+                            "done": true,
+                            "response": { "cloudaicompanionProject": { "id": "gemini-cli-project" } }
+                        }),
+                    )),
+                ],
+            ),
+        ]);
+
+        let hydration = hydrate_gemini_cli_project(&runtime, &sample_gemini_cli_transport())
+            .await
+            .expect("gemini cli onboarding should yield a project");
+
+        assert_eq!(hydration.project_id, "gemini-cli-project");
+        assert!(hydration.onboarded);
+        assert_eq!(
+            hydration
+                .upstream_metadata
+                .pointer("/gemini_cli/project_id"),
+            Some(&json!("gemini-cli-project"))
+        );
+        assert_eq!(
+            hydration.upstream_metadata.pointer("/gemini_cli/plan_type"),
+            Some(&json!("free-tier"))
+        );
+        assert_eq!(
+            hydration
+                .upstream_metadata
+                .pointer("/gemini_cli/project_source"),
+            Some(&json!("onboard_user"))
+        );
+        let bodies = runtime.executed_bodies();
+        assert_eq!(bodies[1]["tierId"], "free-tier");
+        assert_eq!(bodies[1]["metadata"]["ideType"], "IDE_UNSPECIFIED");
+        assert_eq!(
+            runtime.executed_urls(),
+            vec![
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".to_string(),
+                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser".to_string(),
+                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gemini_cli_model_fetch_onboards_when_load_code_assist_has_no_project() {
+        let runtime = SequencedRoutingTestRuntime::new(vec![
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                vec![Ok((200, json!({ "currentTier": { "id": "free-tier" } })))],
+            ),
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                vec![Ok((
+                    200,
+                    json!({
+                        "done": true,
+                        "response": { "cloudaicompanionProject": "gemini-cli-onboarded" }
+                    }),
+                ))],
+            ),
+        ]);
+
+        let outcome = fetch_models_from_transports(&runtime, &[sample_gemini_cli_transport()])
+            .await
+            .expect("gemini cli models fetch should succeed");
+
+        assert_eq!(
+            outcome
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.pointer("/gemini_cli/project_id")),
+            Some(&json!("gemini-cli-onboarded"))
+        );
+        assert_eq!(
+            outcome
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.pointer("/gemini_cli/project_source")),
+            Some(&json!("onboard_user"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gemini_cli_model_fetch_still_succeeds_when_onboarding_fails() {
+        let runtime = SequencedRoutingTestRuntime::new(vec![
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+                vec![Ok((200, json!({ "currentTier": { "id": "free-tier" } })))],
+            ),
+            (
+                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+                vec![Ok((500, json!({ "error": { "message": "boom" } })))],
+            ),
+        ]);
+
+        let outcome = fetch_models_from_transports(&runtime, &[sample_gemini_cli_transport()])
+            .await
+            .expect("gemini cli models fetch is best-effort");
+
+        assert!(outcome
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.pointer("/gemini_cli/project_id"))
+            .is_none());
+        assert_eq!(
+            outcome
+                .upstream_metadata
+                .as_ref()
+                .and_then(|value| value.pointer("/gemini_cli/plan_type")),
+            Some(&json!("free-tier"))
         );
     }
 }

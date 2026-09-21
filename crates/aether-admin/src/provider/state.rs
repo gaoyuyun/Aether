@@ -312,6 +312,12 @@ pub fn enrich_admin_provider_oauth_auth_config(
                 auth_config.entry("email".to_string()).or_insert(email);
             }
         }
+        // P2.6：适配器从 /api/oauth/profile 与 claude_cli/roles 补齐的字段。
+        merge_missing_auth_config_fields(
+            auth_config,
+            token_payload_object,
+            &["org_name", "claude_cli_roles", "profile"],
+        );
         return;
     }
 

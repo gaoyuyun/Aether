@@ -9,6 +9,7 @@ use crate::provider::{
     ProviderOAuthImportInput, ProviderOAuthProbeResult, ProviderOAuthRequestAuth,
     ProviderOAuthTokenSet, ProviderOAuthTransportContext,
 };
+use aether_contracts::ResolvedTransportProfile;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -170,12 +171,17 @@ pub const GENERIC_PROVIDER_OAUTH_TEMPLATES: &[GenericProviderOAuthTemplate] = &[
     },
 ];
 
+/// 按传输上下文决定 token 请求（交换 / 刷新）使用的传输 profile；`None` = reqwest 默认。
+pub type TokenRequestTransportProfileResolver =
+    fn(&ProviderOAuthTransportContext) -> Option<ResolvedTransportProfile>;
+
 #[derive(Clone)]
 pub struct GenericProviderOAuthAdapter {
     template: GenericProviderOAuthTemplate,
     token_url_override: Option<String>,
     client_id_override: Option<String>,
     client_secret_override: Option<String>,
+    token_transport_profile_resolver: Option<TokenRequestTransportProfileResolver>,
 }
 
 impl std::fmt::Debug for GenericProviderOAuthAdapter {
@@ -186,6 +192,10 @@ impl std::fmt::Debug for GenericProviderOAuthAdapter {
             .field("has_token_url_override", &self.token_url_override.is_some())
             .field("client_id_env", &self.template.client_id_env)
             .field("client_secret_env", &self.template.client_secret_env)
+            .field(
+                "has_token_transport_profile_resolver",
+                &self.token_transport_profile_resolver.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -197,7 +207,26 @@ impl GenericProviderOAuthAdapter {
             token_url_override: None,
             client_id_override: None,
             client_secret_override: None,
+            token_transport_profile_resolver: None,
         }
+    }
+
+    /// P5：让 token 交换 / 刷新请求按上下文选择传输 profile（例如 Claude Code 的控制面
+    /// TLS 仿真）。默认不设置，保持 reqwest 行为。
+    pub fn with_token_transport_profile_resolver(
+        mut self,
+        resolver: TokenRequestTransportProfileResolver,
+    ) -> Self {
+        self.token_transport_profile_resolver = Some(resolver);
+        self
+    }
+
+    fn token_request_transport_profile(
+        &self,
+        ctx: &ProviderOAuthTransportContext,
+    ) -> Option<ResolvedTransportProfile> {
+        self.token_transport_profile_resolver
+            .and_then(|resolver| resolver(ctx))
     }
 
     pub fn for_provider_type(provider_type: &str) -> Option<Self> {
@@ -370,7 +399,7 @@ impl GenericProviderOAuthAdapter {
                     json_body: Some(Value::Object(body)),
                     body_bytes: None,
                     network: ctx.network.clone(),
-                    transport_profile: None,
+                    transport_profile: self.token_request_transport_profile(ctx),
                 })
                 .await?
         } else {
@@ -407,10 +436,16 @@ impl GenericProviderOAuthAdapter {
                     json_body: None,
                     body_bytes: Some(form_body),
                     network: ctx.network.clone(),
-                    transport_profile: None,
+                    transport_profile: self.token_request_transport_profile(ctx),
                 })
                 .await?
         };
+        if response.status_code == 429 {
+            return Err(OAuthError::RateLimited {
+                retry_after_secs: response.retry_after_secs,
+                body_excerpt: truncate_body(&response.body_text),
+            });
+        }
         if !(200..300).contains(&response.status_code) {
             return Err(OAuthError::HttpStatus {
                 status_code: response.status_code,
@@ -1256,6 +1291,7 @@ mod tests {
             *self.seen_request.lock().expect("mutex should lock") = Some(request);
             Ok(OAuthHttpResponse {
                 status_code: 200,
+                retry_after_secs: None,
                 body_text: self.response_payload.to_string(),
                 json_body: None,
             })

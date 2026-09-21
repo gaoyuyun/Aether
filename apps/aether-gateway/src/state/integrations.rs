@@ -1,3 +1,4 @@
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot};
@@ -9,6 +10,7 @@ use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, StoredAdminGlobalModelPage,
     StoredAdminProviderModel, UpsertAdminProviderModelRecord,
 };
+use aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyCredentialsCasUpdate;
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
@@ -19,13 +21,15 @@ use aether_data_contracts::repository::usage::{
 };
 use aether_data_contracts::DataLayerError;
 use aether_model_fetch::{
-    aggregate_models_for_cache, build_antigravity_load_code_assist_plan,
-    fetch_models_from_transports, merge_upstream_metadata, model_fetch_interval_minutes,
-    ModelFetchAssociationStore, ModelFetchTransportRuntime,
+    aggregate_models_for_cache, hydrate_antigravity_project, hydrate_gemini_cli_project,
+    merge_upstream_metadata, model_fetch_interval_minutes, ModelFetchAssociationStore,
+    ModelFetchTransportRuntime,
 };
 use aether_scheduler_core::SchedulerAffinityTarget;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use serde_json::Value;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, warn};
 
 use super::{AppState, GatewayError};
@@ -79,7 +83,41 @@ fn provider_transport_snapshot_data_error(error: GatewayError) -> DataLayerError
     DataLayerError::UnexpectedValue(error.into_message())
 }
 
+/// 同一把 Key 的 project 惰性补全一次只跑一个：新账号首批并发请求会同时发现「没有
+/// project」，不加锁就各自发起 loadCodeAssist + onboardUser 并各自轮询。持锁者补全并
+/// 落盘后，等待者重新读一次快照就能直接拿到结果。
+static PROJECT_HYDRATION_LOCKS: LazyLock<DashMap<String, Arc<TokioMutex<()>>>> =
+    LazyLock::new(DashMap::new);
+
+fn project_hydration_lock(key_id: &str) -> Arc<TokioMutex<()>> {
+    PROJECT_HYDRATION_LOCKS
+        .entry(key_id.to_string())
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
+
+fn release_project_hydration_lock(key_id: &str, lock: Arc<TokioMutex<()>>) {
+    drop(lock);
+    // 没有别的等待者时把条目清掉，避免 Key 数量很大时表无限增长。
+    PROJECT_HYDRATION_LOCKS.remove_if(key_id, |_, entry| Arc::strong_count(entry) == 1);
+}
+
 impl AppState {
+    /// 持锁后重读快照：前一个持锁者可能已经把 project 补全并持久化了。
+    async fn reread_transport_snapshot_for_hydration(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Option<GatewayProviderTransportSnapshot> {
+        self.read_provider_transport_snapshot_uncached(
+            &transport.provider.id,
+            &transport.endpoint.id,
+            &transport.key.id,
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
     pub(crate) async fn hydrate_antigravity_project_metadata_for_transport(
         &self,
         transport: &GatewayProviderTransportSnapshot,
@@ -94,65 +132,58 @@ impl AppState {
             return Some(transport.clone());
         }
 
-        let plan = match build_antigravity_load_code_assist_plan(self, transport).await {
-            Ok(plan) => plan,
+        let lock = project_hydration_lock(&transport.key.id);
+        let guard = lock.clone().lock_owned().await;
+        let hydrated = self
+            .hydrate_antigravity_project_metadata_locked(transport)
+            .await;
+        drop(guard);
+        release_project_hydration_lock(&transport.key.id, lock);
+        hydrated
+    }
+
+    async fn hydrate_antigravity_project_metadata_locked(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Option<GatewayProviderTransportSnapshot> {
+        if let Some(fresh) = self
+            .reread_transport_snapshot_for_hydration(transport)
+            .await
+        {
+            if matches!(
+                provider_transport::antigravity::resolve_local_antigravity_request_auth(&fresh),
+                provider_transport::antigravity::AntigravityRequestAuthSupport::Supported(_)
+            ) {
+                return Some(fresh);
+            }
+        }
+
+        // loadCodeAssist 拿不到 project 时会走 onboardUser（免费 tier 新账号），两条路都在
+        // aether-model-fetch 里，与模型拉取共用同一套请求构造与轮询。
+        let hydration = match hydrate_antigravity_project(self, transport).await {
+            Ok(hydration) => hydration,
             Err(err) => {
                 warn!(
                     provider_id = %transport.provider.id,
                     endpoint_id = %transport.endpoint.id,
                     key_id = %transport.key.id,
-                    error = %err,
+                    error = %safe_model_fetch_error(&err),
                     "antigravity project metadata hydration failed"
                 );
                 return None;
             }
         };
-        let result =
-            match execution_runtime::execute_execution_runtime_sync_plan(self, None, &plan).await {
-                Ok(result) => result,
-                Err(err) => {
-                    warn!(
-                        provider_id = %transport.provider.id,
-                        endpoint_id = %transport.endpoint.id,
-                        key_id = %transport.key.id,
-                        error = ?err,
-                        "antigravity project metadata hydration request failed"
-                    );
-                    return None;
-                }
-            };
-        if !(200..300).contains(&result.status_code) {
-            warn!(
+        if hydration.onboarded {
+            debug!(
                 provider_id = %transport.provider.id,
-                endpoint_id = %transport.endpoint.id,
                 key_id = %transport.key.id,
-                status_code = result.status_code,
-                "antigravity project metadata hydration returned non-success status"
+                "antigravity project obtained through onboardUser"
             );
-            return None;
         }
-        let Some(project_id) = result
-            .body
-            .as_ref()
-            .and_then(|body| body.json_body.as_ref())
-            .and_then(extract_antigravity_load_code_assist_project_id)
-        else {
-            warn!(
-                provider_id = %transport.provider.id,
-                endpoint_id = %transport.endpoint.id,
-                key_id = %transport.key.id,
-                "antigravity project metadata hydration response missing project"
-            );
-            return None;
-        };
-        let upstream_metadata = serde_json::json!({
-            "antigravity": {
-                "project_id": project_id,
-                "updated_at": current_unix_secs(),
-            }
-        });
-        let merged_metadata =
-            merge_upstream_metadata(transport.key.upstream_metadata.as_ref(), &upstream_metadata);
+        let merged_metadata = merge_upstream_metadata(
+            transport.key.upstream_metadata.as_ref(),
+            &hydration.upstream_metadata,
+        );
 
         let mut hydrated = transport.clone();
         hydrated.key.upstream_metadata = Some(merged_metadata.clone());
@@ -179,6 +210,8 @@ impl AppState {
                 "antigravity project metadata hydration could not persist metadata"
             );
         }
+        self.persist_hydrated_project_id_into_auth_config(&mut hydrated, &hydration.project_id)
+            .await;
 
         Some(hydrated)
     }
@@ -194,23 +227,53 @@ impl AppState {
             return Some(transport.clone());
         }
 
-        let outcome =
-            match fetch_models_from_transports(self, std::slice::from_ref(transport)).await {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    warn!(
-                        provider_id = %transport.provider.id,
-                        endpoint_id = %transport.endpoint.id,
-                        key_id = %transport.key.id,
-                        error = %safe_model_fetch_error(&err),
-                        "gemini_cli project metadata hydration failed"
-                    );
-                    return None;
-                }
-            };
-        let upstream_metadata = outcome.upstream_metadata.as_ref()?;
-        let merged_metadata =
-            merge_upstream_metadata(transport.key.upstream_metadata.as_ref(), upstream_metadata);
+        let lock = project_hydration_lock(&transport.key.id);
+        let guard = lock.clone().lock_owned().await;
+        let hydrated = self
+            .hydrate_gemini_cli_project_metadata_locked(transport)
+            .await;
+        drop(guard);
+        release_project_hydration_lock(&transport.key.id, lock);
+        hydrated
+    }
+
+    async fn hydrate_gemini_cli_project_metadata_locked(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Option<GatewayProviderTransportSnapshot> {
+        if let Some(fresh) = self
+            .reread_transport_snapshot_for_hydration(transport)
+            .await
+        {
+            if provider_transport::resolve_gemini_cli_project_id(&fresh).is_some() {
+                return Some(fresh);
+            }
+        }
+
+        let hydration = match hydrate_gemini_cli_project(self, transport).await {
+            Ok(hydration) => hydration,
+            Err(err) => {
+                warn!(
+                    provider_id = %transport.provider.id,
+                    endpoint_id = %transport.endpoint.id,
+                    key_id = %transport.key.id,
+                    error = %safe_model_fetch_error(&err),
+                    "gemini_cli project metadata hydration failed"
+                );
+                return None;
+            }
+        };
+        if hydration.onboarded {
+            debug!(
+                provider_id = %transport.provider.id,
+                key_id = %transport.key.id,
+                "gemini_cli project obtained through onboardUser"
+            );
+        }
+        let merged_metadata = merge_upstream_metadata(
+            transport.key.upstream_metadata.as_ref(),
+            &hydration.upstream_metadata,
+        );
 
         let mut hydrated = transport.clone();
         hydrated.key.upstream_metadata = Some(merged_metadata.clone());
@@ -234,33 +297,106 @@ impl AppState {
                 "gemini_cli project metadata hydration could not persist metadata"
             );
         }
+        self.persist_hydrated_project_id_into_auth_config(&mut hydrated, &hydration.project_id)
+            .await;
 
         Some(hydrated)
     }
-}
 
-fn extract_antigravity_load_code_assist_project_id(value: &Value) -> Option<String> {
-    let raw = value
-        .get("cloudaicompanionProject")
-        .or_else(|| value.get("cloudAiCompanionProject"))?;
-    if let Some(project_id) = raw
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(project_id.to_string());
+    /// 把补全得到的 project 写回 Key 的 `auth_config.project_id`，并同步更新内存里的
+    /// transport 快照。失败只记日志：`upstream_metadata` 已经持久化，请求不受影响。
+    async fn persist_hydrated_project_id_into_auth_config(
+        &self,
+        hydrated: &mut GatewayProviderTransportSnapshot,
+        project_id: &str,
+    ) {
+        match self
+            .persist_provider_catalog_key_auth_config_project_id(hydrated, project_id)
+            .await
+        {
+            Ok(Some(auth_config)) => {
+                hydrated.key.decrypted_auth_config = Some(auth_config);
+            }
+            Ok(None) => {}
+            Err(err) => warn!(
+                provider_id = %hydrated.provider.id,
+                key_id = %hydrated.key.id,
+                error = %err.into_message(),
+                "project id could not be written back into auth_config"
+            ),
+        }
     }
-    raw.as_object()
-        .and_then(|object| {
-            object
-                .get("id")
-                .or_else(|| object.get("project_id"))
-                .or_else(|| object.get("projectId"))
-        })
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+
+    /// 写回 `auth_config.project_id`。返回写入后的明文 `auth_config`；已经一致、没有
+    /// `auth_config`、没有写入能力或 CAS 冲突时返回 `Ok(None)`，不做重试。
+    pub(crate) async fn persist_provider_catalog_key_auth_config_project_id(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+        project_id: &str,
+    ) -> Result<Option<String>, GatewayError> {
+        let project_id = project_id.trim();
+        if project_id.is_empty() || !self.has_provider_catalog_data_writer() {
+            return Ok(None);
+        }
+        let key_id = transport.key.id.trim();
+        let Some(stored) = self
+            .data
+            .list_provider_catalog_keys_by_ids(&[key_id.to_string()])
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?
+            .into_iter()
+            .find(|key| key.provider_id == transport.provider.id)
+        else {
+            return Ok(None);
+        };
+        let Some(plaintext) = self.decrypt_provider_catalog_key_auth_config(&stored)? else {
+            return Ok(None);
+        };
+        let Ok(Value::Object(mut auth_config)) = serde_json::from_str::<Value>(&plaintext) else {
+            return Ok(None);
+        };
+        if auth_config
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|existing| existing == project_id)
+        {
+            return Ok(None);
+        }
+        auth_config.insert(
+            "project_id".to_string(),
+            Value::String(project_id.to_string()),
+        );
+        let updated_plaintext = Value::Object(auth_config).to_string();
+        let sealed = self.seal_provider_catalog_key_auth_config(
+            &stored.provider_id,
+            &stored.id,
+            &updated_plaintext,
+        )?;
+        let updated = self
+            .data
+            .compare_and_swap_provider_catalog_key_credentials(
+                &ProviderCatalogKeyCredentialsCasUpdate {
+                    key_id: stored.id.clone(),
+                    expected_provider_id: stored.provider_id.clone(),
+                    expected_encrypted_api_key: stored.encrypted_api_key.clone(),
+                    expected_encrypted_auth_config: stored.encrypted_auth_config.clone(),
+                    encrypted_api_key: stored.encrypted_api_key.clone(),
+                    encrypted_auth_config: Some(sealed),
+                },
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if !updated {
+            debug!(
+                key_id = %stored.id,
+                "auth_config project id write-back lost the credential CAS; another writer moved first"
+            );
+            return Ok(None);
+        }
+        self.clear_provider_transport_snapshot_cache();
+        Ok(Some(updated_plaintext))
+    }
 }
 
 #[async_trait]
@@ -956,5 +1092,203 @@ impl SchedulerRuntimeState for AppState {
             max_entries,
             expected_epoch,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data_contracts::repository::provider_catalog::{
+        StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use serde_json::{json, Value};
+
+    use crate::data::GatewayDataState;
+    use crate::AppState;
+
+    fn credential_state() -> AppState {
+        AppState::new()
+            .expect("credential state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled()
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
+    fn seeded_state(
+        auth_config: Option<Value>,
+    ) -> (AppState, Arc<InMemoryProviderCatalogReadRepository>) {
+        let provider = StoredProviderCatalogProvider::new(
+            "provider-1".to_string(),
+            "Antigravity".to_string(),
+            None,
+            "antigravity".to_string(),
+        )
+        .expect("provider should build");
+        let endpoint = StoredProviderCatalogEndpoint::new(
+            "endpoint-1".to_string(),
+            "provider-1".to_string(),
+            "gemini:generate_content".to_string(),
+            Some("gemini".to_string()),
+            Some("generate_content".to_string()),
+            true,
+        )
+        .expect("endpoint should build")
+        .with_transport_fields(
+            "https://daily-cloudcode-pa.googleapis.com".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("endpoint transport should build");
+        let credential_state = credential_state();
+        let encrypted_api_key = credential_state
+            .seal_provider_catalog_key_api_key("provider-1", "key-1", "__placeholder__")
+            .expect("api key should seal");
+        let encrypted_auth_config = auth_config.map(|auth_config| {
+            credential_state
+                .seal_provider_catalog_key_auth_config(
+                    "provider-1",
+                    "key-1",
+                    &auth_config.to_string(),
+                )
+                .expect("auth config should seal")
+        });
+        let key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "OAuth key".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["gemini:generate_content"])),
+            encrypted_api_key,
+            encrypted_auth_config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build");
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+        ));
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository.clone())
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            );
+        (state, repository)
+    }
+
+    async fn stored_auth_config(state: &AppState) -> Option<Value> {
+        let key = state
+            .data
+            .list_provider_catalog_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("keys should list")
+            .into_iter()
+            .next()
+            .expect("key should exist");
+        state
+            .decrypt_provider_catalog_key_auth_config(&key)
+            .expect("auth config should decrypt")
+            .map(|plaintext| serde_json::from_str(&plaintext).expect("auth config json"))
+    }
+
+    #[tokio::test]
+    async fn onboarded_project_id_is_written_back_into_auth_config() {
+        let (state, _repository) = seeded_state(Some(json!({
+            "provider_type": "antigravity",
+            "refresh_token": "rt-1"
+        })));
+        let transport = state
+            .read_provider_transport_snapshot("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("transport should read")
+            .expect("transport should exist");
+
+        let written = state
+            .persist_provider_catalog_key_auth_config_project_id(&transport, " project-onboarded ")
+            .await
+            .expect("write-back should succeed")
+            .expect("auth config should change");
+        let written: Value = serde_json::from_str(&written).expect("written json");
+        assert_eq!(written["project_id"], "project-onboarded");
+        assert_eq!(written["refresh_token"], "rt-1");
+
+        let stored = stored_auth_config(&state)
+            .await
+            .expect("auth config stored");
+        assert_eq!(stored["project_id"], "project-onboarded");
+        assert_eq!(stored["refresh_token"], "rt-1");
+        assert_eq!(stored["provider_type"], "antigravity");
+
+        // 重新读出的 transport 能直接解析出 project，不再需要再次补全。
+        let reloaded = state
+            .read_provider_transport_snapshot("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("transport should read")
+            .expect("transport should exist");
+        assert!(matches!(
+            crate::provider_transport::antigravity::resolve_local_antigravity_request_auth(&reloaded),
+            crate::provider_transport::antigravity::AntigravityRequestAuthSupport::Supported(auth)
+                if auth.project_id == "project-onboarded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_back_is_a_no_op_when_the_project_id_already_matches() {
+        let (state, _repository) = seeded_state(Some(json!({
+            "refresh_token": "rt-1",
+            "project_id": "already-there"
+        })));
+        let transport = state
+            .read_provider_transport_snapshot("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("transport should read")
+            .expect("transport should exist");
+
+        let written = state
+            .persist_provider_catalog_key_auth_config_project_id(&transport, "already-there")
+            .await
+            .expect("write-back should succeed");
+        assert_eq!(written, None);
+        assert_eq!(
+            stored_auth_config(&state).await.expect("auth config")["project_id"],
+            "already-there"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_back_skips_keys_without_an_auth_config() {
+        let (state, _repository) = seeded_state(None);
+        let transport = state
+            .read_provider_transport_snapshot("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("transport should read")
+            .expect("transport should exist");
+
+        let written = state
+            .persist_provider_catalog_key_auth_config_project_id(&transport, "project-x")
+            .await
+            .expect("write-back should succeed");
+        assert_eq!(written, None);
+        assert_eq!(stored_auth_config(&state).await, None);
     }
 }

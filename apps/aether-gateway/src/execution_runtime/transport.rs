@@ -1823,20 +1823,9 @@ async fn send_request_inner(
         prepare_started_at.elapsed().as_millis() as u64,
     );
 
-    if transport_profile_uses_browser_wreq(plan.transport_profile.as_ref()) {
-        return send_via_browser_wreq_transport(
-            plan,
-            method,
-            headers,
-            body_bytes,
-            total_timeout,
-            stream_first_byte_timeout,
-            transport_controls,
-            apply_request_total_timeout,
-        )
-        .await;
-    }
-
+    // Node proxies own the upstream connection and must receive the selected profile.
+    // Choosing the local browser backend first would ignore the tunnel route (or fail
+    // while trying to read a conventional proxy URL from a node-only snapshot).
     if let Some(node_id) = resolve_tunnel_node_id(plan.proxy.as_ref()) {
         return send_via_tunnel_relay(
             plan,
@@ -1850,6 +1839,20 @@ async fn send_request_inner(
         )
         .await
         .map(DirectHttpResponse::Reqwest);
+    }
+
+    if transport_profile_uses_browser_wreq(plan.transport_profile.as_ref()) {
+        return send_via_browser_wreq_transport(
+            plan,
+            method,
+            headers,
+            body_bytes,
+            total_timeout,
+            stream_first_byte_timeout,
+            transport_controls,
+            apply_request_total_timeout,
+        )
+        .await;
     }
 
     let direct_transport_controls =
@@ -4703,10 +4706,137 @@ fn http_uri_effective_port(uri: &http::Uri) -> Option<u16> {
     })
 }
 
+/// browser_wreq 后端实际使用的 emulation：要么是 wreq-util 内置浏览器，要么是 P5 的
+/// Claude Code TLS 仿真规格映射出来的自定义 `wreq::Emulation`。
+enum BrowserWreqEmulation {
+    Builtin(wreq_util::Emulation),
+    Custom(wreq::Emulation),
+}
+
+impl wreq::EmulationFactory for BrowserWreqEmulation {
+    fn emulation(self) -> wreq::Emulation {
+        match self {
+            Self::Builtin(emulation) => wreq::EmulationFactory::emulation(emulation),
+            Self::Custom(emulation) => emulation,
+        }
+    }
+}
+
 fn browser_wreq_emulation_from_profile(
     profile: &ResolvedTransportProfile,
+) -> Result<BrowserWreqEmulation, ExecutionRuntimeTransportError> {
+    if let Some(spec) = crate::provider_transport::transport_profile_emulation_id(profile)
+        .as_deref()
+        .or(Some(profile.profile_id.as_str()))
+        .and_then(crate::provider_transport::claude_code::resolve_claude_code_tls_emulation_spec)
+    {
+        if spec.id == crate::provider_transport::claude_code::CHATGPT_COM_CHROME_TLS_PROFILE {
+            let browser = builtin_browser_wreq_emulation(
+                crate::provider_transport::claude_code::CHATGPT_COM_CHROME_BROWSER_PROFILE,
+            )?;
+            let mut emulation = wreq::EmulationFactory::emulation(browser);
+            // A TLS profile must preserve provider/OAuth headers. Chrome's default
+            // navigation headers (Sec-Fetch-*, Sec-CH-UA, Accept, ...) are unrelated
+            // to these API calls. Keep its TLS and HTTP/2 transport parameters.
+            emulation.headers_mut().clear();
+            return Ok(BrowserWreqEmulation::Custom(emulation));
+        }
+        return Ok(BrowserWreqEmulation::Custom(
+            claude_code_tls_emulation_from_spec(spec, profile),
+        ));
+    }
+    builtin_browser_wreq_emulation(&browser_transport_profile_name(profile))
+        .map(BrowserWreqEmulation::Builtin)
+}
+
+/// 把 `tls_profile.rs` 的纯数据规格映射成 wreq/BoringSSL 的 `Emulation`。
+///
+/// - 密码套件 / 曲线 / 签名算法直接用 BoringSSL 的 mini-language 字符串；
+/// - `alpn = None` 时清空 ALPN 列表（不发扩展）；
+/// - 扩展顺序走 `extension_permutation`（BoringSSL 的 `SSL_CTX_set_extension_order`：
+///   列出的按序发送、未列出的跟在后面，`padding` / `pre_shared_key` 由库固定放末尾）；
+/// - `aes_hw_override(true)` 让 TLS 1.3 套件顺序与 `cipher_list` 一致，不受本机 AES 硬件影响；
+/// - 头顺序按请求类型写入 `orig_headers`（HTTP/1.1 序列化时按此排序，未列出的跟在后面）。
+fn claude_code_tls_emulation_from_spec(
+    spec: &crate::provider_transport::claude_code::ClaudeCodeTlsEmulationSpec,
+    profile: &ResolvedTransportProfile,
+) -> wreq::Emulation {
+    use crate::provider_transport::claude_code::TlsProtocolVersion;
+    use wreq::tls::{AlpnProtocol, ExtensionType, TlsOptions, TlsVersion};
+
+    let tls_version = |version: TlsProtocolVersion| match version {
+        TlsProtocolVersion::Tls12 => TlsVersion::TLS_1_2,
+        TlsProtocolVersion::Tls13 => TlsVersion::TLS_1_3,
+    };
+    let mut tls = TlsOptions::builder()
+        .min_tls_version(tls_version(spec.min_tls_version))
+        .max_tls_version(tls_version(spec.max_tls_version))
+        .session_ticket(spec.session_ticket)
+        .renegotiation(spec.renegotiation)
+        .psk_dhe_ke(spec.psk_dhe_ke)
+        .enable_ocsp_stapling(spec.ocsp_stapling)
+        .enable_signed_cert_timestamps(spec.signed_cert_timestamps)
+        .grease_enabled(spec.grease)
+        .permute_extensions(spec.permute_extensions)
+        .pre_shared_key(false)
+        .aes_hw_override(true)
+        .preserve_tls13_cipher_list(true);
+    if !spec.cipher_list.is_empty() {
+        tls = tls.cipher_list(spec.cipher_list);
+    }
+    if !spec.curves_list.is_empty() {
+        tls = tls.curves_list(spec.curves_list);
+    }
+    if !spec.sigalgs_list.is_empty() {
+        tls = tls.sigalgs_list(spec.sigalgs_list);
+    }
+    if spec.key_shares_limit > 0 {
+        tls = tls.key_shares_limit(spec.key_shares_limit);
+    }
+    if let Some(protocols) = spec.alpn {
+        tls = tls.alpn_protocols(protocols.iter().map(|protocol| match *protocol {
+            "h2" => AlpnProtocol::HTTP2,
+            "h3" => AlpnProtocol::HTTP3,
+            _ => AlpnProtocol::HTTP1,
+        }));
+    }
+    if !spec.extension_order.is_empty() {
+        tls = tls.extension_permutation(
+            spec.extension_order
+                .iter()
+                .map(|id| ExtensionType::from(*id))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let mut tls = tls.build();
+    if spec.alpn.is_none() {
+        // `TlsOptions` 默认是 `Some([h2, http/1.1])`；显式置回 `None` 才是"不发 ALPN 扩展"。
+        tls.alpn_protocols = None;
+    }
+
+    let request_kind = profile
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.get("request_kind"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut orig_headers = wreq::header::OrigHeaderMap::new();
+    if let Some(order) = spec.header_order_for(request_kind) {
+        for name in order {
+            orig_headers.insert(*name);
+        }
+    }
+
+    wreq::Emulation::builder()
+        .tls_options(tls)
+        .orig_headers(orig_headers)
+        .build()
+}
+
+fn builtin_browser_wreq_emulation(
+    name: &str,
 ) -> Result<wreq_util::Emulation, ExecutionRuntimeTransportError> {
-    match normalize_browser_profile_name(browser_transport_profile_name(profile)).as_str() {
+    match normalize_browser_profile_name(name.to_string()).as_str() {
         "chrome100" => Ok(wreq_util::Emulation::Chrome100),
         "chrome101" => Ok(wreq_util::Emulation::Chrome101),
         "chrome104" => Ok(wreq_util::Emulation::Chrome104),
@@ -8120,6 +8250,11 @@ mod tests {
     #[tokio::test]
     async fn direct_sync_execution_runtime_routes_browser_wreq_transport_in_process() {
         async fn browser_upstream(headers: AxumHeaderMap, body: Bytes) -> axum::response::Response {
+            assert!(headers.contains_key("sec-ch-ua"));
+            assert!(headers["user-agent"]
+                .to_str()
+                .expect("browser user agent")
+                .contains("Chrome/136"));
             assert_eq!(
                 headers
                     .get("content-type")
@@ -8241,6 +8376,177 @@ mod tests {
             ExecutionRuntimeTransportError::UnsupportedTransportProfile(backend)
                 if backend == "browser_wreq:firefox999"
         ));
+    }
+
+    #[tokio::test]
+    async fn browser_wreq_tls_profiles_preserve_api_headers_without_browser_defaults() {
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new().route(
+            "/chat",
+            post(|headers: AxumHeaderMap| async move {
+                assert_eq!(headers["user-agent"], "claude-cli/test");
+                assert_eq!(headers["accept"], "application/json");
+                assert_eq!(headers["authorization"], "Bearer local-test");
+                for name in [
+                    "sec-ch-ua",
+                    "sec-ch-ua-mobile",
+                    "sec-ch-ua-platform",
+                    "sec-fetch-site",
+                    "sec-fetch-mode",
+                    "sec-fetch-user",
+                    "sec-fetch-dest",
+                    "upgrade-insecure-requests",
+                    "accept-language",
+                ] {
+                    assert!(
+                        !headers.contains_key(name),
+                        "unexpected browser header {name}"
+                    );
+                }
+                Json(json!({"ok": true}))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        for profile_id in [
+            "claude_code_node_openssl",
+            "claude_code_oauth_control_plane",
+            "chatgpt_com_chrome",
+        ] {
+            let mut plan = direct_timeout_plan(
+                format!("http://{addr}/chat"),
+                false,
+                ExecutionTimeouts {
+                    total_ms: Some(LOCAL_HTTP_SUCCESS_TIMEOUT_MS),
+                    ..Default::default()
+                },
+            );
+            plan.transport_profile =
+                crate::provider_transport::builtin_tls_emulation_transport_profile(profile_id);
+            plan.headers.extend([
+                ("user-agent".into(), "claude-cli/test".into()),
+                ("accept".into(), "application/json".into()),
+                ("authorization".into(), "Bearer local-test".into()),
+            ]);
+            let result = DirectSyncExecutionRuntime::new()
+                .execute_sync(&plan)
+                .await
+                .expect("TLS profile should send API request");
+            assert_eq!(result.status_code, 200, "{profile_id}");
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn browser_wreq_transport_builds_every_builtin_tls_emulation_profile() {
+        for profile_id in [
+            "claude_code_node_openssl",
+            "claude_code_oauth_control_plane",
+            "chatgpt_com_chrome",
+        ] {
+            let profile =
+                crate::provider_transport::builtin_tls_emulation_transport_profile(profile_id)
+                    .expect("builtin emulation profile should resolve");
+            assert_eq!(profile.backend, TRANSPORT_BACKEND_BROWSER_WREQ);
+            build_browser_wreq_client(
+                None,
+                None,
+                &profile,
+                ExecutionTransportControls::default(),
+                true,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{profile_id} should build a wreq client offline: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn claude_code_tls_emulation_maps_spec_into_wreq_tls_options() {
+        use crate::provider_transport::claude_code::{
+            CLAUDE_CODE_NODE_OPENSSL_SPEC, CLAUDE_CODE_OAUTH_CONTROL_PLANE_SPEC,
+        };
+
+        let inference_profile = crate::provider_transport::builtin_tls_emulation_transport_profile(
+            "claude_code_node_openssl",
+        )
+        .expect("profile");
+        let mut emulation = super::claude_code_tls_emulation_from_spec(
+            &CLAUDE_CODE_NODE_OPENSSL_SPEC,
+            &inference_profile,
+        );
+        let tls = emulation
+            .tls_options_mut()
+            .as_ref()
+            .expect("tls options should be set");
+        assert_eq!(
+            tls.alpn_protocols.as_deref(),
+            Some(&[wreq::tls::AlpnProtocol::HTTP1][..])
+        );
+        assert_eq!(
+            tls.cipher_list.as_deref(),
+            Some(CLAUDE_CODE_NODE_OPENSSL_SPEC.cipher_list)
+        );
+        assert_eq!(tls.curves_list.as_deref(), Some("X25519:P-256:P-384"));
+        assert_eq!(
+            tls.sigalgs_list.as_deref(),
+            Some(CLAUDE_CODE_NODE_OPENSSL_SPEC.sigalgs_list)
+        );
+        assert_eq!(tls.grease_enabled, Some(false));
+        assert_eq!(tls.permute_extensions, Some(false));
+        assert_eq!(tls.key_shares_limit, Some(1));
+        assert!(tls.enable_ocsp_stapling);
+        assert!(tls.enable_signed_cert_timestamps);
+        assert!(!tls.pre_shared_key);
+        assert_eq!(tls.aes_hw_override, Some(true));
+        assert_eq!(
+            tls.extension_permutation
+                .as_ref()
+                .map(|permutation| permutation.len()),
+            Some(CLAUDE_CODE_NODE_OPENSSL_SPEC.extension_order.len())
+        );
+        assert_eq!(
+            tls.extension_permutation
+                .as_ref()
+                .and_then(|permutation| permutation.first().copied()),
+            Some(wreq::tls::ExtensionType::SERVER_NAME)
+        );
+        let orig_headers = emulation.orig_headers_mut();
+        let first_header = orig_headers
+            .iter()
+            .next()
+            .map(|(name, _)| name.as_str().to_string());
+        assert_eq!(first_header.as_deref(), Some("accept"));
+        assert_eq!(
+            orig_headers.len(),
+            CLAUDE_CODE_NODE_OPENSSL_SPEC
+                .header_order_for("messages")
+                .expect("messages order")
+                .len()
+        );
+
+        let control_profile = crate::provider_transport::builtin_tls_emulation_transport_profile(
+            "claude_code_oauth_control_plane",
+        )
+        .expect("profile");
+        let mut emulation = super::claude_code_tls_emulation_from_spec(
+            &CLAUDE_CODE_OAUTH_CONTROL_PLANE_SPEC,
+            &control_profile,
+        );
+        let tls = emulation
+            .tls_options_mut()
+            .as_ref()
+            .expect("tls options should be set");
+        assert!(
+            tls.alpn_protocols.is_none(),
+            "control plane must not offer ALPN"
+        );
+        assert!(!tls.enable_ocsp_stapling);
+        assert!(!tls.enable_signed_cert_timestamps);
     }
 
     #[tokio::test]
@@ -8705,6 +9011,56 @@ mod tests {
             result.body.and_then(|body| body.json_body),
             Some(json!({"tunnel": true, "node_id": "node-1"}))
         );
+    }
+
+    #[tokio::test]
+    async fn browser_wreq_node_proxy_routes_profile_through_tunnel() {
+        let _env_lock = direct_reqwest_env_lock().lock().await;
+        let _relay_secret = set_test_env_var("AETHER_TUNNEL_RELAY_AUTH_SECRET", RELAY_TEST_SECRET);
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let app = Router::new().route(
+            "/api/internal/tunnel/relay/{node_id}",
+            post(|body: Bytes| async move {
+                let (meta, _) = decode_relay_envelope(&body);
+                assert_eq!(meta["transport_profile"]["backend"], "browser_wreq");
+                assert_eq!(
+                    meta["transport_profile"]["profile_id"],
+                    "claude_code_node_openssl"
+                );
+                // The node owns backend support. Preserve its failure rather than
+                // attempting a direct request or replacing the profile with rustls.
+                (
+                    http::StatusCode::NOT_IMPLEMENTED,
+                    Json(json!({"node_backend_unsupported": true})),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("relay test server");
+        });
+        for proxy_url in [None, Some("http://127.0.0.1:1".to_string())] {
+            let mut plan = tunnel_timeout_plan(false);
+            let mut proxy = tunnel_proxy_snapshot(format!("http://{addr}"));
+            proxy.url = proxy_url;
+            plan.proxy = Some(proxy);
+            plan.transport_profile =
+                crate::provider_transport::builtin_tls_emulation_transport_profile(
+                    "claude_code_node_openssl",
+                );
+            let result = DirectSyncExecutionRuntime::new()
+                .execute_sync(&plan)
+                .await
+                .expect("request should reach its configured node relay");
+            assert_eq!(result.status_code, 501);
+            assert_eq!(
+                result.body.and_then(|body| body.json_body),
+                Some(json!({"node_backend_unsupported": true}))
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]

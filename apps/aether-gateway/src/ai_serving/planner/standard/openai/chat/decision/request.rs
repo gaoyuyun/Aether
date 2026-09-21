@@ -86,6 +86,8 @@ pub(crate) struct LocalOpenAiChatCandidatePayloadParts {
     pub(super) conversion_mode: ConversionMode,
     pub(super) report_kind: String,
     pub(super) envelope_name: Option<&'static str>,
+    /// P6：敏感词混淆报告（目前只有 Antigravity 信封会产生），写入 report_context 顶层。
+    pub(super) sensitive_words_obfuscation: Option<Value>,
     pub(super) transport: Arc<GatewayProviderTransportSnapshot>,
     pub(super) request_redacted: bool,
     pub(super) transport_profile: Option<ResolvedTransportProfile>,
@@ -384,6 +386,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             conversion_mode,
             report_kind: resolved_report_kind,
             envelope_name: None,
+            sensitive_words_obfuscation: None,
             transport: Arc::clone(transport),
             request_redacted: redaction.redacted,
             transport_profile,
@@ -625,6 +628,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             conversion_mode,
             report_kind: resolved_report_kind,
             envelope_name: None,
+            sensitive_words_obfuscation: None,
             transport: Arc::clone(transport),
             request_redacted: redaction.redacted,
             transport_profile,
@@ -1007,6 +1011,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         conversion_mode,
         report_kind: resolved_report_kind,
         envelope_name: None,
+        sensitive_words_obfuscation: None,
         transport: Arc::clone(transport),
         request_redacted: redaction.redacted,
         transport_profile: None,
@@ -1159,6 +1164,7 @@ async fn build_antigravity_openai_chat_cross_format_payload_parts(
         conversion_mode,
         report_kind: resolved_report_kind,
         envelope_name: Some(ANTIGRAVITY_V1INTERNAL_ENVELOPE_NAME),
+        sensitive_words_obfuscation: resolved.sensitive_words_obfuscation,
         transport: resolved.transport,
         request_redacted,
         transport_profile: None,
@@ -1310,6 +1316,7 @@ async fn build_gemini_cli_openai_chat_cross_format_payload_parts(
         conversion_mode,
         report_kind: resolved_report_kind,
         envelope_name: Some(GEMINI_CLI_V1INTERNAL_ENVELOPE_NAME),
+        sensitive_words_obfuscation: None,
         transport: resolved.transport,
         request_redacted,
         transport_profile: None,
@@ -1532,6 +1539,7 @@ async fn resolve_openai_chat_to_openai_image_payload_parts(
         conversion_mode,
         report_kind: "openai_chat_stream_success".to_string(),
         envelope_name: None,
+        sensitive_words_obfuscation: None,
         transport: Arc::clone(transport),
         request_redacted: false,
         transport_profile: None,
@@ -1981,6 +1989,7 @@ async fn build_windsurf_openai_chat_payload_parts(
         conversion_mode,
         report_kind: resolved_report_kind,
         envelope_name: Some(WINDSURF_ENVELOPE_NAME),
+        sensitive_words_obfuscation: None,
         transport: Arc::clone(transport),
         request_redacted,
         transport_profile: None,
@@ -2126,6 +2135,7 @@ async fn build_kiro_openai_chat_cross_format_payload_parts(
         conversion_mode,
         report_kind: resolved_report_kind,
         envelope_name: Some(KIRO_ENVELOPE_NAME),
+        sensitive_words_obfuscation: None,
         transport: Arc::clone(transport),
         request_redacted,
         transport_profile: None,
@@ -2692,6 +2702,67 @@ mod tests {
         assert!(payload.provider_request_body["request"]
             .get("contents")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn openai_chat_to_antigravity_obfuscates_sensitive_words_and_carries_the_report() {
+        let state = AppState::new().expect("state should build");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(())
+            .expect("request should build");
+        let (parts, _) = request.into_parts();
+        let body_json = json!({
+            "model": "gemini-3.5-flash",
+            "messages": [
+                {"role": "system", "content": "You are a proxy for the API."},
+                {"role": "user", "content": "hello proxy"}
+            ],
+            "stream": true
+        });
+        let mut eligible = sample_antigravity_eligible();
+        let mut transport = sample_antigravity_transport();
+        transport.provider.config = Some(json!({"cloak": {"sensitive_words": ["proxy", "API"]}}));
+        eligible.transport = Arc::new(transport);
+
+        let payload = resolve_local_openai_chat_candidate_payload_parts(
+            &state,
+            &parts,
+            "trace-openai-chat-antigravity-words",
+            &body_json,
+            &sample_input(),
+            None,
+            &eligible,
+            0,
+            "candidate-0",
+            OPENAI_CHAT_STREAM_PLAN_KIND,
+            "openai_chat_stream_success",
+            true,
+        )
+        .await
+        .expect("candidate resolution should not fail")
+        .expect("antigravity candidate should build a payload");
+
+        assert_eq!(payload.envelope_name, Some("antigravity:v1internal"));
+        assert_eq!(
+            payload.provider_request_body["request"]["systemInstruction"]["parts"][0]["text"],
+            "You are a p\u{200B}roxy for the A\u{200B}PI."
+        );
+        // 对话内容不在 antigravity 的作用范围内。
+        assert_eq!(
+            payload.provider_request_body["request"]["contents"][0]["parts"][0]["text"],
+            "hello proxy"
+        );
+        assert_eq!(
+            payload.sensitive_words_obfuscation,
+            Some(json!({
+                "applied": true,
+                "replaced": 2,
+                "fields": ["request.systemInstruction.parts[0]"]
+            }))
+        );
     }
 
     #[tokio::test]

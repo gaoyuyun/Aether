@@ -8,6 +8,7 @@
 use serde_json::Value;
 
 use super::request::MAX_RESPONSES_WEBSOCKET_RESPONSE_ID_BYTES;
+use crate::ai_serving::openai_responses_incomplete_is_failure;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResponsesWebSocketFrameTerminal {
@@ -202,29 +203,6 @@ fn event_is_started(event: &Value) -> bool {
     )
 }
 
-/// 读取 `response.incomplete` 携带的 `incomplete_details.reason`。
-///
-/// 标准位置是 `response.incomplete_details.reason`；批量封装偶尔把
-/// `incomplete_details` 直接放在事件顶层，两处都要看，否则合法终态会被漏判。
-fn responses_incomplete_reason(event: &Value) -> Option<&str> {
-    [
-        event.pointer("/response/incomplete_details/reason"),
-        event.pointer("/incomplete_details/reason"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(Value::as_str)
-    .map(str::trim)
-    .find(|reason| !reason.is_empty())
-}
-
-fn responses_incomplete_has_explicit_error(event: &Value) -> bool {
-    [event.get("error"), event.pointer("/response/error")]
-        .into_iter()
-        .flatten()
-        .any(|error| !error.is_null())
-}
-
 /// Derives only the fallback status for `response.incomplete`.
 ///
 /// A non-empty reason is provider-owned protocol data. Treating it as a fixed
@@ -232,18 +210,14 @@ fn responses_incomplete_has_explicit_error(event: &Value) -> bool {
 /// and incorrectly penalize provider health. Missing/malformed reasons and
 /// explicit error markers still fail closed; numeric status and recognized
 /// error codes continue to override this fallback in
-/// [`websocket_event_status_code`].
+/// [`websocket_event_status_code`]. The classification itself lives in
+/// `aether_ai_formats` so the HTTP stream parser, the usage runtime and this
+/// relay agree on what a legitimate incomplete is.
 fn responses_incomplete_default_status(event: &Value) -> u16 {
-    match responses_incomplete_reason(event) {
-        None => 502,
-        Some(reason)
-            if reason.eq_ignore_ascii_case("error")
-                || reason.eq_ignore_ascii_case("server_error") =>
-        {
-            502
-        }
-        Some(_) if responses_incomplete_has_explicit_error(event) => 502,
-        Some(_) => 200,
+    if openai_responses_incomplete_is_failure(event) {
+        502
+    } else {
+        200
     }
 }
 

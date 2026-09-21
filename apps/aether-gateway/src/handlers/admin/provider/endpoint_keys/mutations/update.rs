@@ -5,6 +5,7 @@ use crate::handlers::admin::provider::write::keys::{
     admin_provider_key_update_requires_immediate_model_fetch,
     build_provider_catalog_key_admin_cas_update,
 };
+use crate::handlers::admin::provider::write::provider::CLOAK_SENSITIVE_WORDS_CHANGED_WARNING;
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::maintenance::ensure_provider_key_pool_scores_for_keys;
 use crate::provider_key_auth::provider_key_effective_api_formats;
@@ -86,10 +87,32 @@ pub(super) async fn maybe_handle(
         Err(detail) => return Ok(Some(bad_request_response(detail))),
     };
     let admin_update = build_provider_catalog_key_admin_cas_update(
+        state.as_ref(),
         &existing_key,
         updated_record.clone(),
         &provider.provider_type,
     );
+    let sensitive_words_changed =
+        if existing_key.encrypted_auth_config != updated_record.encrypted_auth_config {
+            let old_config = state
+                .as_ref()
+                .decrypt_provider_catalog_key_auth_config(&existing_key)
+                .ok()
+                .flatten();
+            let new_config = state
+                .as_ref()
+                .decrypt_provider_catalog_key_auth_config(&updated_record)
+                .map_err(|_| GatewayError::Internal("无法读取 Key 配置".to_string()))?;
+            crate::provider_transport::resolve_sensitive_word_list(
+                provider.config.as_ref(),
+                old_config.as_deref(),
+            ) != crate::provider_transport::resolve_sensitive_word_list(
+                provider.config.as_ref(),
+                new_config.as_deref(),
+            )
+        } else {
+            false
+        };
     if !state
         .compare_and_update_provider_catalog_key_admin_state(&admin_update)
         .await?
@@ -185,15 +208,16 @@ pub(super) async fn maybe_handle(
     let api_formats =
         provider_key_effective_api_formats(&updated, &provider.provider_type, &endpoints);
 
-    Ok(Some(
-        Json(state.build_admin_provider_key_response(
-            &updated,
-            &provider.provider_type,
-            &api_formats,
-            now_unix_secs,
-        ))
-        .into_response(),
-    ))
+    let mut response = state.build_admin_provider_key_response(
+        &updated,
+        &provider.provider_type,
+        &api_formats,
+        now_unix_secs,
+    );
+    if sensitive_words_changed {
+        response["warnings"] = json!([CLOAK_SENSITIVE_WORDS_CHANGED_WARNING]);
+    }
+    Ok(Some(Json(response).into_response()))
 }
 
 fn bad_request_response(detail: impl Into<String>) -> Response<Body> {

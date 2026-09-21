@@ -1,5 +1,6 @@
 import { renderRequest, renderResponse, type RenderBlock, type RenderResult } from '../conversation'
 import { getRawTextChunk, JsonPageReader, JSON_PAGE_SIZE, JSON_TEXT_CHUNK_SIZE } from './json-viewer'
+import { stripZeroWidth } from './zeroWidth'
 import {
   BodyDocumentError, MAX_BODY_BYTES, MAX_ENCODED_BODY_BYTES,
   type BodyConversationOptions, type BodyConversationPage, type BodyEncoding,
@@ -118,7 +119,16 @@ export class BodyDocumentEngine {
     }
   }
 
-  copy(conversation?: BodyConversationOptions): string {
+  /**
+   * 复制用全文。默认保留原始字节（包括敏感词混淆插入的 U+200B），
+   * `options.stripZeroWidth` 为「去除零宽字符后复制」。
+   */
+  copy(conversation?: BodyConversationOptions, options: { stripZeroWidth?: boolean } = {}): string {
+    const text = this.copyRaw(conversation)
+    return options.stripZeroWidth ? stripZeroWidth(text) : text
+  }
+
+  private copyRaw(conversation?: BodyConversationOptions): string {
     if (!conversation) return JSON.stringify(this.value, null, 2)
     const result = this.render(conversation)
     if (result.error) return `[Error] ${result.error}`

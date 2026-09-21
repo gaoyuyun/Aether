@@ -50,6 +50,30 @@ pub struct OAuthHttpResponse {
     pub status_code: u16,
     pub body_text: String,
     pub json_body: Option<Value>,
+    /// 上游 `Retry-After`（秒）；刷新 429 时据此退避。
+    pub retry_after_secs: Option<u64>,
+}
+
+impl OAuthHttpResponse {
+    /// 解析 HTTP `Retry-After` 头（秒或 HTTP-date）。
+    pub fn parse_retry_after_header(value: Option<&str>) -> Option<u64> {
+        let value = value?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(seconds);
+        }
+        if let Ok(seconds) = value.parse::<f64>() {
+            return (seconds.is_finite() && seconds >= 0.0).then(|| seconds.ceil() as u64);
+        }
+        let deadline = httpdate::parse_http_date(value).ok()?;
+        deadline
+            .duration_since(std::time::SystemTime::now())
+            .ok()
+            .map(|duration| duration.as_secs())
+            .or(Some(0))
+    }
 }
 
 impl std::fmt::Debug for OAuthHttpResponse {
@@ -99,6 +123,12 @@ impl OAuthHttpExecutor for ReqwestOAuthHttpExecutor {
             .await
             .map_err(|err| OAuthError::transport(err.to_string()))?;
         let status_code = response.status().as_u16();
+        let retry_after_secs = OAuthHttpResponse::parse_retry_after_header(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+        );
         if response
             .content_length()
             .is_some_and(|length| length > OAUTH_HTTP_RESPONSE_BODY_LIMIT_BYTES as u64)
@@ -122,6 +152,7 @@ impl OAuthHttpExecutor for ReqwestOAuthHttpExecutor {
             status_code,
             body_text,
             json_body,
+            retry_after_secs,
         })
     }
 }
@@ -142,6 +173,7 @@ mod tests {
     fn response_debug_output_does_not_expose_token_payloads() {
         let response = OAuthHttpResponse {
             status_code: 200,
+            retry_after_secs: None,
             body_text: "{\"access_token\":\"response-body-canary\"}".to_string(),
             json_body: Some(serde_json::json!({"refresh_token": "response-json-canary"})),
         };

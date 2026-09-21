@@ -101,6 +101,7 @@ mod tests {
             [
                 "antigravity",
                 "chatgpt_web",
+                "claude_code",
                 "codex",
                 "gemini_cli",
                 "grok",
@@ -113,9 +114,11 @@ mod tests {
         assert!(service.supports_quota_refresh("grok"));
         assert!(service.supports_quota_refresh("gemini_cli"));
         assert!(service.supports_quota_refresh("windsurf"));
+        // P2.6：claude_code 支持「被动刷新」（只重新物化响应头采集的 5h/7d 窗口）。
+        assert!(service.supports_quota_refresh("claude_code"));
         assert_eq!(
             service.quota_refresh_unsupported_message("claude_code"),
-            "Claude Code 暂不支持自动刷新额度：上游没有稳定可用的账号额度查询接口"
+            "Claude Code 额度为被动采集：5h / 7d 窗口来自请求响应头，不支持主动查询"
         );
         assert_eq!(
             service.quota_refresh_unsupported_message("vertex_ai"),

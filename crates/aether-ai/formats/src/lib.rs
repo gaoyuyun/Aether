@@ -48,10 +48,19 @@ pub use formats::openai::request_contract::{
 pub use formats::openai::responses::codex::{
     build_codex_model_catalog_metadata, bundled_codex_model_cards,
     codex_responses_lite_tool_is_client_executed, effective_codex_model_cards,
-    parse_codex_auth_identity, project_codex_catalog_model_card,
-    resolve_codex_responses_model_capabilities, CodexAuthIdentity, CodexResponsesModelCapabilities,
-    CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_USER_AGENT, CODEX_CLIENT_VERSION,
-    CODEX_MODEL_CATALOG_METADATA_FIELD, CODEX_RESPONSES_LITE_HEADER,
+    embedded_codex_model_catalog_source, parse_codex_auth_identity,
+    project_codex_catalog_model_card, resolve_codex_responses_model_capabilities,
+    CodexAuthIdentity, CodexResponsesModelCapabilities, CODEX_CLIENT_ORIGINATOR,
+    CODEX_CLIENT_USER_AGENT, CODEX_CLIENT_VERSION, CODEX_MODEL_CATALOG_METADATA_FIELD,
+    CODEX_RESPONSES_LITE_HEADER,
+};
+pub use formats::openai::responses::codex_sanitize::{
+    codex_tool_name_map, restore_codex_shortened_tool_name,
+    restore_codex_shortened_tool_names_in_output,
+    restore_codex_shortened_tool_names_in_stream_event, sanitize_codex_input_item_ids,
+    sanitize_codex_tools_for_backend, schema_satisfies_codex_strict_mode, shorten_codex_tool_name,
+    CodexInputIdSanitizeReport, CodexToolSanitizeReport, CODEX_INPUT_ITEM_ID_MAX_LEN,
+    CODEX_TOOL_NAME_MAX_LEN,
 };
 pub use formats::openai::responses::request::{
     validate_openai_responses_request_contract, OpenAiResponsesRequestContractViolation,
@@ -67,6 +76,9 @@ pub use formats::registry::{
     build_stream_transcoder, convert_request, convert_request_pure,
     convert_request_pure_with_context, convert_response, convert_response_pure, emit_request_pure,
     emit_response_pure, parse_request_pure, parse_response_pure,
+};
+pub use formats::shared::claude_thinking_capabilities::{
+    claude_thinking_capability, ClaudeThinkingCapability, ClaudeThinkingMode,
 };
 pub use formats::shared::model_directives::{
     apply_model_directive_mapping_patch, apply_model_directive_overrides_from_model,

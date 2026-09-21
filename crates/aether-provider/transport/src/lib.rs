@@ -23,8 +23,10 @@ pub mod policy;
 pub mod provider_types;
 mod request_body;
 mod request_url;
+pub mod retry_hint;
 pub mod rules;
 pub mod same_format_provider;
+pub mod sensitive_words;
 pub mod snapshot;
 mod standard;
 pub mod url;
@@ -112,10 +114,17 @@ pub use grok_build::{
 };
 pub use headers::{should_skip_request_header, should_skip_upstream_passthrough_header};
 pub use network::{
+    builtin_tls_emulation_transport_profile, configured_tls_emulation_profile_id,
+    configured_transport_profile_id_from_fingerprint,
+    resolve_oauth_control_plane_transport_profile,
+    resolve_oauth_control_plane_transport_profile_from_configs,
     resolve_transport_execution_timeouts, resolve_transport_profile, resolve_transport_profile_id,
     resolve_transport_proxy_snapshot, resolve_transport_proxy_snapshot_with_tunnel_affinity,
+    tls_probe_summary_from_upstream_metadata, transport_profile_emulation_id,
     transport_profile_is_configured, transport_proxy_is_locally_supported,
     TransportTunnelAffinityLookup, TransportTunnelAttachmentOwner,
+    TLS_PROBE_UPSTREAM_METADATA_NAMESPACE, TRANSPORT_EMULATION_PROFILE_EXTRA_KEY,
+    TRANSPORT_TLS_PROBE_EXTRA_KEY,
 };
 pub use oauth_refresh::{
     supports_local_oauth_request_auth_resolution, CachedOAuthEntry, LocalOAuthHttpExecutor,
@@ -153,6 +162,12 @@ pub use request_url::{
     transport_api_operation_unsupported_reason, transport_supports_api_operation,
     TransportOperationUnsupportedReason, TransportRequestUrlParams,
 };
+pub use retry_hint::{
+    anthropic_headers_indicate_unified_rejection, extract_upstream_retry_hint,
+    grok_response_error_text, grok_wait_duration_seconds_from_text, parse_go_duration,
+    parse_retry_after_header, parse_unix_or_timestamp, RetryHintScope, RetryHintSource,
+    UpstreamRetryHint, RETRY_HINT_IMMEDIATE_RETRY_THRESHOLD, RETRY_HINT_QUOTA_EXHAUSTED_THRESHOLD,
+};
 pub use rules::{
     apply_local_body_rules, apply_local_body_rules_with_request_headers, apply_local_header_rules,
     apply_local_header_rules_with_request_headers, body_rules_are_locally_supported,
@@ -169,11 +184,21 @@ pub use same_format_provider::{
     resolve_same_format_provider_direct_auth, same_format_provider_transport_supported,
     same_format_provider_transport_unsupported_reason,
     same_format_provider_transport_unsupported_reason_for_trace,
-    should_try_same_format_provider_oauth_auth, SameFormatProviderCompatibilityEdit,
-    SameFormatProviderCompatibilityEditAction, SameFormatProviderFamily,
-    SameFormatProviderHeadersInput, SameFormatProviderRequestBehavior,
+    should_try_same_format_provider_oauth_auth, ClaudeCodeWirePolicy,
+    SameFormatProviderCompatibilityEdit, SameFormatProviderCompatibilityEditAction,
+    SameFormatProviderFamily, SameFormatProviderHeadersInput, SameFormatProviderRequestBehavior,
     SameFormatProviderRequestBehaviorParams, SameFormatProviderRequestBodyInput,
     SameFormatProviderRequestBodyOutput, SameFormatProviderUpstreamUrlParams,
+};
+pub use sensitive_words::{
+    apply_sensitive_word_obfuscation, key_sensitive_word_list_override,
+    key_sensitive_word_list_override_from_raw, normalize_sensitive_word,
+    provider_sensitive_word_list, provider_type_supports_sensitive_words,
+    resolve_sensitive_word_list, strip_zero_width, SensitiveWordList,
+    SensitiveWordObfuscationReport, CLOAK_CONFIG_NAMESPACE, CLOAK_SENSITIVE_WORDS_AUTH_CONFIG_KEY,
+    CLOAK_SENSITIVE_WORDS_CONFIG_KEY, SENSITIVE_WORDS_OBFUSCATION_REPORT_FIELD,
+    SENSITIVE_WORD_MAX_CHARS, SENSITIVE_WORD_MAX_ENTRIES, SENSITIVE_WORD_MIN_CHARS,
+    SENSITIVE_WORD_ZERO_WIDTH,
 };
 pub use snapshot::{
     read_provider_transport_snapshot, GatewayProviderTransportSnapshot,

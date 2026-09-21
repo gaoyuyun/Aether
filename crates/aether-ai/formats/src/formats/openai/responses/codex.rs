@@ -327,245 +327,89 @@ pub fn effective_codex_model_cards(remote_cards: &[Value]) -> Vec<Value> {
     cards
 }
 
-fn reasoning_level_cards(efforts: &[&str]) -> Vec<Value> {
-    efforts
-        .iter()
-        .map(|effort| {
-            let description = match *effort {
-                "low" => "Fast responses with lighter reasoning",
-                "medium" => "Balances speed and reasoning depth for everyday tasks",
-                "high" => "Greater reasoning depth for complex problems",
-                "xhigh" => "Extra high reasoning depth for complex problems",
-                "max" => "Maximum reasoning depth for the hardest problems",
-                "ultra" => "Maximum reasoning with automatic task delegation",
-                _ => "",
-            };
-            json!({ "effort": effort, "description": description })
-        })
-        .collect()
-}
+/// 编译期内嵌的 Codex 客户端模型目录（`codex_client_models.json`）。上游
+/// `/backend-api/codex/models` 不可达时用它兜底；随版本同步 CLIProxyAPI 的
+/// `codex_client_models.json`，并保留 Aether 历史上支持过的 gpt-5.4 / gpt-5.4-mini /
+/// gpt-5.2 三张卡，避免旧配置里的模型名在拉取失败时消失。
+const EMBEDDED_CODEX_CLIENT_MODELS_JSON: &str = include_str!("codex_client_models.json");
 
-struct BundledCodexModelCardSpec<'a> {
-    model_id: &'a str,
-    display_name: &'a str,
-    description: &'a str,
-    default_reasoning_level: &'a str,
-    default_reasoning_summary: &'a str,
-    use_responses_lite: bool,
-    efforts: &'a [&'a str],
-    default_verbosity: &'a str,
-    supports_priority_tier: bool,
-}
-
-fn bundled_codex_model_card(spec: BundledCodexModelCardSpec<'_>) -> Value {
-    let service_tiers = spec
-        .supports_priority_tier
-        .then(|| {
-            json!({
-                "id": "priority",
-                "name": "Fast",
-                "description": "1.5x speed, increased usage",
+/// 内嵌目录的来源标注，管理端展示兜底原因时使用。
+pub fn embedded_codex_model_catalog_source() -> &'static str {
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE.get_or_init(|| {
+        serde_json::from_str::<Value>(EMBEDDED_CODEX_CLIENT_MODELS_JSON)
+            .ok()
+            .and_then(|root| {
+                root.get("source")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
             })
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
-    json!({
-        "id": spec.model_id,
-        "slug": spec.model_id,
-        "object": "model",
-        "owned_by": "openai",
-        "display_name": spec.display_name,
-        "description": spec.description,
-        "api_formats": ["openai:responses"],
-        "default_reasoning_level": spec.default_reasoning_level,
-        "supported_reasoning_levels": reasoning_level_cards(spec.efforts),
-        "default_reasoning_summary": spec.default_reasoning_summary,
-        "support_verbosity": true,
-        "default_verbosity": spec.default_verbosity,
-        "supports_parallel_tool_calls": true,
-        "service_tiers": service_tiers,
-        "use_responses_lite": spec.use_responses_lite,
+            .unwrap_or_default()
     })
 }
 
-fn bundled_gpt_5_6_codex_model_card(
-    model_id: &str,
-    display_name: &str,
-    description: &str,
-    default_reasoning_level: &str,
-    priority: u64,
-    multi_agent_version: &str,
-    supports_ultra: bool,
-) -> Value {
-    let mut efforts = vec!["low", "medium", "high", "xhigh", "max"];
-    if supports_ultra {
-        efforts.push("ultra");
+fn parse_embedded_codex_model_cards(text: &str) -> Result<Vec<Value>, String> {
+    let root: Value =
+        serde_json::from_str(text).map_err(|error| format!("目录不是合法 JSON：{error}"))?;
+    let models = root
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "models 必须是数组".to_string())?;
+    if models.is_empty() {
+        return Err("models 不能为空".to_string());
     }
-    let mut card = bundled_codex_model_card(BundledCodexModelCardSpec {
-        model_id,
-        display_name,
-        description,
-        default_reasoning_level,
-        default_reasoning_summary: "none",
-        use_responses_lite: true,
-        efforts: &efforts,
-        default_verbosity: "low",
-        supports_priority_tier: true,
-    });
-    let object = card
-        .as_object_mut()
-        .expect("bundled Codex model card must be an object");
-    object.extend(
-        json!({
-            "shell_type": "shell_command",
-            "supports_image_detail_original": true,
-            "supports_search_tool": true,
-            "input_modalities": ["text", "image"],
-            "context_window": 372_000,
-            "max_context_window": 372_000,
-            "comp_hash": "3000",
-            "experimental_supported_tools": [],
-            "visibility": "list",
-            "supported_in_api": true,
-            "priority": priority,
-            "additional_speed_tiers": ["fast"],
-            "multi_agent_version": multi_agent_version,
-            "tool_mode": "code_mode_only",
-            "prefer_websockets": true,
-            "reasoning_summary_format": "experimental",
-            "include_skills_usage_instructions": false,
-            "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": "text_and_image",
-            "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-            "minimal_client_version": "0.144.0",
-        })
-        .as_object()
-        .expect("bundled Codex model card extension must be an object")
-        .clone(),
-    );
-    card
-}
-
-fn bundled_codex_auto_review_model_card() -> Value {
-    let mut card = bundled_codex_model_card(BundledCodexModelCardSpec {
-        model_id: "codex-auto-review",
-        display_name: "Codex Auto Review",
-        description: "Automatic approval review model for Codex.",
-        default_reasoning_level: "medium",
-        default_reasoning_summary: "none",
-        use_responses_lite: false,
-        efforts: &["low", "medium", "high", "xhigh"],
-        default_verbosity: "low",
-        supports_priority_tier: false,
-    });
-    let object = card
-        .as_object_mut()
-        .expect("bundled Codex model card must be an object");
-    object.extend(
-        json!({
-            "shell_type": "shell_command",
-            "supports_image_detail_original": true,
-            "supports_search_tool": true,
-            "input_modalities": ["text", "image"],
-            "context_window": 272_000,
-            "max_context_window": 1_000_000,
-            "experimental_supported_tools": [],
-            "visibility": "hide",
-            "supported_in_api": true,
-            "priority": 43,
-            "additional_speed_tiers": [],
-            "prefer_websockets": true,
-            "reasoning_summary_format": "experimental",
-            "include_skills_usage_instructions": false,
-            "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": "text_and_image",
-            "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-            "minimal_client_version": "0.98.0",
-        })
-        .as_object()
-        .expect("bundled Codex model card extension must be an object")
-        .clone(),
-    );
-    card
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, card) in models.iter().enumerate() {
+        let object = card
+            .as_object()
+            .ok_or_else(|| format!("models[{index}] 必须是对象"))?;
+        let slug = object
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("models[{index}].slug 必填且非空"))?;
+        if object.get("id").and_then(Value::as_str) != Some(slug) {
+            return Err(format!("models[{index}].id 必须等于 slug"));
+        }
+        if !seen.insert(slug.to_string()) {
+            return Err(format!("models[{index}].slug 重复：{slug}"));
+        }
+        for field in ["display_name", "default_reasoning_level"] {
+            if object
+                .get(field)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(format!("models[{index}].{field} 必填"));
+            }
+        }
+        if !object
+            .get("supported_reasoning_levels")
+            .is_some_and(Value::is_array)
+        {
+            return Err(format!(
+                "models[{index}].supported_reasoning_levels 必须是数组"
+            ));
+        }
+        if !object
+            .get("api_formats")
+            .and_then(Value::as_array)
+            .is_some_and(|formats| {
+                !formats.is_empty() && formats.iter().all(|format| format.as_str().is_some())
+            })
+        {
+            return Err(format!("models[{index}].api_formats 必须是非空字符串数组"));
+        }
+    }
+    Ok(models.clone())
 }
 
 pub fn bundled_codex_model_cards() -> &'static [Value] {
     static CARDS: OnceLock<Vec<Value>> = OnceLock::new();
     CARDS.get_or_init(|| {
-        vec![
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-sol",
-                "GPT-5.6-Sol",
-                "Latest frontier agentic coding model.",
-                "low",
-                1,
-                "v2",
-                true,
-            ),
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-terra",
-                "GPT-5.6-Terra",
-                "Balanced agentic coding model for everyday work.",
-                "medium",
-                2,
-                "v2",
-                true,
-            ),
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-luna",
-                "GPT-5.6-Luna",
-                "Fast and affordable agentic coding model.",
-                "medium",
-                3,
-                "v1",
-                false,
-            ),
-            bundled_codex_model_card(BundledCodexModelCardSpec {
-                model_id: "gpt-5.5",
-                display_name: "GPT-5.5",
-                description: "Frontier model for complex coding, research, and real-world work.",
-                default_reasoning_level: "medium",
-                default_reasoning_summary: "none",
-                use_responses_lite: false,
-                efforts: &["low", "medium", "high", "xhigh"],
-                default_verbosity: "low",
-                supports_priority_tier: true,
-            }),
-            bundled_codex_model_card(BundledCodexModelCardSpec {
-                model_id: "gpt-5.4",
-                display_name: "GPT-5.4",
-                description: "Strong model for everyday coding.",
-                default_reasoning_level: "medium",
-                default_reasoning_summary: "none",
-                use_responses_lite: false,
-                efforts: &["low", "medium", "high", "xhigh"],
-                default_verbosity: "low",
-                supports_priority_tier: true,
-            }),
-            bundled_codex_model_card(BundledCodexModelCardSpec {
-                model_id: "gpt-5.4-mini",
-                display_name: "GPT-5.4 Mini",
-                description: "Small, fast, and cost-efficient model for simpler coding tasks.",
-                default_reasoning_level: "none",
-                default_reasoning_summary: "none",
-                use_responses_lite: false,
-                efforts: &["none", "low", "medium", "high", "xhigh"],
-                default_verbosity: "medium",
-                supports_priority_tier: false,
-            }),
-            bundled_codex_model_card(BundledCodexModelCardSpec {
-                model_id: "gpt-5.2",
-                display_name: "GPT-5.2",
-                description: "Optimized for professional work and long-running agents.",
-                default_reasoning_level: "medium",
-                default_reasoning_summary: "auto",
-                use_responses_lite: false,
-                efforts: &["low", "medium", "high", "xhigh"],
-                default_verbosity: "low",
-                supports_priority_tier: false,
-            }),
-            bundled_codex_auto_review_model_card(),
-        ]
+        parse_embedded_codex_model_cards(EMBEDDED_CODEX_CLIENT_MODELS_JSON)
+            .expect("embedded codex_client_models.json must be valid")
     })
 }
 
@@ -1886,6 +1730,7 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
     remove_empty_codex_instructions(body_object);
     strip_codex_hosted_tool_names_for_backend(body_object);
     strip_codex_hosted_tool_choice_name_for_backend(body_object);
+    super::codex_sanitize::sanitize_codex_tools_for_backend(body_object);
     if !is_openai_responses_compact_request(provider_api_format) {
         body_object
             .entry("tool_choice".to_string())
@@ -1956,6 +1801,7 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
         body_rules,
     );
     apply_codex_responses_lite_body_contract(body_object, capabilities, websocket_continuation);
+    super::codex_sanitize::sanitize_codex_input_item_ids(body_object);
     strip_codex_cache_control_fields(provider_request_body);
     apply_codex_openai_responses_compact_body_edits(
         provider_request_body,
@@ -2190,8 +2036,10 @@ mod tests {
         apply_codex_openai_responses_special_body_edits_with_source_model_and_capabilities,
         apply_codex_openai_responses_websocket_continuation_body_edits_with_source_model_and_capabilities,
         apply_codex_openai_special_headers, apply_openai_responses_compact_special_body_edits,
-        build_codex_model_catalog_metadata, bundled_codex_model_cards, effective_codex_model_cards,
-        parse_codex_auth_identity, project_codex_catalog_model_card,
+        build_codex_model_catalog_metadata, bundled_codex_model_cards,
+        codex_responses_model_capabilities_from_card, effective_codex_model_cards,
+        embedded_codex_model_catalog_source, parse_codex_auth_identity,
+        parse_embedded_codex_model_cards, project_codex_catalog_model_card,
         resolve_codex_responses_model_capabilities,
         validate_codex_openai_responses_compact_request_contract, CODEX_CLIENT_ORIGINATOR,
         CODEX_CLIENT_USER_AGENT, CODEX_CLIENT_VERSION, CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
@@ -2842,7 +2690,8 @@ mod tests {
             "codex-auto-review",
             None,
         );
-        assert!(!capabilities.use_responses_lite);
+        // 与上游 codex_client_models.json 保持一致：auto review 走 Responses Lite。
+        assert!(capabilities.use_responses_lite);
         assert_eq!(
             capabilities.default_reasoning_effort.as_deref(),
             Some("medium")
@@ -2850,7 +2699,62 @@ mod tests {
         assert_eq!(capabilities.default_reasoning_summary, None);
         assert!(capabilities.supports_parallel_tool_calls);
         assert_eq!(capabilities.default_verbosity.as_deref(), Some("low"));
-        assert!(capabilities.supported_service_tiers.is_empty());
+        assert_eq!(capabilities.supported_service_tiers, vec!["priority"]);
+    }
+
+    #[test]
+    fn embedded_codex_client_models_catalog_is_valid_and_keeps_legacy_cards() {
+        let cards = bundled_codex_model_cards();
+        let slugs = cards
+            .iter()
+            .map(|card| card["slug"].as_str().expect("slug"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slugs,
+            vec![
+                "gpt-6-astra",
+                "gpt-reserve",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.3-codex-spark",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.2",
+                "codex-auto-review",
+            ]
+        );
+        assert!(!embedded_codex_model_catalog_source().is_empty());
+        for card in cards {
+            assert_eq!(card["id"], card["slug"]);
+            assert_eq!(card["object"], "model");
+            assert_eq!(card["api_formats"], json!(["openai:responses"]));
+            assert!(card.get("base_instructions").is_none());
+            assert!(card.get("model_messages").is_none());
+            assert!(card.get("available_in_plans").is_none());
+            let (model_id, _) =
+                codex_responses_model_capabilities_from_card(card).expect("card projects");
+            assert_eq!(model_id, card["slug"]);
+        }
+        let astra = resolve_codex_responses_model_capabilities("gpt-6-astra", "gpt-6-astra", None);
+        assert!(astra.use_responses_lite);
+        assert!(astra.supports_reasoning_effort("ultra"));
+        let spark = resolve_codex_responses_model_capabilities(
+            "gpt-5.3-codex-spark",
+            "gpt-5.3-codex-spark",
+            None,
+        );
+        assert!(!spark.use_responses_lite);
+        assert_eq!(spark.default_reasoning_effort.as_deref(), Some("high"));
+        assert!(spark.supported_service_tiers.is_empty());
+
+        assert!(parse_embedded_codex_model_cards("{}").is_err());
+        assert!(parse_embedded_codex_model_cards(r#"{"models":[{"slug":"a","id":"b"}]}"#).is_err());
+        assert!(parse_embedded_codex_model_cards(
+            r#"{"models":[{"slug":"a","id":"a","display_name":"A","default_reasoning_level":"low","supported_reasoning_levels":[],"api_formats":["openai:responses"]},{"slug":"a","id":"a","display_name":"A","default_reasoning_level":"low","supported_reasoning_levels":[],"api_formats":["openai:responses"]}]}"#
+        )
+        .is_err());
     }
 
     #[test]

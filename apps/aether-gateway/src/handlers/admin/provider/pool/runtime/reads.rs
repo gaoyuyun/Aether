@@ -1,12 +1,13 @@
 use super::keys::{
     parse_pool_cost_member, parse_pool_latency_member, pool_cooldown_index_key, pool_cooldown_key,
-    pool_cooldown_keys, pool_cost_keys, pool_latency_keys, pool_lru_key, pool_sticky_key,
-    pool_sticky_pattern,
+    pool_cooldown_keys, pool_cooldown_meta_keys, pool_cost_keys, pool_latency_keys, pool_lru_key,
+    pool_model_cooldown_index_key, pool_model_cooldown_key, pool_model_cooldown_meta_key,
+    pool_sticky_key, pool_sticky_pattern,
 };
 use crate::handlers::admin::provider::pool::config::admin_provider_pool_cache_affinity_enabled;
 use crate::handlers::admin::provider::shared::support::{
     admin_provider_pool_quota_probe_active_members_key, AdminProviderPoolConfig,
-    AdminProviderPoolRuntimeState,
+    AdminProviderPoolModelCooldown, AdminProviderPoolRuntimeState,
 };
 use crate::maintenance::PoolQuotaProbeWorkerConfig;
 use crate::provider_pool_demand::{
@@ -184,10 +185,16 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
             .kv_get_many(&cooldown_keys)
             .await
             .unwrap_or_else(|_| vec![None; cooldown_keys.len()]);
-        for (key_id, (cooldown_key, reason)) in key_ids
-            .iter()
-            .zip(cooldown_keys.iter().zip(cooldown_reasons))
-        {
+        let meta_keys = pool_cooldown_meta_keys(provider_id, key_ids);
+        let cooldown_metas = runtime
+            .kv_get_many(&meta_keys)
+            .await
+            .unwrap_or_else(|_| vec![None; meta_keys.len()]);
+        for (key_id, (cooldown_key, (reason, meta))) in key_ids.iter().zip(
+            cooldown_keys
+                .iter()
+                .zip(cooldown_reasons.into_iter().zip(cooldown_metas)),
+        ) {
             if let Some(reason) = reason {
                 state.cooldown_reason_by_key.insert(key_id.clone(), reason);
                 if let Ok(Some(ttl)) = runtime.kv_ttl_seconds(cooldown_key).await {
@@ -198,6 +205,9 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
                                 .insert(key_id.clone(), ttl_seconds);
                         }
                     }
+                }
+                if let Some(meta) = meta.and_then(|raw| serde_json::from_str(&raw).ok()) {
+                    state.cooldown_meta_by_key.insert(key_id.clone(), meta);
                 }
             }
         }
@@ -268,6 +278,29 @@ pub(crate) async fn read_admin_provider_pool_runtime_state(
     state
 }
 
+/// 管理端展示用：把每把 Key 的模型级冷却列表补进运行时状态。调度热路径不要调它——
+/// 每把 Key 至少一次 `set_members`，命中时再逐模型读 KV，Redis 下是成倍的往返；
+/// 真正挡请求的是 `read_admin_provider_pool_key_model_cooldown_reason` 的单次点查。
+pub(crate) async fn attach_admin_provider_pool_model_cooldowns(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_ids: &[String],
+    state: &mut AdminProviderPoolRuntimeState,
+) {
+    let model_cooldowns = join_all(key_ids.iter().map(|key_id| async move {
+        (
+            key_id.clone(),
+            read_admin_provider_pool_key_model_cooldowns(runtime, provider_id, key_id).await,
+        )
+    }))
+    .await;
+    for (key_id, cooldowns) in model_cooldowns {
+        if !cooldowns.is_empty() {
+            state.model_cooldowns_by_key.insert(key_id, cooldowns);
+        }
+    }
+}
+
 pub(crate) async fn read_admin_provider_pool_cooldown_count(
     runtime: &RuntimeState,
     provider_id: &str,
@@ -296,6 +329,62 @@ pub(crate) async fn read_admin_provider_pool_key_cooldown_reason(
     runtime
         .kv_get(&pool_cooldown_key(provider_id, key_id))
         .await
+}
+
+/// 这把 Key 上某个模型的冷却原因；模型级冷却没开或没命中时为 `None`。
+pub(crate) async fn read_admin_provider_pool_key_model_cooldown_reason(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    model: &str,
+) -> Result<Option<String>, DataLayerError> {
+    if model.trim().is_empty() {
+        return Ok(None);
+    }
+    runtime
+        .kv_get(&pool_model_cooldown_key(provider_id, key_id, model))
+        .await
+}
+
+/// 这把 Key 当前所有仍在生效的模型级冷却，供管理端展示。
+pub(crate) async fn read_admin_provider_pool_key_model_cooldowns(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+) -> Vec<AdminProviderPoolModelCooldown> {
+    let models = runtime
+        .set_members(&pool_model_cooldown_index_key(provider_id, key_id))
+        .await
+        .unwrap_or_default();
+    let mut cooldowns = Vec::new();
+    for model in models {
+        let cooldown_key = pool_model_cooldown_key(provider_id, key_id, &model);
+        let Ok(Some(reason)) = runtime.kv_get(&cooldown_key).await else {
+            // 冷却已过期：顺手把索引里的模型名清掉。
+            let _ = runtime
+                .set_remove(&pool_model_cooldown_index_key(provider_id, key_id), &model)
+                .await;
+            continue;
+        };
+        let ttl_seconds = match runtime.kv_ttl_seconds(&cooldown_key).await {
+            Ok(Some(ttl)) if ttl > 0 => u64::try_from(ttl).unwrap_or(0),
+            _ => 0,
+        };
+        let meta = runtime
+            .kv_get(&pool_model_cooldown_meta_key(provider_id, key_id, &model))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        cooldowns.push(AdminProviderPoolModelCooldown {
+            model,
+            reason,
+            ttl_seconds,
+            meta,
+        });
+    }
+    cooldowns.sort_by(|left, right| left.model.cmp(&right.model));
+    cooldowns
 }
 
 #[cfg(test)]

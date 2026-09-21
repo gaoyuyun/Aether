@@ -3,7 +3,8 @@ use crate::ai_serving::planner::common::OPENAI_CHAT_STREAM_PLAN_KIND;
 use crate::ai_serving::planner::decision_input::apply_provider_request_routing_policy_to_decision;
 use crate::ai_serving::planner::report_context::{
     build_local_execution_report_context, insert_native_client_envelope_name,
-    insert_provider_stream_event_api_format, LocalExecutionReportContextParts,
+    insert_provider_stream_event_api_format, insert_sensitive_words_obfuscation_report,
+    LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::{
     build_ai_execution_decision_response, resolve_transport_request_encoding_policy,
@@ -115,6 +116,10 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
         );
         insert_native_client_envelope_name(&mut extra_fields, envelope_name, parts.uri.path());
     }
+    insert_sensitive_words_obfuscation_report(
+        &mut extra_fields,
+        resolved.sensitive_words_obfuscation.as_ref(),
+    );
     insert_provider_stream_event_api_format(
         &mut extra_fields,
         resolved.transport.provider.provider_type.as_str(),
@@ -151,6 +156,7 @@ pub(crate) async fn maybe_build_local_openai_chat_decision_payload_for_candidate
         request_redacted,
         transport_profile: _,
         image_request_summary: _,
+        sensitive_words_obfuscation: _,
     } = resolved;
     let original_request_body_json = if request_redacted {
         Some(&provider_request_body)

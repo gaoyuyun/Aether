@@ -3208,7 +3208,12 @@ impl AppState {
             provider_api_format: "provider_oauth:local_refresh".to_string(),
             model_name: Some(provider_type.to_string()),
             proxy: proxy_snapshot,
-            transport_profile: None,
+            // P5：只有该 Key / 供应商显式选了 TLS 仿真 profile 时，刷新才走对应的控制面
+            // profile（claude_code → Node/OpenSSL 控制面，codex → Chrome）；否则保持 None。
+            // 节点负责校验 backend 支持情况，不在刷新时静默丢弃显式配置。
+            transport_profile: provider_transport::resolve_oauth_control_plane_transport_profile(
+                transport,
+            ),
             timeouts: Some(ExecutionTimeouts {
                 connect_ms: Some(LOCAL_OAUTH_HTTP_TIMEOUT_MS),
                 read_ms: Some(LOCAL_OAUTH_HTTP_TIMEOUT_MS),
@@ -3320,6 +3325,13 @@ impl AppState {
         }
         Ok(provider_transport::LocalOAuthHttpResponse {
             status_code: result.status_code,
+            retry_after_secs: aether_oauth::network::OAuthHttpResponse::parse_retry_after_header(
+                result
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                    .map(|(_, value)| value.as_str()),
+            ),
             body_text: response_body_text,
         })
     }

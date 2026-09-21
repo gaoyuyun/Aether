@@ -254,6 +254,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
     provider_type: &str,
     entry: &AdminProviderOAuthBatchImportEntry,
     request_proxy: Option<ProxySnapshot>,
+    provider_config: Option<Value>,
 ) -> Result<AdminProviderOAuthResolvedBatchImport, String> {
     if provider_type.eq_ignore_ascii_case("codex") {
         if let Some(auth_config) = codex_agent_identity_auth_config_from_import(entry)? {
@@ -371,6 +372,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
             template,
             refresh_token,
             request_proxy.clone(),
+            provider_config,
         )
         .await
         {
@@ -550,6 +552,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
             provider_type,
             entry,
             request_proxy.clone(),
+            provider.config.clone(),
         )
         .await
         {

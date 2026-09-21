@@ -239,10 +239,24 @@ pub(crate) fn next_same_key_retry_index(
     identity.retry_index.checked_add(1)
 }
 
+/// 派生出的同 Key 重试，以及重试前应当等待的时长（上游给了 Retry-After 时才有）。
+pub(crate) struct SameKeyRetryDerivation<A> {
+    pub(crate) attempt: A,
+    /// 上游明确要求「几秒后再来」：按提示等待（封顶 3s）再发，别无间隔地撞。
+    pub(crate) wait_before_retry: Option<std::time::Duration>,
+}
+
 /// Derive the next same-key attempt for `attempt` after a candidate-scoped
 /// failure, reading the attempt identity and retry budget from its report
 /// context. Returns `None` when no further same-key retry is allowed.
 pub(crate) fn next_same_key_retry_attempt<A: AiExecutionAttempt>(attempt: &A) -> Option<A> {
+    next_same_key_retry_attempt_with_wait(attempt).map(|derivation| derivation.attempt)
+}
+
+/// 同 [`next_same_key_retry_attempt`]，另外带上重试前的等待时长。
+pub(crate) fn next_same_key_retry_attempt_with_wait<A: AiExecutionAttempt>(
+    attempt: &A,
+) -> Option<SameKeyRetryDerivation<A>> {
     let owned_report_context = attempt
         .report_context_ref()
         .is_none()
@@ -257,8 +271,41 @@ pub(crate) fn next_same_key_retry_attempt<A: AiExecutionAttempt>(attempt: &A) ->
         policy_same_key_retries: metadata.same_key_retries,
         provider_same_key_retries: provider_same_key_retries_from_report_context(report_context),
     };
-    let retry_index = next_same_key_retry_index(identity, budget)?;
-    attempt.with_same_key_retry(retry_index, Uuid::new_v4().to_string())
+    // 上游明确说「几秒后再来」（Retry-After < 3s 之类）时，号池不冷却这把 Key，
+    // 而是让它在预算之外再试一次。提示每次请求每把 Key 只发放一次、只能取一次，
+    // 所以上游持续限流时最多只会多撞一回，随后正常换 Key。
+    let upstream_retry_after_secs = super::take_pool_immediate_retry_hint(attempt.execution_plan());
+    let retry_index = match next_same_key_retry_index(identity, budget) {
+        Some(retry_index) => retry_index,
+        None if upstream_retry_after_secs.is_some() => {
+            next_same_key_retry_index_beyond_budget(identity)?
+        }
+        None => return None,
+    };
+    let attempt = attempt.with_same_key_retry(retry_index, Uuid::new_v4().to_string())?;
+    Some(SameKeyRetryDerivation {
+        attempt,
+        wait_before_retry: upstream_retry_after_secs
+            .map(super::pool_immediate_retry_wait)
+            .filter(|wait| !wait.is_zero()),
+    })
+}
+
+/// 上游要求立即重试时，在预算之外再给一次重试索引；仍受池内 stride 约束。
+fn next_same_key_retry_index_beyond_budget(identity: ExecutionAttemptIdentity) -> Option<u32> {
+    let (retry_base, pool_limit) = match identity.pool_key_index {
+        None => (0, u32::MAX),
+        Some(pool_key_index) => (
+            pool_key_index.checked_mul(POOL_KEY_RETRY_INDEX_STRIDE)?,
+            POOL_KEY_RETRY_INDEX_STRIDE,
+        ),
+    };
+    let retries_so_far = identity.retry_index.checked_sub(retry_base)?;
+    let next_retry = retries_so_far.checked_add(1)?;
+    if next_retry >= pool_limit {
+        return None;
+    }
+    identity.retry_index.checked_add(1)
 }
 
 #[cfg(test)]

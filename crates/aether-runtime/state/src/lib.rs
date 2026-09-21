@@ -666,6 +666,14 @@ impl RuntimeState {
         }
     }
 
+    /// 任意类型键的剩余 TTL（秒）。`Some(-1)` 表示没有过期时间，`None` 表示键不存在。
+    pub async fn key_ttl_seconds(&self, key: &str) -> Result<Option<i64>, DataLayerError> {
+        match self.backend.as_ref() {
+            RuntimeStateBackend::Memory(memory) => Ok(memory.key_ttl_seconds(key).await),
+            RuntimeStateBackend::Redis(redis) => redis.runtime.kv_ttl_seconds(key).await,
+        }
+    }
+
     pub async fn key_expire(&self, key: &str, ttl: Duration) -> Result<bool, DataLayerError> {
         match self.backend.as_ref() {
             RuntimeStateBackend::Memory(memory) => Ok(memory.key_expire(key, ttl).await),

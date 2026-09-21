@@ -15,6 +15,7 @@ use crate::ai_serving::planner::materialization_policy::{
 };
 use crate::ai_serving::planner::report_context::{
     build_local_execution_report_context, insert_native_client_envelope_name,
+    insert_sensitive_words_obfuscation_report, nested_sensitive_words_obfuscation_report,
     LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_same_format_provider_spec_metadata;
@@ -161,6 +162,34 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
             extra_fields.insert("request_body_compatibility_edits".to_string(), value);
         }
     }
+    if let Some(report) = resolved.claude_code_cloak_report.as_ref() {
+        extra_fields.insert(
+            crate::ai_serving::planner::claude_code_cloak::CLAUDE_CODE_CLOAK_REPORT_FIELD
+                .to_string(),
+            report.clone(),
+        );
+        // P6：混淆报告同时提升到 report_context 顶层，前端徽标与落库白名单只认顶层字段。
+        insert_sensitive_words_obfuscation_report(
+            &mut extra_fields,
+            nested_sensitive_words_obfuscation_report(report),
+        );
+        // 原生透传：不算兼容改写，保持 native_transparent 以便原始字节逐字节透传。
+        if report
+            .get("passthrough")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            adaptation_mode = AdaptationMode::NativeTransparent;
+            extra_fields.insert(
+                "adaptation_mode".to_string(),
+                json!(adaptation_mode.as_str()),
+            );
+        }
+    }
+    insert_sensitive_words_obfuscation_report(
+        &mut extra_fields,
+        resolved.sensitive_words_obfuscation.as_ref(),
+    );
     let provider_api_format = resolved.provider_api_format.clone();
     let (execution_strategy, conversion_mode) = ai_local_execution_contract_for_formats(
         spec_metadata.api_format,
@@ -240,6 +269,8 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         transport_profile: _,
         compatibility_edits: _,
         request_redacted: _,
+        claude_code_cloak_report: _,
+        sensitive_words_obfuscation: _,
     } = resolved;
     let request_encoding = resolve_transport_request_encoding_policy(&transport);
 

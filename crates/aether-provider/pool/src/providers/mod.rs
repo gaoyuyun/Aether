@@ -40,8 +40,9 @@ pub use kiro::{
     KIRO_USAGE_SDK_VERSION,
 };
 pub use unsupported::{
-    UnsupportedQuotaProviderPoolAdapter, CLAUDE_CODE_PROVIDER_POOL_ADAPTER,
-    GROK_BUILD_PROVIDER_POOL_ADAPTER, VERTEX_AI_PROVIDER_POOL_ADAPTER,
+    ClaudeCodePassiveQuotaProviderPoolAdapter, UnsupportedQuotaProviderPoolAdapter,
+    CLAUDE_CODE_PROVIDER_POOL_ADAPTER, GROK_BUILD_PROVIDER_POOL_ADAPTER,
+    VERTEX_AI_PROVIDER_POOL_ADAPTER,
 };
 pub use windsurf::{
     build_windsurf_pool_model_configs_request,

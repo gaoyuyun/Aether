@@ -2052,13 +2052,15 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_gemini_cli_with_trus
 async fn gateway_refresh_quota_reconciles_unsupported_fixed_provider_endpoints_before_clear_message(
 ) {
     let cases = [
+        // P2.6 之后 claude_code 支持被动刷新：端点照样先补全，但没有 Key 时给出
+        // 「没有可刷新的 Key」而不是「暂不支持」。
         (
             "provider-claude-code-reconcile",
             "claude_code",
             1usize,
             "claude:messages",
             "https://api.anthropic.com/v1",
-            "Claude Code 暂不支持自动刷新额度",
+            "没有可刷新的 Key",
         ),
         (
             "provider-vertex-ai-reconcile",

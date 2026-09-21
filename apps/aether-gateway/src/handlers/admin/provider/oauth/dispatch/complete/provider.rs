@@ -169,6 +169,7 @@ pub(super) async fn handle_admin_provider_oauth_complete_provider(
             &callback.state_nonce,
             state_data.pkce_verifier.as_deref(),
             request_proxy.clone(),
+            provider.config.clone(),
         )
         .await
     {

@@ -256,6 +256,14 @@ pub(crate) struct AdminProviderPoolConfig {
     pub(crate) stream_timeout_cooldown_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AdminProviderPoolModelCooldown {
+    pub(crate) model: String,
+    pub(crate) reason: String,
+    pub(crate) ttl_seconds: u64,
+    pub(crate) meta: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AdminProviderPoolRuntimeState {
     pub(crate) total_sticky_sessions: usize,
@@ -268,6 +276,10 @@ pub(crate) struct AdminProviderPoolRuntimeState {
     pub(crate) provider_burst_pending: bool,
     pub(crate) cooldown_reason_by_key: BTreeMap<String, String>,
     pub(crate) cooldown_ttl_by_key: BTreeMap<String, u64>,
+    /// 与冷却同生命周期的决策元数据（来源、绝对截止时刻、退避等级）。
+    pub(crate) cooldown_meta_by_key: BTreeMap<String, serde_json::Value>,
+    /// Key+模型 级冷却：`key_id -> model -> (reason, ttl_seconds, meta)`。
+    pub(crate) model_cooldowns_by_key: BTreeMap<String, Vec<AdminProviderPoolModelCooldown>>,
     pub(crate) cost_window_usage_by_key: BTreeMap<String, u64>,
     pub(crate) latency_avg_ms_by_key: BTreeMap<String, f64>,
     pub(crate) lru_score_by_key: BTreeMap<String, f64>,

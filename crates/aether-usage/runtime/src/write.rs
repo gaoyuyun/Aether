@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use aether_ai_formats::api::openai_responses_incomplete_reason_is_failure;
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::settlement::{
@@ -2962,12 +2963,16 @@ fn extract_explicit_error_message_from_json(value: &Value) -> Option<String> {
                 .map(ToOwned::to_owned)
         })
         .or_else(|| {
-            value
+            // 合法 incomplete（max_output_tokens / content_filter / 未来合法原因）是
+            // 可计费终态，不是错误；只有原因缺失或本身是错误时才提取成错误信息。
+            let reason = value
                 .get("response")
                 .and_then(|response| response.get("incomplete_details"))
                 .and_then(|details| details.get("reason"))
-                .and_then(Value::as_str)
-                .map(|reason| format!("Response incomplete: {reason}"))
+                .and_then(Value::as_str);
+            openai_responses_incomplete_reason_is_failure(reason)
+                .then(|| reason.map(|reason| format!("Response incomplete: {reason}")))
+                .flatten()
         })
         .or_else(|| extract_stream_error_message_from_chunks(value))
 }

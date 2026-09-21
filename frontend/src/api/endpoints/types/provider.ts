@@ -197,9 +197,247 @@ export interface ResponsesWebSocketProviderConfig {
   enabled: boolean
 }
 
+/**
+ * 供应商级冷却策略（`config.cooldown`）；Key 级 `auth_config.cooldown` 用同样的形状覆盖。
+ * - disable：关闭全部冷却写入（回滚开关）
+ * - transient_error_seconds：5xx / 408 / 520–526 等瞬时错误的冷却秒数
+ * - model_level：冷却按 Key+模型 而不是整把 Key
+ */
+export interface ProviderCooldownConfig {
+  disable?: boolean
+  transient_error_seconds?: number
+  model_level?: boolean
+}
+
+export const DEFAULT_PROVIDER_COOLDOWN_CONFIG: Required<ProviderCooldownConfig> = {
+  disable: false,
+  transient_error_seconds: 60,
+  model_level: false,
+}
+
+export function normalizeProviderCooldownConfig(value: unknown): Required<ProviderCooldownConfig> {
+  if (!isPlainObject(value)) return { ...DEFAULT_PROVIDER_COOLDOWN_CONFIG }
+  const source = value as ProviderCooldownConfig
+  const seconds = Number(source.transient_error_seconds)
+  return {
+    disable: source.disable === true,
+    transient_error_seconds: Number.isFinite(seconds) && seconds >= 0
+      ? Math.floor(seconds)
+      : DEFAULT_PROVIDER_COOLDOWN_CONFIG.transient_error_seconds,
+    model_level: source.model_level === true,
+  }
+}
+
+/**
+ * Claude Code 客户端伪装模式（`config.cloak.mode`，仅 claude_code）。
+ * - auto：只对识别为第三方的客户端改写（原生 Claude Code 逐字节透传）
+ * - always：所有客户端都改写
+ * - off：不改写，只做计费头版本同步
+ */
+export type ClaudeCodeCloakMode = 'auto' | 'always' | 'off'
+export const CLAUDE_CODE_CLOAK_MODES: readonly ClaudeCodeCloakMode[] = ['auto', 'always', 'off'] as const
+export const DEFAULT_CLAUDE_CODE_CLOAK_MODE: ClaudeCodeCloakMode = 'auto'
+
+export function normalizeClaudeCodeCloakMode(value: unknown): ClaudeCodeCloakMode {
+  const mode = String(value ?? '').trim().toLowerCase()
+  return (CLAUDE_CODE_CLOAK_MODES as readonly string[]).includes(mode)
+    ? (mode as ClaudeCodeCloakMode)
+    : DEFAULT_CLAUDE_CODE_CLOAK_MODE
+}
+
+/**
+ * 敏感词零宽混淆（`config.cloak.sensitive_words`，Key 级 `auth_config.cloak_sensitive_words` 覆盖）。
+ * 只对 claude_code 与 antigravity 生效；每个词 2–256 个 Unicode 标量、不区分大小写、最多 256 条。
+ */
+export const SENSITIVE_WORD_PROVIDER_TYPES: readonly string[] = ['claude_code', 'antigravity'] as const
+export const SENSITIVE_WORD_MIN_CHARS = 2
+export const SENSITIVE_WORD_MAX_CHARS = 256
+export const SENSITIVE_WORD_MAX_ENTRIES = 256
+
+export function providerTypeSupportsSensitiveWords(providerType: unknown): boolean {
+  return SENSITIVE_WORD_PROVIDER_TYPES.includes(String(providerType ?? '').trim().toLowerCase())
+}
+
+/** /iu 使用与后端正则一致的简单大小写折叠；toLowerCase 会错误合并 İ 和 i + U+0307。 */
+function sensitiveWordLiteralMatcher(word: string): RegExp {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`^(?:${escaped})$`, 'iu')
+}
+
+/** 后端回读的词表：非数组一律视为空。 */
+export function normalizeSensitiveWordList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const seen: RegExp[] = []
+  const words: string[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const word = entry.trim()
+    if (!word) continue
+    if (seen.some(matcher => matcher.test(word))) continue
+    seen.push(sensitiveWordLiteralMatcher(word))
+    words.push(word)
+  }
+  return words
+}
+
+export interface SensitiveWordListParseResult {
+  /** 去空、去重（不区分大小写）后的词表。 */
+  words: string[]
+  /** 过短（少于 2 个字符）的词，原样返回给表单高亮。 */
+  tooShort: string[]
+  /** 过长（超过 256 个 Unicode 标量）的词。 */
+  tooLong: string[]
+  /** 是否超过 256 条上限。 */
+  tooMany: boolean
+  /** 含零宽字符的词（词表本身不该带零宽）。 */
+  zeroWidth: string[]
+}
+
+/** 把逐行输入的文本解析成词表；每行一个词，空行忽略。 */
+export function parseSensitiveWordListText(text: string): SensitiveWordListParseResult {
+  const seen: RegExp[] = []
+  const words: string[] = []
+  const tooShort: string[] = []
+  const tooLong: string[] = []
+  const zeroWidth: string[] = []
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    const word = line.trim()
+    if (!word) continue
+    if (word.includes('\u200B')) {
+      zeroWidth.push(word)
+      continue
+    }
+    const length = [...word].length
+    if (length < SENSITIVE_WORD_MIN_CHARS) {
+      tooShort.push(word)
+      continue
+    }
+    if (length > SENSITIVE_WORD_MAX_CHARS) {
+      tooLong.push(word)
+      continue
+    }
+    if (seen.some(matcher => matcher.test(word))) continue
+    seen.push(sensitiveWordLiteralMatcher(word))
+    words.push(word)
+  }
+  return { words, tooShort, tooLong, tooMany: words.length > SENSITIVE_WORD_MAX_ENTRIES, zeroWidth }
+}
+
+/** 写入接口在响应顶层并列返回的提示（例如词表变更会让提示词缓存失效）。 */
+export function extractProviderWriteWarnings(payload: unknown): string[] {
+  const warnings = (payload as { warnings?: unknown } | null | undefined)?.warnings
+  if (!Array.isArray(warnings)) return []
+  return warnings.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
+/** 词表是否实际变化（不区分大小写、忽略顺序）。 */
+export function sensitiveWordListsEqual(left: readonly string[], right: readonly string[]): boolean {
+  const a = normalizeSensitiveWordList(left)
+  const b = normalizeSensitiveWordList(right).map(sensitiveWordLiteralMatcher)
+  return a.length === b.length && a.every(word => b.some(matcher => matcher.test(word)))
+}
+
+/**
+ * P5：传输指纹 profile（供应商 `config.fingerprint.transport_profile`，Key `fingerprint.transport_profile`）。
+ * - null：系统默认（claude_code 走 reqwest/rustls 的 `claude_code_nodejs`，其它类型走 reqwest 默认）
+ * - claude_code_node_openssl：BoringSSL/wreq 复刻 Claude Code 2.1.x 的 Node/OpenSSL ClientHello（HTTP/1.1）
+ * - chatgpt_com_chrome：BoringSSL/wreq 内置 Chrome 136（codex 控制面 / chatgpt.com）
+ * 控制面 profile（`claude_code_oauth_control_plane`）由网关按供应商类型自动选择，不作为可选项。
+ */
+export type TransportProfileId = 'claude_code_node_openssl' | 'chatgpt_com_chrome'
+export const TRANSPORT_PROFILE_IDS: readonly TransportProfileId[] = ['claude_code_node_openssl', 'chatgpt_com_chrome'] as const
+export const TRANSPORT_PROFILE_OPTIONS_BY_PROVIDER_TYPE: Readonly<Record<string, readonly TransportProfileId[]>> = {
+  claude_code: ['claude_code_node_openssl', 'chatgpt_com_chrome'],
+  codex: ['chatgpt_com_chrome'],
+}
+
+export function transportProfileOptionsForProviderType(providerType: unknown): readonly TransportProfileId[] {
+  return TRANSPORT_PROFILE_OPTIONS_BY_PROVIDER_TYPE[String(providerType ?? '').trim().toLowerCase()] ?? []
+}
+
+export function providerTypeSupportsTransportProfile(providerType: unknown): boolean {
+  return transportProfileOptionsForProviderType(providerType).length > 0
+}
+
+/** 后端回读的 transport_profile：只认内置 id（不区分大小写、`-` 视同 `_`），其它一律 null。 */
+export function normalizeTransportProfile(value: unknown): TransportProfileId | null {
+  const id = String(value ?? '').trim().toLowerCase().replace(/[-\s]/g, '_')
+  return (TRANSPORT_PROFILE_IDS as readonly string[]).includes(id) ? (id as TransportProfileId) : null
+}
+
+export function transportProfileLabel(value: TransportProfileId | null | undefined): string {
+  switch (value) {
+    case 'claude_code_node_openssl':
+      return 'Claude Code Node/OpenSSL'
+    case 'chatgpt_com_chrome':
+      return 'Chrome'
+    default:
+      return '系统默认'
+  }
+}
+
+/** Key 最近一次 TLS 指纹探针的摘要（只读，来自 `upstream_metadata.tls_probe`）。 */
+export interface TlsProbeSummary {
+  observed: boolean
+  probe_url?: string | null
+  probed_at_unix_secs?: number | null
+  emulation_profile?: string | null
+  profile_id?: string | null
+  backend?: string | null
+  tls_stack?: string | null
+  http_version?: string | null
+  ja3?: string | null
+  ja3_hash?: string | null
+  ja4?: string | null
+  peetprint?: string | null
+  akamai_fingerprint?: string | null
+  tls_version_negotiated?: string | null
+  http1_header_order?: string[] | null
+}
+
+export function normalizeTlsProbeSummary(value: unknown): TlsProbeSummary | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (record.observed !== true) return null
+  const str = (key: string): string | null => (typeof record[key] === 'string' && (record[key] as string).trim() ? (record[key] as string) : null)
+  const probedAt = Number(record.probed_at_unix_secs)
+  return {
+    observed: true,
+    probe_url: str('probe_url'),
+    probed_at_unix_secs: Number.isFinite(probedAt) && probedAt > 0 ? Math.floor(probedAt) : null,
+    emulation_profile: str('emulation_profile'),
+    profile_id: str('profile_id'),
+    backend: str('backend'),
+    tls_stack: str('tls_stack'),
+    http_version: str('http_version'),
+    ja3: str('ja3'),
+    ja3_hash: str('ja3_hash'),
+    ja4: str('ja4'),
+    peetprint: str('peetprint'),
+    akamai_fingerprint: str('akamai_fingerprint'),
+    tls_version_negotiated: str('tls_version_negotiated'),
+    http1_header_order: Array.isArray(record.http1_header_order)
+      ? record.http1_header_order.filter((item): item is string => typeof item === 'string')
+      : null,
+  }
+}
+
+/** Key 的 Claude Code 设备 profile 摘要（只读，完整 device_id 不下发）。 */
+export interface ClaudeCodeDeviceProfileSummary {
+  device_id_prefix: string
+  cli_version: string
+  package_version: string
+  runtime_version: string
+  os: string
+  arch: string
+  created_at_unix_secs: number
+  updated_at_unix_secs: number
+}
+
 export interface ProviderConfig {
   chat_pii_redaction?: ChatPiiRedactionProviderConfig
   codex?: CodexProviderConfig
+  cooldown?: ProviderCooldownConfig
   responses_websocket?: ResponsesWebSocketProviderConfig
   pool_advanced?: PoolAdvancedConfig
   failover_rules?: FailoverRulesConfig
@@ -245,6 +483,8 @@ export function isAllowedModelsList(value: AllowedModels): value is string[] {
 }
 
 export interface EndpointAPIKey {
+  /** 写入响应中的提示，例如有效词表变化导致提示词缓存失效。 */
+  warnings?: string[]
   id: string
   provider_id: string
   api_formats: string[]  // 支持的 endpoint signature 列表（如 "openai:chat"）
@@ -257,6 +497,14 @@ export interface EndpointAPIKey {
   runtime_auth_kind?: 'api_key' | 'bearer' | 'service_account' | 'mixed' | 'unknown' | string | null
   oauth_managed?: boolean
   agent_identity?: boolean
+  /** claude_code 供应商 Key 的设备 profile 摘要；未生成时为 null。 */
+  claude_code_device_profile?: ClaudeCodeDeviceProfileSummary | null
+  /** Key 级敏感词覆盖（仅 claude_code / antigravity）：null = 继承供应商；数组 = 覆盖（空数组 = 关闭混淆）。 */
+  cloak_sensitive_words?: string[] | null
+  /** P5：Key 级传输指纹 profile（`fingerprint.transport_profile`），未配置为 null。 */
+  transport_profile?: TransportProfileId | string | null
+  /** P5：最近一次 TLS 指纹探针摘要，未探测为 null。 */
+  tls_probe?: TlsProbeSummary | null
   oauth_header_auth?: boolean
   can_refresh_oauth?: boolean
   can_export_oauth?: boolean
@@ -577,6 +825,10 @@ export interface EndpointAPIKeyUpdate {
   model_exclude_patterns?: string[]  // 模型排除规则（支持 * 和 ? 通配符）
   // Key 级别代理配置（覆盖 Provider 级别代理），null=清除
   proxy?: ProxyConfig | null
+  /** Key 级敏感词覆盖三态：缺席 = 不动；null = 删除覆盖（继承供应商）；数组 = 覆盖（空数组 = 关闭）。 */
+  cloak_sensitive_words?: string[] | null
+  /** P5：Key 级传输指纹 profile 三态：缺席 = 不动；null = 回到供应商 / 系统默认；字符串 = 覆盖。 */
+  transport_profile?: TransportProfileId | null
 }
 
 export interface EndpointHealthDetail {
@@ -930,8 +1182,18 @@ export interface ProviderWithEndpointsSummary {
   ops_configured: boolean  // 是否配置了扩展操作（余额监控等）
   ops_architecture_id?: string  // 扩展操作使用的架构 ID（如 new_api, anyrouter）
   codex_fingerprint_convergence_enabled?: boolean
+  /** claude_code 供应商的客户端伪装模式；其它类型为 null。 */
+  claude_code_cloak_mode?: ClaudeCodeCloakMode | null
+  /** 敏感词词表（仅 claude_code / antigravity 回读数组，未配置为 []）；其它类型为 null。 */
+  cloak_sensitive_words?: string[] | null
+  /** P5：供应商级传输指纹 profile（`config.fingerprint.transport_profile`），未配置为 null。 */
+  transport_profile?: TransportProfileId | string | null
+  /** P5：该供应商类型可选的传输指纹 profile；非 claude_code / codex 为 []。 */
+  transport_profile_options?: string[] | null
   kiro_simulated_cache_enabled?: boolean
   responses_websocket_enabled?: boolean
+  /** 供应商级冷却策略；后端总是返回三个字段（缺省时为默认值）。 */
+  cooldown?: ProviderCooldownConfig | null
   ops_quota_alert_enabled?: boolean
   created_at: string
   updated_at: string

@@ -1,4 +1,5 @@
 import type { UsageRecord } from '../types'
+import { stripZeroWidth } from './zeroWidth'
 
 type SearchableUsageRecord = Pick<
   UsageRecord,
@@ -22,14 +23,15 @@ function normalizedSearchValues(record: SearchableUsageRecord): string[] {
     record.provider_key_name,
   ]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-    .map(value => value.toLocaleLowerCase())
+    .map(value => stripZeroWidth(value).toLocaleLowerCase())
 }
 
 export function matchesUsageRecordSearch(
   record: SearchableUsageRecord,
   search: string,
 ): boolean {
-  const keywords = search
+  // 混淆后的词按原词搜索：关键词与被搜索值都先去掉零宽字符。
+  const keywords = stripZeroWidth(search)
     .trim()
     .toLocaleLowerCase()
     .split(/\s+/)

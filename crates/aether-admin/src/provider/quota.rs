@@ -635,6 +635,95 @@ fn friendly_quota_display_name(
     candidate
 }
 
+/// Anthropic 在每个响应上都会带 `anthropic-ratelimit-unified-*` 头，描述共享的 5h / 7d
+/// 窗口。这里把它们收进 `upstream_metadata.claude_code`，形状：
+/// `{ updated_at, unified_status, representative_claim, windows: { "5h": {status, utilization, reset_at}, ... }, overage: {status, disabled_reason} }`。
+/// 没有任何限流头时返回 `None`。
+pub fn parse_claude_code_rate_limit_headers(
+    headers: &BTreeMap<String, String>,
+    updated_at_unix_secs: u64,
+) -> Option<serde_json::Value> {
+    const PREFIX: &str = "anthropic-ratelimit-unified-";
+    let normalized = codex_normalized_headers(headers);
+    if !normalized.keys().any(|key| key.starts_with(PREFIX)) {
+        return None;
+    }
+    let text = |name: &str| {
+        normalized
+            .get(&format!("{PREFIX}{name}"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let number = |name: &str| text(name).and_then(|value| value.parse::<f64>().ok());
+    let timestamp = |name: &str| {
+        text(name).and_then(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .map(|raw| {
+                    if raw > 100_000_000_000 {
+                        raw / 1_000
+                    } else {
+                        raw
+                    }
+                })
+                .or_else(|| {
+                    chrono::DateTime::parse_from_rfc3339(&value)
+                        .ok()
+                        .and_then(|parsed| u64::try_from(parsed.timestamp()).ok())
+                })
+        })
+    };
+
+    let mut windows = serde_json::Map::new();
+    for window in ["5h", "7d", "7d_oi"] {
+        let status = text(&format!("{window}-status"));
+        let utilization = number(&format!("{window}-utilization"));
+        let reset_at = timestamp(&format!("{window}-reset"));
+        if status.is_none() && utilization.is_none() && reset_at.is_none() {
+            continue;
+        }
+        let mut object = serde_json::Map::new();
+        if let Some(status) = status.as_deref() {
+            object.insert("status".to_string(), json!(status.to_ascii_lowercase()));
+        }
+        if let Some(utilization) = utilization {
+            object.insert("utilization".to_string(), json!(utilization));
+        }
+        if let Some(reset_at) = reset_at {
+            object.insert("reset_at".to_string(), json!(reset_at));
+        }
+        windows.insert(window.to_string(), serde_json::Value::Object(object));
+    }
+
+    let mut result = serde_json::Map::new();
+    result.insert("updated_at".to_string(), json!(updated_at_unix_secs));
+    if let Some(status) = text("status") {
+        result.insert(
+            "unified_status".to_string(),
+            json!(status.to_ascii_lowercase()),
+        );
+    }
+    if let Some(reset_at) = timestamp("reset") {
+        result.insert("unified_reset_at".to_string(), json!(reset_at));
+    }
+    if let Some(claim) = text("representative-claim") {
+        result.insert("representative_claim".to_string(), json!(claim));
+    }
+    let mut overage = serde_json::Map::new();
+    if let Some(status) = text("overage-status") {
+        overage.insert("status".to_string(), json!(status.to_ascii_lowercase()));
+    }
+    if let Some(reason) = text("overage-disabled-reason") {
+        overage.insert("disabled_reason".to_string(), json!(reason));
+    }
+    if !overage.is_empty() {
+        result.insert("overage".to_string(), serde_json::Value::Object(overage));
+    }
+    result.insert("windows".to_string(), serde_json::Value::Object(windows));
+    Some(serde_json::Value::Object(result))
+}
+
 pub fn parse_gemini_cli_v1internal_credits_response(
     value: &serde_json::Value,
     updated_at_unix_secs: u64,
@@ -4058,9 +4147,10 @@ mod tests {
         extract_execution_error_detail, merge_codex_quota_metadata_snapshot,
         normalize_codex_reset_credit_consume_outcome, parse_antigravity_quota_summary_response,
         parse_antigravity_usage_response, parse_chatgpt_web_conversation_init_response,
-        parse_codex_backend_me_response, parse_codex_usage_headers,
-        parse_codex_websocket_rate_limits_response, parse_codex_wham_reset_credits_detail_response,
-        parse_codex_wham_usage_response, parse_gemini_cli_retrieve_user_quota_response,
+        parse_claude_code_rate_limit_headers, parse_codex_backend_me_response,
+        parse_codex_usage_headers, parse_codex_websocket_rate_limits_response,
+        parse_codex_wham_reset_credits_detail_response, parse_codex_wham_usage_response,
+        parse_gemini_cli_retrieve_user_quota_response,
         parse_gemini_cli_v1internal_credits_response, parse_windsurf_model_configs_response,
         parse_windsurf_rate_limit_response, parse_windsurf_user_status_response,
         provider_auto_remove_quota_exhausted_keys, quota_refresh_success_invalid_state,
@@ -7450,5 +7540,60 @@ mod tests {
         let serialized = parsed.to_string();
         assert!(!serialized.contains("upstream-secret"));
         assert!(!serialized.contains("user:password"));
+    }
+
+    #[test]
+    fn parses_claude_code_unified_rate_limit_headers() {
+        let headers = BTreeMap::from([
+            (
+                "Anthropic-Ratelimit-Unified-Status".to_string(),
+                "allowed_warning".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-status".to_string(),
+                "allowed".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-utilization".to_string(),
+                "0.42".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset".to_string(),
+                "1800003600".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-status".to_string(),
+                "rejected".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-utilization".to_string(),
+                "1.0".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-reset".to_string(),
+                "1800300000".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-overage-status".to_string(),
+                "rejected".to_string(),
+            ),
+        ]);
+        let parsed = parse_claude_code_rate_limit_headers(&headers, 1_800_000_000)
+            .expect("headers should parse");
+        assert_eq!(parsed["updated_at"], json!(1_800_000_000u64));
+        assert_eq!(parsed["unified_status"], json!("allowed_warning"));
+        assert_eq!(parsed["windows"]["5h"]["status"], json!("allowed"));
+        assert_eq!(parsed["windows"]["5h"]["utilization"], json!(0.42));
+        assert_eq!(parsed["windows"]["5h"]["reset_at"], json!(1_800_003_600u64));
+        assert_eq!(parsed["windows"]["7d"]["status"], json!("rejected"));
+        assert_eq!(parsed["windows"]["7d"]["reset_at"], json!(1_800_300_000u64));
+        assert!(parsed["windows"].get("7d_oi").is_none());
+        assert_eq!(parsed["overage"]["status"], json!("rejected"));
+
+        assert!(parse_claude_code_rate_limit_headers(
+            &BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            1_800_000_000
+        )
+        .is_none());
     }
 }

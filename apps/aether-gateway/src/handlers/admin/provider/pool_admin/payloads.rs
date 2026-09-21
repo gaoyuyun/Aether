@@ -1100,10 +1100,7 @@ pub(super) fn build_admin_pool_key_payload(
     codex_cycle_usage_by_code: Option<&BTreeMap<String, StoredProviderApiKeyWindowUsageSummary>>,
     now_unix_secs: u64,
 ) -> serde_json::Value {
-    let cooldown_reason = runtime
-        .cooldown_reason_by_key
-        .get(&key.id)
-        .map(|_| "Provider key is cooling down".to_string());
+    let cooldown_reason = runtime.cooldown_reason_by_key.get(&key.id).cloned();
     let cooldown_ttl_seconds = cooldown_reason
         .as_ref()
         .and_then(|_| runtime.cooldown_ttl_by_key.get(&key.id).copied());
@@ -1417,6 +1414,31 @@ pub(super) fn build_admin_pool_key_payload(
     payload.insert(
         "cooldown_ttl_seconds".to_string(),
         json!(cooldown_ttl_seconds),
+    );
+    payload.insert(
+        "cooldown_until".to_string(),
+        json!(cooldown_ttl_seconds.map(|ttl| now_unix_secs.saturating_add(ttl))),
+    );
+    payload.insert(
+        "cooldown_meta".to_string(),
+        json!(runtime.cooldown_meta_by_key.get(&key.id).cloned()),
+    );
+    payload.insert(
+        "model_cooldowns".to_string(),
+        json!(runtime
+            .model_cooldowns_by_key
+            .get(&key.id)
+            .map(|cooldowns| cooldowns
+                .iter()
+                .map(|cooldown| json!({
+                    "model": cooldown.model,
+                    "reason": cooldown.reason,
+                    "ttl_seconds": cooldown.ttl_seconds,
+                    "until": now_unix_secs.saturating_add(cooldown.ttl_seconds),
+                    "meta": cooldown.meta,
+                }))
+                .collect::<Vec<_>>())
+            .unwrap_or_default()),
     );
     payload.insert(
         "cost_window_usage".to_string(),

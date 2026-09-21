@@ -467,8 +467,12 @@ pub(crate) async fn update_existing_provider_oauth_catalog_key(
     }
     updated.updated_at_unix_secs = Some(now_unix_secs);
     rotate_codex_credential_generation(&mut updated, provider_type);
-    let admin_update =
-        build_provider_catalog_key_admin_cas_update(existing_key, updated.clone(), provider_type);
+    let admin_update = build_provider_catalog_key_admin_cas_update(
+        state.app(),
+        existing_key,
+        updated.clone(),
+        provider_type,
+    );
     if !state
         .compare_and_update_provider_catalog_key_admin_state(&admin_update)
         .await?

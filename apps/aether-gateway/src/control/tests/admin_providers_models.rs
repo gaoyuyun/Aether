@@ -194,6 +194,28 @@ fn classifies_admin_provider_clear_pool_cooldown_as_admin_proxy_route() {
 }
 
 #[test]
+fn classifies_admin_provider_clear_reasoning_replay_as_admin_proxy_route() {
+    let headers = headers(&[]);
+    let uri: Uri = "/api/admin/providers/provider-codex/pool/clear-reasoning-replay/key-codex"
+        .parse()
+        .expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_class.as_deref(), Some("admin_proxy"));
+    assert_eq!(decision.route_family.as_deref(), Some("providers_manage"));
+    assert_eq!(
+        decision.route_kind.as_deref(),
+        Some("clear_reasoning_replay")
+    );
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("admin:providers")
+    );
+    assert!(!decision.is_execution_runtime_candidate());
+}
+
+#[test]
 fn classifies_admin_provider_reset_pool_cost_as_admin_proxy_route() {
     let headers = headers(&[]);
     let uri: Uri = "/api/admin/providers/provider-openai/pool/reset-cost/key-openai"

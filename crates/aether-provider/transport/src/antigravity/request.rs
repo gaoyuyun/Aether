@@ -1,6 +1,127 @@
 use serde_json::{Map, Value};
 
-use super::auth::{AntigravityRequestAuth, ANTIGRAVITY_REQUEST_USER_AGENT};
+use super::auth::AntigravityRequestAuth;
+use super::version::{
+    antigravity_request_user_agent_for_version, resolve_antigravity_client_version,
+};
+
+/// Antigravity 私有后端按模型卡限制 `maxOutputTokens`（对应 CLIProxyAPI 注册表里的
+/// `max_completion_tokens`）。超过上限的请求会被上游拒绝，所以在信封层截断。
+/// 前缀匹配放在精确匹配之后，用来兜住未列出的同系列型号。
+const ANTIGRAVITY_MODEL_OUTPUT_LIMITS: &[(&str, u64)] = &[
+    ("claude-opus-4-6-thinking", 64_000),
+    ("claude-sonnet-4-6", 64_000),
+    ("gemini-3-flash", 65_536),
+    ("gemini-3.6-flash-high", 65_536),
+    ("gemini-3.7-flash-high", 65_536),
+    ("gemini-3.8-flash-high", 65_536),
+    ("gemini-pro-agent", 65_535),
+    ("gemini-3.1-pro-low", 65_535),
+    ("gemini-3.1-flash-lite", 65_535),
+    ("gemini-3.5-flash-lite", 65_535),
+    ("gpt-oss-120b-medium", 32_768),
+];
+const ANTIGRAVITY_MODEL_OUTPUT_LIMIT_PREFIXES: &[(&str, u64)] = &[
+    ("claude-", 64_000),
+    ("gemini-", 65_535),
+    ("gpt-oss-", 32_768),
+];
+
+/// 信封构造时的模型策略。`max_output_tokens_cap` 为 `None` 时按内置模型卡查表。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AntigravityRequestPolicy {
+    pub max_output_tokens_cap: Option<u64>,
+}
+
+/// Antigravity 上的 Claude 系列走 Anthropic Vertex 通道：工具调用只接受
+/// `VALIDATED` 模式，`maxOutputTokens` 需要保留并按模型卡截断。
+pub fn antigravity_model_is_claude(model: &str) -> bool {
+    model
+        .trim()
+        .get(.."claude-".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude-"))
+}
+
+/// 内置模型卡里的输出上限；未知模型返回 `None`，此时不截断。
+pub fn antigravity_model_max_output_tokens(model: &str) -> Option<u64> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    ANTIGRAVITY_MODEL_OUTPUT_LIMITS
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(model))
+        .or_else(|| {
+            ANTIGRAVITY_MODEL_OUTPUT_LIMIT_PREFIXES
+                .iter()
+                .find(|(prefix, _)| {
+                    model
+                        .get(..prefix.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                })
+        })
+        .map(|(_, limit)| *limit)
+}
+
+/// 与 CLIProxyAPI `antigravity_executor_request.go` 一致的模型分支：
+/// 1. `maxOutputTokens` 超过模型卡上限时截断到上限；
+/// 2. Claude 模型强制 `toolConfig.functionCallingConfig.mode = "VALIDATED"`；
+/// 3. 非 Claude 模型删除 `maxOutputTokens`，交给上游按模型默认值处理。
+fn apply_antigravity_model_request_policy(
+    request: &mut Map<String, Value>,
+    model: &str,
+    policy: AntigravityRequestPolicy,
+) {
+    let cap = policy
+        .max_output_tokens_cap
+        .or_else(|| antigravity_model_max_output_tokens(model));
+    if let Some(cap) = cap {
+        for config_key in ["generationConfig", "generation_config"] {
+            let Some(config) = request.get_mut(config_key).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for tokens_key in ["maxOutputTokens", "max_output_tokens"] {
+                let Some(current) = config.get(tokens_key).and_then(Value::as_u64) else {
+                    continue;
+                };
+                if current > cap {
+                    config.insert(tokens_key.to_string(), Value::from(cap));
+                }
+            }
+        }
+    }
+
+    if antigravity_model_is_claude(model) {
+        let tool_config = request
+            .entry("toolConfig".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !tool_config.is_object() {
+            *tool_config = Value::Object(Map::new());
+        }
+        let Some(tool_config) = tool_config.as_object_mut() else {
+            return;
+        };
+        tool_config.remove("function_calling_config");
+        let calling_config = tool_config
+            .entry("functionCallingConfig".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !calling_config.is_object() {
+            *calling_config = Value::Object(Map::new());
+        }
+        if let Some(calling_config) = calling_config.as_object_mut() {
+            calling_config.insert("mode".to_string(), Value::String("VALIDATED".to_string()));
+        }
+        return;
+    }
+
+    for config_key in ["generationConfig", "generation_config"] {
+        let Some(config) = request.get_mut(config_key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        config.remove("maxOutputTokens");
+        config.remove("max_output_tokens");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AntigravityEnvelopeRequestType {
@@ -53,6 +174,24 @@ pub fn build_antigravity_safe_v1internal_request(
     request_body: &Value,
     request_type: AntigravityEnvelopeRequestType,
 ) -> AntigravityRequestEnvelopeSupport {
+    build_antigravity_safe_v1internal_request_with_policy(
+        auth,
+        request_id,
+        model,
+        request_body,
+        request_type,
+        AntigravityRequestPolicy::default(),
+    )
+}
+
+pub fn build_antigravity_safe_v1internal_request_with_policy(
+    auth: &AntigravityRequestAuth,
+    request_id: &str,
+    model: &str,
+    request_body: &Value,
+    request_type: AntigravityEnvelopeRequestType,
+    policy: AntigravityRequestPolicy,
+) -> AntigravityRequestEnvelopeSupport {
     if request_id.trim().is_empty() {
         return AntigravityRequestEnvelopeSupport::Unsupported(
             AntigravityRequestEnvelopeUnsupportedReason::MissingRequestId,
@@ -80,9 +219,13 @@ pub fn build_antigravity_safe_v1internal_request(
         inner_request.remove("safety_settings");
         normalize_antigravity_builtin_tool_names(&mut inner_request);
         normalize_antigravity_function_declaration_parameters(&mut inner_request);
+        apply_antigravity_model_request_policy(&mut inner_request, model, policy);
         let request_id = non_empty_string_field(source, "requestId").unwrap_or(request_id);
+        let default_user_agent = antigravity_request_user_agent_for_version(
+            &resolve_antigravity_client_version(auth.client_version.as_deref()),
+        );
         let user_agent =
-            non_empty_string_field(source, "userAgent").unwrap_or(ANTIGRAVITY_REQUEST_USER_AGENT);
+            non_empty_string_field(source, "userAgent").unwrap_or(default_user_agent.as_str());
         let request_type =
             existing_v1internal_request_type(source).unwrap_or_else(|| request_type.as_str());
 
@@ -102,13 +245,16 @@ pub fn build_antigravity_safe_v1internal_request(
     inner_request.remove("safety_settings");
     normalize_antigravity_builtin_tool_names(&mut inner_request);
     normalize_antigravity_function_declaration_parameters(&mut inner_request);
+    apply_antigravity_model_request_policy(&mut inner_request, model, policy);
 
     AntigravityRequestEnvelopeSupport::Supported(serde_json::json!({
         "project": auth.project_id,
         "requestId": request_id,
         "request": Value::Object(inner_request),
         "model": model,
-        "userAgent": ANTIGRAVITY_REQUEST_USER_AGENT,
+        "userAgent": antigravity_request_user_agent_for_version(
+            &resolve_antigravity_client_version(auth.client_version.as_deref()),
+        ),
         "requestType": request_type.as_str(),
     }))
 }
@@ -202,8 +348,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_antigravity_safe_v1internal_request, classify_antigravity_safe_request_body,
-        AntigravityEnvelopeRequestType, AntigravityRequestAuth, AntigravityRequestEnvelopeSupport,
+        antigravity_model_is_claude, antigravity_model_max_output_tokens,
+        build_antigravity_safe_v1internal_request,
+        build_antigravity_safe_v1internal_request_with_policy,
+        classify_antigravity_safe_request_body, AntigravityEnvelopeRequestType,
+        AntigravityRequestAuth, AntigravityRequestEnvelopeSupport, AntigravityRequestPolicy,
     };
     use crate::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT;
 
@@ -309,6 +458,10 @@ mod tests {
             envelope["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             4000
         );
+        // 非 Claude 模型不带 maxOutputTokens，由上游按模型默认值处理。
+        assert!(envelope["request"]["generationConfig"]
+            .get("maxOutputTokens")
+            .is_none());
         assert_eq!(
             envelope["request"]["toolConfig"]["functionCallingConfig"]["mode"],
             "VALIDATED"
@@ -509,5 +662,224 @@ mod tests {
         assert_eq!(declarations[1]["parameters"]["type"], "object");
         assert!(declarations[0].get("parametersJsonSchema").is_none());
         assert!(declarations[1].get("parameters_json_schema").is_none());
+    }
+    #[test]
+    fn claude_models_force_validated_function_calling_and_keep_a_capped_output_limit() {
+        let request_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": { "maxOutputTokens": 128000, "temperature": 0.1 },
+            "toolConfig": { "functionCallingConfig": { "mode": "AUTO" } },
+            "tools": [{ "functionDeclarations": [{ "name": "lookup" }] }]
+        });
+
+        let envelope = match build_antigravity_safe_v1internal_request(
+            &sample_auth(),
+            "request-claude-1",
+            "claude-sonnet-4-6",
+            &request_body,
+            AntigravityEnvelopeRequestType::Agent,
+        ) {
+            AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
+            AntigravityRequestEnvelopeSupport::Unsupported(reason) => {
+                panic!("claude envelope should be supported: {reason:?}")
+            }
+        };
+
+        assert_eq!(
+            envelope["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+        assert_eq!(
+            envelope["request"]["generationConfig"]["maxOutputTokens"],
+            64000
+        );
+        assert_eq!(envelope["request"]["generationConfig"]["temperature"], 0.1);
+    }
+
+    #[test]
+    fn claude_models_get_a_tool_config_even_when_the_client_sent_none() {
+        let request_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": { "maxOutputTokens": 4096 }
+        });
+
+        let envelope = match build_antigravity_safe_v1internal_request(
+            &sample_auth(),
+            "request-claude-2",
+            "claude-opus-4-6-thinking",
+            &request_body,
+            AntigravityEnvelopeRequestType::Agent,
+        ) {
+            AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
+            AntigravityRequestEnvelopeSupport::Unsupported(reason) => {
+                panic!("claude envelope should be supported: {reason:?}")
+            }
+        };
+
+        assert_eq!(
+            envelope["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+        // 未超过上限的值原样保留。
+        assert_eq!(
+            envelope["request"]["generationConfig"]["maxOutputTokens"],
+            4096
+        );
+    }
+
+    #[test]
+    fn non_claude_models_drop_max_output_tokens_in_both_spellings() {
+        let request_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": { "maxOutputTokens": 8192, "max_output_tokens": 8192, "topP": 0.9 },
+            "toolConfig": { "functionCallingConfig": { "mode": "NONE" } }
+        });
+
+        let envelope = match build_antigravity_safe_v1internal_request(
+            &sample_auth(),
+            "request-gemini-1",
+            "gemini-3.5-flash-low",
+            &request_body,
+            AntigravityEnvelopeRequestType::Agent,
+        ) {
+            AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
+            AntigravityRequestEnvelopeSupport::Unsupported(reason) => {
+                panic!("gemini envelope should be supported: {reason:?}")
+            }
+        };
+
+        let generation_config = &envelope["request"]["generationConfig"];
+        assert!(generation_config.get("maxOutputTokens").is_none());
+        assert!(generation_config.get("max_output_tokens").is_none());
+        assert_eq!(generation_config["topP"], 0.9);
+        // 非 Claude 模型不动 toolConfig。
+        assert_eq!(
+            envelope["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+            "NONE"
+        );
+    }
+
+    #[test]
+    fn explicit_policy_cap_overrides_the_builtin_model_card() {
+        let request_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": { "maxOutputTokens": 50000 }
+        });
+
+        let envelope = match build_antigravity_safe_v1internal_request_with_policy(
+            &sample_auth(),
+            "request-claude-3",
+            "claude-sonnet-4-6",
+            &request_body,
+            AntigravityEnvelopeRequestType::Agent,
+            AntigravityRequestPolicy {
+                max_output_tokens_cap: Some(32000),
+            },
+        ) {
+            AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
+            AntigravityRequestEnvelopeSupport::Unsupported(reason) => {
+                panic!("claude envelope should be supported: {reason:?}")
+            }
+        };
+
+        assert_eq!(
+            envelope["request"]["generationConfig"]["maxOutputTokens"],
+            32000
+        );
+    }
+
+    #[test]
+    fn existing_envelope_also_gets_the_model_policy() {
+        let request_body = json!({
+            "project": "client-project",
+            "requestId": "client-request",
+            "model": "claude-sonnet-4-6",
+            "userAgent": "antigravity",
+            "requestType": "agent",
+            "request": {
+                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+                "generationConfig": { "maxOutputTokens": 999999 }
+            }
+        });
+
+        let envelope = match build_antigravity_safe_v1internal_request(
+            &sample_auth(),
+            "trace-id",
+            "claude-sonnet-4-6",
+            &request_body,
+            AntigravityEnvelopeRequestType::Agent,
+        ) {
+            AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
+            AntigravityRequestEnvelopeSupport::Unsupported(reason) => {
+                panic!("existing envelope should be supported: {reason:?}")
+            }
+        };
+
+        assert_eq!(
+            envelope["request"]["generationConfig"]["maxOutputTokens"],
+            64000
+        );
+        assert_eq!(
+            envelope["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+    }
+
+    #[test]
+    fn envelope_user_agent_follows_the_key_level_client_version() {
+        let auth = AntigravityRequestAuth {
+            project_id: "project-ant-123".to_string(),
+            client_version: Some("3.2.1".to_string()),
+            session_id: None,
+        };
+        let request_body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
+        });
+
+        let envelope = match build_antigravity_safe_v1internal_request(
+            &auth,
+            "request-ua",
+            "gemini-3.5-flash-low",
+            &request_body,
+            AntigravityEnvelopeRequestType::Agent,
+        ) {
+            AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,
+            AntigravityRequestEnvelopeSupport::Unsupported(reason) => {
+                panic!("envelope should be supported: {reason:?}")
+            }
+        };
+
+        assert_eq!(envelope["userAgent"], "vscode/1.X.X (Antigravity/3.2.1)");
+    }
+
+    #[test]
+    fn model_card_lookup_matches_exact_ids_then_prefixes() {
+        assert_eq!(
+            antigravity_model_max_output_tokens("claude-sonnet-4-6"),
+            Some(64000)
+        );
+        assert_eq!(
+            antigravity_model_max_output_tokens("CLAUDE-OPUS-4-6-THINKING"),
+            Some(64000)
+        );
+        assert_eq!(
+            antigravity_model_max_output_tokens("claude-future-9"),
+            Some(64000)
+        );
+        assert_eq!(
+            antigravity_model_max_output_tokens("gemini-3-flash"),
+            Some(65536)
+        );
+        assert_eq!(
+            antigravity_model_max_output_tokens("gemini-3.5-flash-low"),
+            Some(65535)
+        );
+        assert_eq!(antigravity_model_max_output_tokens("chat_23310"), None);
+        assert_eq!(antigravity_model_max_output_tokens(""), None);
+
+        assert!(antigravity_model_is_claude("claude-sonnet-4-6"));
+        assert!(antigravity_model_is_claude(" Claude-Opus-4-6-thinking "));
+        assert!(!antigravity_model_is_claude("gemini-3.5-flash-low"));
+        assert!(!antigravity_model_is_claude("claude"));
     }
 }

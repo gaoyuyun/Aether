@@ -24,6 +24,7 @@ use super::{
     VideoTaskTruthSourceMode,
 };
 
+mod codex_reasoning_replay;
 mod decision;
 mod image;
 mod pii_redaction;

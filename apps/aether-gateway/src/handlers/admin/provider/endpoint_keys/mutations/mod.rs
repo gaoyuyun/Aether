@@ -3,7 +3,9 @@ mod codex_reset_credit;
 mod create;
 mod delete;
 mod oauth_invalid;
+mod reset_claude_code_device;
 mod reset_cycle_stats;
+mod tls_probe;
 mod update;
 
 use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
@@ -35,6 +37,14 @@ pub(super) async fn maybe_handle(
     if let Some(response) =
         reset_cycle_stats::maybe_handle(state, request_context, request_body).await?
     {
+        return Ok(Some(response));
+    }
+    if let Some(response) =
+        reset_claude_code_device::maybe_handle(state, request_context, request_body).await?
+    {
+        return Ok(Some(response));
+    }
+    if let Some(response) = tls_probe::maybe_handle(state, request_context, request_body).await? {
         return Ok(Some(response));
     }
     if let Some(response) =

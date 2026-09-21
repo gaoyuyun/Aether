@@ -6,7 +6,7 @@ import vueParser from 'vue-eslint-parser'
 export default [
   // 忽略的文件和目录
   {
-    ignores: ['dist/**', 'node_modules/**', '*.config.js', '*.config.ts'],
+    ignores: ['dist/**', 'node_modules/**', 'public/aether-vscodex/**', '*.config.js', '*.config.ts'],
   },
 
   // JavaScript 基础配置
@@ -26,6 +26,7 @@ export default [
       globals: {
         // 浏览器全局变量
         window: 'readonly',
+        Window: 'readonly',
         document: 'readonly',
         navigator: 'readonly',
         console: 'readonly',

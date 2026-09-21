@@ -5,8 +5,9 @@ use aether_ai_formats::api::{
     EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
 };
 use aether_contracts::{
-    ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile, TRANSPORT_BACKEND_HYPER_RUSTLS,
-    TRANSPORT_BACKEND_REQWEST_RUSTLS, TRANSPORT_HTTP_MODE_HTTP1_ONLY,
+    ExecutionTimeouts, ProxySnapshot, ResolvedTransportProfile, TRANSPORT_BACKEND_BROWSER_WREQ,
+    TRANSPORT_BACKEND_HYPER_RUSTLS, TRANSPORT_BACKEND_REQWEST_RUSTLS,
+    TRANSPORT_HTTP_MODE_HTTP1_ONLY,
 };
 use serde_json::{json, Map, Value};
 
@@ -128,6 +129,16 @@ fn attach_outgoing_tls_fingerprint(
     Some(Value::Object(report_context))
 }
 
+/// `ResolvedTransportProfile.extra` 里 P5 仿真 profile 的 id（与 transport crate 的
+/// `TRANSPORT_EMULATION_PROFILE_EXTRA_KEY` 同名；serving crate 不依赖 transport crate）。
+const TRANSPORT_EMULATION_PROFILE_EXTRA_KEY: &str = "emulation_profile";
+/// `ResolvedTransportProfile.extra` 里附带的探针摘要。
+const TRANSPORT_TLS_PROBE_EXTRA_KEY: &str = "tls_probe";
+const TLS_STACK_RUSTLS: &str = "rustls";
+const TLS_STACK_BORINGSSL_WREQ: &str = "boringssl_wreq";
+/// 控制面 profile 不发 ALPN 扩展（Axios/Node）。
+const CLAUDE_CODE_OAUTH_CONTROL_PLANE_PROFILE: &str = "claude_code_oauth_control_plane";
+
 fn outgoing_tls_fingerprint_value(
     transport_profile: Option<&ResolvedTransportProfile>,
     proxy: Option<&ProxySnapshot>,
@@ -148,11 +159,33 @@ fn outgoing_tls_fingerprint_value(
         .map(|profile| profile.http_mode.trim())
         .filter(|value| !value.is_empty())
         .unwrap_or("auto");
-    let alpn_offered = if http_mode.eq_ignore_ascii_case(TRANSPORT_HTTP_MODE_HTTP1_ONLY) {
+    let uses_browser_wreq = backend.eq_ignore_ascii_case(TRANSPORT_BACKEND_BROWSER_WREQ);
+    let emulation_profile = transport_profile
+        .and_then(|profile| profile.extra.as_ref())
+        .and_then(|extra| extra.get(TRANSPORT_EMULATION_PROFILE_EXTRA_KEY))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let alpn_offered = if emulation_profile
+        .is_some_and(|value| value.eq_ignore_ascii_case(CLAUDE_CODE_OAUTH_CONTROL_PLANE_PROFILE))
+    {
+        json!([])
+    } else if http_mode.eq_ignore_ascii_case(TRANSPORT_HTTP_MODE_HTTP1_ONLY) {
         json!(["http/1.1"])
     } else {
         json!(["h2", "http/1.1"])
     };
+    let probe_summary = transport_profile
+        .and_then(|profile| profile.extra.as_ref())
+        .and_then(|extra| extra.get(TRANSPORT_TLS_PROBE_EXTRA_KEY))
+        .and_then(Value::as_object)
+        .filter(|probe| {
+            probe
+                .get("ja3_hash")
+                .or_else(|| probe.get("ja4"))
+                .and_then(Value::as_str)
+                .is_some()
+        });
     let transport_path = if via_local_proxy {
         "aether_proxy_tunnel"
     } else if proxy.is_some() {
@@ -166,7 +199,7 @@ fn outgoing_tls_fingerprint_value(
         "source".to_string(),
         Value::String("aether_transport_config".to_string()),
     );
-    object.insert("observed".to_string(), Value::Bool(false));
+    object.insert("observed".to_string(), Value::Bool(probe_summary.is_some()));
     object.insert(
         "transport_path".to_string(),
         Value::String(transport_path.to_string()),
@@ -176,12 +209,41 @@ fn outgoing_tls_fingerprint_value(
         "http_mode".to_string(),
         Value::String(http_mode.to_string()),
     );
-    object.insert("tls_stack".to_string(), Value::String("rustls".to_string()));
+    object.insert(
+        "tls_stack".to_string(),
+        Value::String(
+            if uses_browser_wreq {
+                TLS_STACK_BORINGSSL_WREQ
+            } else {
+                TLS_STACK_RUSTLS
+            }
+            .to_string(),
+        ),
+    );
     object.insert(
         "tls_versions_offered".to_string(),
         json!(["TLS1.3", "TLS1.2"]),
     );
     object.insert("alpn_offered".to_string(), alpn_offered);
+    if let Some(emulation_profile) = emulation_profile {
+        object.insert(
+            "emulation_profile".to_string(),
+            Value::String(emulation_profile.to_string()),
+        );
+    }
+    if let Some(probe) = probe_summary {
+        for key in ["ja3", "ja3_hash", "ja4", "peetprint", "akamai_fingerprint"] {
+            if let Some(value) = probe.get(key).and_then(Value::as_str) {
+                object.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+        if let Some(value) = probe.get("probed_at_unix_secs").and_then(Value::as_u64) {
+            object.insert("probed_at_unix_secs".to_string(), json!(value));
+        }
+        if let Some(value) = probe.get("probe_url").and_then(Value::as_str) {
+            object.insert("probe_url".to_string(), Value::String(value.to_string()));
+        }
+    }
 
     if let Some(profile) = transport_profile {
         object.insert(
@@ -200,7 +262,9 @@ fn outgoing_tls_fingerprint_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aether_contracts::{TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY};
+    use aether_contracts::{
+        TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_HTTP_MODE_HTTP1_ONLY, TRANSPORT_POOL_SCOPE_KEY,
+    };
 
     fn sample_parts() -> AiExecutionDecisionResponseParts {
         AiExecutionDecisionResponseParts {
@@ -287,6 +351,64 @@ mod tests {
             tls_fingerprint["outgoing"]["alpn_offered"],
             json!(["h2", "http/1.1"])
         );
+    }
+
+    #[test]
+    fn decision_response_records_boringssl_emulation_profile_without_probe() {
+        let mut parts = sample_parts();
+        parts.transport_profile = Some(ResolvedTransportProfile {
+            profile_id: "claude_code_node_openssl".to_string(),
+            backend: TRANSPORT_BACKEND_BROWSER_WREQ.to_string(),
+            http_mode: TRANSPORT_HTTP_MODE_HTTP1_ONLY.to_string(),
+            pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
+            header_fingerprint: None,
+            extra: Some(json!({"emulation_profile": "claude_code_node_openssl"})),
+        });
+
+        let decision = build_ai_execution_decision_response(parts);
+        let outgoing = &decision.report_context.unwrap()["tls_fingerprint"]["outgoing"];
+
+        assert_eq!(outgoing["backend"], TRANSPORT_BACKEND_BROWSER_WREQ);
+        assert_eq!(outgoing["tls_stack"], "boringssl_wreq");
+        assert_eq!(outgoing["emulation_profile"], "claude_code_node_openssl");
+        assert_eq!(outgoing["alpn_offered"], json!(["http/1.1"]));
+        assert_eq!(outgoing["observed"], false);
+        assert!(outgoing.get("ja3_hash").is_none());
+    }
+
+    #[test]
+    fn decision_response_marks_outgoing_tls_observed_when_probe_summary_is_attached() {
+        let mut parts = sample_parts();
+        parts.transport_profile = Some(ResolvedTransportProfile {
+            profile_id: "claude_code_oauth_control_plane".to_string(),
+            backend: TRANSPORT_BACKEND_BROWSER_WREQ.to_string(),
+            http_mode: TRANSPORT_HTTP_MODE_AUTO.to_string(),
+            pool_scope: TRANSPORT_POOL_SCOPE_KEY.to_string(),
+            header_fingerprint: None,
+            extra: Some(json!({
+                "emulation_profile": "claude_code_oauth_control_plane",
+                "tls_probe": {
+                    "ja3": "771,4865-4866-4867,0-23-65281,29-23-24,0",
+                    "ja3_hash": "0123456789abcdef0123456789abcdef",
+                    "ja4": "t13d1716h1_5b57614c22b0_3d5db4fb5c1e",
+                    "http_version": "h1",
+                    "probe_url": "https://tls.peet.ws/api/all",
+                    "probed_at_unix_secs": 1_760_000_000u64
+                }
+            })),
+        });
+
+        let decision = build_ai_execution_decision_response(parts);
+        let outgoing = &decision.report_context.unwrap()["tls_fingerprint"]["outgoing"];
+
+        assert_eq!(outgoing["observed"], true);
+        assert_eq!(outgoing["ja3_hash"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(outgoing["ja4"], "t13d1716h1_5b57614c22b0_3d5db4fb5c1e");
+        assert_eq!(outgoing["probed_at_unix_secs"], 1_760_000_000u64);
+        assert_eq!(outgoing["probe_url"], "https://tls.peet.ws/api/all");
+        // 控制面 profile 不发 ALPN。
+        assert_eq!(outgoing["alpn_offered"], json!([]));
+        assert_eq!(outgoing["tls_stack"], "boringssl_wreq");
     }
 
     #[test]

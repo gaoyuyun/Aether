@@ -36,7 +36,10 @@ use super::admission::ResponsesWebSocketTurnAdmission;
 use super::frame::ParsedResponsesWebSocketFrame;
 use super::observation::ResponsesStructuredTerminalObserver;
 use super::settlement::attempt_facts_for_outcome;
-use crate::ai_serving::{build_openai_responses_stream_plan_from_decision, AiExecutionDecision};
+use crate::ai_serving::{
+    build_openai_responses_stream_plan_from_decision,
+    openai_responses_event_has_meaningful_output_delta, AiExecutionDecision,
+};
 use crate::clock::current_unix_ms;
 use crate::control::{
     execution_plan_balance_capacity_rejection, GatewayControlDecision, GatewayLocalAuthRejection,
@@ -45,7 +48,7 @@ use crate::execution_runtime::attach_provider_response_headers_to_report_context
 use crate::execution_runtime::attempt_lifecycle::{
     attempt_billing_is_void, AttemptBodyCapture, AttemptClientDelivery, AttemptLifecycleSeed,
     AttemptProviderOutcome, AttemptStageGuard, AttemptTerminalFacts, AttemptTerminalFactsInput,
-    ExecutionAttemptLifecycle,
+    ExecutionAttemptLifecycle, STREAM_MISSING_TERMINAL_STATUS_CODE,
 };
 use crate::orchestration::{
     apply_local_stream_failure_effects, apply_local_stream_success_effects,
@@ -157,9 +160,11 @@ impl ResponsesWebSocketTurnOutcome {
         }
     }
 
+    /// 上游正常关闭了连接却没有给出终态事件：与 HTTP 流「流结束但没有
+    /// `response.completed`」同一个事实，按 408 记账并投射供应商失败。
     pub(super) const fn upstream_closed() -> Self {
         Self::Failure {
-            status_code: 502,
+            status_code: STREAM_MISSING_TERMINAL_STATUS_CODE,
             reason: "upstream WebSocket closed before provider terminal event",
         }
     }
@@ -602,6 +607,8 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
 
     let candidate_started_at_unix_ms = current_unix_ms();
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
+    crate::orchestration::apply_reasoning_replay_to_plan(state, &mut plan, &mut report_context)
+        .await;
     let admission = match ResponsesWebSocketTurnAdmission::acquire(
         state,
         &plan,
@@ -1033,6 +1040,15 @@ impl ResponsesProviderAttempt {
         });
         let report_context = self.lifecycle.report_context().unwrap_or(&fallback_context);
         self.observer.observe_events(report_context, &events);
+        if events
+            .iter()
+            .copied()
+            .any(openai_responses_event_has_meaningful_output_delta)
+        {
+            // 增量事件不进观测器（它只看身份与终态），但空 incomplete 的判定需要
+            // 知道这条流有没有出过内容。
+            self.observer.note_output_content();
+        }
 
         let event_type = frame.event_type().unwrap_or_default();
         if matches!(event_type, "error" | "response.failed") {

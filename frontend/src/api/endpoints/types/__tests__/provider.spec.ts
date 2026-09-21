@@ -33,3 +33,22 @@ describe('normalizeChatPiiRedactionProviderConfig', () => {
     expect(normalizeChatPiiRedactionProviderConfig({ enabled: false, entities: ['email'] })).toEqual({ enabled: false })
   })
 })
+
+describe('normalizeProviderCooldownConfig', () => {
+  it('falls back to defaults and coerces partial objects', async () => {
+    const { normalizeProviderCooldownConfig, DEFAULT_PROVIDER_COOLDOWN_CONFIG } = await import('../provider')
+    expect(normalizeProviderCooldownConfig(undefined)).toEqual(DEFAULT_PROVIDER_COOLDOWN_CONFIG)
+    expect(normalizeProviderCooldownConfig(null)).toEqual(DEFAULT_PROVIDER_COOLDOWN_CONFIG)
+    expect(normalizeProviderCooldownConfig({ disable: true })).toEqual({
+      disable: true,
+      transient_error_seconds: 60,
+      model_level: false,
+    })
+    expect(normalizeProviderCooldownConfig({ transient_error_seconds: 15.9, model_level: true })).toEqual({
+      disable: false,
+      transient_error_seconds: 15,
+      model_level: true,
+    })
+    expect(normalizeProviderCooldownConfig({ transient_error_seconds: -1 }).transient_error_seconds).toBe(60)
+  })
+})

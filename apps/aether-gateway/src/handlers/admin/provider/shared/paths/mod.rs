@@ -6,18 +6,19 @@ mod strategy;
 
 pub(crate) use self::crud::{
     admin_provider_assign_global_models_path, admin_provider_available_source_models_path,
-    admin_provider_clear_pool_cooldown_parts, admin_provider_delete_task_parts,
-    admin_provider_id_for_health_monitor, admin_provider_id_for_manage_path,
-    admin_provider_id_for_mapping_preview, admin_provider_id_for_models_list,
-    admin_provider_id_for_pool_status, admin_provider_id_for_summary,
-    admin_provider_import_models_path, admin_provider_model_route_parts,
-    admin_provider_models_batch_path, admin_provider_reset_pool_cost_parts,
-    is_admin_providers_root,
+    admin_provider_clear_pool_cooldown_parts, admin_provider_clear_reasoning_replay_parts,
+    admin_provider_delete_task_parts, admin_provider_id_for_health_monitor,
+    admin_provider_id_for_manage_path, admin_provider_id_for_mapping_preview,
+    admin_provider_id_for_models_list, admin_provider_id_for_pool_status,
+    admin_provider_id_for_summary, admin_provider_import_models_path,
+    admin_provider_model_route_parts, admin_provider_models_batch_path,
+    admin_provider_reset_pool_cost_parts, is_admin_providers_root,
 };
 pub(crate) use self::endpoint_keys::{
     admin_clear_oauth_invalid_key_id, admin_codex_reset_credit_consume_key_id, admin_export_key_id,
     admin_provider_id_for_keys, admin_provider_id_for_refresh_quota,
-    admin_reset_cycle_stats_key_id, admin_reveal_key_id, admin_update_key_id,
+    admin_reset_claude_code_device_key_id, admin_reset_cycle_stats_key_id, admin_reveal_key_id,
+    admin_tls_probe_key_id, admin_update_key_id,
 };
 pub(crate) use self::oauth::{
     admin_provider_oauth_agent_identity_import_task_path,

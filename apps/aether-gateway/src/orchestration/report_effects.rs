@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 use std::time::Duration;
 
 use aether_admin::provider::quota as admin_provider_quota_pure;
+use aether_cache::ExpiringMap;
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyRuntimeMetadataUpdate;
 use aether_provider_pool::grok_quota_window_key_for_model;
 use aether_usage_runtime::{
@@ -25,6 +27,18 @@ use crate::{AppState, GatewayError};
 
 const RUNTIME_METADATA_CAS_MAX_ATTEMPTS: usize = 16;
 const CODEX_WEBSOCKET_RATE_LIMITS_REPORT_CONTEXT_FIELD: &str = "codex_websocket_rate_limits";
+const CLAUDE_CODE_RATE_LIMIT_HEARTBEAT_SECS: u64 = 60;
+const CLAUDE_CODE_OBSERVATION_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const CLAUDE_CODE_OBSERVATION_CACHE_MAX_ENTRIES: usize = 50_000;
+const CLAUDE_CODE_OBSERVATION_LOCK_SHARDS: usize = 256;
+type ClaudeCodeObservationKey = (usize, String);
+// Weak ownership keeps state identities distinct without keeping an AppState alive.
+static CLAUDE_CODE_OBSERVATIONS: LazyLock<
+    ExpiringMap<ClaudeCodeObservationKey, (Weak<crate::data::GatewayDataState>, u64)>,
+> = LazyLock::new(ExpiringMap::new);
+static CLAUDE_CODE_OBSERVATION_LOCKS: LazyLock<
+    [tokio::sync::Mutex<()>; CLAUDE_CODE_OBSERVATION_LOCK_SHARDS],
+> = LazyLock::new(|| std::array::from_fn(|_| tokio::sync::Mutex::new(())));
 static GROK_CHINESE_WAIT_DURATION_RE: OnceLock<Regex> = OnceLock::new();
 static GROK_ENGLISH_WAIT_DURATION_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -289,6 +303,221 @@ fn codex_websocket_quota_from_stream_payload(
         }
     }
     latest
+}
+
+/// 被动采集 Claude Code 的 `anthropic-ratelimit-unified-*` 头（成功与 429 都带），
+/// 写进 `upstream_metadata.claude_code` 并同步 quota 快照，管理端据此展示 5h / 7d 窗口。
+async fn sync_claude_code_rate_limit_from_response_headers(
+    state: &AppState,
+    report_context: Option<&Value>,
+    headers: &BTreeMap<String, String>,
+) -> Result<bool, GatewayError> {
+    let observed_at_unix_ms = report_context_u64(
+        report_context,
+        "provider_response_headers_observed_at_unix_ms",
+    )
+    .filter(|value| *value >= 1_000)
+    .unwrap_or_else(crate::clock::current_unix_ms);
+    let observed_at_unix_secs = observed_at_unix_ms / 1_000;
+    let provider_headers = report_context_provider_response_headers(report_context);
+    let Some(parsed) = provider_headers
+        .as_ref()
+        .and_then(|headers| {
+            admin_provider_quota_pure::parse_claude_code_rate_limit_headers(
+                headers,
+                observed_at_unix_secs,
+            )
+        })
+        .or_else(|| {
+            admin_provider_quota_pure::parse_claude_code_rate_limit_headers(
+                headers,
+                observed_at_unix_secs,
+            )
+        })
+    else {
+        return Ok(false);
+    };
+    let key_id = match report_context_key_id(report_context) {
+        Some(value) => value,
+        None => return Ok(false),
+    };
+    let observation_key = (Arc::as_ptr(&state.data) as usize, key_id.clone());
+    let mut hasher = DefaultHasher::new();
+    observation_key.hash(&mut hasher);
+    // Serialize local writers, including observations whose unchanged facts skip CAS.
+    // Fixed shards and the expiring watermark cache keep memory bounded.
+    // Other instances only see persisted observations; the heartbeat deliberately
+    // does not establish a global order for every unchanged response.
+    let _observation_guard = CLAUDE_CODE_OBSERVATION_LOCKS
+        [hasher.finish() as usize % CLAUDE_CODE_OBSERVATION_LOCK_SHARDS]
+        .lock()
+        .await;
+    let remember_observation = |observed_at_unix_ms| {
+        CLAUDE_CODE_OBSERVATIONS.insert(
+            observation_key.clone(),
+            (Arc::downgrade(&state.data), observed_at_unix_ms),
+            CLAUDE_CODE_OBSERVATION_CACHE_TTL,
+            CLAUDE_CODE_OBSERVATION_CACHE_MAX_ENTRIES,
+        );
+    };
+    if CLAUDE_CODE_OBSERVATIONS
+        .get_fresh(&observation_key, CLAUDE_CODE_OBSERVATION_CACHE_TTL)
+        .is_some_and(|(_, previous)| previous > observed_at_unix_ms)
+    {
+        return Ok(false);
+    }
+    for attempt in 0..RUNTIME_METADATA_CAS_MAX_ATTEMPTS {
+        let Some(key) = state
+            .read_provider_catalog_keys_by_ids(std::slice::from_ref(&key_id))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(false);
+        };
+        let Some(provider) = state
+            .read_provider_catalog_providers_by_ids(std::slice::from_ref(&key.provider_id))
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(false);
+        };
+        if !provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("claude_code")
+        {
+            return Ok(false);
+        }
+        let expected_namespace_value =
+            upstream_metadata_namespace_value(key.upstream_metadata.as_ref(), "claude_code");
+        // Persist milliseconds as well as the display timestamp so reports within
+        // the same second cannot overwrite a newer persisted observation.
+        let previous_updated_at = expected_namespace_value
+            .as_ref()
+            .and_then(|value| value.get("updated_at"))
+            .and_then(admin_provider_quota_pure::coerce_json_u64)
+            .unwrap_or(0);
+        let previous_observed_at_unix_ms = expected_namespace_value
+            .as_ref()
+            .and_then(|value| value.get("observed_at_unix_ms"))
+            .and_then(admin_provider_quota_pure::coerce_json_u64)
+            .unwrap_or_else(|| previous_updated_at.saturating_mul(1_000));
+        if previous_observed_at_unix_ms > observed_at_unix_ms {
+            remember_observation(previous_observed_at_unix_ms);
+            return Ok(false);
+        }
+        let mut bucket = expected_namespace_value
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        // A response may carry only some fields of a window. Preserve the
+        // remaining facts until a different reset identifies a new window.
+        if let Some(existing_windows) = bucket.get_mut("windows").and_then(Value::as_object_mut) {
+            if let Some(new_windows) = parsed.get("windows").and_then(Value::as_object) {
+                for (code, window) in new_windows {
+                    let existing = existing_windows
+                        .entry(code.clone())
+                        .or_insert_with(|| json!({}));
+                    let reset_changed = window.get("reset_at").is_some()
+                        && existing.get("reset_at").is_some()
+                        && window.get("reset_at") != existing.get("reset_at");
+                    match (existing.as_object_mut(), window.as_object()) {
+                        (Some(existing), Some(window)) if !reset_changed => {
+                            existing.extend(window.clone());
+                        }
+                        _ => *existing = window.clone(),
+                    }
+                }
+            }
+        } else if let Some(new_windows) = parsed.get("windows") {
+            bucket.insert("windows".to_string(), new_windows.clone());
+        }
+        for field in [
+            "updated_at",
+            "unified_status",
+            "unified_reset_at",
+            "representative_claim",
+            "overage",
+        ] {
+            match parsed.get(field) {
+                Some(value) => {
+                    bucket.insert(field.to_string(), value.clone());
+                }
+                None => {
+                    bucket.remove(field);
+                }
+            }
+        }
+        bucket.insert(
+            "observed_at_unix_ms".to_string(),
+            json!(observed_at_unix_ms),
+        );
+        let namespace_value = Value::Object(bucket);
+        // `updated_at` 每个响应都变，所以要比较的是窗口事实（status / utilization /
+        // reset_at / unified_* / overage），不是整个对象：Claude Code 是主力渠道，每个
+        // 成功响应都 CAS 写库并清目录缓存在高 QPS 下是不可接受的。事实没变时
+        // 每分钟补一次心跳，让活跃 Key 的展示时间继续前进；其余观测只更新本地水位。
+        if claude_code_rate_limit_facts_unchanged(
+            expected_namespace_value.as_ref(),
+            &namespace_value,
+        ) && observed_at_unix_secs.saturating_sub(previous_updated_at)
+            < CLAUDE_CODE_RATE_LIMIT_HEARTBEAT_SECS
+        {
+            remember_observation(observed_at_unix_ms);
+            return Ok(false);
+        }
+        let updated_upstream_metadata = merge_metadata_object(
+            key.upstream_metadata.as_ref(),
+            "claude_code",
+            namespace_value.clone(),
+        );
+        let updated_status_snapshot = sync_provider_key_quota_status_snapshot(
+            key.status_snapshot.as_ref(),
+            provider.provider_type.as_str(),
+            updated_upstream_metadata.as_ref(),
+            "response_headers",
+        );
+        let persisted = state
+            .update_provider_catalog_key_runtime_metadata(
+                &ProviderCatalogKeyRuntimeMetadataUpdate {
+                    key_id: key_id.clone(),
+                    namespace: "claude_code".to_string(),
+                    expected_upstream_metadata_value: expected_namespace_value,
+                    upstream_metadata_value: namespace_value,
+                    status_snapshot_patch: quota_status_snapshot_patch(
+                        updated_status_snapshot.as_ref(),
+                    ),
+                    updated_at_unix_secs: Some(observed_at_unix_secs),
+                },
+            )
+            .await?;
+        if persisted {
+            remember_observation(observed_at_unix_ms);
+            return Ok(true);
+        }
+        if attempt + 1 < RUNTIME_METADATA_CAS_MAX_ATTEMPTS {
+            let backoff_us = 50_u64.saturating_mul((attempt + 1) as u64).min(1_000);
+            tokio::time::sleep(Duration::from_micros(backoff_us)).await;
+        }
+    }
+    Ok(false)
+}
+
+/// Compare quota facts independently of observation/display timestamps.
+fn claude_code_rate_limit_facts_unchanged(previous: Option<&Value>, next: &Value) -> bool {
+    fn facts(value: &Value) -> Option<serde_json::Map<String, Value>> {
+        let mut object = value.as_object()?.clone();
+        object.remove("updated_at");
+        object.remove("observed_at_unix_ms");
+        Some(object)
+    }
+    match (previous.and_then(facts), facts(next)) {
+        (Some(previous), Some(next)) => previous == next,
+        _ => false,
+    }
 }
 
 async fn sync_gemini_cli_credits_from_report(
@@ -569,6 +798,22 @@ async fn apply_local_sync_report_effect(state: &AppState, payload: &GatewaySyncR
             );
         }
     }
+    if let Err(err) = sync_claude_code_rate_limit_from_response_headers(
+        state,
+        payload.report_context.as_ref(),
+        &payload.headers,
+    )
+    .await
+    {
+        warn!(
+            event_name = "claude_code_rate_limit_sync_failed",
+            log_type = "ops",
+            report_kind = %payload.report_kind,
+            report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
+            error = ?err,
+            "gateway failed to persist claude code rate limit windows from sync response headers"
+        );
+    }
     if let Err(err) = sync_grok_quota_from_report_context(
         state,
         payload.report_context.as_ref(),
@@ -640,6 +885,22 @@ async fn apply_local_stream_report_effect(state: &AppState, payload: &GatewayStr
                 "gateway failed to persist codex realtime quota from stream response headers"
             );
         }
+    }
+    if let Err(err) = sync_claude_code_rate_limit_from_response_headers(
+        state,
+        payload.report_context.as_ref(),
+        &payload.headers,
+    )
+    .await
+    {
+        warn!(
+            event_name = "claude_code_rate_limit_sync_failed",
+            log_type = "ops",
+            report_kind = %payload.report_kind,
+            report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
+            error = ?err,
+            "gateway failed to persist claude code rate limit windows from stream response headers"
+        );
     }
     if let Err(err) = sync_grok_quota_from_report_context(
         state,
@@ -1119,6 +1380,352 @@ mod tests {
             .with_data_state_for_tests(
                 GatewayDataState::with_provider_catalog_repository_for_tests(repository),
             )
+    }
+
+    fn claude_code_test_state(key_id: &str) -> AppState {
+        let provider = StoredProviderCatalogProvider::new(
+            "claude-code-provider".to_string(),
+            "Claude Code".to_string(),
+            None,
+            "claude_code".to_string(),
+        )
+        .expect("provider should build");
+        let key = StoredProviderCatalogKey::new(
+            key_id.to_string(),
+            provider.id.clone(),
+            "Claude Key".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![],
+            vec![key],
+        ));
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository),
+            )
+    }
+
+    /// 验收：`anthropic-ratelimit-unified-5h-reset` 为未来 3 小时 → 快照标记耗尽，
+    /// 调度层按 reset_at 过期前不会再选中这把 Key。
+    #[tokio::test]
+    async fn claude_code_rate_limit_headers_materialize_5h_and_7d_windows() {
+        clear_local_report_effect_caches_for_tests();
+        let key_id = "claude-code-rate-limit-key";
+        let state = claude_code_test_state(key_id);
+        let report_context = json!({
+            "key_id": key_id,
+            "provider_response_headers_observed_at_unix_ms": 1_800_000_000_000u64,
+        });
+        let reset_at = 1_800_000_000u64 + 3 * 3600;
+        let headers = BTreeMap::from([
+            (
+                "anthropic-ratelimit-unified-status".to_string(),
+                "rejected".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-status".to_string(),
+                "rejected".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-utilization".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset".to_string(),
+                reset_at.to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-status".to_string(),
+                "allowed".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-utilization".to_string(),
+                "0.25".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-reset".to_string(),
+                (reset_at + 86_400).to_string(),
+            ),
+        ]);
+        assert!(sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&report_context),
+            &headers
+        )
+        .await
+        .expect("sync should succeed"));
+
+        let key = state
+            .read_provider_catalog_keys_by_ids(&[key_id.to_string()])
+            .await
+            .expect("key should reload")
+            .pop()
+            .expect("key should exist");
+        let metadata = key
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("claude_code"))
+            .cloned()
+            .expect("claude_code metadata");
+        assert_eq!(metadata["windows"]["5h"]["status"], json!("rejected"));
+        assert_eq!(metadata["windows"]["5h"]["reset_at"], json!(reset_at));
+        assert_eq!(metadata["windows"]["7d"]["utilization"], json!(0.25));
+        let quota = key
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.get("quota"))
+            .cloned()
+            .expect("quota snapshot");
+        assert_eq!(quota["provider_type"], json!("claude_code"));
+        assert_eq!(quota["exhausted"], json!(true));
+        assert_eq!(quota["reset_at"], json!(reset_at));
+        assert!(
+            aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "claude_code")
+        );
+
+        // 同样的窗口事实再来一次：只有 updated_at 会变，不写库、不清缓存。
+        let repeat_context = json!({
+            "key_id": key_id,
+            "provider_response_headers_observed_at_unix_ms": 1_800_000_005_000u64,
+        });
+        assert!(!sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&repeat_context),
+            &headers
+        )
+        .await
+        .expect("sync should succeed"));
+        assert_eq!(
+            stored_claude_code_metadata(&state, key_id).await["updated_at"],
+            json!(1_800_000_000u64)
+        );
+
+        // 只带 7d 头的后续响应不会抹掉已记录的 5h 窗口。
+        let follow_up = BTreeMap::from([(
+            "anthropic-ratelimit-unified-7d-utilization".to_string(),
+            "0.3".to_string(),
+        )]);
+        let later_context = json!({
+            "key_id": key_id,
+            "provider_response_headers_observed_at_unix_ms": 1_800_000_010_000u64,
+        });
+        assert!(sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&later_context),
+            &follow_up
+        )
+        .await
+        .expect("sync should succeed"));
+        let metadata = stored_claude_code_metadata(&state, key_id).await;
+        assert_eq!(metadata["windows"]["5h"]["reset_at"], json!(reset_at));
+        assert_eq!(metadata["windows"]["7d"]["utilization"], json!(0.3));
+        assert_eq!(metadata["windows"]["7d"]["status"], json!("allowed"));
+        assert_eq!(
+            metadata["windows"]["7d"]["reset_at"],
+            json!(reset_at + 86_400)
+        );
+        assert!(metadata.get("unified_status").is_none());
+    }
+
+    fn claude_code_observation_context(key_id: &str, observed_at_unix_ms: u64) -> Value {
+        json!({
+            "key_id": key_id,
+            "provider_response_headers_observed_at_unix_ms": observed_at_unix_ms,
+        })
+    }
+
+    fn claude_code_utilization_headers(utilization: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            "anthropic-ratelimit-unified-5h-utilization".to_string(),
+            utilization.to_string(),
+        )])
+    }
+
+    #[tokio::test]
+    async fn claude_code_unchanged_facts_refresh_observed_at_once_per_minute() {
+        let key_id = "claude-code-heartbeat-key";
+        let state = claude_code_test_state(key_id);
+        let observed_at = 1_800_000_000_000u64;
+        let headers = claude_code_utilization_headers("0.25");
+        for (offset_ms, expected_persisted, expected_stored_ms) in [
+            (0, true, 0),
+            (59_999, false, 0),
+            (60_000, true, 60_000),
+            (119_999, false, 60_000),
+            (120_000, true, 120_000),
+        ] {
+            let context = claude_code_observation_context(key_id, observed_at + offset_ms);
+            assert_eq!(
+                sync_claude_code_rate_limit_from_response_headers(&state, Some(&context), &headers)
+                    .await
+                    .expect("heartbeat should succeed"),
+                expected_persisted,
+                "offset {offset_ms}"
+            );
+            let key = state
+                .read_provider_catalog_keys_by_ids(&[key_id.to_string()])
+                .await
+                .expect("key should reload")
+                .pop()
+                .expect("key should exist");
+            let stored_ms = observed_at + expected_stored_ms;
+            let metadata = &key.upstream_metadata.as_ref().unwrap()["claude_code"];
+            assert_eq!(metadata["observed_at_unix_ms"], json!(stored_ms));
+            assert_eq!(metadata["updated_at"], json!(stored_ms / 1_000));
+            assert_eq!(
+                key.status_snapshot.as_ref().unwrap()["quota"]["observed_at"],
+                json!(stored_ms / 1_000)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_code_unchanged_observation_rejects_older_changed_facts_before_heartbeat() {
+        let key_id = "claude-code-local-watermark-key";
+        let state = claude_code_test_state(key_id);
+        let observed_at = 1_800_000_000_000u64;
+        let headers = claude_code_utilization_headers("0.25");
+        let first = claude_code_observation_context(key_id, observed_at);
+        assert!(
+            sync_claude_code_rate_limit_from_response_headers(&state, Some(&first), &headers)
+                .await
+                .expect("first observation should persist")
+        );
+
+        let repeat = claude_code_observation_context(key_id, observed_at + 50_900);
+        assert!(!sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&repeat),
+            &headers
+        )
+        .await
+        .expect("unchanged observation should skip persistence"));
+        let stale = claude_code_observation_context(key_id, observed_at + 50_800);
+        let changed = claude_code_utilization_headers("0.75");
+        assert!(
+            !sync_claude_code_rate_limit_from_response_headers(&state, Some(&stale), &changed)
+                .await
+                .expect("older changed observation should be ignored")
+        );
+        let metadata = stored_claude_code_metadata(&state, key_id).await;
+        assert_eq!(metadata["windows"]["5h"]["utilization"], json!(0.25));
+        assert_eq!(metadata["observed_at_unix_ms"], json!(observed_at));
+
+        let current = claude_code_observation_context(key_id, observed_at + 50_950);
+        assert!(sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&current),
+            &changed
+        )
+        .await
+        .expect("newer changed facts should persist immediately"));
+        assert_eq!(
+            stored_claude_code_metadata(&state, key_id).await["windows"]["5h"]["utilization"],
+            json!(0.75)
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_persisted_milliseconds_reject_older_report_after_cache_eviction() {
+        let key_id = "claude-code-persisted-watermark-key";
+        let state = claude_code_test_state(key_id);
+        let observed_at = 1_800_000_000_900u64;
+        let context = claude_code_observation_context(key_id, observed_at);
+        let headers = claude_code_utilization_headers("0.25");
+        assert!(sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&context),
+            &headers
+        )
+        .await
+        .expect("first observation should persist"));
+        CLAUDE_CODE_OBSERVATIONS.remove(&(Arc::as_ptr(&state.data) as usize, key_id.to_string()));
+
+        let stale = claude_code_observation_context(key_id, observed_at - 100);
+        assert!(!sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&stale),
+            &claude_code_utilization_headers("0.75"),
+        )
+        .await
+        .expect("persisted milliseconds should reject stale facts"));
+        let metadata = stored_claude_code_metadata(&state, key_id).await;
+        assert_eq!(metadata["windows"]["5h"]["utilization"], json!(0.25));
+        assert_eq!(metadata["observed_at_unix_ms"], json!(observed_at));
+    }
+
+    #[tokio::test]
+    async fn claude_code_partial_window_updates_preserve_fields_until_reset_changes() {
+        let key_id = "claude-code-partial-window-key";
+        let state = claude_code_test_state(key_id);
+        let observed_at = 1_800_000_000_000u64;
+        let reset_at = observed_at / 1_000 + 3_600;
+        let headers = BTreeMap::from([
+            (
+                "anthropic-ratelimit-unified-5h-status".to_string(),
+                "rejected".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-utilization".to_string(),
+                "1.0".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset".to_string(),
+                reset_at.to_string(),
+            ),
+        ]);
+        for (offset_ms, headers) in [
+            (0, headers),
+            (1_000, claude_code_utilization_headers("0.75")),
+        ] {
+            let context = claude_code_observation_context(key_id, observed_at + offset_ms);
+            assert!(sync_claude_code_rate_limit_from_response_headers(
+                &state,
+                Some(&context),
+                &headers,
+            )
+            .await
+            .expect("window update should persist"));
+        }
+        let metadata = stored_claude_code_metadata(&state, key_id).await;
+        assert_eq!(metadata["windows"]["5h"]["status"], json!("rejected"));
+        assert_eq!(metadata["windows"]["5h"]["utilization"], json!(0.75));
+        assert_eq!(metadata["windows"]["5h"]["reset_at"], json!(reset_at));
+
+        let next_reset_at = reset_at + 18_000;
+        let next_window = BTreeMap::from([(
+            "anthropic-ratelimit-unified-5h-reset".to_string(),
+            next_reset_at.to_string(),
+        )]);
+        let context = claude_code_observation_context(key_id, observed_at + 2_000);
+        assert!(sync_claude_code_rate_limit_from_response_headers(
+            &state,
+            Some(&context),
+            &next_window,
+        )
+        .await
+        .expect("new window should replace previous facts"));
+        assert_eq!(
+            stored_claude_code_metadata(&state, key_id).await["windows"]["5h"],
+            json!({ "reset_at": next_reset_at })
+        );
+    }
+
+    async fn stored_claude_code_metadata(state: &AppState, key_id: &str) -> Value {
+        state
+            .read_provider_catalog_keys_by_ids(&[key_id.to_string()])
+            .await
+            .expect("key should reload")
+            .pop()
+            .and_then(|key| key.upstream_metadata)
+            .and_then(|metadata| metadata.get("claude_code").cloned())
+            .expect("claude_code metadata should exist")
     }
 
     async fn stored_codex_metadata(state: &AppState, key_id: &str) -> Value {
