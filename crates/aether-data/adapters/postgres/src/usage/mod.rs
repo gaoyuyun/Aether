@@ -1735,7 +1735,10 @@ AND lower(BTRIM(COALESCE(\"usage\".provider_name, ''))) NOT IN ('unknown', 'unkn
     );
 }
 
-/// Opening terms of the predicate that hides Claude token counting rows.
+/// Opening terms of the predicate that is true for non-token-count rows.
+///
+/// The completed predicate is negated where the skipped-record classifier needs
+/// to identify token-count failures; successful token-count rows remain visible.
 ///
 /// Mirrors the SQLite and MySQL predicates, minus the base-table `route_kind`
 /// term: on Postgres the routing fields live only on `usage_routing_snapshots`
@@ -1756,23 +1759,52 @@ const POSTGRES_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX: &str = r#"(
       AND LOWER(BTRIM(COALESCE(count_tokens_routing.route_kind, ''))) = 'count_tokens'
   )"#;
 
-fn push_postgres_usage_exclude_count_tokens_filter(
-    builder: &mut QueryBuilder<'_, Postgres>,
-    has_where: &mut bool,
-    exclude_count_tokens: bool,
-) {
-    if !exclude_count_tokens {
-        return;
-    }
-
-    push_postgres_usage_where(builder, has_where);
-    builder.push(POSTGRES_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX);
+fn postgres_usage_exclude_count_tokens_predicate() -> String {
+    let mut predicate = POSTGRES_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX.to_string();
     for key in ["request_path", "request_path_and_query"] {
-        builder.push(format!(
+        predicate.push_str(&format!(
             " AND RTRIM(SPLIT_PART(COALESCE(\"usage\".request_metadata->>'{key}', ''), '?', 1), '/') NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
         ));
     }
-    builder.push(")");
+    predicate.push(')');
+    predicate
+}
+
+fn postgres_usage_skipped_predicate() -> String {
+    format!(
+        r#"(
+      "usage".status = 'skipped'
+      OR (
+        (NULLIF(BTRIM("usage".request_metadata->>'routing_candidate_skip_reason'), '') IS NOT NULL
+          OR COALESCE("usage".request_metadata->>'local_execution_runtime_miss_reason', '') IN ('all_candidates_skipped', 'candidate_list_empty')
+          OR EXISTS (SELECT 1 FROM usage_routing_snapshots AS skipped_routing
+            WHERE skipped_routing.request_id = "usage".request_id
+              AND skipped_routing.local_execution_runtime_miss_reason IN ('all_candidates_skipped', 'candidate_list_empty')))
+        AND (COALESCE("usage".request_metadata->>'execution_path', '') = 'local_execution_runtime_miss'
+          OR EXISTS (SELECT 1 FROM usage_routing_snapshots AS skipped_routing
+            WHERE skipped_routing.request_id = "usage".request_id
+              AND skipped_routing.execution_path = 'local_execution_runtime_miss'))
+      )
+      OR (NOT ({}) AND "usage".status NOT IN ('pending', 'streaming') AND NOT (
+        "usage".status IN ('completed', 'success', 'ok', 'billed', 'settled')
+        AND COALESCE("usage".status_code, 0) < 400
+        AND NULLIF(BTRIM("usage".error_message), '') IS NULL))
+    )"#,
+        postgres_usage_exclude_count_tokens_predicate()
+    )
+}
+
+fn push_postgres_usage_exclude_skipped_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    has_where: &mut bool,
+    exclude_skipped: bool,
+) {
+    if exclude_skipped {
+        push_postgres_usage_where(builder, has_where);
+        builder
+            .push("NOT ")
+            .push(postgres_usage_skipped_predicate());
+    }
 }
 
 const USAGE_PROVIDER_IDENTITY_FILTER_SQL: &str = r#" AND (
@@ -3240,10 +3272,10 @@ ORDER BY request_count DESC, "usage".provider_name ASC
             &mut has_where,
             query.exclude_unknown_model_or_provider,
         );
-        push_postgres_usage_exclude_count_tokens_filter(
+        push_postgres_usage_exclude_skipped_filter(
             &mut builder,
             &mut has_where,
-            query.exclude_count_tokens,
+            query.exclude_skipped,
         );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -3358,10 +3390,10 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             &mut has_where,
             query.exclude_unknown_model_or_provider,
         );
-        push_postgres_usage_exclude_count_tokens_filter(
+        push_postgres_usage_exclude_skipped_filter(
             &mut builder,
             &mut has_where,
-            query.exclude_count_tokens,
+            query.exclude_skipped,
         );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -3557,10 +3589,10 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             &mut has_where,
             query.exclude_unknown_model_or_provider,
         );
-        push_postgres_usage_exclude_count_tokens_filter(
+        push_postgres_usage_exclude_skipped_filter(
             &mut builder,
             &mut has_where,
-            query.exclude_count_tokens,
+            query.exclude_skipped,
         );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -3664,10 +3696,10 @@ OR (\"usage\".error_message IS NOT NULL AND BTRIM(\"usage\".error_message) <> ''
             &mut has_where,
             query.exclude_unknown_model_or_provider,
         );
-        push_postgres_usage_exclude_count_tokens_filter(
+        push_postgres_usage_exclude_skipped_filter(
             &mut builder,
             &mut has_where,
-            query.exclude_count_tokens,
+            query.exclude_skipped,
         );
         if let Some(statuses) = query.statuses.as_deref() {
             if !statuses.is_empty() {
@@ -10655,7 +10687,9 @@ WHERE provider_id = $1
                         .execute(&mut **tx)
                         .await
                         .map_postgres_err()?;
-                    let rows_affected = sqlx::query(REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL)
+                    let rebuild_sql = REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL
+                        .replace("{skipped_predicate}", &postgres_usage_skipped_predicate());
+                    let rows_affected = sqlx::query(&rebuild_sql)
                         .execute(&mut **tx)
                         .await
                         .map_postgres_err()?

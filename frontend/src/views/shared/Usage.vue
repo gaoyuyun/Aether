@@ -102,7 +102,7 @@
       :page-size-options="pageSizeOptions"
       :auto-refresh="globalAutoRefresh"
       :hide-unknown-records="hideUnknownRecords"
-      :hide-count-tokens-records="hideCountTokensRecords"
+      :hide-skipped-records="hideSkippedRecords"
       @update:time-range="handleTimeRangeChange"
       @update:filter-search="handleFilterSearchChange"
       @update:filter-user="handleFilterUserChange"
@@ -115,7 +115,7 @@
       @update:page-size="handlePageSizeChange"
       @update:auto-refresh="handleAutoRefreshChange"
       @update:hide-unknown-records="handleHideUnknownRecordsChange"
-      @update:hide-count-tokens-records="handleHideCountTokensRecordsChange"
+      @update:hide-skipped-records="handleHideSkippedRecordsChange"
       @refresh="handleManualRefresh"
       @prefetch-detail="prefetchRequestDetail"
       @show-detail="showRequestDetail"
@@ -174,7 +174,7 @@ import {
   resolveDisplayRequestStatus,
 } from '@/features/usage/utils/status'
 import { matchesUsageRecordSearch } from '@/features/usage/utils/recordSearch'
-import { isUsageCountTokensRequest } from '@/features/usage/utils/countTokens'
+import { isUsageHiddenBySkipFilter } from '@/features/usage/utils/countTokens'
 import {
   isUserLocalOnlyRecordStatus,
   shouldUseServerUserRecordFilters,
@@ -199,7 +199,9 @@ const isAdminPage = computed(() => route.path.startsWith('/admin'))
 // 每次进入页面默认收起分析面板，优先展示使用记录。
 const statsExpanded = ref(false)
 const hideUnknownRecords = useLocalStorage('usage-hide-unknown-records', false)
-const hideCountTokensRecords = useLocalStorage('usage-hide-count-tokens-records', true)
+// Preserve the user's choice from the former token counting toggle.
+const legacyHideCountTokensRecords = useLocalStorage('usage-hide-count-tokens-records', true)
+const hideSkippedRecords = useLocalStorage('usage-hide-skipped-records', legacyHideCountTokensRecords.value)
 const analyticsReady = ref(false)
 let analyticsLoadStarted = false
 let analyticsIdleHandle: number | null = null
@@ -463,8 +465,8 @@ const filteredRecords = computed(() => {
     ? currentRecords.value.filter(record => !hasUnknownModelOrProvider(record))
     : [...currentRecords.value]
 
-  if (isAdminPage.value && hideCountTokensRecords.value) {
-    records = records.filter(record => !isUsageCountTokensRequest(record))
+  if (isAdminPage.value && hideSkippedRecords.value) {
+    records = records.filter(record => !isUsageHiddenBySkipFilter(record))
   }
 
   if (!isAdminPage.value) {
@@ -921,8 +923,8 @@ async function handleHideUnknownRecordsChange(value: boolean) {
   }
 }
 
-async function handleHideCountTokensRecordsChange(value: boolean) {
-  hideCountTokensRecords.value = value
+async function handleHideSkippedRecordsChange(value: boolean) {
+  hideSkippedRecords.value = value
   currentPage.value = 1
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
@@ -1091,7 +1093,7 @@ function getCurrentFilters() {
     status: filterStatus.value !== '__all__' ? filterStatus.value : undefined,
     client_family: filterClientFamily.value !== '__all__' ? filterClientFamily.value : undefined,
     hideUnknownRecords: hideUnknownRecords.value || undefined,
-    hideCountTokensRecords: hideCountTokensRecords.value || undefined
+    hideSkippedRecords: hideSkippedRecords.value || undefined
   }
 }
 

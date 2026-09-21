@@ -112,6 +112,14 @@ pub(crate) async fn refresh_oauth_plan_auth_for_retry(
             body_excerpt,
             ..
         }) if matches!(refresh_status_code, 400 | 401 | 403) => {
+            if crate::orchestration::local_execution_is_count_tokens(
+                crate::orchestration::LocalExecutionEffectContext {
+                    plan,
+                    report_context,
+                },
+            ) {
+                return false;
+            }
             let observed_credential_generation =
                 report_context_string(report_context, "codex_credential_generation");
             let runtime_invalid_message = local_failover_error_message(response_text);

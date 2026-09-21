@@ -1717,7 +1717,7 @@ async fn mysql_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_ser
     let storage = MysqlUsageStorage::new(pool.clone());
     let mut query = UsageAuditListQuery {
         user_id: Some(user_id.clone()),
-        exclude_count_tokens: true,
+        exclude_skipped: true,
         ..UsageAuditListQuery::default()
     };
     let visible = storage
@@ -1731,7 +1731,7 @@ async fn mysql_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_ser
             .collect::<Vec<_>>(),
         [format!("served-{suffix}").as_str()]
     );
-    query.exclude_count_tokens = false;
+    query.exclude_skipped = false;
     assert_eq!(
         storage
             .count_usage_audits(&query)

@@ -122,27 +122,27 @@ describe('useUsageData', () => {
     getAllUsageRecordsMock.mockResolvedValue({ records: [], total: 21, total_is_estimated: true })
     getAllUsageRecordTotalMock.mockResolvedValue(42)
 
-    await loadRecords({ page: 1, pageSize: 20 }, { hideCountTokensRecords: true, search: 'claude' })
+    await loadRecords({ page: 1, pageSize: 20 }, { hideSkippedRecords: true, search: 'claude' })
     await flushMicrotasks()
 
     expect(getAllUsageRecordsMock).toHaveBeenLastCalledWith(expect.objectContaining({
-      hide_count_tokens: true,
+      hide_skipped: true,
       search: 'claude',
       include_total: false,
     }))
     expect(getAllUsageRecordTotalMock).toHaveBeenLastCalledWith(expect.objectContaining({
-      hide_count_tokens: true,
+      hide_skipped: true,
       search: 'claude',
     }))
     expect(totalRecords.value).toBe(42)
 
     await loadRecords(
       { page: 1, pageSize: 20 },
-      { hideCountTokensRecords: false, search: 'claude' },
+      { hideSkippedRecords: false, search: 'claude' },
       undefined,
       { loadExactTotal: false },
     )
-    expect(getAllUsageRecordsMock.mock.lastCall?.[0]).not.toHaveProperty('hide_count_tokens')
+    expect(getAllUsageRecordsMock.mock.lastCall?.[0]).not.toHaveProperty('hide_skipped')
     expect(totalRecords.value).toBe(21)
   })
 

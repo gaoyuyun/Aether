@@ -217,9 +217,11 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap();
+    let first_request_id = format!("quota-first-{stream}-{failure}-{fallback}");
+    let recovery_request_id = format!("quota-recovery-{stream}-{failure}-{fallback}");
     let first = client.post(format!("{}/v1/chat/completions", gateway.url))
         .bearer_auth(if fallback { "sk-quota-both" } else { "sk-quota-only-a" })
-        .header("x-trace-id", format!("quota-{stream}-{failure}-{fallback}"))
+        .header("x-trace-id", &first_request_id)
         .json(&json!({"model": "quota-test", "messages": [{"role": "user", "content": "test"}], "stream": stream}))
         .send().await.unwrap();
     let status = first.status();
@@ -296,6 +298,7 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
     let hits_before = a_hits.load(Ordering::SeqCst);
     let next = client.post(format!("{}/v1/chat/completions", gateway.url))
         .bearer_auth("sk-quota-only-a")
+        .header("x-trace-id", &recovery_request_id)
         .json(&json!({"model": "quota-test", "messages": [{"role": "user", "content": "retry"}], "stream": stream}))
         .send().await.unwrap();
     let status = next.status();
@@ -329,20 +332,13 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
             .await
             .unwrap();
     assert_eq!(successes, 1 + expected_b_hits as i64);
-    let usage = sqlx::query("SELECT provider_id, status, input_tokens, output_tokens, total_cost_usd, billing_status FROM usage ORDER BY created_at_unix_ms")
+    let usage = sqlx::query("SELECT request_id, provider_id, status, input_tokens, output_tokens, total_cost_usd, billing_status FROM usage WHERE request_id IN (?, ?)")
+        .bind(&first_request_id)
+        .bind(&recovery_request_id)
         .fetch_all(&pool).await.unwrap();
     assert_eq!(usage.len(), 2);
-    for (index, row) in usage.iter().enumerate() {
-        let completed = index == 1 || expected_b_hits == 1;
-        assert_eq!(
-            row.get::<String, _>("provider_id"),
-            if index == 0 && expected_b_hits == 1 {
-                &b_id
-            } else {
-                &a_id
-            }
-            .as_str()
-        );
+    let assert_usage = |row: &sqlx::sqlite::SqliteRow, provider_id: &str, completed: bool| {
+        assert_eq!(row.get::<String, _>("provider_id"), provider_id);
         assert_eq!(
             row.get::<String, _>("status"),
             if completed { "completed" } else { "failed" }
@@ -363,7 +359,21 @@ async fn run_case(stream: bool, failure: usize, fallback: bool) {
             (row.get::<f64, _>("total_cost_usd") - if completed { 0.00002 } else { 0.0 }).abs()
                 < 1e-12
         );
-    }
+    };
+    let first_usage = usage
+        .iter()
+        .find(|row| row.get::<String, _>("request_id") == first_request_id)
+        .expect("first request usage row should be persisted");
+    assert_usage(
+        first_usage,
+        if expected_b_hits == 1 { &b_id } else { &a_id },
+        expected_b_hits == 1,
+    );
+    let recovery_usage = usage
+        .iter()
+        .find(|row| row.get::<String, _>("request_id") == recovery_request_id)
+        .expect("recovery request usage row should be persisted");
+    assert_usage(recovery_usage, &a_id, true);
     let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_counter_deltas d WHERE d.kind='provider_monthly' AND d.quota_accounting_status != 'ready' AND NOT EXISTS (SELECT 1 FROM provider_quota_reservations r WHERE r.candidate_id=d.request_id AND r.state='uncertain')")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(unresolved, 0);

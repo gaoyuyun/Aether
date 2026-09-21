@@ -543,7 +543,14 @@ GREATEST(
 /// Mirrors `SQLITE_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL`; see that constant for why
 /// both facts are required.
 const MYSQL_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL: &str = r#"(
-  NULLIF(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.routing_candidate_skip_reason')), '')), '') IS NOT NULL
+  (
+    NULLIF(TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.routing_candidate_skip_reason')), '')), '') IS NOT NULL
+    OR COALESCE(`usage`.local_execution_runtime_miss_reason, '') IN ('all_candidates_skipped', 'candidate_list_empty')
+    OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.local_execution_runtime_miss_reason')), '') IN ('all_candidates_skipped', 'candidate_list_empty')
+    OR EXISTS (SELECT 1 FROM usage_routing_snapshots AS skipped_routing
+      WHERE skipped_routing.request_id = `usage`.request_id
+        AND skipped_routing.local_execution_runtime_miss_reason IN ('all_candidates_skipped', 'candidate_list_empty'))
+  )
   AND (
     TRIM(COALESCE(`usage`.execution_path, '')) = 'local_execution_runtime_miss'
     OR TRIM(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.execution_path')), '')) = 'local_execution_runtime_miss'
@@ -1583,7 +1590,7 @@ SET provider_api_keys.request_count = aggregated.request_count,
     provider_api_keys.total_response_time_ms = aggregated.total_response_time_ms,
     provider_api_keys.last_used_at = aggregated.last_used_at
 "#,
-            never_called_predicate = MYSQL_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL,
+            never_called_predicate = read::mysql_usage_skipped_predicate(),
             success_flag_expr = MYSQL_PROVIDER_KEY_SUCCESS_FLAG_EXPR,
             error_flag_expr = MYSQL_PROVIDER_KEY_ERROR_FLAG_EXPR,
             canonical_total_tokens_expr = MYSQL_USAGE_CANONICAL_TOTAL_TOKENS_EXPR,

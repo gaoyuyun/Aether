@@ -40,6 +40,27 @@ use crate::data::GatewayDataState;
 
 const ADMIN_PROVIDERS_DATA_UNAVAILABLE_DETAIL: &str = "Admin provider catalog data unavailable";
 
+fn run_async_test_on_large_stack<F>(name: &'static str, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime should build")
+                .block_on(future);
+        })
+        .expect("large-stack admin provider test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 async fn provider_health_summary(
     endpoints: &[StoredProviderCatalogEndpoint],
     keys: &[StoredProviderCatalogKey],
@@ -1854,8 +1875,15 @@ async fn gateway_lists_effective_api_formats_for_fixed_oauth_provider_keys() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_health_monitor_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_provider_health_monitor_locally_with_trusted_admin_principal() {
+    run_async_test_on_large_stack(
+        "gateway_handles_admin_provider_health_monitor_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_health_monitor_locally_with_trusted_admin_principal_impl(),
+    );
+}
+
+async fn gateway_handles_admin_provider_health_monitor_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -1974,11 +2002,11 @@ async fn gateway_handles_admin_provider_health_monitor_locally_with_trusted_admi
         .is_some_and(|value| value.ends_with(".000Z")));
     assert_eq!(endpoints[1]["endpoint_id"], "endpoint-openai-cli");
     assert_eq!(endpoints[1]["api_format"], "openai:responses");
-    assert_eq!(endpoints[1]["total_attempts"], 1);
+    assert_eq!(endpoints[1]["total_attempts"], 0);
     assert_eq!(endpoints[1]["success_count"], 0);
     assert_eq!(endpoints[1]["failed_count"], 0);
     assert_eq!(endpoints[1]["skipped_count"], 1);
-    assert_eq!(endpoints[1]["success_rate"], 0.0);
+    assert_eq!(endpoints[1]["success_rate"], 1.0);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

@@ -94,7 +94,7 @@ vi.mock('lucide-vue-next', async () => {
   return {
     RefreshCcw: Icon,
     EyeOff: Icon,
-    Calculator: Icon,
+    SkipForward: Icon,
     Search: Icon,
     Shuffle: Icon,
     ChevronDown: Icon,
@@ -168,7 +168,7 @@ function mountUsageRecordsTable(records: UsageRecord[], overrides: Record<string
     pageSizeOptions: [20, 50],
     autoRefresh: false,
     hideUnknownRecords: false,
-    hideCountTokensRecords: true,
+    hideSkippedRecords: true,
     ...overrides,
   })
 
@@ -701,16 +701,27 @@ describe('UsageRecordsTable', () => {
     expect(onUpdateHideUnknownRecords).toHaveBeenCalledWith(true)
   })
 
-  it.each(['desktop', 'mobile'])('can show token counting requests on %s', layout => {
-    const onUpdateHideCountTokensRecords = vi.fn()
+  it('labels skipped requests without a failure badge while retaining their diagnostic status', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      is_skipped: true, status: 'failed', status_code: 503, error_message: 'no upstream available',
+    })])
+    const badges = [...root.querySelectorAll<HTMLElement>('span[variant]')]
+    expect(badges.filter(badge => badge.textContent?.trim() === '跳过')).toHaveLength(2)
+    expect(root.textContent).toContain('跳过')
+    expect(badges.some(badge => badge.textContent?.trim() === '失败')).toBe(false)
+  })
+
+  it.each(['desktop', 'mobile'])('can show skipped requests on %s', layout => {
+    const onUpdateHideSkippedRecords = vi.fn()
     const root = mountUsageRecordsTable([buildRecord()], {
-      'onUpdate:hideCountTokensRecords': onUpdateHideCountTokensRecords,
+      'onUpdate:hideSkippedRecords': onUpdateHideSkippedRecords,
     })
-    const toggle = root.querySelector<HTMLElement>(`[data-usage-hide-count-tokens-toggle="${layout}"]`)
+    const toggle = root.querySelector<HTMLElement>(`[data-usage-hide-skipped-toggle="${layout}"]`)
 
     expect(toggle?.getAttribute('aria-pressed')).toBe('true')
+    expect(toggle?.getAttribute('title')).toBe('显示跳过的记录')
     toggle?.click()
-    expect(onUpdateHideCountTokensRecords).toHaveBeenCalledWith(false)
+    expect(onUpdateHideSkippedRecords).toHaveBeenCalledWith(false)
   })
 
   it('debounces usage search updates', async () => {

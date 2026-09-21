@@ -396,6 +396,28 @@ pub(crate) async fn apply_local_execution_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalExecutionEffect<'_>,
 ) {
+    // Token counting is an auxiliary operation. Its failure is a skip and must
+    // not alter account health, affinity, credentials, cooldowns or pool score.
+    // A pool lease still has to be released on the terminal error path.
+    if local_execution_is_count_tokens(context)
+        && matches!(
+            effect,
+            LocalExecutionEffect::AttemptFailure(_)
+                | LocalExecutionEffect::AdaptiveRateLimit(_)
+                | LocalExecutionEffect::HealthFailure(_)
+                | LocalExecutionEffect::OauthInvalidation(_)
+                | LocalExecutionEffect::PoolError(_)
+                | LocalExecutionEffect::PoolStreamTimeout
+        )
+    {
+        if matches!(
+            effect,
+            LocalExecutionEffect::PoolError(_) | LocalExecutionEffect::PoolStreamTimeout
+        ) {
+            release_local_pool_key_lease(state, context).await;
+        }
+        return;
+    }
     match effect {
         LocalExecutionEffect::AttemptFailure(effect) => {
             record_attempt_failure_effect(state, context, effect).await;
@@ -435,6 +457,40 @@ pub(crate) async fn apply_local_execution_effect(
             release_local_pool_key_lease(state, context).await;
         }
     }
+}
+
+pub(crate) fn report_context_is_count_tokens(report_context: Option<&Value>) -> bool {
+    ["api_operation", "route_kind", "request_type"]
+        .into_iter()
+        .any(|key| {
+            report_context_string_field(report_context, key)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("count_tokens"))
+        })
+        || ["request_path", "request_path_and_query"]
+            .into_iter()
+            .any(|key| {
+                report_context_string_field(report_context, key)
+                    .is_some_and(count_tokens_request_path)
+            })
+}
+
+fn count_tokens_request_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    path.ends_with("/messages/count_tokens") || path.ends_with("/messages/count_token")
+}
+
+pub(crate) fn execution_plan_is_count_tokens(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> bool {
+    report_context_is_count_tokens(report_context)
+        || url::Url::parse(&plan.url)
+            .ok()
+            .is_some_and(|url| count_tokens_request_path(url.path()))
+}
+
+pub(crate) fn local_execution_is_count_tokens(context: LocalExecutionEffectContext<'_>) -> bool {
+    execution_plan_is_count_tokens(context.plan, context.report_context)
 }
 
 /// Apply the provider/key effects shared by every successful streaming
@@ -3843,6 +3899,136 @@ mod tests {
             LocalFailoverClassification::RetryUpstreamFailure,
             503,
         ));
+    }
+
+    #[tokio::test]
+    async fn count_tokens_failures_preserve_account_health_cooldown_and_pool_score() {
+        use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
+        use aether_data_contracts::repository::pool_scores::GetPoolMemberScoresByIdsQuery;
+
+        for use_operation in [true, false] {
+            let key = sample_adaptive_key();
+            let catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                vec![sample_pool_health_provider()],
+                vec![sample_health_endpoint()],
+                vec![key.clone()],
+            ));
+            let state = AppState::new().unwrap().with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(catalog)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY)
+                    .with_pool_score_repository_for_tests(Arc::new(
+                        InMemoryPoolMemberScoreRepository::default(),
+                    )),
+            );
+            let score = state
+                .data
+                .upsert_pool_member_score(crate::ai_serving::build_provider_key_pool_score_upsert(
+                    &key,
+                    "custom",
+                    None,
+                    1,
+                    Default::default(),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut plan = sample_plan();
+            let mut report_context = json!({
+                "api_key_id": "api-key-1", "client_api_format": "openai:chat", "model": "gpt-5"
+            });
+            if use_operation {
+                report_context["api_operation"] = json!("count_tokens");
+            } else {
+                plan.url =
+                    "https://example.com/custom/v1/messages/count_tokens/?beta=true".to_string();
+            }
+            let cache_key = build_scheduler_affinity_cache_key_for_api_key_id(
+                "api-key-1",
+                "openai:chat",
+                "gpt-5",
+            )
+            .unwrap();
+            let target = SchedulerAffinityTarget {
+                provider_id: plan.provider_id.clone(),
+                endpoint_id: plan.endpoint_id.clone(),
+                key_id: plan.key_id.clone(),
+            };
+            state.remember_scheduler_affinity_target(
+                &cache_key,
+                target.clone(),
+                SCHEDULER_AFFINITY_TTL,
+                16,
+            );
+            let headers = BTreeMap::from([("Retry-After".to_string(), "120".to_string())]);
+            let context = LocalExecutionEffectContext {
+                plan: &plan,
+                report_context: Some(&report_context),
+            };
+            for status_code in [401, 403, 404, 429, 503] {
+                let classification = LocalFailoverClassification::RetryUpstreamFailure;
+                for effect in [
+                    LocalExecutionEffect::AttemptFailure(LocalAttemptFailureEffect {
+                        status_code,
+                        classification,
+                    }),
+                    LocalExecutionEffect::AdaptiveRateLimit(LocalAdaptiveRateLimitEffect {
+                        status_code,
+                        classification,
+                        headers: Some(&headers),
+                    }),
+                    LocalExecutionEffect::HealthFailure(LocalHealthFailureEffect {
+                        status_code,
+                        classification,
+                    }),
+                    LocalExecutionEffect::OauthInvalidation(LocalOAuthInvalidationEffect {
+                        status_code,
+                        response_text: Some("invalid api key"),
+                    }),
+                    LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                        status_code,
+                        classification,
+                        headers: &headers,
+                        error_body: Some("unavailable"),
+                    }),
+                    LocalExecutionEffect::PoolStreamTimeout,
+                ] {
+                    apply_local_execution_effect(&state, context, effect).await;
+                }
+            }
+            let stored_key = state
+                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&plan.key_id))
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                ProviderCatalogKeyAdaptiveState::from(&stored_key),
+                ProviderCatalogKeyAdaptiveState::from(&key)
+            );
+            assert_eq!(stored_key.health_by_format, key.health_by_format);
+            assert_eq!(
+                stored_key.circuit_breaker_by_format,
+                key.circuit_breaker_by_format
+            );
+            assert_eq!(
+                stored_key.oauth_invalid_at_unix_secs,
+                key.oauth_invalid_at_unix_secs
+            );
+            assert_eq!(
+                state.read_scheduler_affinity_target(&cache_key, SCHEDULER_AFFINITY_TTL),
+                Some(target)
+            );
+            assert_eq!(crate::handlers::shared::provider_pool::read_admin_provider_pool_key_cooldown_reason(
+                state.runtime_state.as_ref(), &plan.provider_id, &plan.key_id
+            ).await.unwrap(), None);
+            let stored_scores = state
+                .data
+                .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+                    ids: vec![score.id.clone()],
+                })
+                .await
+                .unwrap();
+            assert_eq!(stored_scores, [score]);
+        }
     }
 
     #[tokio::test]

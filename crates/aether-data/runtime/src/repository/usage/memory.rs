@@ -6,10 +6,10 @@ use std::sync::RwLock;
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_data_contracts::repository::usage::{
     canonical_usage_body_ref_for, parse_usage_body_ref, sanitize_usage_request_metadata,
-    usage_body_ref, ProviderQuotaWindowUsageRequest, StoredProviderQuotaWindowUsage,
-    StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBreakdownSummaryRow,
-    StoredUsageCacheAffinityHitSummary, StoredUsageCacheAffinityIntervalRow,
-    StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
+    usage_body_ref, usage_is_skipped, ProviderQuotaWindowUsageRequest,
+    StoredProviderQuotaWindowUsage, StoredUsageAuditAggregation, StoredUsageAuditSummary,
+    StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
+    StoredUsageCacheAffinityIntervalRow, StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
     StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardProviderCount,
     StoredUsageDashboardSummary, StoredUsageErrorDistributionRow, StoredUsageLeaderboardSummary,
     StoredUsagePerformancePercentilesRow, StoredUsageProviderPerformance,
@@ -274,41 +274,6 @@ fn usage_has_admin_unknown_model_or_provider(item: &StoredRequestUsageAudit) -> 
     usage_admin_unknown_label(&item.model) || usage_admin_unknown_label(&item.provider_name)
 }
 
-/// Whether a usage row records a Claude token counting request.
-///
-/// Mirrors the SQL predicates in the three database adapters. Every
-/// `route_kind` source has to be consulted because none of them covers every
-/// row: `request_type` only names the operation for rows written after the usage
-/// writer started carrying the planned API operation, and the captured request
-/// path is absent whenever the gateway rejected the request locally without ever
-/// building an upstream request.
-fn usage_is_count_tokens(item: &StoredRequestUsageAudit) -> bool {
-    fn is_count_tokens(value: Option<&str>) -> bool {
-        value.is_some_and(|value| value.trim().eq_ignore_ascii_case("count_tokens"))
-    }
-
-    if is_count_tokens(item.request_type.as_deref()) || is_count_tokens(item.routing_route_kind()) {
-        return true;
-    }
-    ["request_path", "request_path_and_query"]
-        .iter()
-        .any(|key| {
-            item.request_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get(key))
-                .and_then(Value::as_str)
-                .is_some_and(|path| {
-                    matches!(
-                        path.split('?')
-                            .next()
-                            .unwrap_or_default()
-                            .trim_end_matches('/'),
-                        "/v1/messages/count_tokens" | "/v1/messages/count_token"
-                    )
-                })
-        })
-}
-
 fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditListQuery) -> bool {
     // The field is historically named `created_at_unix_ms`, but usage audit rows
     // across gateway handlers, SQL repositories and tests are stored as epoch seconds.
@@ -357,7 +322,7 @@ fn usage_matches_list_query(item: &StoredRequestUsageAudit, query: &UsageAuditLi
     if query.exclude_unknown_model_or_provider && usage_has_admin_unknown_model_or_provider(item) {
         return false;
     }
-    if query.exclude_count_tokens && usage_is_count_tokens(item) {
+    if query.exclude_skipped && usage_is_skipped(item) {
         return false;
     }
     if let Some(statuses) = query.statuses.as_ref() {
@@ -446,7 +411,7 @@ fn usage_matches_keyword_search_query(
     if query.exclude_unknown_model_or_provider && usage_has_admin_unknown_model_or_provider(item) {
         return false;
     }
-    if query.exclude_count_tokens && usage_is_count_tokens(item) {
+    if query.exclude_skipped && usage_is_skipped(item) {
         return false;
     }
     if let Some(statuses) = query.statuses.as_ref() {

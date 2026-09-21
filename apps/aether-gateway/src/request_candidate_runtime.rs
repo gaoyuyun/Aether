@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::clock::current_unix_ms;
 use crate::log_ids::short_request_id;
+use crate::orchestration::{execution_plan_is_count_tokens, report_context_is_count_tokens};
 use crate::GatewayError;
 
 const REQUEST_CANDIDATE_PERSISTENCE_ENV: &str = "AETHER_GATEWAY_REQUEST_CANDIDATE_PERSISTENCE";
@@ -240,6 +241,7 @@ pub(crate) struct LocalRequestCandidateStatusSnapshot {
     model_id: Option<String>,
     global_model_name: Option<String>,
     provider_api_format: String,
+    is_count_tokens: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -467,7 +469,29 @@ pub(crate) fn snapshot_local_request_candidate_status(
         model_id: report_context_string(report_context, "model_id"),
         global_model_name: report_context_string(report_context, "global_model_name"),
         provider_api_format: plan.provider_api_format.clone(),
+        is_count_tokens: execution_plan_is_count_tokens(plan, report_context),
     })
+}
+
+fn normalize_count_tokens_failure_status(
+    is_count_tokens: bool,
+    mut status_update: SchedulerRequestCandidateStatusUpdate,
+) -> SchedulerRequestCandidateStatusUpdate {
+    if is_count_tokens && status_update.status == RequestCandidateStatus::Failed {
+        status_update.status = RequestCandidateStatus::Skipped;
+    }
+    status_update
+}
+
+fn normalize_count_tokens_failure_status_value(
+    is_count_tokens: bool,
+    status: RequestCandidateStatus,
+) -> RequestCandidateStatus {
+    if is_count_tokens && status == RequestCandidateStatus::Failed {
+        RequestCandidateStatus::Skipped
+    } else {
+        status
+    }
 }
 
 fn report_context_string(report_context: Option<&Value>, key: &str) -> Option<String> {
@@ -539,6 +563,10 @@ pub(crate) async fn record_local_request_candidate_dispatch(
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) -> Result<(), GatewayError> {
+    let status_update = normalize_count_tokens_failure_status(
+        execution_plan_is_count_tokens(plan, report_context),
+        status_update,
+    );
     let Some(record) =
         build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
             plan,
@@ -641,6 +669,10 @@ pub(crate) async fn record_local_request_candidate_status(
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) {
+    let status_update = normalize_count_tokens_failure_status(
+        execution_plan_is_count_tokens(plan, report_context),
+        status_update,
+    );
     let Some(mut record) =
         build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
             plan,
@@ -688,6 +720,7 @@ pub(crate) async fn record_local_request_candidate_extra_data(
     let Some(snapshot) = snapshot_local_request_candidate_status(plan, report_context) else {
         return;
     };
+    let status = normalize_count_tokens_failure_status_value(snapshot.is_count_tokens, status);
     let record = UpsertRequestCandidateRecord {
         id: snapshot.candidate_id.clone(),
         request_id: snapshot.request_id.clone(),
@@ -721,6 +754,8 @@ fn build_local_request_candidate_status_snapshot_record(
     snapshot: &LocalRequestCandidateStatusSnapshot,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) -> UpsertRequestCandidateRecord {
+    let status_update =
+        normalize_count_tokens_failure_status(snapshot.is_count_tokens, status_update);
     let SchedulerRequestCandidateStatusUpdate {
         status,
         status_code,
@@ -823,6 +858,10 @@ pub(crate) async fn record_report_request_candidate_status(
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) {
+    let status_update = normalize_count_tokens_failure_status(
+        report_context_is_count_tokens(report_context),
+        status_update,
+    );
     let Some(slot) = resolve_report_request_candidate_slot(state, report_context).await else {
         return;
     };
@@ -1363,8 +1402,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ensure_execution_request_candidate_slot, persist_available_local_candidate,
-        record_local_request_candidate_dispatch, record_report_request_candidate_status,
+        ensure_execution_request_candidate_slot, normalize_count_tokens_failure_status,
+        persist_available_local_candidate, record_local_request_candidate_dispatch,
+        record_report_request_candidate_status,
         record_request_terminal_local_request_candidate_status,
         record_request_terminal_report_request_candidate_status,
         request_candidate_marks_request_terminal, resolve_request_candidate_required_capabilities,
@@ -1540,6 +1580,51 @@ mod tests {
             transport_profile: None,
             timeouts: None,
         }
+    }
+
+    #[test]
+    fn failed_count_tokens_candidate_is_recorded_as_skipped_but_success_is_preserved() {
+        let failed = SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Failed,
+            status_code: Some(404),
+            error_type: Some("upstream4xx".to_string()),
+            error_message: Some("count_tokens is unsupported".to_string()),
+            latency_ms: Some(12),
+            started_at_unix_ms: Some(100),
+            finished_at_unix_ms: Some(112),
+        };
+        assert_eq!(
+            normalize_count_tokens_failure_status(true, failed).status,
+            RequestCandidateStatus::Skipped
+        );
+
+        let success = SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Success,
+            status_code: Some(200),
+            error_type: None,
+            error_message: None,
+            latency_ms: Some(12),
+            started_at_unix_ms: Some(100),
+            finished_at_unix_ms: Some(112),
+        };
+        assert_eq!(
+            normalize_count_tokens_failure_status(true, success).status,
+            RequestCandidateStatus::Success
+        );
+
+        let ordinary_failure = SchedulerRequestCandidateStatusUpdate {
+            status: RequestCandidateStatus::Failed,
+            status_code: Some(500),
+            error_type: Some("server_error".to_string()),
+            error_message: Some("ordinary request failed".to_string()),
+            latency_ms: Some(12),
+            started_at_unix_ms: Some(100),
+            finished_at_unix_ms: Some(112),
+        };
+        assert_eq!(
+            normalize_count_tokens_failure_status(false, ordinary_failure).status,
+            RequestCandidateStatus::Failed
+        );
     }
 
     #[test]

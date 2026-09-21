@@ -967,7 +967,8 @@ fn released_usage_identity() -> Vec<(
 ///
 /// Only the selected identity is cleared. The candidate id stays because an older
 /// quota repair joins on it, and the route kind and execution path stay because they
-/// are what still explains the row and lets the records view hide token counting.
+/// are what still explains the row and lets the records view classify token-count
+/// failures without hiding successful token-count rows.
 type ReleasedRoutingSnapshot = (
     String,
     Option<String>,

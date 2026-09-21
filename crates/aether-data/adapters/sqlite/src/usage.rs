@@ -844,7 +844,14 @@ END
 /// miss, but so does a genuine exhaustion whose upstream really did fail; only a
 /// candidate that was rejected before dispatch carries a skip reason.
 const SQLITE_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL: &str = r#"(
-  NULLIF(TRIM(COALESCE(json_extract("usage".request_metadata, '$.routing_candidate_skip_reason'), '')), '') IS NOT NULL
+  (
+    NULLIF(TRIM(COALESCE(json_extract("usage".request_metadata, '$.routing_candidate_skip_reason'), '')), '') IS NOT NULL
+    OR COALESCE("usage".local_execution_runtime_miss_reason, '') IN ('all_candidates_skipped', 'candidate_list_empty')
+    OR COALESCE(json_extract("usage".request_metadata, '$.local_execution_runtime_miss_reason'), '') IN ('all_candidates_skipped', 'candidate_list_empty')
+    OR EXISTS (SELECT 1 FROM usage_routing_snapshots AS skipped_routing
+      WHERE skipped_routing.request_id = "usage".request_id
+        AND skipped_routing.local_execution_runtime_miss_reason IN ('all_candidates_skipped', 'candidate_list_empty'))
+  )
   AND (
     TRIM(COALESCE("usage".execution_path, '')) = 'local_execution_runtime_miss'
     OR TRIM(COALESCE(json_extract("usage".request_metadata, '$.execution_path'), '')) = 'local_execution_runtime_miss'
@@ -904,7 +911,10 @@ fn push_sqlite_usage_where(builder: &mut QueryBuilder<'_, Sqlite>, has_where: &m
     *has_where = true;
 }
 
-/// Opening terms of the predicate that hides Claude token counting rows.
+/// Opening terms of the predicate that is true for non-token-count rows.
+///
+/// The completed predicate is negated where the skipped-record classifier needs
+/// to identify token-count failures; successful token-count rows remain visible.
 ///
 /// Every `route_kind` source has to be consulted, not just one, because none of
 /// them covers every row:
@@ -932,6 +942,23 @@ const SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX: &str = r#"(
     WHERE count_tokens_routing.request_id = "usage".request_id
       AND LOWER(TRIM(COALESCE(count_tokens_routing.route_kind, ''))) = 'count_tokens'
   )"#;
+
+fn sqlite_usage_exclude_count_tokens_predicate() -> String {
+    let mut predicate = SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX.to_string();
+    for key in ["request_path", "request_path_and_query"] {
+        let path = format!("COALESCE(json_extract(\"usage\".request_metadata, '$.{key}'), '')");
+        predicate.push_str(&format!(
+            " AND RTRIM(SUBSTR({path}, 1, INSTR({path} || '?', '?') - 1), '/') NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
+        ));
+    }
+    predicate.push(')');
+    predicate
+}
+
+fn sqlite_usage_skipped_predicate() -> String {
+    format!("(\"usage\".status = 'skipped' OR {SQLITE_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL} OR (NOT ({}) AND ({SQLITE_PROVIDER_KEY_ERROR_FLAG_EXPR}) = 1))",
+        sqlite_usage_exclude_count_tokens_predicate())
+}
 
 fn push_sqlite_usage_list_filters(
     builder: &mut QueryBuilder<'_, Sqlite>,
@@ -985,16 +1012,9 @@ fn push_sqlite_usage_list_filters(
 AND LOWER(TRIM(COALESCE(provider_name, ''))) NOT IN ('unknown', 'unknow'))",
         );
     }
-    if query.exclude_count_tokens {
+    if query.exclude_skipped {
         push_sqlite_usage_where(builder, has_where);
-        builder.push(SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX);
-        for key in ["request_path", "request_path_and_query"] {
-            let path = format!("COALESCE(json_extract(\"usage\".request_metadata, '$.{key}'), '')");
-            builder.push(format!(
-                " AND RTRIM(SUBSTR({path}, 1, INSTR({path} || '?', '?') - 1), '/') NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
-            ));
-        }
-        builder.push(")");
+        builder.push("NOT ").push(sqlite_usage_skipped_predicate());
     }
     if let Some(statuses) = query.statuses.as_deref() {
         if !statuses.is_empty() {
@@ -1063,7 +1083,7 @@ fn push_sqlite_usage_keyword_filters(
             api_format: query.api_format.clone(),
             client_family: query.client_family.clone(),
             exclude_unknown_model_or_provider: query.exclude_unknown_model_or_provider,
-            exclude_count_tokens: query.exclude_count_tokens,
+            exclude_skipped: query.exclude_skipped,
             statuses: query.statuses.clone(),
             exclude_status_codes: query.exclude_status_codes.clone(),
             is_stream: query.is_stream,
@@ -5653,7 +5673,7 @@ WHERE "usage".provider_api_key_id IS NOT NULL
   AND NOT {never_called_predicate}
 GROUP BY "usage".provider_api_key_id
 "#,
-            never_called_predicate = SQLITE_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL,
+            never_called_predicate = sqlite_usage_skipped_predicate(),
             success_flag_expr = SQLITE_PROVIDER_KEY_SUCCESS_FLAG_EXPR,
             error_flag_expr = SQLITE_PROVIDER_KEY_ERROR_FLAG_EXPR,
             total_tokens_expr = SQLITE_USAGE_CANONICAL_TOTAL_TOKENS_EXPR

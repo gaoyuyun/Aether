@@ -24,3 +24,8 @@ export function isUsageCountTokensRequest(record: Pick<UsageRecord, 'request_typ
     return COUNT_TOKENS_PATHS.includes(pathname ?? '')
   })
 }
+
+/** Hide only rows classified as skipped; successful token-count calls stay visible. */
+export function isUsageHiddenBySkipFilter(record: Pick<UsageRecord, 'is_skipped'>): boolean {
+  return record.is_skipped === true
+}

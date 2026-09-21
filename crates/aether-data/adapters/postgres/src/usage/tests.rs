@@ -495,7 +495,7 @@ async fn postgres_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_
     // The same row is a token counting request that only the route kind identifies.
     let mut query = UsageAuditListQuery {
         user_id: Some(user_id.clone()),
-        exclude_count_tokens: true,
+        exclude_skipped: true,
         ..UsageAuditListQuery::default()
     };
     let visible = repository
@@ -509,7 +509,7 @@ async fn postgres_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_
             .collect::<Vec<_>>(),
         [served_id.as_str()]
     );
-    query.exclude_count_tokens = false;
+    query.exclude_skipped = false;
     assert_eq!(
         repository
             .count_usage_audits(&query)
@@ -3619,7 +3619,7 @@ fn usage_sql_raw_aggregates_use_canonical_billing_facts() {
         super::REBUILD_API_KEY_USAGE_STATS_SQL.contains("FROM usage_billing_facts AS \"usage\"")
     );
     assert!(super::REBUILD_PROVIDER_API_KEY_USAGE_STATS_SQL
-        .contains("FROM usage_billing_facts AS \"usage\""));
+        .contains("FROM usage_billing_facts AS billing"));
     assert!(super::SUMMARIZE_TOTAL_TOKENS_BY_API_KEY_IDS_SQL
         .contains("FROM usage_billing_facts AS \"usage\""));
     assert!(super::SUMMARIZE_USAGE_TOTALS_BY_USER_IDS_SQL

@@ -642,7 +642,10 @@ AND `usage`.provider_name NOT IN ('unknown', 'pending')",
     Ok(builder)
 }
 
-/// Opening terms of the predicate that hides Claude token counting rows.
+/// Opening terms of the predicate that is true for non-token-count rows.
+///
+/// The completed predicate is negated where the skipped-record classifier needs
+/// to identify token-count failures; successful token-count rows remain visible.
 ///
 /// Mirrors the SQLite and Postgres predicates. See
 /// `SQLITE_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX` for why every `route_kind` source
@@ -658,6 +661,26 @@ const MYSQL_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX: &str = r#"(
     WHERE count_tokens_routing.request_id = `usage`.request_id
       AND LOWER(TRIM(COALESCE(count_tokens_routing.route_kind, ''))) = 'count_tokens'
   )"#;
+
+fn mysql_usage_exclude_count_tokens_predicate() -> String {
+    let mut predicate = MYSQL_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX.to_string();
+    for key in ["request_path", "request_path_and_query"] {
+        predicate.push_str(&format!(
+            " AND TRIM(TRAILING '/' FROM SUBSTRING_INDEX(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.{key}')), ''), '?', 1)) NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
+        ));
+    }
+    predicate.push(')');
+    predicate
+}
+
+pub(super) fn mysql_usage_skipped_predicate() -> String {
+    format!(
+        "(`usage`.status = 'skipped' OR {} OR (NOT ({}) AND ({}) = 1))",
+        super::MYSQL_USAGE_PROVIDER_KEY_NEVER_CALLED_SQL,
+        mysql_usage_exclude_count_tokens_predicate(),
+        super::MYSQL_PROVIDER_KEY_ERROR_FLAG_EXPR
+    )
+}
 
 fn push_list_filters(
     builder: &mut QueryBuilder<'_, MySql>,
@@ -708,15 +731,9 @@ fn push_list_filters(
 AND LOWER(TRIM(COALESCE(`usage`.provider_name, ''))) NOT IN ('unknown', 'unknow'))",
         );
     }
-    if query.exclude_count_tokens {
+    if query.exclude_skipped {
         push_where(builder, has_where);
-        builder.push(MYSQL_USAGE_EXCLUDE_COUNT_TOKENS_PREFIX);
-        for key in ["request_path", "request_path_and_query"] {
-            builder.push(format!(
-                " AND TRIM(TRAILING '/' FROM SUBSTRING_INDEX(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`usage`.request_metadata, '$.{key}')), ''), '?', 1)) NOT IN ('/v1/messages/count_tokens', '/v1/messages/count_token')"
-            ));
-        }
-        builder.push(")");
+        builder.push("NOT ").push(mysql_usage_skipped_predicate());
     }
     if let Some(statuses) = query
         .statuses
@@ -776,7 +793,7 @@ fn push_keyword_filters(
             api_format: query.api_format.clone(),
             client_family: query.client_family.clone(),
             exclude_unknown_model_or_provider: query.exclude_unknown_model_or_provider,
-            exclude_count_tokens: query.exclude_count_tokens,
+            exclude_skipped: query.exclude_skipped,
             statuses: query.statuses.clone(),
             exclude_status_codes: query.exclude_status_codes.clone(),
             is_stream: query.is_stream,

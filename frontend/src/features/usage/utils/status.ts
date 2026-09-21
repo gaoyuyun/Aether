@@ -5,6 +5,7 @@ export type TimelineFinalStatus = 'success' | 'failed' | 'streaming' | 'pending'
 type RequestStatusLike = RequestStatus | string | null | undefined
 
 type UsageFailureSignal = {
+  is_skipped?: boolean
   status_code?: number | null
   error_message?: string | null
   image_progress?: {
@@ -184,6 +185,7 @@ function hasTerminalSuccessStatusCode(
 }
 
 export function isUsageRecordFailed(record: UsageFailureSignal & Pick<UsageRecord, 'status'>): boolean {
+  if (record.is_skipped) return false
   const status = typeof record.status === 'string' ? record.status.trim().toLowerCase() : ''
   if (status) {
     if (status === 'pending' || status === 'streaming') {

@@ -59,6 +59,7 @@ export interface UsageRecord {
   request_path_and_query?: string | null
   // 控制面解析出的路由操作。本地被拒的请求没有上游请求路径，只有这个字段能表明它是什么操作
   route_kind?: string | null
+  is_skipped?: boolean // 跳过的请求仍保留原始 HTTP 状态和错误用于诊断
   status_code?: number
   error_message?: string
   status?: RequestStatus  // 请求状态: pending, streaming, completed, failed

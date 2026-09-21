@@ -1347,9 +1347,9 @@ fn admin_usage_active_request_json(
         "request_path_and_query": admin_usage_metadata_string(item, "request_path_and_query"),
         // The resolved route kind is the only signal that identifies an operation the
         // gateway rejected locally: such a row has no captured request path, because no
-        // upstream request was ever built. The records view needs it to hide token
-        // counting requests without refetching each row's detail.
+        // upstream request was ever built.
         "route_kind": item.routing_route_kind(),
+        "is_skipped": aether_data_contracts::repository::usage::usage_is_skipped(item),
         "has_fallback": admin_usage_has_fallback(item),
     });
     value["end_to_end_time_ms"] = json!(admin_usage_metadata_u64(item, "end_to_end_time_ms"));
@@ -1463,6 +1463,12 @@ pub fn admin_usage_record_json(
     let object = payload
         .as_object_mut()
         .expect("admin usage record payload should be an object");
+    object.insert(
+        "is_skipped".to_string(),
+        json!(aether_data_contracts::repository::usage::usage_is_skipped(
+            item
+        )),
+    );
     object.insert(
         "end_to_end_time_ms".to_string(),
         json!(admin_usage_metadata_u64(item, "end_to_end_time_ms")),

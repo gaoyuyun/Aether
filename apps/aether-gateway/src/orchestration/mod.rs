@@ -42,12 +42,14 @@ pub(crate) use self::codex_quota_breaker::{
 };
 pub(crate) use self::effects::{
     apply_local_execution_effect, apply_local_stream_failure_effects,
-    apply_local_stream_success_effects, pool_immediate_retry_wait, release_local_pool_key_lease,
-    release_pool_key_lease_from_report_context, spawn_local_oauth_success_effect,
-    take_pool_immediate_retry_hint, LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect,
-    LocalAttemptFailureEffect, LocalExecutionEffect, LocalExecutionEffectContext,
-    LocalHealthFailureEffect, LocalHealthSuccessEffect, LocalOAuthInvalidationEffect,
-    LocalOAuthSuccessEffect, LocalPoolErrorEffect, LocalStreamFailureEffect,
+    apply_local_stream_success_effects, execution_plan_is_count_tokens,
+    local_execution_is_count_tokens, pool_immediate_retry_wait, release_local_pool_key_lease,
+    release_pool_key_lease_from_report_context, report_context_is_count_tokens,
+    spawn_local_oauth_success_effect, take_pool_immediate_retry_hint, LocalAdaptiveRateLimitEffect,
+    LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
+    LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
+    LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect, LocalPoolErrorEffect,
+    LocalStreamFailureEffect,
 };
 pub(crate) use self::health::{
     project_local_failure_health, project_local_key_circuit_closed,

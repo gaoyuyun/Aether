@@ -111,7 +111,9 @@ pub(crate) async fn build_admin_provider_health_monitor_payload(
                 .iter()
                 .filter(|candidate| candidate.status == RequestCandidateStatus::Skipped)
                 .count();
-            let total_attempts = candidates.len();
+            // Planner-only skips are useful diagnostics, but they do not represent an upstream
+            // execution and must not lower the endpoint's health rate.
+            let total_attempts = success_count + failed_count;
             let success_rate = if total_attempts > 0 {
                 success_count as f64 / total_attempts as f64
             } else {

@@ -1644,8 +1644,15 @@ async fn gateway_filters_admin_usage_records_with_unknown_model_or_provider() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_filters_admin_usage_records_count_tokens() {
+#[test]
+fn gateway_filters_admin_usage_records_skipped_and_count_tokens() {
+    run_async_test_on_large_stack(
+        "gateway_filters_admin_usage_records_skipped_and_count_tokens",
+        gateway_filters_admin_usage_records_skipped_and_count_tokens_impl(),
+    );
+}
+
+async fn gateway_filters_admin_usage_records_skipped_and_count_tokens_impl() {
     let normal = sample_usage_row(
         "usage-normal",
         "req-normal",
@@ -1682,6 +1689,34 @@ async fn gateway_filters_admin_usage_records_count_tokens() {
     typed.request_id = "req-typed".to_string();
     typed.request_type = Some("count_tokens".to_string());
     rows.push(typed);
+    for (id, request_type, metadata) in [
+        (
+            "skipped",
+            "chat",
+            serde_json::json!({"execution_path": "local_execution_runtime_miss", "routing_candidate_skip_reason": "provider_quota_blocked"}),
+        ),
+        (
+            "all-skipped",
+            "chat",
+            serde_json::json!({"execution_path": "local_execution_runtime_miss", "local_execution_runtime_miss_reason": "all_candidates_skipped"}),
+        ),
+        ("count-failed", "count_tokens", serde_json::json!({})),
+        (
+            "upstream-failed",
+            "chat",
+            serde_json::json!({"execution_path": "local_execution_runtime_miss", "local_execution_runtime_miss_reason": "execution_runtime_candidates_exhausted"}),
+        ),
+    ] {
+        let mut row = normal.clone();
+        row.id = format!("usage-{id}");
+        row.request_id = format!("req-{id}");
+        row.status = "failed".to_string();
+        row.status_code = Some(503);
+        row.error_message = Some("upstream unavailable".to_string());
+        row.request_type = Some(request_type.to_string());
+        row.request_metadata = Some(metadata);
+        rows.push(row);
+    }
 
     let gateway = build_router_with_state(
         AppState::new()
@@ -1694,9 +1729,10 @@ async fn gateway_filters_admin_usage_records_count_tokens() {
     let base_url = format!("{gateway_url}/api/admin/usage/records?start_date=2024-03-21&end_date=2024-03-22&tz_offset_minutes=0");
     for search in ["", "&search=claude"] {
         for (visibility, expected_total) in [
-            ("&hide_count_tokens=true", 1),
-            ("&hide_count_tokens=false", 5),
-            ("", 5),
+            ("&hide_skipped=true", 6),
+            ("&hide_count_tokens=true", 6),
+            ("&hide_skipped=false", 9),
+            ("", 9),
         ] {
             let response = admin_request(
                 reqwest::Client::new()
@@ -1710,8 +1746,12 @@ async fn gateway_filters_admin_usage_records_count_tokens() {
                 response.json().await.expect("records JSON should parse");
             assert_eq!(payload["total"], expected_total);
             assert_eq!(payload["records"].as_array().unwrap().len(), 1);
-            if expected_total == 1 {
-                assert_eq!(payload["records"][0]["id"], "usage-normal");
+            if expected_total == 6 {
+                assert!(!matches!(
+                    payload["records"][0]["id"].as_str().unwrap(),
+                    "usage-skipped" | "usage-all-skipped" | "usage-count-failed"
+                ));
+                assert_eq!(payload["records"][0]["is_skipped"], false);
             }
 
             let response = admin_request(
@@ -1727,6 +1767,21 @@ async fn gateway_filters_admin_usage_records_count_tokens() {
             assert_eq!(payload["total"], expected_total);
             assert!(payload["records"].as_array().unwrap().is_empty());
         }
+    }
+    let payload: serde_json::Value =
+        admin_request(reqwest::Client::new().get(format!("{base_url}&limit=20")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    for record in payload["records"].as_array().unwrap() {
+        let expected = matches!(
+            record["id"].as_str().unwrap(),
+            "usage-skipped" | "usage-all-skipped" | "usage-count-failed"
+        );
+        assert_eq!(record["is_skipped"], expected, "{record}");
     }
     gateway_handle.abort();
 }

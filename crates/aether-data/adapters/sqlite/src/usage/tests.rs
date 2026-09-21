@@ -673,7 +673,7 @@ async fn sqlite_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_se
     // The same row is a token counting request that only the route kind identifies.
     let reader = SqliteUsageReadRepository::new(pool);
     let mut query = UsageAuditListQuery {
-        exclude_count_tokens: true,
+        exclude_skipped: true,
         ..UsageAuditListQuery::default()
     };
     let visible = reader
@@ -687,7 +687,7 @@ async fn sqlite_provider_key_is_not_charged_or_rebuilt_from_requests_it_never_se
             .collect::<Vec<_>>(),
         ["served"]
     );
-    query.exclude_count_tokens = false;
+    query.exclude_skipped = false;
     assert_eq!(
         reader
             .count_usage_audits(&query)
@@ -2371,10 +2371,10 @@ async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keywo
 
     let reader = SqliteUsageReadRepository::new(pool);
     let mut query = UsageAuditListQuery {
-        exclude_count_tokens: true,
+        exclude_skipped: true,
         newest_first: true,
         limit: Some(1),
-        offset: Some(1),
+        offset: Some(5),
         ..UsageAuditListQuery::default()
     };
     let rows = reader
@@ -2388,9 +2388,9 @@ async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keywo
             .count_usage_audits(&query)
             .await
             .expect("count should load"),
-        3
+        7
     );
-    query.exclude_count_tokens = false;
+    query.exclude_skipped = false;
     assert_eq!(
         reader
             .count_usage_audits(&query)
@@ -2400,11 +2400,11 @@ async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keywo
     );
 
     let mut keyword_query = UsageAuditKeywordSearchQuery {
-        exclude_count_tokens: true,
+        exclude_skipped: true,
         keywords: vec!["model-1".to_string()],
         newest_first: true,
         limit: Some(1),
-        offset: Some(1),
+        offset: Some(5),
         ..UsageAuditKeywordSearchQuery::default()
     };
     let rows = reader
@@ -2418,15 +2418,127 @@ async fn sqlite_usage_count_tokens_filter_applies_before_pagination_and_to_keywo
             .count_usage_audits_by_keyword_search(&keyword_query)
             .await
             .expect("keyword count should load"),
-        3
+        7
     );
-    keyword_query.exclude_count_tokens = false;
+    keyword_query.exclude_skipped = false;
     assert_eq!(
         reader
             .count_usage_audits_by_keyword_search(&keyword_query)
             .await
             .expect("unfiltered keyword count should load"),
         8
+    );
+}
+
+#[tokio::test]
+async fn sqlite_skipped_records_do_not_affect_account_counters_or_filtered_totals() {
+    let pool = crate::test_support::migrated_pool().await;
+    seed_stats_targets(&pool).await;
+    let writer = SqliteUsageWriteRepository::new(pool.clone());
+    writer
+        .upsert(sample_usage("normal", "completed", "settled", 1_000))
+        .await
+        .unwrap();
+    let mut failure = sample_usage("upstream-failed", "failed", "void", 1_001);
+    failure.status_code = Some(503);
+    failure.error_message = Some("upstream failed".to_string());
+    failure.execution_path = Some("local_execution_runtime_miss".to_string());
+    failure.local_execution_runtime_miss_reason =
+        Some("execution_runtime_candidates_exhausted".to_string());
+    writer.upsert(failure).await.unwrap();
+
+    let mut count = sample_usage("count-failed", "pending", "pending", 1_002);
+    count.request_type = Some("count_tokens".to_string());
+    count.status_code = None;
+    writer.upsert(count.clone()).await.unwrap();
+    writer.flush_usage_counter_deltas(100).await.unwrap();
+    count.status = "failed".to_string();
+    count.billing_status = "void".to_string();
+    count.status_code = Some(404);
+    count.error_message = Some("token counting is unsupported".to_string());
+    count.updated_at_unix_secs += 1;
+    writer.upsert(count).await.unwrap();
+
+    for (id, metadata) in [
+        (
+            "quota-skipped",
+            serde_json::json!({"execution_path": "local_execution_runtime_miss", "routing_candidate_skip_reason": "provider_quota_blocked"}),
+        ),
+        (
+            "cooldown-skipped",
+            serde_json::json!({"execution_path": "local_execution_runtime_miss", "routing_candidate_skip_reason": "pool_cooldown"}),
+        ),
+        (
+            "all-skipped",
+            serde_json::json!({"execution_path": "local_execution_runtime_miss", "local_execution_runtime_miss_reason": "all_candidates_skipped"}),
+        ),
+        (
+            "empty-skipped",
+            serde_json::json!({"execution_path": "local_execution_runtime_miss", "local_execution_runtime_miss_reason": "candidate_list_empty"}),
+        ),
+    ] {
+        let mut row = sample_usage(id, "failed", "void", 1_003);
+        row.status_code = Some(503);
+        row.execution_path = None;
+        row.local_execution_runtime_miss_reason = None;
+        row.request_metadata = Some(metadata);
+        writer.upsert(row).await.unwrap();
+    }
+    // Legacy routing facts may exist only in the detached snapshot.
+    sqlx::query(r#"UPDATE "usage" SET execution_path = NULL, local_execution_runtime_miss_reason = NULL,
+        request_metadata = json_remove(request_metadata, '$.execution_path', '$.local_execution_runtime_miss_reason')
+        WHERE request_id = 'all-skipped'"#).execute(&pool).await.unwrap();
+    writer.flush_usage_counter_deltas(100).await.unwrap();
+    for rebuild in [false, true] {
+        if rebuild {
+            writer.rebuild_provider_api_key_usage_stats().await.unwrap();
+        }
+        let counters: (i64, i64, i64) = sqlx::query_as(
+            "SELECT request_count, success_count, error_count FROM provider_api_keys WHERE id = 'provider-key-1'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(counters, (2, 1, 1), "rebuild={rebuild}");
+    }
+
+    let reader = SqliteUsageReadRepository::new(pool);
+    let query = UsageAuditListQuery {
+        exclude_skipped: true,
+        limit: Some(1),
+        offset: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(reader.count_usage_audits(&query).await.unwrap(), 2);
+    assert_eq!(
+        reader.list_usage_audits(&query).await.unwrap()[0].request_id,
+        "upstream-failed"
+    );
+    let search = UsageAuditKeywordSearchQuery {
+        exclude_skipped: true,
+        keywords: vec!["model-1".to_string()],
+        limit: Some(1),
+        offset: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(
+        reader
+            .count_usage_audits_by_keyword_search(&search)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        reader
+            .list_usage_audits_by_keyword_search(&search)
+            .await
+            .unwrap()[0]
+            .request_id,
+        "upstream-failed"
+    );
+    assert_eq!(
+        reader
+            .count_usage_audits(&UsageAuditListQuery::default())
+            .await
+            .unwrap(),
+        7
     );
 }
 

@@ -571,13 +571,62 @@ pub fn provider_api_key_usage_is_error(
 /// call sites because every counter update funnels through this function.
 fn usage_names_a_provider_key_that_was_never_called(usage: &StoredRequestUsageAudit) -> bool {
     usage.routing_execution_path() == Some("local_execution_runtime_miss")
-        && usage.routing_candidate_skip_reason().is_some()
+        && (usage.routing_candidate_skip_reason().is_some()
+            || matches!(
+                usage.routing_local_execution_runtime_miss_reason(),
+                Some("all_candidates_skipped" | "candidate_list_empty")
+            ))
+}
+
+/// Includes legacy rows whose operation survives only in routing metadata or the path.
+pub fn usage_is_count_tokens(usage: &StoredRequestUsageAudit) -> bool {
+    let metadata_string = |key| {
+        usage
+            .request_metadata
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    [
+        usage.request_type.as_deref(),
+        usage.route_kind.as_deref(),
+        metadata_string("route_kind"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.trim().eq_ignore_ascii_case("count_tokens"))
+        || ["request_path", "request_path_and_query"]
+            .into_iter()
+            .any(|key| {
+                metadata_string(key).is_some_and(|path| {
+                    matches!(
+                        path.split('?')
+                            .next()
+                            .unwrap_or_default()
+                            .trim_end_matches('/'),
+                        "/v1/messages/count_tokens" | "/v1/messages/count_token"
+                    )
+                })
+            })
+}
+
+/// Skips are diagnostic outcomes, not evidence of an unhealthy provider account.
+/// Keep the original HTTP status and error on the audit row for troubleshooting.
+pub fn usage_is_skipped(usage: &StoredRequestUsageAudit) -> bool {
+    usage.status == "skipped"
+        || usage_names_a_provider_key_that_was_never_called(usage)
+        || (usage_is_count_tokens(usage)
+            && provider_api_key_usage_is_error(
+                &usage.status,
+                usage.status_code,
+                usage.error_message.as_deref(),
+            ))
 }
 
 pub fn provider_api_key_usage_contribution(
     usage: &StoredRequestUsageAudit,
 ) -> Option<ProviderApiKeyUsageContribution> {
-    if usage_names_a_provider_key_that_was_never_called(usage) {
+    if usage_is_skipped(usage) {
         return None;
     }
     let key_id = usage
@@ -833,6 +882,63 @@ mod tests {
             "routing_candidate_skip_reason": "provider_quota_blocked"
         }));
         assert!(provider_api_key_usage_contribution(&legacy).is_none());
+    }
+
+    #[test]
+    fn skipped_usage_does_not_affect_provider_key_counters() {
+        for source in [
+            "request_type",
+            "route_kind",
+            "metadata_route_kind",
+            "request_path",
+            "request_path_and_query",
+        ] {
+            let mut usage = failed_usage_naming_a_provider_key();
+            match source {
+                "request_type" => usage.request_type = Some("count_tokens".to_string()),
+                "route_kind" => usage.route_kind = Some("count_tokens".to_string()),
+                "metadata_route_kind" => {
+                    usage.request_metadata = Some(json!({"route_kind": "count_tokens"}))
+                }
+                key => {
+                    usage.request_metadata =
+                        Some(json!({key: "/v1/messages/count_tokens/?beta=true"}))
+                }
+            }
+            assert!(super::usage_is_skipped(&usage), "{source}");
+            assert!(
+                provider_api_key_usage_contribution(&usage).is_none(),
+                "{source}"
+            );
+            usage.status = "completed".to_string();
+            usage.status_code = Some(200);
+            usage.error_message = None;
+            assert!(
+                !super::usage_is_skipped(&usage),
+                "a real token count succeeded"
+            );
+            assert_eq!(
+                provider_api_key_usage_contribution(&usage)
+                    .unwrap()
+                    .success_count,
+                1
+            );
+            usage.status = "pending".to_string();
+            assert!(
+                !super::usage_is_skipped(&usage),
+                "in-flight requests are not skips"
+            );
+        }
+        for reason in ["all_candidates_skipped", "candidate_list_empty"] {
+            let mut usage = failed_usage_naming_a_provider_key();
+            usage.execution_path = Some("local_execution_runtime_miss".to_string());
+            usage.local_execution_runtime_miss_reason = Some(reason.to_string());
+            assert!(super::usage_is_skipped(&usage));
+            assert!(provider_api_key_usage_contribution(&usage).is_none());
+        }
+        let mut usage = failed_usage_naming_a_provider_key();
+        usage.status = "skipped".to_string();
+        assert!(provider_api_key_usage_contribution(&usage).is_none());
     }
 
     #[test]

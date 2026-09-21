@@ -32,15 +32,15 @@
         v-if="isAdmin"
         variant="ghost"
         size="icon"
-        data-usage-hide-count-tokens-toggle="mobile"
+        data-usage-hide-skipped-toggle="mobile"
         class="absolute right-20 top-2.5 h-8 w-8 shrink-0 md:hidden"
-        :class="hideCountTokensRecords ? 'text-primary' : ''"
-        :title="hideCountTokensRecords ? '显示 Token 计数请求' : '隐藏 Token 计数请求'"
-        aria-label="隐藏 Token 计数请求"
-        :aria-pressed="hideCountTokensRecords"
-        @click="$emit('update:hideCountTokensRecords', !hideCountTokensRecords)"
+        :class="hideSkippedRecords ? 'text-primary' : ''"
+        :title="hideSkippedRecords ? '显示跳过的记录' : '隐藏跳过的记录'"
+        aria-label="隐藏跳过的记录"
+        :aria-pressed="hideSkippedRecords"
+        @click="$emit('update:hideSkippedRecords', !hideSkippedRecords)"
       >
-        <Calculator class="w-3.5 h-3.5" />
+        <SkipForward class="w-3.5 h-3.5" />
       </Button>
       <Button
         variant="ghost"
@@ -217,15 +217,15 @@
         v-if="isAdmin"
         variant="ghost"
         size="icon"
-        data-usage-hide-count-tokens-toggle="desktop"
+        data-usage-hide-skipped-toggle="desktop"
         class="hidden h-8 w-8 shrink-0 md:inline-flex"
-        :class="hideCountTokensRecords ? 'text-primary' : ''"
-        :title="hideCountTokensRecords ? '显示 Token 计数请求' : '隐藏 Token 计数请求'"
-        aria-label="隐藏 Token 计数请求"
-        :aria-pressed="hideCountTokensRecords"
-        @click="$emit('update:hideCountTokensRecords', !hideCountTokensRecords)"
+        :class="hideSkippedRecords ? 'text-primary' : ''"
+        :title="hideSkippedRecords ? '显示跳过的记录' : '隐藏跳过的记录'"
+        aria-label="隐藏跳过的记录"
+        :aria-pressed="hideSkippedRecords"
+        @click="$emit('update:hideSkippedRecords', !hideSkippedRecords)"
       >
-        <Calculator class="w-3.5 h-3.5" />
+        <SkipForward class="w-3.5 h-3.5" />
       </Button>
       <Button
         variant="ghost"
@@ -282,7 +282,14 @@
               />
               <!-- 状态 Badge -->
               <Badge
-                v-if="isUsageRecordFailed(record)"
+                v-if="record.is_skipped"
+                variant="outline"
+                class="whitespace-nowrap text-muted-foreground text-[10px] px-1.5 h-4 leading-4 inline-flex items-center flex-shrink-0"
+              >
+                跳过
+              </Badge>
+              <Badge
+                v-else-if="isUsageRecordFailed(record)"
                 variant="destructive"
                 class="whitespace-nowrap text-[10px] px-1.5 h-4 leading-4 inline-flex items-center flex-shrink-0"
               >
@@ -868,7 +875,14 @@
           >
             <!-- 优先显示请求状态 -->
             <Badge
-              v-if="isUsageRecordFailed(record)"
+              v-if="record.is_skipped"
+              variant="outline"
+              class="whitespace-nowrap text-muted-foreground"
+            >
+              跳过
+            </Badge>
+            <Badge
+              v-else-if="isUsageRecordFailed(record)"
               variant="destructive"
               class="whitespace-nowrap"
             >
@@ -1118,7 +1132,7 @@ import {
   SortableTableHead,
   TableFilterMenu,
 } from '@/components/ui'
-import { Calculator, EyeOff, RefreshCcw, Search, Shuffle } from 'lucide-vue-next'
+import { EyeOff, RefreshCcw, Search, Shuffle, SkipForward } from 'lucide-vue-next'
 import { formatTokens, formatCurrency } from '@/utils/format'
 import { getCacheCreationTokens, getCacheReadTokens, getEffectiveInputTokens } from '../token-normalization'
 import {
@@ -1212,7 +1226,7 @@ const props = defineProps<{
   // 自动刷新
   autoRefresh: boolean
   hideUnknownRecords: boolean
-  hideCountTokensRecords: boolean
+  hideSkippedRecords: boolean
 }>()
 
 const emit = defineEmits<{
@@ -1228,7 +1242,7 @@ const emit = defineEmits<{
   'update:pageSize': [value: number]
   'update:autoRefresh': [value: boolean]
   'update:hideUnknownRecords': [value: boolean]
-  'update:hideCountTokensRecords': [value: boolean]
+  'update:hideSkippedRecords': [value: boolean]
   'refresh': []
   'showDetail': [id: string]
   'prefetchDetail': [id: string]

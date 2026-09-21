@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { isUsageCountTokensRequest } from '../countTokens'
+import { isUsageCountTokensRequest, isUsageHiddenBySkipFilter } from '../countTokens'
 
 describe('token counting usage records', () => {
+  it('hides skipped records while keeping successful token counting and ordinary requests visible', () => {
+    expect(isUsageHiddenBySkipFilter({ is_skipped: true })).toBe(true)
+    expect(isUsageHiddenBySkipFilter({ is_skipped: false })).toBe(false)
+    expect(isUsageHiddenBySkipFilter({})).toBe(false)
+  })
   it.each([
     { request_type: 'count_tokens' },
     { request_type: 'chat', request_path: '/v1/messages/count_tokens' },
