@@ -1098,18 +1098,38 @@ export const adminApi = {
   },
 
   // 查询 Provider 可用模型（从上游 API 获取）
-  async queryProviderModels(providerId: string, apiKeyId?: string, forceRefresh = false): Promise<ProviderModelsQueryResponse> {
+  async queryProviderModels(
+    providerId: string,
+    apiKeyId?: string,
+    forceRefresh = false,
+    clientVersion?: string,
+  ): Promise<ProviderModelsQueryResponse> {
     const response = await apiClient.post<ProviderModelsQueryResponse>(
       '/api/admin/provider-query/models',
-      { provider_id: providerId, api_key_id: apiKeyId, force_refresh: forceRefresh }
+      {
+        provider_id: providerId,
+        api_key_id: apiKeyId,
+        force_refresh: forceRefresh,
+        client_version: clientVersion?.trim() || undefined,
+      }
     )
     return response.data
   },
 
-  async queryProviderModelsForKeys(providerId: string, apiKeyIds: string[], forceRefresh = false): Promise<ProviderModelsQueryResponse> {
+  async queryProviderModelsForKeys(
+    providerId: string,
+    apiKeyIds: string[],
+    forceRefresh = false,
+    clientVersion?: string,
+  ): Promise<ProviderModelsQueryResponse> {
     const response = await apiClient.post<ProviderModelsQueryResponse>(
       '/api/admin/provider-query/models',
-      { provider_id: providerId, api_key_ids: apiKeyIds, force_refresh: forceRefresh }
+      {
+        provider_id: providerId,
+        api_key_ids: apiKeyIds,
+        force_refresh: forceRefresh,
+        client_version: clientVersion?.trim() || undefined,
+      }
     )
     return response.data
   },

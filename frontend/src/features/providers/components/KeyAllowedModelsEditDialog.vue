@@ -67,6 +67,11 @@
           />
         </div>
 
+        <CodexClientVersionField
+          v-model="codexClientVersion"
+          :provider-type="props.providerType"
+        />
+
         <!-- 模型列表 -->
         <div class="border rounded-lg overflow-hidden">
           <div class="max-h-96 overflow-y-auto">
@@ -375,7 +380,9 @@ import {
   type AllowedModels,
 } from '@/api/endpoints'
 import { useUpstreamModelsCache } from '../composables/useUpstreamModelsCache'
+import { useCodexClientVersion } from '../composables/useCodexClientVersion'
 import { formatApiFormatShort, type UpstreamModel } from '@/api/endpoints/types'
+import CodexClientVersionField from './CodexClientVersionField.vue'
 
 interface AvailableModel {
   name: string
@@ -388,6 +395,7 @@ const props = defineProps<{
   open: boolean
   apiKey: EndpointAPIKey | null
   providerId: string
+  providerType?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -404,6 +412,7 @@ const saving = ref(false)
 const loadingProviderModels = ref(false)
 const fetchingUpstreamModels = ref(false)
 const upstreamModelsLoaded = ref(false)
+const codexClientVersion = useCodexClientVersion()
 
 // 用于取消异步操作的标志
 let loadingCancelled = false
@@ -683,7 +692,12 @@ async function fetchUpstreamModels(forceRefresh = false) {
   if (!props.providerId || !props.apiKey) return
   try {
     fetchingUpstreamModels.value = true
-    const result = await fetchCachedModels(props.providerId, props.apiKey.id, forceRefresh)
+    const result = await fetchCachedModels(
+      props.providerId,
+      props.apiKey.id,
+      forceRefresh,
+      codexClientVersion.value,
+    )
     if (loadingCancelled) return
     if (result.models.length > 0) {
       upstreamModels.value = result.models

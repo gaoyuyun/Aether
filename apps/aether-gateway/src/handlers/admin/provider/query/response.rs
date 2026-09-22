@@ -8,6 +8,8 @@ use serde_json::json;
 
 pub(crate) const ADMIN_PROVIDER_QUERY_INVALID_JSON_DETAIL: &str = "Invalid JSON request body";
 pub(crate) const ADMIN_PROVIDER_QUERY_PROVIDER_ID_REQUIRED_DETAIL: &str = "provider_id is required";
+pub(crate) const ADMIN_PROVIDER_QUERY_INVALID_CLIENT_VERSION_DETAIL: &str =
+    "client_version must be a valid semantic version";
 pub(crate) const ADMIN_PROVIDER_QUERY_MODEL_REQUIRED_DETAIL: &str = "model is required";
 pub(crate) const ADMIN_PROVIDER_QUERY_FAILOVER_MODELS_REQUIRED_DETAIL: &str =
     "failover_models should not be empty";

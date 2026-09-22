@@ -754,6 +754,46 @@ mod tests {
             }))),
             "kiro",
         ));
+        let mut legacy_kiro_snapshot = sample_key(None);
+        legacy_kiro_snapshot.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "kiro",
+                "exhausted": true,
+                "windows": [{
+                    "code": "usage",
+                    "scope": "account",
+                    "used_ratio": 0.0,
+                    "remaining_ratio": 1.0,
+                    "remaining_value": 0.0,
+                    "limit_value": 0.0
+                }]
+            }
+        }));
+        assert!(provider_pool_key_account_quota_exhausted(
+            &legacy_kiro_snapshot,
+            "kiro",
+        ));
+        legacy_kiro_snapshot.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "kiro",
+                "exhausted": true,
+                "reset_at": 1,
+                "windows": [{
+                    "code": "usage",
+                    "scope": "account",
+                    "used_ratio": 0.0,
+                    "remaining_ratio": 1.0,
+                    "remaining_value": 0.0,
+                    "limit_value": 0.0
+                }]
+            }
+        }));
+        assert!(!provider_pool_key_account_quota_exhausted(
+            &legacy_kiro_snapshot,
+            "kiro",
+        ));
         assert!(provider_pool_key_account_quota_exhausted(
             &sample_key(Some(json!({
                 "chatgpt_web": {

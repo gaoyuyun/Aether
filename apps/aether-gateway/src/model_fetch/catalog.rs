@@ -1496,10 +1496,21 @@ pub(crate) async fn read_recent_codex_catalog_client_version(
 
 /// Management is not tied to a downstream client's compatibility version. Keep its
 /// directory at least as new as the built-in fingerprint and successful catalogs.
+#[derive(Debug, Clone)]
 pub(crate) struct CodexManagementCatalog {
     pub(crate) client_version: String,
     pub(crate) models: Option<Vec<Value>>,
     target: CodexCatalogTarget,
+}
+
+impl CodexManagementCatalog {
+    pub(crate) fn with_client_version(&self, client_version: &str) -> Self {
+        Self {
+            client_version: client_version.to_string(),
+            models: self.models.clone(),
+            target: self.target.clone(),
+        }
+    }
 }
 
 pub(crate) async fn read_codex_management_catalog<R>(

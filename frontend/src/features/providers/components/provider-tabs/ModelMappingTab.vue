@@ -307,6 +307,7 @@
     v-if="dialogOpen"
     v-model:open="dialogOpen"
     :provider-id="provider.id"
+    :provider-type="provider.provider_type"
     :models="models"
     :endpoints="endpoints"
     :editing-group="editingGroup"

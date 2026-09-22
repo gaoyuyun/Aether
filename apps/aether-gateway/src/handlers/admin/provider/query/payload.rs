@@ -85,6 +85,15 @@ pub(crate) fn provider_query_extract_force_refresh(payload: &serde_json::Value) 
         .unwrap_or(false)
 }
 
+pub(crate) fn provider_query_extract_client_version(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("client_version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub(crate) fn provider_query_extract_model(payload: &serde_json::Value) -> Option<String> {
     payload
         .get("model")

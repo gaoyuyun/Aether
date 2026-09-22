@@ -11,9 +11,10 @@ use crate::provider::{
     ProviderPoolMemberInput,
 };
 use crate::quota::{
-    provider_pool_current_unix_secs, provider_pool_json_f64, provider_pool_metadata_bucket,
-    provider_pool_model_quota_exhausted, provider_pool_quota_snapshot_exhausted_decision,
-    provider_pool_reset_deadline_elapsed, provider_pool_timestamp_unix_secs,
+    provider_pool_current_unix_secs, provider_pool_json_f64, provider_pool_member_quota_snapshot,
+    provider_pool_metadata_bucket, provider_pool_model_quota_exhausted,
+    provider_pool_quota_snapshot_exhausted_decision, provider_pool_reset_deadline_elapsed,
+    provider_pool_timestamp_unix_secs,
 };
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 use aether_provider_transport::kiro::normalize_kiro_region;
@@ -65,6 +66,11 @@ impl ProviderPoolAdapter for KiroProviderPoolAdapter {
         }) {
             return exhausted;
         }
+        if let Some(exhausted) = provider_pool_member_quota_snapshot(input.key, input.provider_type)
+            .and_then(legacy_usage_window_exhausted)
+        {
+            return exhausted;
+        }
         if let Some(exhausted) =
             provider_pool_quota_snapshot_exhausted_decision(input.key, input.provider_type)
         {
@@ -88,6 +94,31 @@ impl ProviderPoolAdapter for KiroProviderPoolAdapter {
     fn quota_refresh_missing_endpoint_message(&self) -> String {
         "找不到有效的 Kiro 端点".to_string()
     }
+}
+
+fn legacy_usage_window_exhausted(snapshot: &Map<String, Value>) -> Option<bool> {
+    // Old Kiro snapshots omit the window's exhaustion flag and record 0%
+    // usage when total capacity is zero. The explicit remaining amount must
+    // still block the account, even before its next quota refresh.
+    let window = snapshot
+        .get("windows")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|window| {
+            window.get("code").and_then(Value::as_str) == Some("usage")
+                && window.get("scope").and_then(Value::as_str) == Some("account")
+                && !window.contains_key("is_exhausted")
+                && !window.contains_key("exhausted")
+                && provider_pool_json_f64(window.get("remaining_value"))
+                    .is_some_and(|remaining| remaining <= 0.0)
+        })?;
+    let observed_at = provider_pool_timestamp_unix_secs(snapshot.get("observed_at"))
+        .or_else(|| provider_pool_timestamp_unix_secs(snapshot.get("updated_at")));
+    Some(!provider_pool_current_unix_secs().is_some_and(|now| {
+        provider_pool_reset_deadline_elapsed(window, observed_at, now)
+            || provider_pool_reset_deadline_elapsed(snapshot, observed_at, now)
+    }))
 }
 
 pub fn build_kiro_pool_quota_request(

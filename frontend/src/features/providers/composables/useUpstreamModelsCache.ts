@@ -24,12 +24,18 @@ const loadingMap = ref<Map<string, boolean>>(new Map())
 /**
  * 生成请求 key
  */
-function getRequestKey(providerId: string, apiKeyId?: string): string {
-  return apiKeyId ? `${providerId}:${apiKeyId}` : providerId
+function getRequestKey(providerId: string, apiKeyId?: string, clientVersion?: string): string {
+  const versionKey = clientVersion?.trim() || 'auto'
+  return `${providerId}:${apiKeyId || 'all'}:version:${versionKey}`
 }
 
-function getBatchRequestKey(providerId: string, apiKeyIds: string[]): string {
-  return `${providerId}:batch:${JSON.stringify([...new Set(apiKeyIds)].sort())}`
+function getBatchRequestKey(
+  providerId: string,
+  apiKeyIds: string[],
+  clientVersion?: string,
+): string {
+  const versionKey = clientVersion?.trim() || 'auto'
+  return `${providerId}:batch:${JSON.stringify([...new Set(apiKeyIds)].sort())}:version:${versionKey}`
 }
 
 function providerModelsFetchResult(response: ProviderModelsQueryResponse): FetchResult {
@@ -88,31 +94,34 @@ export function useUpstreamModelsCache() {
    * @param providerId 提供商ID
    * @param apiKeyId 可选的 API Key ID（用于获取特定 Key 支持的模型）
    * @param forceRefresh 是否强制刷新（跳过后端缓存）
+   * @param clientVersion 可选的 Codex client version；为空时由后台自动选择
    * @returns 模型列表或错误信息
    */
   async function fetchModels(
     providerId: string,
     apiKeyId?: string,
-    forceRefresh = false
+    forceRefresh = false,
+    clientVersion?: string,
   ): Promise<FetchResult> {
-    const requestKey = getRequestKey(providerId, apiKeyId)
+    const requestKey = getRequestKey(providerId, apiKeyId, clientVersion)
     return fetchProviderModels(
       requestKey,
       forceRefresh,
-      () => adminApi.queryProviderModels(providerId, apiKeyId, forceRefresh),
+      () => adminApi.queryProviderModels(providerId, apiKeyId, forceRefresh, clientVersion),
     )
   }
 
   async function fetchModelsForKeys(
     providerId: string,
     apiKeyIds: string[],
-    forceRefresh = false
+    forceRefresh = false,
+    clientVersion?: string,
   ): Promise<FetchResult> {
     const normalizedKeyIds = [...new Set(apiKeyIds.map(id => id.trim()).filter(Boolean))].sort()
     if (normalizedKeyIds.length === 0) {
       return { models: [], error: '请先选择账号' }
     }
-    const requestKey = getBatchRequestKey(providerId, normalizedKeyIds)
+    const requestKey = getBatchRequestKey(providerId, normalizedKeyIds, clientVersion)
     return fetchProviderModels(
       requestKey,
       forceRefresh,
@@ -120,6 +129,7 @@ export function useUpstreamModelsCache() {
           providerId,
           normalizedKeyIds,
           forceRefresh,
+          clientVersion,
         ),
     )
   }

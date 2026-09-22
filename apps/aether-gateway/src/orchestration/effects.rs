@@ -1716,13 +1716,11 @@ async fn record_pool_error_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalPoolErrorEffect<'_>,
 ) {
-    if !local_candidate_failure_should_apply_key_effects(
+    let applies_key_effects = local_candidate_failure_should_apply_key_effects(
         &context.plan.provider_api_format,
         effect.classification,
         effect.status_code,
-    ) {
-        return;
-    }
+    );
     let terminal_error_reason =
         admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
     if terminal_error_reason.is_none()
@@ -1736,9 +1734,21 @@ async fn record_pool_error_effect(
 
     let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
         // 非号池 Key 没有冷却 KV，但上游「几秒后再来」的提示仍然值得同 Key 立即重试一次。
-        remember_immediate_retry_hint_without_pool(state, context, &effect).await;
+        if applies_key_effects {
+            remember_immediate_retry_hint_without_pool(state, context, &effect).await;
+        }
         return;
     };
+    // Kiro uses the Claude message format, but its account limits are not
+    // Anthropic's model-scoped limits. Resolve the actual provider before
+    // suppressing key-wide feedback, otherwise Kiro 402/429 never pause the key.
+    let is_kiro = pool_context
+        .error_context
+        .provider_type
+        .eq_ignore_ascii_case("kiro");
+    if !applies_key_effects && !is_kiro {
+        return;
+    }
 
     clear_pool_key_circuit_breaker(state, context).await;
     if capture_local_execution_auth_config_fence(state, context.plan)
@@ -1746,6 +1756,13 @@ async fn record_pool_error_effect(
         .is_none()
     {
         return;
+    }
+    if is_kiro
+        && (effect.status_code == 402
+            || (effect.status_code == 429
+                && error_body_indicates_quota_exhaustion(effect.error_body)))
+    {
+        record_kiro_quota_exhaustion(state, context, effect.status_code).await;
     }
     let decision = record_admin_provider_pool_error_with_context(
         state.runtime_state.as_ref(),
@@ -1797,6 +1814,69 @@ async fn record_pool_error_effect(
         feedback,
     )
     .await;
+}
+
+/// A payment/quota rejection must also reach catalog admission: score-only
+/// feedback can be bypassed by the pool's fallback candidate scan. Keep the
+/// account exhausted until its known reset or a successful quota refresh.
+async fn record_kiro_quota_exhaustion(
+    state: &AppState,
+    context: LocalExecutionEffectContext<'_>,
+    status_code: u16,
+) {
+    let now = current_unix_secs();
+    let reset_at = state
+        .read_provider_catalog_keys_by_ids(std::slice::from_ref(&context.plan.key_id))
+        .await
+        .ok()
+        .and_then(|keys| keys.into_iter().next())
+        .and_then(|key| {
+            crate::handlers::shared::provider_key_status_snapshot_payload(&key, "kiro")
+                .pointer("/quota/reset_at")
+                .and_then(admin_provider_quota_pure::coerce_json_u64)
+        })
+        .filter(|reset_at| *reset_at > now);
+    let reset_seconds = reset_at.map(|reset_at| reset_at.saturating_sub(now));
+    let quota = serde_json::json!({
+        "version": 2,
+        "provider_type": "kiro",
+        "code": "exhausted",
+        "label": "额度耗尽",
+        "reason": format!("Kiro 返回 HTTP {status_code}，账户额度不可用"),
+        "freshness": "fresh",
+        "source": "upstream_error",
+        "observed_at": now,
+        "updated_at": now,
+        "exhausted": true,
+        "usage_ratio": 1.0,
+        "reset_at": reset_at,
+        "reset_seconds": reset_seconds,
+        "windows": [{
+            "code": "usage",
+            "label": "额度",
+            "scope": "account",
+            "is_exhausted": true,
+            "used_ratio": 1.0,
+            "remaining_ratio": 0.0,
+            "reset_at": reset_at,
+            "reset_seconds": reset_seconds,
+        }],
+    });
+    if let Err(err) = state
+        .update_provider_catalog_key_status_snapshot(&ProviderCatalogKeyStatusSnapshotUpdate {
+            key_id: context.plan.key_id.clone(),
+            status_snapshot_patch: serde_json::json!({"quota": quota}),
+            updated_at_unix_secs: Some(now),
+        })
+        .await
+    {
+        warn!(
+            provider_id = %context.plan.provider_id,
+            key_id = %context.plan.key_id,
+            error = ?err,
+            "gateway orchestration effects: failed to persist Kiro quota exhaustion"
+        );
+    }
 }
 
 /// 上游明确给出 ≥5 分钟的重置时刻：把它写进 Key 的 quota 元数据，调度层按 `reset_at`
@@ -2964,6 +3044,173 @@ mod tests {
                 GatewayDataState::with_provider_catalog_repository_for_tests(repository)
                     .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
             )
+    }
+
+    fn kiro_pool_state(upstream_metadata: Option<Value>) -> AppState {
+        let mut provider = sample_pool_health_provider();
+        provider.provider_type = "kiro".to_string();
+        let mut endpoint = sample_health_endpoint();
+        endpoint.api_format = "claude:messages".to_string();
+        let mut key = sample_health_key();
+        key.api_formats = Some(json!(["claude:messages"]));
+        key.upstream_metadata = upstream_metadata;
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+        ));
+        AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+    }
+
+    #[tokio::test]
+    async fn kiro_rate_limit_feedback_cools_account_using_claude_messages_format() {
+        for retry_after in [None, Some("3600")] {
+            let state = kiro_pool_state(None);
+            let plan = sample_claude_plan();
+            let headers = retry_after
+                .map(|value| BTreeMap::from([("Retry-After".to_string(), value.to_string())]))
+                .unwrap_or_default();
+            apply_local_execution_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: None,
+                },
+                LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                    status_code: 429,
+                    classification: LocalFailoverClassification::RetryUpstreamFailure,
+                    headers: &headers,
+                    error_body: Some(r#"{"message":"quota exhausted"}"#),
+                }),
+            )
+            .await;
+
+            let cooldown = crate::handlers::shared::provider_pool::read_admin_provider_pool_key_cooldown_reason(
+                state.runtime_state.as_ref(), &plan.provider_id, &plan.key_id,
+            ).await.expect("cooldown should load");
+            assert_eq!(cooldown.as_deref(), Some("quota_exhausted_429"));
+            let key = state
+                .read_provider_catalog_keys_by_ids(&[plan.key_id.clone()])
+                .await
+                .expect("key should load")
+                .remove(0);
+            assert!(aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "kiro"));
+        }
+    }
+
+    #[tokio::test]
+    async fn kiro_payment_required_pauses_account_until_reset_or_quota_refresh() {
+        let now = crate::clock::current_unix_secs();
+        for reset_at in [None, Some(now - 60), Some(now + 3600)] {
+            let state = kiro_pool_state(Some(json!({"kiro": {
+                "current_usage": 10.0,
+                "usage_limit": 100.0,
+                "remaining": 90.0,
+                "usage_percentage": 10.0,
+                "updated_at": now - 120,
+                "next_reset_at": reset_at,
+            }})));
+            let plan = sample_claude_plan();
+            apply_local_execution_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: None,
+                },
+                LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                    status_code: 402,
+                    classification: LocalFailoverClassification::RetryUpstreamFailure,
+                    headers: &BTreeMap::new(),
+                    error_body: Some(r#"{"message":"quota exhausted"}"#),
+                }),
+            )
+            .await;
+
+            let mut key = state
+                .read_provider_catalog_keys_by_ids(&[plan.key_id.clone()])
+                .await
+                .expect("key should load")
+                .remove(0);
+            assert!(aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "kiro"));
+            let quota = &key.status_snapshot.as_ref().unwrap()["quota"];
+            assert_eq!(
+                quota["reset_at"],
+                json!(reset_at.filter(|reset| *reset > now))
+            );
+
+            if reset_at.is_some_and(|reset| reset > now) {
+                let mut expired = key.clone();
+                let quota = &mut expired.status_snapshot.as_mut().unwrap()["quota"];
+                quota["reset_at"] = json!(now - 1);
+                quota["windows"][0]["reset_at"] = json!(now - 1);
+                assert!(
+                    !aether_provider_pool::provider_pool_key_account_quota_exhausted(
+                        &expired, "kiro"
+                    )
+                );
+            }
+
+            // A successful quota probe with new capacity releases the account.
+            key.status_snapshot = crate::handlers::shared::sync_provider_key_quota_status_snapshot(
+                key.status_snapshot.as_ref(),
+                "kiro",
+                Some(&json!({"kiro": {
+                    "remaining": 100.0, "usage_limit": 100.0,
+                    "current_usage": 0.0, "usage_percentage": 0.0,
+                    "updated_at": now + 1,
+                }})),
+                "quota_refresh",
+            );
+            assert!(!aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "kiro"));
+        }
+    }
+
+    #[tokio::test]
+    async fn kiro_client_errors_and_stopped_rate_limits_preserve_quota_and_cooldown() {
+        for (status_code, classification, count_tokens) in [
+            (
+                400,
+                LocalFailoverClassification::RetryUpstreamFailure,
+                false,
+            ),
+            (429, LocalFailoverClassification::StopErrorPattern, false),
+            (402, LocalFailoverClassification::RetryUpstreamFailure, true),
+        ] {
+            let state = kiro_pool_state(None);
+            let plan = sample_claude_plan();
+            let report_context = json!({
+                "api_operation": if count_tokens { "count_tokens" } else { "messages" },
+            });
+            apply_local_execution_effect(
+                &state,
+                LocalExecutionEffectContext {
+                    plan: &plan,
+                    report_context: Some(&report_context),
+                },
+                LocalExecutionEffect::PoolError(LocalPoolErrorEffect {
+                    status_code,
+                    classification,
+                    headers: &BTreeMap::new(),
+                    error_body: Some(r#"{"message":"request rejected"}"#),
+                }),
+            )
+            .await;
+            let cooldown = crate::handlers::shared::provider_pool::read_admin_provider_pool_key_cooldown_reason(
+                state.runtime_state.as_ref(), &plan.provider_id, &plan.key_id,
+            ).await.expect("cooldown should load");
+            assert!(cooldown.is_none());
+            let key = state
+                .read_provider_catalog_keys_by_ids(&[plan.key_id.clone()])
+                .await
+                .expect("key should load")
+                .remove(0);
+            assert!(!aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "kiro"));
+        }
     }
 
     #[tokio::test]

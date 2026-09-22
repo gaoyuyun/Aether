@@ -1318,6 +1318,9 @@ fn build_kiro_quota_status_snapshot(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
+    let exhausted = !is_banned
+        && (remaining.is_some_and(|value| value <= 0.0)
+            || usage_ratio.is_some_and(|value| value >= 1.0 - 1e-6));
     let mut windows = Vec::new();
     if usage_ratio.is_some()
         || remaining.is_some()
@@ -1329,6 +1332,7 @@ fn build_kiro_quota_status_snapshot(
             "code": "usage",
             "label": "额度",
             "scope": "account",
+            "is_exhausted": exhausted,
             "unit": "count",
             "used_ratio": usage_ratio,
             "remaining_ratio": remaining_ratio,
@@ -1344,9 +1348,6 @@ fn build_kiro_quota_status_snapshot(
         return None;
     }
 
-    let exhausted = !is_banned
-        && (remaining.is_some_and(|value| value <= 0.0)
-            || usage_ratio.is_some_and(|value| value >= 1.0 - 1e-6));
     let reason = if is_banned {
         ban_reason
     } else if exhausted {
@@ -3384,6 +3385,27 @@ mod tests {
             quota.get("windows").and_then(Value::as_array).map(Vec::len),
             Some(2usize)
         );
+    }
+
+    #[test]
+    fn kiro_zero_capacity_snapshot_stays_exhausted_until_reset() {
+        let now = crate::clock::current_unix_secs();
+        for (reset_at, expected_exhausted) in [(now + 3600, true), (now - 60, false)] {
+            let mut key = sample_catalog_key();
+            key.upstream_metadata = Some(json!({"kiro": {
+                "usage_limit": 0.0,
+                "current_usage": 0.0,
+                "remaining": 0.0,
+                "usage_percentage": 0.0,
+                "next_reset_at": reset_at,
+                "updated_at": now - 120,
+            }}));
+            key.status_snapshot = Some(provider_key_status_snapshot_payload(&key, "kiro"));
+            assert_eq!(
+                aether_provider_pool::provider_pool_key_account_quota_exhausted(&key, "kiro"),
+                expected_exhausted,
+            );
+        }
     }
 
     #[test]

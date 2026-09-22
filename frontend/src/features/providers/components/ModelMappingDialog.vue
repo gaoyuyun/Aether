@@ -92,6 +92,11 @@
           />
         </div>
 
+        <CodexClientVersionField
+          v-model="codexClientVersion"
+          :provider-type="props.providerType"
+        />
+
         <!-- 模型列表 -->
         <div class="border rounded-lg overflow-hidden">
           <div class="min-h-60 max-h-80 overflow-y-auto">
@@ -333,6 +338,8 @@ import {
 } from '@/api/endpoints'
 import { updateModel } from '@/api/endpoints/models'
 import { useUpstreamModelsCache } from '../composables/useUpstreamModelsCache'
+import { useCodexClientVersion } from '../composables/useCodexClientVersion'
+import CodexClientVersionField from './CodexClientVersionField.vue'
 import {
   ALL_REQUESTS_SCOPE_VALUE,
   COMPACT_REQUEST_SCOPE_VALUE,
@@ -362,6 +369,7 @@ export interface AliasGroup {
 const props = defineProps<{
   open: boolean
   providerId: string
+  providerType?: string | null
   /** @deprecated */
   providerApiFormats?: string[]
   endpoints?: ProviderEndpoint[]
@@ -390,6 +398,7 @@ const submitting = ref(false)
 const loadingModels = ref(false)
 const fetchingUpstreamModels = ref(false)
 const upstreamModelsLoaded = ref(false)
+const codexClientVersion = useCodexClientVersion()
 
 // 搜索
 const searchQuery = ref('')
@@ -683,7 +692,12 @@ async function fetchUpstreamModels(forceRefresh = false) {
   try {
     loadingModels.value = true
     fetchingUpstreamModels.value = true
-    const result = await fetchCachedModels(props.providerId, undefined, forceRefresh)
+    const result = await fetchCachedModels(
+      props.providerId,
+      undefined,
+      forceRefresh,
+      codexClientVersion.value,
+    )
     if (result.models.length > 0) {
       upstreamModels.value = result.models
       upstreamModelsLoaded.value = true

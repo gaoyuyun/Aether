@@ -916,6 +916,7 @@
     :open="keyPermissionsDialogOpen"
     :api-key="editingKey"
     :provider-id="providerId || ''"
+    :provider-type="provider?.provider_type ?? null"
     @close="keyPermissionsDialogOpen = false"
     @saved="handleKeyChanged"
   />

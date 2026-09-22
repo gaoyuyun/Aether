@@ -178,6 +178,7 @@
   <ModelMappingDialog
     v-model:open="dialogOpen"
     :provider-id="provider.id"
+    :provider-type="provider.provider_type"
     :provider-api-formats="providerApiFormats"
     :models="models"
     :editing-group="editingGroup"
