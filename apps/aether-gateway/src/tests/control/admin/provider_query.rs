@@ -4158,6 +4158,180 @@ async fn gateway_handles_non_kiro_multi_model_failover_locally_impl() {
 }
 
 #[test]
+fn gateway_grok_build_model_tests_send_cli_identity_headers() {
+    run_provider_query_test(
+        "gateway_grok_build_model_tests_send_cli_identity_headers",
+        gateway_grok_build_model_tests_send_cli_identity_headers_impl,
+    );
+}
+
+async fn gateway_grok_build_model_tests_send_cli_identity_headers_impl() {
+    for (base_url, expects_cli_identity) in [
+        ("https://cli-chat-proxy.grok.com/v1", true),
+        ("https://api.x.ai/v1", false),
+    ] {
+        let captured_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
+        let captured_plans_clone = Arc::clone(&captured_plans);
+        let execution_runtime = Router::new().route(
+            "/v1/execute/sync",
+            any(move |Json(plan): Json<ExecutionPlan>| {
+                let captured_plans = Arc::clone(&captured_plans_clone);
+                async move {
+                    let response = Json(json!({
+                        "request_id": plan.request_id,
+                        "candidate_id": plan.candidate_id,
+                        "status_code": 200,
+                        "headers": {"content-type": "application/json"},
+                        "body": {
+                            "json_body": {
+                                "id": "resp-grok-build-test",
+                                "object": "response",
+                                "output": [{
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{"type": "output_text", "text": "Hello from Grok Build"}]
+                                }]
+                            }
+                        }
+                    }));
+                    captured_plans.lock().expect("mutex should lock").push(plan);
+                    response
+                }
+            }),
+        );
+        let (execution_runtime_url, execution_runtime_handle) =
+            start_server(execution_runtime).await;
+        let mut provider = sample_provider("provider-grok-build", "Grok Build", 10);
+        provider.provider_type = "grok_build".to_string();
+        let mut key = sample_bound_key(
+            "key-grok-build",
+            "provider-grok-build",
+            "openai:responses",
+            "grok-build-access-token",
+        );
+        key.auth_type = "oauth".to_string();
+        key.encrypted_auth_config = Some(sample_bound_auth_config(
+            "provider-grok-build",
+            "key-grok-build",
+            r#"{"provider_type":"grok_build"}"#,
+        ));
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![provider],
+            vec![sample_endpoint(
+                "endpoint-grok-build",
+                "provider-grok-build",
+                "openai:responses",
+                base_url,
+            )],
+            vec![key],
+        ));
+        let gateway = build_router_with_state(
+            build_state_with_execution_runtime_override(execution_runtime_url)
+                .with_data_state_for_tests(
+                    GatewayDataState::with_provider_transport_reader_for_tests(
+                        repository,
+                        DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+                    ),
+                ),
+        );
+        let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+        for route in ["test-model", "test-model-failover"] {
+            let mut request_payload = json!({
+                "provider_id": "provider-grok-build",
+                "api_format": "openai:responses",
+                "request_headers": {
+                    "User-Agent": "admin-test-client/1.0",
+                    "x-test-header": "preserved"
+                }
+            });
+            if route == "test-model" {
+                request_payload["model"] = json!("grok-4.6");
+            } else {
+                request_payload["failover_models"] = json!(["grok-4.6"]);
+                if expects_cli_identity {
+                    request_payload["request_headers"]["X-Grok-Client-Version"] = json!("0.0.1");
+                    request_payload["request_headers"]["X-XAI-Token-Auth"] = json!("stale-client");
+                }
+            }
+            let response = reqwest::Client::new()
+                .post(format!("{gateway_url}/api/admin/provider-query/{route}"))
+                .header(GATEWAY_HEADER, "rust-phase3b")
+                .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+                .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+                .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+                .json(&request_payload)
+                .send()
+                .await
+                .expect("request should succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: serde_json::Value = response.json().await.expect("json body should parse");
+            assert_eq!(
+                payload["success"],
+                json!(true),
+                "{base_url} {route}: {payload}"
+            );
+            assert_eq!(payload["total_attempts"], json!(1));
+            assert_eq!(
+                payload["data"]["response"]["output"][0]["content"][0]["text"],
+                json!("Hello from Grok Build")
+            );
+
+            let plans = std::mem::take(&mut *captured_plans.lock().expect("mutex should lock"));
+            assert_eq!(plans.len(), 1);
+            let plan = &plans[0];
+            assert_eq!(plan.url, format!("{base_url}/responses"));
+            assert_eq!(
+                plan.headers.get("authorization").map(String::as_str),
+                Some("Bearer grok-build-access-token")
+            );
+            assert_eq!(
+                plan.headers.get("x-test-header").map(String::as_str),
+                Some("preserved")
+            );
+            if expects_cli_identity {
+                let version = aether_provider_transport::GROK_BUILD_CLIENT_VERSION;
+                for (name, expected) in [
+                    ("x-xai-token-auth", "xai-grok-cli"),
+                    ("x-grok-client-version", version),
+                    ("x-grok-client-identifier", "grok-shell"),
+                    ("x-authenticateresponse", "authenticate-response"),
+                ] {
+                    assert_eq!(
+                        plan.headers.get(name).map(String::as_str),
+                        Some(expected),
+                        "{route}: {name}"
+                    );
+                }
+                assert_eq!(
+                    plan.headers.get("user-agent"),
+                    Some(&format!("xai-grok-workspace/{version}"))
+                );
+            } else {
+                for name in [
+                    "x-xai-token-auth",
+                    "x-grok-client-version",
+                    "x-grok-client-identifier",
+                    "x-authenticateresponse",
+                ] {
+                    assert!(
+                        !plan.headers.contains_key(name),
+                        "{route}: unexpected {name}"
+                    );
+                }
+                assert_eq!(
+                    plan.headers.get("user-agent").map(String::as_str),
+                    Some("admin-test-client/1.0")
+                );
+            }
+        }
+
+        gateway_handle.abort();
+        execution_runtime_handle.abort();
+    }
+}
+
+#[test]
 fn gateway_handles_openai_responses_test_model_locally() {
     run_provider_query_test(
         "gateway_handles_openai_responses_test_model_locally",

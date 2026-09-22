@@ -3501,6 +3501,9 @@ async fn provider_query_execute_standard_test_candidate(
             codex_model_capabilities.as_ref(),
         );
     }
+    // Model tests bypass planner outbound policies, so apply the same Grok Build
+    // client identity here after header rules and before dispatch.
+    crate::provider_transport::apply_grok_build_client_headers(&transport, &mut request_headers);
     if !uses_vertex_query_auth {
         if let (Some(auth_header), Some(auth_value)) =
             (auth_header.as_deref(), auth_value.as_deref())
