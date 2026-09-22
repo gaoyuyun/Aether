@@ -26,6 +26,7 @@ use super::shared::{
     should_auto_remove_oauth_invalid_key, CodexAccountResetCompleteResult,
     CodexAccountResetReserveResult, CodexAccountResetTerminal, ProviderQuotaExecutionOutcome,
 };
+use crate::handlers::admin::provider::oauth::provisioning::seed_provider_oauth_pool_score;
 use crate::handlers::admin::request::{AdminAppState, AdminGatewayProviderTransportSnapshot};
 use crate::provider_key_auth::provider_key_is_oauth_managed;
 use crate::state::ProviderTransportCredentialFence;
@@ -1363,6 +1364,15 @@ async fn refresh_codex_provider_quota_locally_with_reset_fence(
             state
                 .cleanup_deleted_provider_catalog_refs(&provider.id, false, &[], &deleted_key_ids)
                 .await?;
+        }
+        if !auto_removed && status == "success" && request_owns_persisted_oauth_state {
+            if let Some(persisted_key) = persisted_key.as_ref() {
+                // A successful quota query can still report an exhausted
+                // account. Recompute from the persisted quota, and make a
+                // recovered account visible without waiting for the worker.
+                seed_provider_oauth_pool_score(state, &provider.id, persisted_key, now_unix_secs)
+                    .await;
+            }
         }
         let refresh_fixed =
             status == "success" && had_oauth_refresh_issue && oauth_invalid_reason.is_none();

@@ -76,8 +76,21 @@ where
     }
 }
 
-#[tokio::test]
-async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_admin_principal() {
+#[test]
+fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_admin_principal() {
+    run_provider_quota_test(
+        "gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_admin_principal",
+        gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_admin_principal_impl(
+) {
+    use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
+    use aether_data_contracts::repository::pool_scores::{
+        GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolScoreReadRepository,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeRequest {
         url: String,
@@ -101,10 +114,13 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
 
     let seen_execution_runtime = Arc::new(Mutex::new(Vec::<SeenExecutionRuntimeRequest>::new()));
     let seen_execution_runtime_clone = Arc::clone(&seen_execution_runtime);
+    let reports_exhausted = Arc::new(AtomicBool::new(false));
+    let reports_exhausted_clone = Arc::clone(&reports_exhausted);
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |request: Request| {
             let seen_execution_runtime_inner = Arc::clone(&seen_execution_runtime_clone);
+            let exhausted = reports_exhausted_clone.load(Ordering::SeqCst);
             async move {
                 let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
                     &to_bytes(request.into_body(), usize::MAX)
@@ -155,8 +171,10 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
                         json_body: Some(json!({
                             "plan_type": "plus",
                             "rate_limit": {
+                                "allowed": !exhausted,
+                                "limit_reached": exhausted,
                                 "primary_window": {
-                                    "used_percent": 12.5,
+                                    "used_percent": if exhausted { 100.0 } else { 12.5 },
                                     "window_minutes": 300
                                 },
                                 "secondary_window": {
@@ -180,26 +198,45 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
         }),
     );
 
+    let mut provider = StoredProviderCatalogProvider::new(
+        "provider-codex".to_string(),
+        "codex".to_string(),
+        Some("https://example.com".to_string()),
+        "codex".to_string(),
+    )
+    .expect("provider should build");
+    provider.config = Some(json!({"pool_advanced": {}}));
+    let mut key = sample_key(
+        "key-codex-a",
+        "provider-codex",
+        "openai:responses",
+        "sk-codex-123",
+    );
+    key.health_by_format = Some(json!({"openai:responses": {"health_score": 1.0}}));
+    let mut old_score = crate::ai_serving::build_provider_key_pool_score_upsert(
+        &key,
+        "codex",
+        None,
+        100,
+        Default::default(),
+    )
+    .into_stored();
+    old_score.hard_state = PoolMemberHardState::QuotaExhausted;
+    old_score.score = 0.05;
+    old_score.score_reason["hard_state"] = json!("quota_exhausted");
+    let score_query = GetPoolMemberScoresByIdsQuery {
+        ids: vec![old_score.id.clone()],
+    };
+    let pool_scores = Arc::new(InMemoryPoolMemberScoreRepository::seed(vec![old_score]));
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![StoredProviderCatalogProvider::new(
-            "provider-codex".to_string(),
-            "codex".to_string(),
-            Some("https://example.com".to_string()),
-            "codex".to_string(),
-        )
-        .expect("provider should build")],
+        vec![provider],
         vec![sample_endpoint(
             "endpoint-codex-cli",
             "provider-codex",
             "openai:responses",
             "https://chatgpt.com/backend-api",
         )],
-        vec![sample_key(
-            "key-codex-a",
-            "provider-codex",
-            "openai:responses",
-            "sk-codex-123",
-        )],
+        vec![key],
     ));
 
     let (_upstream_url, upstream_handle) = start_server(upstream).await;
@@ -210,6 +247,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
                 GatewayDataState::with_provider_catalog_repository_for_tests(
                     provider_catalog_repository.clone(),
                 )
+                .with_pool_score_repository_for_tests(Arc::clone(&pool_scores))
                 .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
             ),
     );
@@ -233,6 +271,15 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
     assert_eq!(payload["failed"], 0);
     assert_eq!(payload["total"], 1);
     assert_eq!(payload["results"][0]["status"], "success");
+    let score = pool_scores
+        .get_pool_member_scores_by_ids(&score_query)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(score.hard_state, PoolMemberHardState::Available);
+    assert_eq!(score.score_reason["hard_state"], json!("available"));
+    assert!(score.score > 0.05);
     assert_eq!(
         payload["results"][0]["quota_snapshot"]["provider_type"],
         "codex"
@@ -319,6 +366,36 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
             .and_then(|value| value.get("secondary_reset_at")),
         Some(&json!(1_900_000_000u64))
     );
+
+    // HTTP 200 means the query succeeded; the returned account may still be
+    // exhausted. Do not unconditionally mark it available after a refresh.
+    reports_exhausted.store(true, Ordering::SeqCst);
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["results"][0]["status"], "success");
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["exhausted"],
+        json!(true)
+    );
+    let score = pool_scores
+        .get_pool_member_scores_by_ids(&score_query)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(score.hard_state, PoolMemberHardState::QuotaExhausted);
+    assert_eq!(score.score_reason["hard_state"], json!("quota_exhausted"));
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

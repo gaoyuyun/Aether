@@ -89,13 +89,16 @@ fn provider_key_score_input(
     existing: Option<&aether_data_contracts::repository::pool_scores::StoredPoolMemberScore>,
     now_unix_secs: u64,
 ) -> PoolMemberScoreInput {
-    let status_snapshot = provider_key_status_snapshot_payload(key, provider_type);
+    let materialized_key = StoredProviderCatalogKey {
+        status_snapshot: Some(provider_key_status_snapshot_payload(key, provider_type)),
+        ..key.clone()
+    };
+    let key = &materialized_key;
+    let status_snapshot = key.status_snapshot.as_ref().and_then(Value::as_object);
     let quota_snapshot = status_snapshot
-        .as_object()
         .and_then(|snapshot| snapshot.get("quota"))
         .and_then(Value::as_object);
     let account_snapshot = status_snapshot
-        .as_object()
         .and_then(|snapshot| snapshot.get("account"))
         .and_then(Value::as_object);
     let (health_score, _, _, _, _) = provider_key_health_summary(key);
@@ -105,6 +108,13 @@ fn provider_key_score_input(
         .and_then(Value::as_object)
         .filter(|payload| !payload.is_empty())
         .map(|_| health_score);
+
+    // Keep pool-score hard state aligned with scheduler eligibility.  The
+    // materialized snapshot may intentionally retain `exhausted: true` after
+    // a provider window has reset; the provider-pool adapter resolves that
+    // state against the window reset deadline before marking the key blocked.
+    let quota_exhausted =
+        aether_provider_pool::provider_pool_key_account_quota_exhausted(key, provider_type);
 
     PoolMemberScoreInput {
         identity,
@@ -116,10 +126,7 @@ fn provider_key_score_input(
             .and_then(|quota| quota.get("usage_ratio"))
             .and_then(json_f64)
             .map(|value| value.clamp(0.0, 1.0)),
-        quota_exhausted: quota_snapshot
-            .and_then(|quota| quota.get("exhausted"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        quota_exhausted,
         account_blocked: account_snapshot
             .and_then(|account| account.get("blocked"))
             .and_then(Value::as_bool)
@@ -222,6 +229,135 @@ mod tests {
             PoolMemberScoreRules::default(),
         );
 
+        assert_eq!(score.hard_state, PoolMemberHardState::Available);
+    }
+
+    #[test]
+    fn expired_codex_quota_window_does_not_leave_pool_score_exhausted() {
+        let now_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs();
+        let mut key = StoredProviderCatalogKey::new(
+            "key-codex-expired-quota".to_string(),
+            "provider-codex".to_string(),
+            "codex".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("sample key should be valid");
+        key.health_by_format = Some(json!({
+            "openai:responses": {"health_score": 1.0}
+        }));
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "codex",
+                "code": "exhausted",
+                "exhausted": true,
+                "updated_at": now_unix_secs.saturating_sub(600),
+                "windows": [{
+                    "code": "5h",
+                    "scope": "account",
+                    "used_ratio": 1.0,
+                    "is_exhausted": true,
+                    "reset_at": now_unix_secs.saturating_sub(60)
+                }]
+            }
+        }));
+
+        let score = build_provider_key_pool_score_upsert(
+            &key,
+            "codex",
+            None,
+            now_unix_secs,
+            PoolMemberScoreRules::default(),
+        );
+
+        assert_eq!(score.hard_state, PoolMemberHardState::Available);
+
+        key.status_snapshot.as_mut().unwrap()["quota"]["windows"][0]["reset_at"] =
+            json!(now_unix_secs.saturating_add(3_600));
+        let active_score = build_provider_key_pool_score_upsert(
+            &key,
+            "codex",
+            None,
+            now_unix_secs,
+            PoolMemberScoreRules::default(),
+        );
+        assert_eq!(active_score.hard_state, PoolMemberHardState::QuotaExhausted);
+        assert!(score.score > active_score.score);
+        assert_eq!(score.score_reason["hard_state"], json!("available"));
+        assert_eq!(
+            active_score.score_reason["hard_state"],
+            json!("quota_exhausted")
+        );
+    }
+
+    #[test]
+    fn pool_score_uses_materialized_codex_quota_from_newer_metadata() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut key = sample_key_with_circuit_next_probe(0);
+        key.status_snapshot = Some(json!({"quota": {
+            "provider_type": "codex",
+            "code": "exhausted",
+            "exhausted": true,
+            "allowed": false,
+            "limit_reached": true,
+            "updated_at": now - 60,
+            "reset_at": now + 3_600,
+            "windows": [{"code": "5h", "used_ratio": 1.0, "reset_at": now + 3_600}]
+        }}));
+        key.upstream_metadata = Some(json!({"codex": {
+            "updated_at": now,
+            "allowed": true,
+            "limit_reached": false,
+            "primary_used_percent": 25.0,
+            "primary_reset_at": now + 3_600,
+            "primary_window_minutes": 300
+        }}));
+
+        let score = build_provider_key_pool_score_upsert(
+            &key,
+            "codex",
+            None,
+            now,
+            PoolMemberScoreRules::default(),
+        );
+        assert_eq!(score.hard_state, PoolMemberHardState::Available);
+        assert_eq!(
+            score.score_reason["factors"]["quota_remaining"],
+            json!(0.75)
+        );
+    }
+
+    #[test]
+    fn model_only_quota_exhaustion_does_not_block_account_pool_score() {
+        let mut key = sample_key_with_circuit_next_probe(0);
+        key.status_snapshot = Some(json!({"quota": {
+            "provider_type": "codex",
+            "code": "exhausted",
+            "exhausted": true,
+            "windows": [{
+                "code": "model:spark",
+                "scope": "model",
+                "model": "spark",
+                "used_ratio": 1.0,
+                "is_exhausted": true
+            }]
+        }}));
+
+        let score = build_provider_key_pool_score_upsert(
+            &key,
+            "codex",
+            None,
+            1_000,
+            PoolMemberScoreRules::default(),
+        );
         assert_eq!(score.hard_state, PoolMemberHardState::Available);
     }
 }
