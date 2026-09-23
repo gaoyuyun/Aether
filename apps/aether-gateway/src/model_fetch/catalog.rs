@@ -1495,28 +1495,19 @@ pub(crate) async fn read_recent_codex_catalog_client_version(
 }
 
 /// Management is not tied to a downstream client's compatibility version. Keep its
-/// directory at least as new as the built-in fingerprint and successful catalogs.
-#[derive(Debug, Clone)]
+/// directory at least as new as the built-in fingerprint and successful catalogs,
+/// unless the administrator explicitly selects a compatibility version.
 pub(crate) struct CodexManagementCatalog {
     pub(crate) client_version: String,
     pub(crate) models: Option<Vec<Value>>,
     target: CodexCatalogTarget,
 }
 
-impl CodexManagementCatalog {
-    pub(crate) fn with_client_version(&self, client_version: &str) -> Self {
-        Self {
-            client_version: client_version.to_string(),
-            models: self.models.clone(),
-            target: self.target.clone(),
-        }
-    }
-}
-
 pub(crate) async fn read_codex_management_catalog<R>(
     runtime: &R,
     provider_id: &str,
     key_id: &str,
+    requested_version: Option<&NormalizedCodexClientVersion>,
 ) -> Option<CodexManagementCatalog>
 where
     R: CodexCatalogRuntime + ?Sized,
@@ -1532,28 +1523,32 @@ where
     .await?;
     let scope = target.credential_scope()?;
     let state = runtime.codex_catalog_runtime_state();
-    let mut version = Version::parse(crate::ai_serving::CODEX_CLIENT_VERSION).ok()?;
-    if let Some(recent) =
-        read_recent_codex_catalog_client_version(state, provider_id, key_id, scope).await
-    {
-        version = version.max(Version::parse(&recent).ok()?);
-    }
-    // The most recently seen client can be older than an already successful catalog.
-    // Only consider the current credential generation's bounded success index.
-    for member in state
-        .score_range_by_min(&catalog_versions_key(&target.identity), 0.0)
-        .await
-        .unwrap_or_default()
-    {
-        if let Some((stored_scope, stored_version)) = parse_catalog_version_member(&member) {
-            if stored_scope == scope {
-                if let Ok(candidate) = Version::parse(stored_version) {
-                    version = version.max(candidate);
+    let client_version = if let Some(requested) = requested_version {
+        requested.as_str().to_string()
+    } else {
+        let mut version = Version::parse(crate::ai_serving::CODEX_CLIENT_VERSION).ok()?;
+        if let Some(recent) =
+            read_recent_codex_catalog_client_version(state, provider_id, key_id, scope).await
+        {
+            version = version.max(Version::parse(&recent).ok()?);
+        }
+        // The most recently seen client can be older than an already successful catalog.
+        // Only consider the current credential generation's bounded success index.
+        for member in state
+            .score_range_by_min(&catalog_versions_key(&target.identity), 0.0)
+            .await
+            .unwrap_or_default()
+        {
+            if let Some((stored_scope, stored_version)) = parse_catalog_version_member(&member) {
+                if stored_scope == scope {
+                    if let Ok(candidate) = Version::parse(stored_version) {
+                        version = version.max(candidate);
+                    }
                 }
             }
         }
-    }
-    let client_version = version.to_string();
+        version.to_string()
+    };
     let models = if let Some(snapshot) = read_lkg_snapshot(runtime, &target, &client_version).await
     {
         let fresh = state
@@ -2469,7 +2464,7 @@ mod tests {
     async fn management_catalog_uses_version_floor_and_newest_success_not_last_client() {
         let runtime = TestRuntime::new(vec![successful_execution("gpt-new", "etag")]);
         remember_seen_version(&runtime.state, &target(), "0.144.1").await;
-        let initial = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID)
+        let initial = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID, None)
             .await
             .expect("management context");
         assert_eq!(
@@ -2480,7 +2475,7 @@ mod tests {
 
         seed_catalog(&runtime, &version("0.200.0")).await;
         remember_seen_version(&runtime.state, &target(), "0.144.1").await;
-        let current = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID)
+        let current = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID, None)
             .await
             .expect("management context");
         assert_eq!(current.client_version, "0.200.0");
@@ -2496,7 +2491,7 @@ mod tests {
             .kv_delete(&catalog_fresh_key(&target(), "0.200.0"))
             .await
             .unwrap();
-        let stale = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID)
+        let stale = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID, None)
             .await
             .unwrap();
         assert_eq!(stale.client_version, "0.200.0");
@@ -2506,7 +2501,7 @@ mod tests {
         );
 
         runtime.set_credential_generation(TEST_CREDENTIAL_GENERATION_B);
-        let rebound = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID)
+        let rebound = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2519,7 +2514,7 @@ mod tests {
     #[tokio::test]
     async fn management_refresh_updates_shared_catalog_but_rejects_replaced_credentials() {
         let runtime = TestRuntime::new(vec![]);
-        let context = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID)
+        let context = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID, None)
             .await
             .unwrap();
         let transports = vec![sample_codex_transport()];
@@ -2536,9 +2531,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(shared.models[0]["slug"], slug);
-            let admin = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID)
-                .await
-                .unwrap();
+            let admin =
+                read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID, None)
+                    .await
+                    .unwrap();
             assert_eq!(admin.models.unwrap()[0]["slug"], slug);
         }
         runtime.set_credential_generation(TEST_CREDENTIAL_GENERATION_B);
@@ -2550,7 +2546,7 @@ mod tests {
             None,
         )
         .await;
-        let rebound = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID)
+        let rebound = read_codex_management_catalog(&runtime, TEST_PROVIDER_ID, TEST_KEY_ID, None)
             .await
             .unwrap();
         assert!(rebound.models.is_none());

@@ -952,6 +952,7 @@
     :open="batchAssignDialogOpen"
     :provider-id="provider.id"
     :provider-name="provider.name"
+    :provider-type="provider.provider_type"
     @update:open="handleBatchAssignDialogOpenUpdate"
     @changed="handleBatchAssignChanged"
   />

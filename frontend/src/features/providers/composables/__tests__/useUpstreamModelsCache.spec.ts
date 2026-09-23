@@ -41,6 +41,7 @@ describe('useUpstreamModelsCache', () => {
       'provider-1',
       ['key-a', 'key-b'],
       false,
+      undefined,
     )
 
     request.resolve(response('gpt-5.6-sol'))
@@ -67,5 +68,52 @@ describe('useUpstreamModelsCache', () => {
     forcedRequest.resolve(response('gpt-5.6-luna'))
     await forced
     expect(isLoading('provider-1', 'key-a')).toBe(false)
+  })
+
+  it('isolates concurrent catalogs and loading state by client version', async () => {
+    const oldRequest = deferred<ReturnType<typeof response>>()
+    const newRequest = deferred<ReturnType<typeof response>>()
+    adminApiMocks.queryProviderModels
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockReturnValueOnce(newRequest.promise)
+    const { fetchModels, isLoading } = useUpstreamModelsCache()
+
+    const oldCatalog = fetchModels('provider-versions', 'key-a', false, '0.153.4')
+    const newCatalog = fetchModels('provider-versions', 'key-a', false, '0.200.0')
+    const sameCatalog = fetchModels('provider-versions', 'key-a', false, ' 0.200.0 ')
+    expect(adminApiMocks.queryProviderModels).toHaveBeenCalledTimes(2)
+    expect(isLoading('provider-versions', 'key-a', '0.200.0')).toBe(true)
+
+    oldRequest.resolve(response('gpt-old'))
+    await expect(oldCatalog).resolves.toMatchObject({ models: [{ id: 'gpt-old' }] })
+    expect(isLoading('provider-versions', 'key-a', '0.153.4')).toBe(false)
+    expect(isLoading('provider-versions', 'key-a', '0.200.0')).toBe(true)
+
+    newRequest.resolve(response('gpt-6-sol'))
+    await expect(newCatalog).resolves.toMatchObject({ models: [{ id: 'gpt-6-sol' }] })
+    await expect(sameCatalog).resolves.toMatchObject({ models: [{ id: 'gpt-6-sol' }] })
+    expect(isLoading('provider-versions', 'key-a', '0.200.0')).toBe(false)
+  })
+
+  it('keeps batch requests for different client versions separate', async () => {
+    const older = deferred<ReturnType<typeof response>>()
+    const newer = deferred<ReturnType<typeof response>>()
+    adminApiMocks.queryProviderModelsForKeys
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise)
+    const { fetchModelsForKeys } = useUpstreamModelsCache()
+
+    const first = fetchModelsForKeys('provider-batch', ['key-a', 'key-b'], false, '0.153.4')
+    const second = fetchModelsForKeys('provider-batch', ['key-b', 'key-a'], false, '0.200.0')
+    const same = fetchModelsForKeys('provider-batch', ['key-a', 'key-b'], false, ' 0.200.0 ')
+    expect(adminApiMocks.queryProviderModelsForKeys).toHaveBeenCalledTimes(2)
+    expect(adminApiMocks.queryProviderModelsForKeys).toHaveBeenLastCalledWith(
+      'provider-batch', ['key-a', 'key-b'], false, '0.200.0',
+    )
+    older.resolve(response('gpt-old'))
+    newer.resolve(response('gpt-6-sol'))
+    await expect(first).resolves.toMatchObject({ models: [{ id: 'gpt-old' }] })
+    await expect(second).resolves.toMatchObject({ models: [{ id: 'gpt-6-sol' }] })
+    await expect(same).resolves.toMatchObject({ models: [{ id: 'gpt-6-sol' }] })
   })
 })

@@ -31,6 +31,12 @@
         </Button>
       </div>
 
+      <CodexClientVersionField
+        v-model="codexClientVersion"
+        :provider-type="props.providerType"
+        :disabled="loading"
+      />
+
       <!-- 加载状态 -->
       <div
         v-if="loading"
@@ -208,11 +214,14 @@ import {
 } from '@/api/endpoints'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { useUpstreamModelsCache } from '../composables/useUpstreamModelsCache'
+import { useCodexClientVersion } from '../composables/useCodexClientVersion'
+import CodexClientVersionField from './CodexClientVersionField.vue'
 
 const props = defineProps<{
   open: boolean
   apiKey: EndpointAPIKey | null
   providerId: string | null
+  providerType?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -222,6 +231,7 @@ const emit = defineEmits<{
 
 const { success, error: showError, warning: showWarning } = useToast()
 const { fetchModels: fetchCachedModels } = useUpstreamModelsCache()
+const codexClientVersion = useCodexClientVersion()
 
 const isOpen = computed(() => props.open)
 const loading = ref(false)
@@ -294,7 +304,14 @@ async function fetchUpstreamModels() {
   try {
     // 不传 apiKeyId，后端会遍历所有 Key 并聚合结果。
     // 已查询过再点“刷新”时，强制跳过后端缓存，避免长期 TTL 导致模型列表不更新。
-    const result = await fetchCachedModels(props.providerId, undefined, hasQueried.value)
+    const result = await fetchCachedModels(
+      props.providerId,
+      undefined,
+      hasQueried.value,
+      props.providerType?.trim().toLowerCase() === 'codex'
+        ? codexClientVersion.value.trim() || undefined
+        : undefined,
+    )
 
     if (result.models.length > 0) {
       upstreamModels.value = result.models

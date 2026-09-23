@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 
 import ModelMappingDialog, { type AliasGroup } from '../ModelMappingDialog.vue'
 import type { Model, ProviderEndpoint } from '@/api/endpoints'
 import { updateModel } from '@/api/endpoints/models'
+import { useCodexClientVersion } from '../../composables/useCodexClientVersion'
 
 const upstreamModelMocks = vi.hoisted(() => ({
   fetchModels: vi.fn(),
@@ -116,6 +117,11 @@ vi.mock('../../composables/useUpstreamModelsCache', () => ({
 
 const mountedApps: Array<{ app: App, root: HTMLElement }> = []
 
+beforeEach(async () => {
+  useCodexClientVersion().value = ''
+  await nextTick()
+})
+
 afterEach(() => {
   vi.mocked(updateModel).mockClear()
   upstreamModelMocks.fetchModels.mockReset()
@@ -159,7 +165,7 @@ describe('ModelMappingDialog', () => {
     mountedApps.push({ app, root })
 
     await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenCalledTimes(1))
-    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1', undefined, false)
+    expect(upstreamModelMocks.fetchModels).toHaveBeenCalledWith('provider-1', undefined, false, undefined)
 
     // Both manual fetch and refresh must bypass the backend cache.
     upstreamModelMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-old' }] })
@@ -168,7 +174,7 @@ describe('ModelMappingDialog', () => {
     expect(fetchButton).not.toBeNull()
     fetchButton!.click()
     await vi.waitFor(() => expect(root.textContent).toContain('gpt-old'))
-    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true)
+    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true, undefined)
 
     upstreamModelMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-6-astra' }] })
     const refreshButton = root.querySelector<HTMLButtonElement>('[title="刷新上游模型"]')
@@ -176,7 +182,57 @@ describe('ModelMappingDialog', () => {
     refreshButton!.click()
     await vi.waitFor(() => expect(root.textContent).toContain('gpt-6-astra'))
     expect(root.textContent).not.toContain('gpt-old')
-    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true)
+    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', undefined, true, undefined)
+  })
+
+  it('remembers the manual Codex version across dialogs and lets users restore automatic selection', async () => {
+    upstreamModelMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-6-sol' }] })
+    function mount(providerType = 'codex') {
+      const root = document.createElement('div')
+      document.body.appendChild(root)
+      const app = createApp(ModelMappingDialog, {
+        open: true, providerId: 'provider-1', providerType, models: [], hasAutoFetchKey: true,
+      })
+      app.mount(root)
+      mountedApps.push({ app, root })
+      return root
+    }
+    const firstRoot = mount()
+    await vi.waitFor(() => expect(firstRoot.textContent).toContain('gpt-6-sol'))
+    const input = firstRoot.querySelector<HTMLInputElement>('[aria-label="Codex 客户端版本"]')!
+    expect(input).not.toBeNull()
+    input.value = ' 0.200.0 '
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(localStorage.getItem('aether:codex-client-version')).toBe('0.200.0')
+    firstRoot.querySelector<HTMLButtonElement>('[title="刷新上游模型"]')!.click()
+    await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith(
+      'provider-1', undefined, true, '0.200.0',
+    ))
+    const first = mountedApps.pop()!
+    first.app.unmount()
+    first.root.remove()
+
+    const secondRoot = mount()
+    await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith(
+      'provider-1', undefined, false, '0.200.0',
+    ))
+    const savedInput = secondRoot.querySelector<HTMLInputElement>('[aria-label="Codex 客户端版本"]')!
+    expect(savedInput.value.trim()).toBe('0.200.0')
+    const customRoot = mount('custom')
+    expect(customRoot.querySelector('[aria-label="Codex 客户端版本"]')).toBeNull()
+    expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith(
+      'provider-1', undefined, false, undefined,
+    )
+
+    savedInput.value = ''
+    savedInput.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(localStorage.getItem('aether:codex-client-version')).toBeNull()
+    secondRoot.querySelector<HTMLButtonElement>('[title="刷新上游模型"]')!.click()
+    await vi.waitFor(() => expect(upstreamModelMocks.fetchModels).toHaveBeenLastCalledWith(
+      'provider-1', undefined, true, undefined,
+    ))
   })
 
   it('offers session compaction only for an explicitly selected Responses endpoint', async () => {

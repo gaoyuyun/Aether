@@ -595,7 +595,7 @@ impl ModelFetchRuntimeState for AppState {
         provider_id: &str,
         key_id: &str,
     ) -> Option<String> {
-        crate::model_fetch::read_codex_management_catalog(self, provider_id, key_id)
+        crate::model_fetch::read_codex_management_catalog(self, provider_id, key_id, None)
             .await
             .map(|catalog| catalog.client_version)
     }

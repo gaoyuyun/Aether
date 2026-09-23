@@ -85,13 +85,20 @@ pub(crate) fn provider_query_extract_force_refresh(payload: &serde_json::Value) 
         .unwrap_or(false)
 }
 
-pub(crate) fn provider_query_extract_client_version(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("client_version")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+pub(crate) fn provider_query_extract_client_version(
+    payload: &serde_json::Value,
+) -> Result<Option<crate::model_fetch::NormalizedCodexClientVersion>, &'static str> {
+    let raw = match payload.get("client_version") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => return Ok(None),
+        Some(serde_json::Value::String(value)) => value,
+        Some(_) => return Err(super::response::ADMIN_PROVIDER_QUERY_INVALID_CLIENT_VERSION_DETAIL),
+    };
+    let normalized = crate::model_fetch::normalize_codex_client_version(Some(raw));
+    if normalized.used_fallback() {
+        return Err(super::response::ADMIN_PROVIDER_QUERY_INVALID_CLIENT_VERSION_DETAIL);
+    }
+    Ok(Some(normalized))
 }
 
 pub(crate) fn provider_query_extract_model(payload: &serde_json::Value) -> Option<String> {

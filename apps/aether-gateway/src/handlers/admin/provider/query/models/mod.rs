@@ -6,8 +6,7 @@ use super::payload::{
 };
 use super::response::{
     build_admin_provider_query_bad_request_response, build_admin_provider_query_not_found_response,
-    ADMIN_PROVIDER_QUERY_API_KEY_NOT_FOUND_DETAIL,
-    ADMIN_PROVIDER_QUERY_INVALID_CLIENT_VERSION_DETAIL, ADMIN_PROVIDER_QUERY_MODEL_REQUIRED_DETAIL,
+    ADMIN_PROVIDER_QUERY_API_KEY_NOT_FOUND_DETAIL, ADMIN_PROVIDER_QUERY_MODEL_REQUIRED_DETAIL,
     ADMIN_PROVIDER_QUERY_NO_ACTIVE_API_KEY_DETAIL, ADMIN_PROVIDER_QUERY_NO_LOCAL_MODELS_DETAIL,
     ADMIN_PROVIDER_QUERY_PROVIDER_ID_REQUIRED_DETAIL,
     ADMIN_PROVIDER_QUERY_PROVIDER_NOT_FOUND_DETAIL,
@@ -506,11 +505,17 @@ async fn provider_query_fetch_models_for_key(
     endpoints: &[StoredProviderCatalogEndpoint],
     key: &StoredProviderCatalogKey,
     force_refresh: bool,
-    codex_client_version: Option<&str>,
+    codex_client_version: Option<&crate::model_fetch::NormalizedCodexClientVersion>,
 ) -> Result<ProviderQueryKeyFetchResult, GatewayError> {
     let is_codex = provider.provider_type.trim().eq_ignore_ascii_case("codex");
     let codex_catalog = if is_codex {
-        crate::model_fetch::read_codex_management_catalog(state.app(), &provider.id, &key.id).await
+        crate::model_fetch::read_codex_management_catalog(
+            state.app(),
+            &provider.id,
+            &key.id,
+            codex_client_version,
+        )
+        .await
     } else {
         None
     };
@@ -520,11 +525,10 @@ async fn provider_query_fetch_models_for_key(
         let cached_models = if is_codex {
             codex_catalog
                 .as_ref()
-                .filter(|catalog| {
-                    codex_client_version.map_or(true, |version| catalog.client_version == version)
-                        && selected_models_fetch_endpoints(endpoints, key)
-                            .iter()
-                            .any(|endpoint| endpoint.api_format == "openai:responses")
+                .filter(|_| {
+                    selected_models_fetch_endpoints(endpoints, key)
+                        .iter()
+                        .any(|endpoint| endpoint.api_format == "openai:responses")
                 })
                 .and_then(|catalog| catalog.models.as_ref())
                 .map(|models| {
@@ -599,12 +603,14 @@ async fn provider_query_fetch_models_for_key(
     }
 
     let client_version = is_codex.then(|| {
-        codex_client_version.unwrap_or_else(|| {
-            codex_catalog
-                .as_ref()
-                .map(|catalog| catalog.client_version.as_str())
-                .unwrap_or(crate::ai_serving::CODEX_CLIENT_VERSION)
-        })
+        codex_client_version
+            .map(|version| version.as_str())
+            .unwrap_or_else(|| {
+                codex_catalog
+                    .as_ref()
+                    .map(|catalog| catalog.client_version.as_str())
+                    .unwrap_or(crate::ai_serving::CODEX_CLIENT_VERSION)
+            })
     });
     let outcome =
         match fetch_models_from_transports_for_management(state.app(), &transports, client_version)
@@ -635,12 +641,9 @@ async fn provider_query_fetch_models_for_key(
     if outcome.has_success && !unique_models.is_empty() {
         if all_errors.is_empty() && outcome.native_codex_catalog {
             if let Some(catalog) = codex_catalog.as_ref() {
-                let catalog = codex_client_version
-                    .map(|version| catalog.with_client_version(version))
-                    .unwrap_or_else(|| catalog.clone());
                 crate::model_fetch::store_codex_management_catalog(
                     state.app(),
-                    &catalog,
+                    catalog,
                     &transports,
                     outcome.cached_models,
                     outcome.etag.as_deref(),
@@ -715,6 +718,15 @@ pub(crate) async fn build_admin_provider_query_models_response(
         ));
     };
 
+    let codex_client_version = if provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+        match provider_query_extract_client_version(payload) {
+            Ok(version) => version,
+            Err(detail) => return Ok(build_admin_provider_query_bad_request_response(detail)),
+        }
+    } else {
+        None
+    };
+
     let provider_ids = vec![provider.id.clone()];
     let endpoints = state
         .app()
@@ -725,23 +737,6 @@ pub(crate) async fn build_admin_provider_query_models_response(
         .list_provider_catalog_keys_by_provider_ids(&provider_ids)
         .await?;
     let force_refresh = provider_query_extract_force_refresh(payload);
-    let requested_client_version = provider_query_extract_client_version(payload);
-    let codex_client_version = if provider.provider_type.trim().eq_ignore_ascii_case("codex") {
-        match requested_client_version.as_deref() {
-            Some(raw) => {
-                let normalized = crate::model_fetch::normalize_codex_client_version(Some(raw));
-                if normalized.used_fallback() {
-                    return Ok(build_admin_provider_query_bad_request_response(
-                        ADMIN_PROVIDER_QUERY_INVALID_CLIENT_VERSION_DETAIL,
-                    ));
-                }
-                Some(normalized.as_str().to_string())
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
 
     if let Some(api_key_id) = provider_query_extract_api_key_id(payload) {
         let Some(selected_key) = keys.iter().find(|key| key.id == api_key_id) else {
@@ -756,7 +751,7 @@ pub(crate) async fn build_admin_provider_query_models_response(
             &endpoints,
             selected_key,
             force_refresh,
-            codex_client_version.as_deref(),
+            codex_client_version.as_ref(),
         )
         .await?;
         let models = provider_query_attach_model_test_capabilities(&provider, result.models);
@@ -839,7 +834,7 @@ pub(crate) async fn build_admin_provider_query_models_response(
             &endpoints,
             key,
             force_refresh,
-            codex_client_version.as_deref(),
+            codex_client_version.as_ref(),
         )
         .await?;
         all_models.extend(result.models);

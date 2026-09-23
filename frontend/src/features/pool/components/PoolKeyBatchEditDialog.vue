@@ -284,6 +284,12 @@
                 </Button>
               </div>
 
+              <CodexClientVersionField
+                v-model="codexClientVersion"
+                :provider-type="props.providerType"
+                :disabled="fetchingUpstreamModels || modelSelectionDisabled"
+              />
+
               <div class="flex items-center justify-between gap-3 text-xs text-muted-foreground">
                 <span>已选择 {{ form.selectedModels.length }} 个模型</span>
                 <button
@@ -414,6 +420,8 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
 import { useUpstreamModelsCache } from '@/features/providers/composables/useUpstreamModelsCache'
+import { useCodexClientVersion } from '@/features/providers/composables/useCodexClientVersion'
+import CodexClientVersionField from '@/features/providers/components/CodexClientVersionField.vue'
 import BatchFieldToggle from './PoolKeyBatchFieldToggle.vue'
 import {
   buildPoolKeyBatchUpdatePatch,
@@ -429,6 +437,7 @@ const props = defineProps<{
   open: boolean
   providerId: string
   providerName?: string
+  providerType?: string | null
   keyIds: string[]
   availableApiFormats: string[]
 }>()
@@ -441,6 +450,7 @@ const emit = defineEmits<{
 const { success, warning, error: showError } = useToast()
 const { confirm } = useConfirm()
 const { fetchModelsForKeys } = useUpstreamModelsCache()
+const codexClientVersion = useCodexClientVersion()
 
 const activeTab = ref('configuration')
 const saving = ref(false)
@@ -590,7 +600,14 @@ async function fetchUpstreamModels(forceRefresh = false): Promise<void> {
   if (!props.providerId || props.keyIds.length === 0) return
   fetchingUpstreamModels.value = true
   try {
-    const result = await fetchModelsForKeys(props.providerId, props.keyIds, forceRefresh)
+    const result = await fetchModelsForKeys(
+      props.providerId,
+      props.keyIds,
+      forceRefresh,
+      props.providerType?.trim().toLowerCase() === 'codex'
+        ? codexClientVersion.value.trim() || undefined
+        : undefined,
+    )
     if (result.error) {
       warning(result.error)
       return

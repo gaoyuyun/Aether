@@ -1006,6 +1006,7 @@
       :open="keyBatchEditDialogOpen"
       :provider-id="selectedProviderId"
       :provider-name="selectedProviderData?.name || ''"
+      :provider-type="selectedProviderData?.provider_type"
       :key-ids="keyBatchEditKeyIds"
       :available-api-formats="selectedProviderData?.api_formats || []"
       @close="closeKeyBatchEditDialog"

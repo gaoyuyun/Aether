@@ -1,7 +1,7 @@
 /**
  * 上游模型获取服务
  *
- * 缓存已移至后端（Redis），前端只保留并发请求去重，避免同时发多个相同请求。
+ * 缓存由后端管理，前端只保留并发请求去重，避免同时发多个相同请求。
  */
 import { ref } from 'vue'
 import { isAxiosError } from 'axios'
@@ -25,8 +25,7 @@ const loadingMap = ref<Map<string, boolean>>(new Map())
  * 生成请求 key
  */
 function getRequestKey(providerId: string, apiKeyId?: string, clientVersion?: string): string {
-  const versionKey = clientVersion?.trim() || 'auto'
-  return `${providerId}:${apiKeyId || 'all'}:version:${versionKey}`
+  return JSON.stringify([providerId, 'single', apiKeyId ?? null, clientVersion?.trim() || null])
 }
 
 function getBatchRequestKey(
@@ -34,8 +33,9 @@ function getBatchRequestKey(
   apiKeyIds: string[],
   clientVersion?: string,
 ): string {
-  const versionKey = clientVersion?.trim() || 'auto'
-  return `${providerId}:batch:${JSON.stringify([...new Set(apiKeyIds)].sort())}:version:${versionKey}`
+  return JSON.stringify([
+    providerId, 'batch', [...new Set(apiKeyIds)].sort(), clientVersion?.trim() || null,
+  ])
 }
 
 function providerModelsFetchResult(response: ProviderModelsQueryResponse): FetchResult {
@@ -103,11 +103,12 @@ export function useUpstreamModelsCache() {
     forceRefresh = false,
     clientVersion?: string,
   ): Promise<FetchResult> {
-    const requestKey = getRequestKey(providerId, apiKeyId, clientVersion)
+    const normalizedVersion = clientVersion?.trim() || undefined
+    const requestKey = getRequestKey(providerId, apiKeyId, normalizedVersion)
     return fetchProviderModels(
       requestKey,
       forceRefresh,
-      () => adminApi.queryProviderModels(providerId, apiKeyId, forceRefresh, clientVersion),
+      () => adminApi.queryProviderModels(providerId, apiKeyId, forceRefresh, normalizedVersion),
     )
   }
 
@@ -121,24 +122,25 @@ export function useUpstreamModelsCache() {
     if (normalizedKeyIds.length === 0) {
       return { models: [], error: '请先选择账号' }
     }
-    const requestKey = getBatchRequestKey(providerId, normalizedKeyIds, clientVersion)
+    const normalizedVersion = clientVersion?.trim() || undefined
+    const requestKey = getBatchRequestKey(providerId, normalizedKeyIds, normalizedVersion)
     return fetchProviderModels(
       requestKey,
       forceRefresh,
       () => adminApi.queryProviderModelsForKeys(
-          providerId,
-          normalizedKeyIds,
-          forceRefresh,
-          clientVersion,
-        ),
+        providerId,
+        normalizedKeyIds,
+        forceRefresh,
+        normalizedVersion,
+      ),
     )
   }
 
   /**
    * 检查是否正在加载
    */
-  function isLoading(providerId: string, apiKeyId?: string): boolean {
-    const requestKey = getRequestKey(providerId, apiKeyId)
+  function isLoading(providerId: string, apiKeyId?: string, clientVersion?: string): boolean {
+    const requestKey = getRequestKey(providerId, apiKeyId, clientVersion)
     return loadingMap.value.get(requestKey) || false
   }
 

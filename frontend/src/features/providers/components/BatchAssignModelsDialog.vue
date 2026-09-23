@@ -64,6 +64,12 @@
           </DropdownMenu>
         </div>
 
+        <CodexClientVersionField
+          v-model="codexClientVersion"
+          :provider-type="props.providerType"
+          :disabled="fetchingAutoMatchedModels"
+        />
+
         <!-- 模型列表 -->
         <div class="border rounded-lg overflow-hidden">
           <div class="max-h-96 overflow-y-auto">
@@ -183,6 +189,8 @@ import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { parseApiError } from '@/utils/errorParser'
 import { useUpstreamModelsCache } from '../composables/useUpstreamModelsCache'
+import { useCodexClientVersion } from '../composables/useCodexClientVersion'
+import CodexClientVersionField from './CodexClientVersionField.vue'
 import {
   getGlobalModels,
   type GlobalModelResponse
@@ -202,6 +210,7 @@ interface Props {
   open: boolean
   providerId: string
   providerName?: string
+  providerType?: string | null
 }
 
 const props = defineProps<Props>()
@@ -220,6 +229,7 @@ interface AutoMatchKeyLike {
 const { error: showError, success, warning: showWarning } = useToast()
 const { confirmWarning } = useConfirm()
 const { fetchModels: fetchCachedModels } = useUpstreamModelsCache()
+const codexClientVersion = useCodexClientVersion()
 
 // 状态
 const loadingGlobalModels = ref(false)
@@ -354,7 +364,14 @@ async function applyAutoMatchFromKey(key: AutoMatchKey) {
 
   fetchingAutoMatchedModels.value = true
   try {
-    const result = await fetchCachedModels(props.providerId, key.id, true)
+    const result = await fetchCachedModels(
+      props.providerId,
+      key.id,
+      true,
+      props.providerType?.trim().toLowerCase() === 'codex'
+        ? codexClientVersion.value.trim() || undefined
+        : undefined,
+    )
     if (!props.open) return
 
     if (result.warning) {

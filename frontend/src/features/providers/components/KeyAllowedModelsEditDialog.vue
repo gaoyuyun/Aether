@@ -70,6 +70,7 @@
         <CodexClientVersionField
           v-model="codexClientVersion"
           :provider-type="props.providerType"
+          :disabled="fetchingUpstreamModels"
         />
 
         <!-- 模型列表 -->
@@ -696,7 +697,9 @@ async function fetchUpstreamModels(forceRefresh = false) {
       props.providerId,
       props.apiKey.id,
       forceRefresh,
-      codexClientVersion.value,
+      props.providerType?.trim().toLowerCase() === 'codex'
+        ? codexClientVersion.value.trim() || undefined
+        : undefined,
     )
     if (loadingCancelled) return
     if (result.models.length > 0) {

@@ -701,6 +701,7 @@ async fn gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache_impl(
                 &cache_state,
                 "provider-codex-dynamic",
                 "key-codex-dynamic",
+                None,
             )
             .await
             .unwrap();
@@ -738,6 +739,159 @@ async fn gateway_recovers_codex_slug_only_models_from_a_stale_legacy_cache_impl(
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_admin_codex_client_version_selects_matching_catalogs() {
+    run_provider_query_test(
+        "gateway_admin_codex_client_version_selects_matching_catalogs",
+        gateway_admin_codex_client_version_selects_matching_catalogs_impl,
+    );
+}
+
+async fn gateway_admin_codex_client_version_selects_matching_catalogs_impl() {
+    let hits = Arc::new(Mutex::new(0usize));
+    let upstream_hits = Arc::clone(&hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let hits = Arc::clone(&upstream_hits);
+            async move {
+                *hits.lock().unwrap() += 1;
+                let url = url::Url::parse(&plan.url).unwrap();
+                let version = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "client_version")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                assert_eq!(
+                    plan.headers.get("user-agent"),
+                    Some(&format!("codex_cli_rs/{version}")),
+                );
+                let slug = if version == "0.200.0" {
+                    "gpt-6-sol"
+                } else {
+                    "gpt-old"
+                };
+                Json(json!({
+                    "request_id": "req-codex-client-version",
+                    "status_code": 200,
+                    "headers": { "content-type": "application/json" },
+                    "body": { "json_body": { "models": [{ "slug": slug }] } },
+                }))
+            }
+        }),
+    );
+    let (runtime_url, runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-codex-version", "Codex", 10);
+    provider.provider_type = "codex".to_string();
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-codex-version",
+            "provider-codex-version",
+            "openai:responses",
+            "https://chatgpt.com/backend-api/codex",
+        )],
+        vec![sample_bound_key(
+            "key-codex-version",
+            "provider-codex-version",
+            "openai:responses",
+            "codex-token",
+        )],
+    ));
+    let state = build_state_with_execution_runtime_override(runtime_url).with_data_state_for_tests(
+        GatewayDataState::with_provider_transport_reader_for_tests(
+            repository,
+            DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+        ),
+    );
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state.clone())).await;
+    let client = reqwest::Client::new();
+    let request = |payload: serde_json::Value| {
+        client
+            .post(format!("{gateway_url}/api/admin/provider-query/models"))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&payload)
+    };
+    let default_version = aether_ai_formats::CODEX_CLIENT_VERSION;
+    for (version, scope, force, cached, expected_hits, model) in [
+        (None, "single", false, false, 1, "gpt-old"),
+        (
+            Some(" 0.200.0-beta.1+desktop.7 "),
+            "single",
+            false,
+            false,
+            2,
+            "gpt-6-sol",
+        ),
+        (Some(default_version), "single", false, true, 2, "gpt-old"),
+        (Some("0.200.0"), "batch", false, true, 2, "gpt-6-sol"),
+        (Some("  "), "all", false, true, 2, "gpt-6-sol"),
+        (None, "all", false, true, 2, "gpt-6-sol"),
+        (Some("0.200.0"), "single", true, false, 3, "gpt-6-sol"),
+        (Some(default_version), "single", true, false, 4, "gpt-old"),
+        (None, "single", false, true, 4, "gpt-6-sol"),
+    ] {
+        let mut body = json!({
+            "provider_id": "provider-codex-version",
+            "force_refresh": force,
+        });
+        if let Some(version) = version {
+            body["client_version"] = json!(version);
+        }
+        if scope == "single" {
+            body["api_key_id"] = json!("key-codex-version");
+        }
+        if scope == "batch" {
+            body["api_key_ids"] = json!(["key-codex-version"]);
+        }
+        let response = request(body).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["data"]["from_cache"], cached, "{result}");
+        assert_eq!(result["data"]["models"][0]["id"], model, "{result}");
+        assert_eq!(*hits.lock().unwrap(), expected_hits);
+    }
+
+    // The scheduled worker uses the newest successful management version too.
+    assert_eq!(
+        <AppState as crate::model_fetch::ModelFetchRuntimeState>::read_recent_codex_catalog_client_version(
+            &state, "provider-codex-version", "key-codex-version",
+        ).await.as_deref(),
+        Some("0.200.0"),
+    );
+    for invalid in [
+        json!("not-a-version"),
+        json!("0.200"),
+        json!("0.200.0&extra=1"),
+        json!("0.200.0-".to_string() + &"x".repeat(64)),
+        json!(123),
+        json!(true),
+        json!([]),
+        json!({}),
+    ] {
+        let response = request(json!({
+            "provider_id": "provider-codex-version",
+            "client_version": invalid,
+        }))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{invalid}");
+    }
+    assert_eq!(
+        *hits.lock().unwrap(),
+        4,
+        "invalid versions must not fetch upstream"
+    );
+    gateway_handle.abort();
+    runtime_handle.abort();
 }
 
 #[test]
