@@ -133,13 +133,13 @@
       <!-- 推理回放缓存（仅 Codex / Google 系渠道） -->
       <div
         v-if="showReasoningReplayAction"
-        class="flex items-center justify-between gap-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        class="flex flex-col gap-3 p-3 rounded-lg border border-border/60 bg-muted/30 sm:flex-row sm:items-center sm:justify-between"
         data-testid="reasoning-replay-section"
       >
-        <div class="space-y-0.5">
+        <div class="min-w-0 flex-1 space-y-1">
           <Label class="text-sm font-medium">推理回放缓存</Label>
-          <p class="text-xs text-muted-foreground">
-            跨格式多轮工具调用时，网关会缓存上一轮的推理签名并在下一轮回放。上游持续报签名无效时可手动清除。
+          <p class="text-xs text-muted-foreground leading-relaxed">
+            持续提示推理签名无效时，可清除缓存。
           </p>
           <p
             v-if="reasoningReplayClearedCount !== null"
@@ -152,6 +152,7 @@
           type="button"
           variant="outline"
           size="sm"
+          class="shrink-0 self-start whitespace-nowrap sm:self-auto"
           :disabled="clearingReasoningReplay"
           data-testid="clear-reasoning-replay"
           @click="handleClearReasoningReplay"
@@ -163,17 +164,17 @@
       <!-- Claude Code 设备身份（仅 claude_code；只读摘要 + 重置） -->
       <div
         v-if="showClaudeCodeDeviceSection"
-        class="flex items-center justify-between gap-3 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        class="flex flex-col gap-3 p-3 rounded-lg border border-border/60 bg-muted/30 sm:flex-row sm:items-center sm:justify-between"
         data-testid="claude-code-device-section"
       >
-        <div class="space-y-0.5">
+        <div class="min-w-0 flex-1 space-y-1">
           <Label class="text-sm font-medium">设备身份</Label>
           <p class="text-xs text-muted-foreground">
             第三方客户端经此 Key 上游时，网关以固定的设备标识与软件版本冒充原生 Claude Code；7 天内只升不降。
           </p>
           <p
             v-if="claudeCodeDeviceProfile"
-            class="text-xs text-muted-foreground font-mono"
+            class="break-words text-xs text-muted-foreground font-mono"
             data-testid="claude-code-device-summary"
           >
             {{ claudeCodeDeviceProfile.device_id_prefix }}… · CLI {{ claudeCodeDeviceProfile.cli_version }} · SDK {{ claudeCodeDeviceProfile.package_version }} · Node {{ claudeCodeDeviceProfile.runtime_version }} · {{ claudeCodeDeviceProfile.os }}/{{ claudeCodeDeviceProfile.arch }}
@@ -190,6 +191,7 @@
           type="button"
           variant="outline"
           size="sm"
+          class="shrink-0 self-start whitespace-nowrap sm:self-auto"
           :disabled="resettingClaudeCodeDevice || !claudeCodeDeviceProfile"
           data-testid="reset-claude-code-device"
           @click="handleResetClaudeCodeDevice"
@@ -201,18 +203,18 @@
       <!-- 敏感词混淆（仅 claude_code / antigravity；Key 级覆盖供应商词表） -->
       <div
         v-if="showSensitiveWordsSection"
-        class="space-y-2 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        class="space-y-2 p-3 rounded-lg border border-border/60 bg-muted/30"
         data-testid="sensitive-words-section"
       >
-        <div class="flex items-center justify-between gap-3">
-          <div class="space-y-0.5">
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0 flex-1 space-y-1">
             <Label class="text-sm font-medium">敏感词混淆</Label>
             <p class="text-xs text-muted-foreground">
               默认继承供应商词表；选择「覆盖」后本 Key 只用这里的词表（留空即关闭混淆）。
             </p>
           </div>
           <div
-            class="flex items-center gap-3 text-xs"
+            class="flex shrink-0 items-center gap-3 whitespace-nowrap text-xs"
             role="radiogroup"
             aria-label="敏感词来源"
           >
@@ -267,27 +269,27 @@
       <!-- 传输指纹 profile（P5，仅 claude_code / codex；Key 级覆盖供应商设置） -->
       <div
         v-if="showTransportProfileSection"
-        class="space-y-2 py-2 px-3 rounded-md border border-border/60 bg-muted/30"
+        class="space-y-3 p-3 rounded-lg border border-border/60 bg-muted/30"
         data-testid="transport-profile-section"
       >
-        <div class="flex items-center justify-between gap-3">
-          <div class="space-y-0.5">
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0 flex-1 space-y-1">
             <Label
               for="key-transport-profile"
               class="text-sm font-medium"
-            >传输指纹 profile</Label>
-            <p class="text-xs text-muted-foreground">
-              留空继承供应商设置；选择仿真 profile 后本 Key 的出站 TLS 改用 BoringSSL 复刻原生客户端的 ClientHello。
+            >传输指纹</Label>
+            <p class="text-xs text-muted-foreground leading-relaxed">
+              探测使用已保存的配置。
             </p>
           </div>
           <select
             id="key-transport-profile"
             v-model="form.transport_profile"
-            class="h-8 rounded-md border border-input bg-background px-2 text-sm"
+            class="h-9 w-full min-w-0 rounded-lg border border-border/60 bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 sm:w-64 sm:shrink-0"
             data-testid="transport-profile-select"
           >
             <option :value="null">
-              继承供应商 / 系统默认
+              继承供应商
             </option>
             <option
               v-for="option in transportProfileOptions"
@@ -298,31 +300,45 @@
             </option>
           </select>
         </div>
-        <div class="flex items-center justify-between gap-3">
+        <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-border/40 pt-3">
           <p
-            v-if="tlsProbe"
-            class="text-xs text-muted-foreground font-mono break-all"
+            class="min-w-0 text-xs text-muted-foreground leading-relaxed"
             data-testid="tls-probe-summary"
+            role="status"
           >
-            JA3 {{ tlsProbe.ja3_hash ?? '-' }} · JA4 {{ tlsProbe.ja4 ?? '-' }} · {{ tlsProbe.tls_stack ?? '-' }} · {{ tlsProbe.http_version ?? '-' }} · {{ formatProbedAt(tlsProbe.probed_at_unix_secs) }}
+            <template v-if="tlsProbe">
+              已探测
+              <span v-if="tlsProbe.probed_at_unix_secs">· {{ formatProbedAt(tlsProbe.probed_at_unix_secs) }}</span>
+            </template>
+            <template v-else>
+              尚未探测
+            </template>
           </p>
-          <p
-            v-else
-            class="text-xs text-muted-foreground"
-            data-testid="tls-probe-summary"
-          >
-            尚未探测；探测会按当前保存的 profile 与代理向 tls.peet.ws 发一次请求。
-          </p>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            :disabled="probingTls"
-            data-testid="probe-tls-fingerprint"
-            @click="handleProbeTlsFingerprint"
-          >
-            {{ probingTls ? '探测中...' : '探测 TLS 指纹' }}
-          </Button>
+          <div class="flex shrink-0 items-center gap-2">
+            <Button
+              v-if="tlsProbe"
+              type="button"
+              variant="ghost"
+              size="sm"
+              class="shrink-0 whitespace-nowrap text-xs text-muted-foreground"
+              title="复制完整指纹"
+              data-testid="copy-tls-fingerprint"
+              @click="handleCopyTlsFingerprint"
+            >
+              复制结果
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              class="shrink-0 whitespace-nowrap"
+              :disabled="probingTls"
+              data-testid="probe-tls-fingerprint"
+              @click="handleProbeTlsFingerprint"
+            >
+              {{ probingTls ? '探测中...' : '探测指纹' }}
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -396,6 +412,7 @@ import { ref, computed, watch } from 'vue'
 import { Dialog, Button, Input, Label, Switch, Textarea } from '@/components/ui'
 import { SquarePen } from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
+import { useClipboard } from '@/composables/useClipboard'
 import { useConfirm } from '@/composables/useConfirm'
 import { useFormDialog } from '@/composables/useFormDialog'
 import { parseApiError } from '@/utils/errorParser'
@@ -440,6 +457,7 @@ const emit = defineEmits<{
 
 const { success, error: showError, warning } = useToast()
 const { confirmWarning } = useConfirm()
+const { copyToClipboard } = useClipboard()
 
 // 显示自动获取模型警告：编辑模式下，原本未启用但现在启用，且已有 allowed_models
 const showAutoFetchWarning = computed(() => {
@@ -575,6 +593,11 @@ const tlsProbe = computed<TlsProbeSummary | null>(() => {
 function formatProbedAt(unixSecs: number | null | undefined): string {
   if (!unixSecs) return '-'
   return new Date(unixSecs * 1000).toLocaleString()
+}
+
+async function handleCopyTlsFingerprint() {
+  if (!tlsProbe.value) return
+  await copyToClipboard(JSON.stringify(tlsProbe.value, null, 2))
 }
 
 async function handleProbeTlsFingerprint() {

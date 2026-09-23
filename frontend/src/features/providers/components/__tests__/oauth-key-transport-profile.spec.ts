@@ -11,6 +11,7 @@ const endpointMocks = vi.hoisted(() => ({
   confirmWarning: vi.fn(),
   toastSuccess: vi.fn(),
   toastError: vi.fn(),
+  copyToClipboard: vi.fn(),
 }))
 
 vi.mock('@/api/endpoints', () => ({
@@ -99,6 +100,10 @@ vi.mock('@/composables/useConfirm', () => ({
   useConfirm: () => ({ confirmWarning: endpointMocks.confirmWarning }),
 }))
 
+vi.mock('@/composables/useClipboard', () => ({
+  useClipboard: () => ({ copyToClipboard: endpointMocks.copyToClipboard }),
+}))
+
 vi.mock('lucide-vue-next', async () => {
   const { defineComponent, h } = await import('vue')
   const Icon = defineComponent({ name: 'IconStub', setup: () => () => h('span') })
@@ -168,6 +173,7 @@ function clickSave(root: HTMLElement) {
 beforeEach(() => {
   for (const mock of Object.values(endpointMocks)) mock.mockReset()
   endpointMocks.confirmWarning.mockResolvedValue(true)
+  endpointMocks.copyToClipboard.mockResolvedValue(true)
   endpointMocks.updateProviderKey.mockImplementation(async (_id: string, payload: Record<string, unknown>) => ({
     ...createKey(),
     ...payload,
@@ -186,11 +192,17 @@ const probeResult = {
   probe_url: 'https://tls.peet.ws/api/all',
   probed_at_unix_secs: 1_760_000_000,
   emulation_profile: 'claude_code_node_openssl',
+  profile_id: 'claude_code_node_openssl',
   backend: 'browser_wreq',
   tls_stack: 'boringssl_wreq',
   http_version: 'h1',
+  ja3: '771,4865-4866-4867,0-11-10-35-16-13-43-45-51,29-23-24,0',
   ja3_hash: '3f2a1c9e8b7d6f5a4c3b2a1908f7e6d5',
   ja4: 't13d1716h1_5b57614c22b0_3d5db4fb5c1e',
+  peetprint: '771-772|2-1.1|29-23-24',
+  akamai_fingerprint: '1:65536;2:0;4:6291456|15663105|0|m,a,s,p',
+  tls_version_negotiated: '772',
+  http1_header_order: ['host', 'accept', 'user-agent'],
 }
 
 async function selectKeyTransportProfile(root: HTMLElement, index: number) {
@@ -240,7 +252,7 @@ describe('OAuthKeyEditDialog transport profile and TLS probe', () => {
     )
   })
 
-  it('shows the stored probe summary and refreshes it after probing', async () => {
+  it('keeps fingerprints out of the summary and copies the complete latest probe result', async () => {
     endpointMocks.probeProviderKeyTlsFingerprint.mockResolvedValue({
       message: '已完成 TLS 指纹探测',
       key_id: 'key-claude-1',
@@ -248,14 +260,28 @@ describe('OAuthKeyEditDialog transport profile and TLS probe', () => {
     })
     const root = mountDialog('claude_code', createKey({ tls_probe: probeResult }))
     await settle()
-    expect(root.querySelector('[data-testid="tls-probe-summary"]')?.textContent).toContain('JA3 3f2a1c9e8b7d6f5a4c3b2a1908f7e6d5')
-    expect(root.querySelector('[data-testid="tls-probe-summary"]')?.textContent).toContain('t13d1716h1_5b57614c22b0_3d5db4fb5c1e')
+    const summary = root.querySelector('[data-testid="tls-probe-summary"]')
+    expect(summary?.textContent).toContain('已探测')
+    expect(summary?.textContent).toContain(new Date(probeResult.probed_at_unix_secs * 1000).toLocaleString())
+    expect(root.textContent).not.toContain(probeResult.ja3_hash)
+    expect(root.textContent).not.toContain(probeResult.ja4)
+
+    root.querySelector<HTMLButtonElement>('[data-testid="copy-tls-fingerprint"]')?.click()
+    await settle()
+    expect(JSON.parse(endpointMocks.copyToClipboard.mock.calls[0]![0])).toEqual(probeResult)
 
     root.querySelector<HTMLButtonElement>('[data-testid="probe-tls-fingerprint"]')?.click()
     await settle()
     expect(endpointMocks.probeProviderKeyTlsFingerprint).toHaveBeenCalledWith('key-claude-1')
     expect(endpointMocks.toastSuccess).toHaveBeenCalledWith('已完成 TLS 指纹探测', '成功')
-    expect(root.querySelector('[data-testid="tls-probe-summary"]')?.textContent).toContain('t13d1716h1_refreshed_after_probe')
+    expect(root.textContent).not.toContain('t13d1716h1_refreshed_after_probe')
+
+    root.querySelector<HTMLButtonElement>('[data-testid="copy-tls-fingerprint"]')?.click()
+    await settle()
+    expect(JSON.parse(endpointMocks.copyToClipboard.mock.calls[1]![0])).toEqual({
+      ...probeResult,
+      ja4: 't13d1716h1_refreshed_after_probe',
+    })
   })
 
   it('explains the pending state and surfaces probe failures', async () => {
@@ -263,10 +289,12 @@ describe('OAuthKeyEditDialog transport profile and TLS probe', () => {
     const root = mountDialog('codex', createKey({ tls_probe: null }))
     await settle()
     expect(root.querySelector('[data-testid="tls-probe-summary"]')?.textContent).toContain('尚未探测')
+    expect(root.querySelector('[data-testid="copy-tls-fingerprint"]')).toBeNull()
 
     root.querySelector<HTMLButtonElement>('[data-testid="probe-tls-fingerprint"]')?.click()
     await settle()
     expect(endpointMocks.toastError).toHaveBeenCalledWith(expect.stringContaining('503'), '错误')
     expect(root.querySelector('[data-testid="tls-probe-summary"]')?.textContent).toContain('尚未探测')
+    expect(root.querySelector('[data-testid="copy-tls-fingerprint"]')).toBeNull()
   })
 })

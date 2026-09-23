@@ -368,7 +368,7 @@ export function normalizeTransportProfile(value: unknown): TransportProfileId | 
 export function transportProfileLabel(value: TransportProfileId | null | undefined): string {
   switch (value) {
     case 'claude_code_node_openssl':
-      return 'Claude Code Node/OpenSSL'
+      return 'Claude Code'
     case 'chatgpt_com_chrome':
       return 'Chrome'
     default:

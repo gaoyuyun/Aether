@@ -568,19 +568,19 @@
         <!-- 传输指纹 profile（P5，仅 claude_code / codex） -->
         <div
           v-if="showTransportProfileSetting"
-          class="space-y-3 p-3 border rounded-lg bg-muted/50"
+          class="p-3 border rounded-lg bg-muted/50"
           data-testid="transport-profile-setting"
         >
-          <div class="flex items-center justify-between gap-4">
-            <div class="space-y-0.5">
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div class="min-w-0 flex-1 space-y-1">
               <Label
                 for="transport-profile"
                 class="text-sm font-medium"
               >
-                {{ legacyT('传输指纹 profile') }}
+                {{ legacyT('传输指纹') }}
               </Label>
               <p class="text-xs text-muted-foreground leading-relaxed">
-                {{ legacyT('系统默认走 rustls；选择仿真 profile 后出站 TLS 改用 BoringSSL 复刻原生客户端的 ClientHello 与头顺序。Key 级设置优先。') }}
+                {{ legacyT('Key 可单独覆盖此设置。') }}
               </p>
             </div>
             <Select
@@ -589,8 +589,8 @@
             >
               <SelectTrigger
                 id="transport-profile"
-                class="w-56"
-                :aria-label="legacyT('传输指纹 profile')"
+                class="h-9 w-full rounded-lg sm:w-64 sm:shrink-0"
+                :aria-label="legacyT('传输指纹')"
               >
                 <SelectValue />
               </SelectTrigger>
@@ -608,9 +608,6 @@
               </SelectContent>
             </Select>
           </div>
-          <p class="text-xs text-muted-foreground leading-relaxed">
-            {{ legacyT('仿真参数以 CLIProxyAPI 复刻的 Claude Code 2.1.220 抓包为起点，尚未用真实抓包核对；可在 Key 编辑里「探测 TLS 指纹」查看实际 JA3/JA4。') }}
-          </p>
         </div>
 
         <div
